@@ -32,6 +32,7 @@ use lore_server::authnz::auth::AuthChannel;
 use lore_server::authnz::auth::auth_unavailable_status;
 use lore_server::authnz::auth::is_auth_unavailable;
 use lore_server::authnz::auth::with_auth_budget;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::Grants;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -208,7 +209,7 @@ async fn check(authorizer: &AuthClientAuthorizer) -> Result<(), Status> {
         claims: &claims,
     };
     authorizer
-        .check_repository_access(Some(&token), repository(), None)
+        .check_repository_access(Some(&token), repository(), Action::Read)
         .await
 }
 
@@ -553,7 +554,7 @@ async fn a_hung_source_check_after_a_healthy_partition_call_starts_a_hold() {
             claims: &claims,
         };
         let status = authorizer
-            .check_repository_access(Some(&token), source, None)
+            .check_repository_access(Some(&token), source, Action::Read)
             .await
             .unwrap_err();
         assert!(is_auth_unavailable(&status), "{status:?}");
@@ -621,7 +622,7 @@ impl RepositoryAuthorizer for Fixed {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         self.check.clone()
     }
@@ -752,7 +753,7 @@ async fn require_action_passes_a_timeout_on_and_a_denial_stays_permission_denied
     let authorizer: &dyn RepositoryAuthorizer = &timed_out;
     // `granted_access` itself asks reachability first, which also times out.
     let status = authorizer
-        .require_action(None, repository(), "write")
+        .require_action(None, repository(), Action::Write)
         .await
         .unwrap_err();
     assert!(is_auth_unavailable(&status), "{status:?}");
@@ -764,7 +765,7 @@ async fn require_action_passes_a_timeout_on_and_a_denial_stays_permission_denied
     };
     let authorizer: &dyn RepositoryAuthorizer = &denied;
     let status = authorizer
-        .require_action(None, repository(), "write")
+        .require_action(None, repository(), Action::Write)
         .await
         .unwrap_err();
     assert!(!is_auth_unavailable(&status), "{status:?}");
@@ -783,7 +784,7 @@ async fn require_action_on_a_hung_service_fails_within_one_deadline() {
     };
     let started = Instant::now();
     let status = authorizer
-        .require_action(Some(&token), repository(), "write")
+        .require_action(Some(&token), repository(), Action::Write)
         .await
         .unwrap_err();
     assert!(is_auth_unavailable(&status), "{status:?}");

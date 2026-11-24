@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::env;
+use std::num::NonZeroU8;
+use std::num::NonZeroUsize;
 
 use config::Config;
 use lore_base::runtime::TokioSettings;
@@ -28,6 +30,9 @@ use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
 use crate::store::replica_factory::ReplicaFactorySettings;
 use crate::tls::CertificateSettings;
 use crate::topology::TopologySettings;
@@ -208,6 +213,12 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
     let Some(auth) = auth else {
         return Ok(());
     };
+    if settings.server.trust_unsigned_identity {
+        return Err(config::ConfigError::Message(
+            "server.trust_unsigned_identity applies only to a server without [server.auth]"
+                .to_string(),
+        ));
+    }
     if auth.jwt_issuer.is_empty() {
         return Err(config::ConfigError::Message(
             "server.auth.jwt_issuer must not be empty".to_string(),
@@ -411,6 +422,12 @@ pub struct AuthSettings {
     pub jwt_typ: Option<Vec<String>>,
     /// Dotted path of the JWT claim carrying the caller's allowed actions.
     pub permission_claim: Option<String>,
+    /// Tier 1 only: the actions every token holder gets, added to whatever
+    /// `permission_claim` carries and to `read`, which any token implies.
+    /// Absent means `["write"]`. Read
+    /// through [`AuthSettings::implicit_actions`]; `None` is kept distinct so
+    /// startup can refuse an explicit value that would do nothing.
+    pub implicit_actions: Option<Vec<crate::authnz::repository_authorizer::Action>>,
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
@@ -478,6 +495,12 @@ fn default_enforce_write_permission() -> bool {
 }
 
 impl AuthSettings {
+    pub fn implicit_actions(&self) -> Vec<crate::authnz::repository_authorizer::Action> {
+        self.implicit_actions
+            .clone()
+            .unwrap_or_else(|| vec![crate::authnz::repository_authorizer::Action::Write])
+    }
+
     fn default_resource_id_template() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
     }
@@ -514,8 +537,8 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
-    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
-    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    /// Ask `RepositoryList` on the `lore.user.v1.RepositoryRegistryService`
+    /// at `[environment.endpoint] user_url`, forwarding the caller's token.
     UserService,
 }
 
@@ -618,10 +641,19 @@ pub struct QuicSettings {
     pub idle_timeout: Option<u64>,
     pub keep_alive: Option<u64>,
     pub max_bidi_streams: Option<u64>,
-    pub num_listeners: u8,
+    /// Accept tasks per socket; see
+    /// [`QuinnConfigBuilder::num_listeners`](crate::quic::quinn::QuinnConfigBuilder::num_listeners).
+    pub num_listeners: Option<NonZeroU8>,
+    /// UDP sockets bound to `port`, used on Linux and Android only; see
+    /// [`QuinnConfigBuilder::num_sockets`](crate::quic::quinn::QuinnConfigBuilder::num_sockets).
+    pub num_sockets: Option<NonZeroUsize>,
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
+    /// Congestion window each accepted connection starts with: how much the server sends before
+    /// the peer's first acknowledgements arrive. When unset, the internal endpoint uses 1 MiB and
+    /// the public endpoint its congestion controller's own default.
+    pub initial_cwnd_bytes: Option<InitialCwndBytes>,
     /// Keep below a threshold for whatever Load Balancer sits infront of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
@@ -640,10 +672,30 @@ pub struct QuicSettings {
     pub permit_timeout_ms: Option<u64>,
 }
 
+/// Only Lore servers connect to the internal endpoint, so its connections start with the window
+/// known to suit the path between peers rather than the controller's default.
+fn deserialize_quic_internal<'de, D>(deserializer: D) -> Result<Option<QuicSettings>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut settings = Option::<QuicSettings>::deserialize(deserializer)?;
+    if let Some(settings) = settings.as_mut() {
+        settings
+            .initial_cwnd_bytes
+            .get_or_insert(DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+    Ok(settings)
+}
+
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
+    /// Without `[server.auth]`, take the caller's identity from an unsigned
+    /// bearer token. Anyone can claim any identity, so this only names
+    /// callers; it grants nothing. Refused at load beside `[server.auth]`.
+    #[serde(default)]
+    pub trust_unsigned_identity: bool,
     pub grpc: Option<GrpcSettings>,
     /// One block per public gRPC service; an absent table enables every
     /// service.
@@ -654,6 +706,7 @@ pub struct ServerSettings {
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,
     // the internal-only QUIC server settings
+    #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
     /// Seconds to wait for existing connections to close gracefully after shutdown signal.
     #[serde(default = "default_connection_close_timeout")]
@@ -891,6 +944,11 @@ pub struct ReplicatedStoreSettings {
     pub client_max_reconnects: Option<u32>,
     pub max_bandwidth_bytes_per_second: Option<u64>,
     pub expected_rtt_ms: Option<u64>,
+    /// Initial congestion window, in bytes, for a new connection to the remote's internal QUIC
+    /// endpoint. This is also the minimum window carried over when a connection is periodically
+    /// refreshed.
+    #[serde(default = "default_peer_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 #[derive(Copy, Clone, Default, Debug, Deserialize, PartialEq)]

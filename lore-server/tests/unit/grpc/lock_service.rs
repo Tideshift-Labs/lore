@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use lore_proto::LockService;
 use lore_revision::lore::RepositoryId;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::lock_service::LoreLockService;
@@ -103,6 +104,7 @@ fn lock_service_with(
         Arc::new(lore_server::notification::local::NotificationSender::default()),
         Arc::new(lore_server::hooks::HookDispatcher::empty()),
         authorizer,
+        None,
         Duration::from_secs(60),
         false,
     )
@@ -112,7 +114,7 @@ fn lock_service(lock_store: store::MockMockLockStore) -> LoreLockService {
     lock_service_with(lock_store, Arc::new(AllowAllRepositoryAuthorizer))
 }
 
-mod store {
+pub(super) mod store {
     use async_trait::async_trait;
     use lore_base::types::LockData;
     use lore_base::types::LockResource;
@@ -288,8 +290,10 @@ mod unlock {
             .expect("Status did not return ok status");
     }
 
+    /// `migrate` is checked before an empty request short-circuits, so an
+    /// empty admin lock is refused without the action like any other.
     #[tokio::test]
-    async fn admin_unlock_zero_resources() {
+    async fn admin_lock_checks_migrate_before_the_empty_short_circuit() {
         let lock_store = super::store::MockMockLockStore::new();
 
         let lock_service = super::lock_service(lock_store);
@@ -304,10 +308,11 @@ mod unlock {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let _ = lock_service
+        let denied = lock_service
             .admin_lock(request)
             .await
-            .expect("Admin lock did not return ok status");
+            .expect_err("allow-all does not grant `migrate`");
+        assert_eq!(denied.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -360,9 +365,10 @@ mod actions {
 
     /// Tier 1, reading the actions from a dotted global claim.
     fn tier1() -> Arc<dyn RepositoryAuthorizer> {
-        Arc::new(GlobalGrantsAuthorizer::new(Some(
-            "realm_access.roles".to_string(),
-        )))
+        Arc::new(GlobalGrantsAuthorizer::new(
+            Some("realm_access.roles".to_string()),
+            vec![Action::Read, Action::Write],
+        ))
     }
 
     /// Tier 2, reading per-repository grants from the legacy-shaped
@@ -463,11 +469,29 @@ mod actions {
                     resources: one_resource(),
                 },
                 repository,
-                // A perfectly good token that grants something else.
-                Some(token_granting(repository, &["push"])),
+                Some(token_granting(repository, &["write"])),
             );
             lock_service.unlock(request).await.unwrap();
         }
+    }
+
+    /// Neither elevated nor holding `write`: refused before the store is
+    /// touched. Tier 2 only, since Tier 1 grants `write` to every token.
+    #[tokio::test]
+    async fn unlock_without_write_or_elevation_is_refused() {
+        let repository = random::<RepositoryId>();
+        let lock_service = lock_service_with(store::MockMockLockStore::new(), tier2());
+        let denied = lock_service
+            .unlock(request_with_token(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                Some(token_granting(repository, &["read"])),
+            ))
+            .await
+            .expect_err("unlock without `write` is refused");
+        assert_eq!(denied.code(), Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -507,13 +531,27 @@ mod actions {
         }
     }
 
-    /// Always deny, if there is no token, whatever the authorizer would
-    /// say: on a no-auth server the allow-all authorizer must not
-    /// elevate anonymous callers without a token.
+    /// Without a token the authorizer decides. A token-reading tier grants
+    /// nothing, so unlock is refused. Allow-all grants `write` but neither
+    /// `owner` nor `migrate`: unlock releases the caller's own locks only,
+    /// and admin lock is denied.
     #[tokio::test]
-    async fn no_token_means_no_elevation_and_no_admin_lock() {
+    async fn no_token_unlocks_own_locks_only_under_allow_all_and_never_admin_locks() {
         let repository = random::<RepositoryId>();
-        let lock_service = lock_service_with(store_expecting_validate_user(true), tier1());
+        let lock_service = lock_service_with(store::MockMockLockStore::new(), tier1());
+        let denied = lock_service
+            .unlock(request_with_token(
+                UnlockRequest {
+                    resources: one_resource(),
+                },
+                repository,
+                None,
+            ))
+            .await
+            .expect_err("a token-reading tier grants nothing without a token");
+        assert_eq!(denied.code(), Code::PermissionDenied);
+
+        let lock_service = super::lock_service(store_expecting_validate_user(true));
         lock_service
             .unlock(request_with_token(
                 UnlockRequest {
@@ -560,6 +598,7 @@ mod permission {
             Arc::new(NotificationSender::default()),
             Arc::new(lore_server::hooks::HookDispatcher::empty()),
             Arc::new(AllowAllRepositoryAuthorizer),
+            None,
             Duration::from_secs(60),
             enforce,
         )
@@ -574,6 +613,12 @@ mod permission {
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
+        // Fork claim readers read only a verified token: claims travel with their raw token.
+        request
+            .extensions_mut()
+            .insert(lore_server::authnz::repository_authorizer::RawToken(
+                "raw.jwt".to_string(),
+            ));
         request.extensions_mut().insert(AuthorizationToken {
             user_id: "test-user".into(),
             resources: Some(vec![ResourcePermission {
@@ -660,5 +705,295 @@ mod permission {
             .lock(request)
             .await
             .expect("enforcement disabled lets a read-only token through");
+    }
+}
+
+mod query {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use lore_base::types::LockData;
+    use lore_base::types::LockResource;
+    use lore_proto::lock::Lock;
+    use lore_proto::lock::QueryRequest;
+    use lore_proto::lock::QueryResponse;
+    use lore_revision::lock::LockQuery;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::grpc::forwarded_requests::CallerContext;
+    use lore_server::grpc::forwarded_requests::ForwardedRequestResult;
+    use lore_server::grpc::forwarded_requests::ForwardedRequests;
+    use lore_server::grpc::forwarded_requests::InternalClientError;
+    use lore_server::grpc::forwarded_requests::RpcFlags;
+    use lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient;
+    use lore_server::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient;
+    use lore_server::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
+    use tonic::Response;
+    use tonic::Status;
+
+    use super::*;
+
+    type SharedResponse = Arc<Mutex<Option<ForwardedRequestResult<QueryResponse>>>>;
+    type SharedRequest = Arc<Mutex<Option<Request<QueryRequest>>>>;
+
+    /// Answers its one call with a pre-configured result and keeps the request
+    /// it was sent.
+    struct SingleShotClient {
+        response: SharedResponse,
+        sent: SharedRequest,
+    }
+
+    #[async_trait]
+    impl ForwardedLockServiceClient for SingleShotClient {
+        async fn query(
+            &mut self,
+            request: Request<QueryRequest>,
+        ) -> ForwardedRequestResult<QueryResponse> {
+            *self.sent.lock().unwrap() = Some(request);
+            self.response
+                .lock()
+                .unwrap()
+                .take()
+                .expect("query called more than once")
+        }
+    }
+
+    struct StubForwardedRequests {
+        flags: RpcFlags,
+        response: SharedResponse,
+        sent: SharedRequest,
+    }
+
+    impl StubForwardedRequests {
+        fn new(flags: RpcFlags, response: ForwardedRequestResult<QueryResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                flags,
+                response: Arc::new(Mutex::new(Some(response))),
+                sent: Arc::new(Mutex::new(None)),
+            })
+        }
+
+        fn forwarding_enabled(response: ForwardedRequestResult<QueryResponse>) -> Arc<Self> {
+            Self::new(
+                RpcFlags {
+                    lock_query: true,
+                    ..Default::default()
+                },
+                response,
+            )
+        }
+
+        fn sent_request(&self) -> Request<QueryRequest> {
+            self.sent
+                .lock()
+                .unwrap()
+                .take()
+                .expect("no request was forwarded")
+        }
+    }
+
+    impl ForwardedRequests for StubForwardedRequests {
+        fn rpc_flags(&self) -> &RpcFlags {
+            &self.flags
+        }
+
+        fn forwarded_revision_service(&self) -> Box<dyn ForwardedRevisionServiceClient> {
+            unreachable!("forwarded_revision_service should not be called in query tests")
+        }
+
+        fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient> {
+            unreachable!("forwarded_repository_service should not be called in query tests")
+        }
+
+        fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient> {
+            Box::new(SingleShotClient {
+                response: Arc::clone(&self.response),
+                sent: Arc::clone(&self.sent),
+            })
+        }
+    }
+
+    fn lock_service_forwarding(
+        lock_store: store::MockMockLockStore,
+        forwarded_requests: Arc<StubForwardedRequests>,
+    ) -> LoreLockService {
+        LoreLockService::new(
+            Arc::new(lock_store),
+            Arc::new(lore_server::notification::local::NotificationSender::default()),
+            Arc::new(lore_server::hooks::HookDispatcher::empty()),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            Some(forwarded_requests),
+            Duration::from_secs(60),
+            false,
+        )
+    }
+
+    fn query_by_owner(repository: RepositoryId, owner: &str) -> Request<QueryRequest> {
+        let mut request = Request::new(QueryRequest {
+            branch: None,
+            owner: Some(owner.to_string()),
+            description: None,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        request.extensions_mut().insert(AuthorizationToken {
+            user_id: "caller".into(),
+            ..AuthorizationToken::default()
+        });
+        request
+    }
+
+    fn store_answering(repository: RepositoryId, owner: &'static str) -> store::MockMockLockStore {
+        let mut lock_store = store::MockMockLockStore::new();
+        lock_store
+            .expect_query_locks()
+            .withf(move |query| *query == LockQuery::OwnerRepository(owner.into(), repository))
+            .return_once(move |_| {
+                Ok(vec![LockData {
+                    resource: LockResource::default(),
+                    owner: owner.into(),
+                    locked_at: 0,
+                }])
+            });
+        lock_store
+    }
+
+    fn owners(response: Response<QueryResponse>) -> Vec<String> {
+        response
+            .into_inner()
+            .result
+            .into_iter()
+            .map(|lock| lock.owner)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn answers_from_the_local_store_without_forwarding_configured() {
+        let repository = random::<RepositoryId>();
+        let lock_service = super::lock_service(store_answering(repository, "alice"));
+
+        let response = lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect("local query should succeed");
+
+        assert_eq!(owners(response), vec!["alice".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn answers_from_the_local_store_when_lock_query_is_not_enabled() {
+        let repository = random::<RepositoryId>();
+        // Every other forwardable RPC is on, so only `lock_query` decides.
+        let forwarded_requests = StubForwardedRequests::new(
+            RpcFlags {
+                revision_branch_create: true,
+                revision_branch_delete: true,
+                revision_branch_get: true,
+                revision_branch_list: true,
+                repository_create: true,
+                repository_get: true,
+                lock_query: false,
+            },
+            Err(InternalClientError::internal("must not be forwarded")),
+        );
+        let lock_service =
+            lock_service_forwarding(store_answering(repository, "alice"), forwarded_requests);
+
+        let response = lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect("local query should succeed");
+
+        assert_eq!(owners(response), vec!["alice".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn returns_the_peer_answer_without_reading_the_local_store() {
+        let repository = random::<RepositoryId>();
+        let forwarded_requests =
+            StubForwardedRequests::forwarding_enabled(Ok(Ok(Response::new(QueryResponse {
+                result: vec![Lock {
+                    resource: None,
+                    owner: "peer-owner".into(),
+                    locked_at: None,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }))));
+        // A mock with no expectations panics on any call.
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::clone(&forwarded_requests),
+        );
+
+        let response = lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect("forwarded query should succeed");
+
+        assert_eq!(owners(response), vec!["peer-owner".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn forwards_the_query_on_behalf_of_the_caller() {
+        let repository = random::<RepositoryId>();
+        let forwarded_requests =
+            StubForwardedRequests::forwarding_enabled(Ok(Ok(Response::new(QueryResponse {
+                result: vec![],
+                ..Default::default()
+            }))));
+        let lock_service = lock_service_forwarding(
+            store::MockMockLockStore::new(),
+            Arc::clone(&forwarded_requests),
+        );
+
+        lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect("forwarded query should succeed");
+
+        let sent = forwarded_requests.sent_request();
+        let caller = CallerContext::from_forwarded_request(&sent)
+            .expect("the forwarded request should carry the caller");
+        assert_eq!(caller.repository_id, repository);
+        assert_eq!(caller.user_id, "caller");
+        assert_eq!(sent.into_inner().owner.as_deref(), Some("alice"));
+    }
+
+    #[tokio::test]
+    async fn peer_error_reaches_the_client_as_the_peer_wrote_it() {
+        let repository = random::<RepositoryId>();
+        let forwarded_requests = StubForwardedRequests::forwarding_enabled(Ok(Err(
+            Status::invalid_argument("unsupported lock query combination"),
+        )));
+        let lock_service =
+            lock_service_forwarding(store::MockMockLockStore::new(), forwarded_requests);
+
+        let err = lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect_err("the peer's error should reach the client");
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert_eq!(err.message(), "unsupported lock query combination");
+    }
+
+    #[tokio::test]
+    async fn unreachable_peer_is_the_origin_own_internal_error() {
+        let repository = random::<RepositoryId>();
+        let forwarded_requests = StubForwardedRequests::forwarding_enabled(Err(
+            InternalClientError::internal("peer unreachable"),
+        ));
+        let lock_service =
+            lock_service_forwarding(store::MockMockLockStore::new(), forwarded_requests);
+
+        let err = lock_service
+            .query(query_by_owner(repository, "alice"))
+            .await
+            .expect_err("a transport failure should fail the query");
+
+        assert_eq!(err.code(), Code::Internal);
+        assert_eq!(err.message(), "Error making forwarded request");
     }
 }

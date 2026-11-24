@@ -23,6 +23,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedMetadataCas;
 use crate::domain::GovernedScope;
@@ -36,9 +38,12 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::branch_metadata_set::changes_protection;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
+use crate::grpc::require_action;
 use crate::grpc::require_permission;
+use crate::grpc::require_repository_administration;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -52,10 +57,14 @@ use crate::util::setup_execution;
 ///
 /// `protect` remains writable through this RPC (it is not in the
 /// read-only key set) so clients can continue to toggle branch
-/// protection without dedicated protect/unprotect RPCs.
+/// protection without dedicated protect/unprotect RPCs. Changing it needs
+/// the same rights as those RPCs; comparing against the caller's `expected`
+/// is sound because the CAS succeeds only when `expected` is the stored
+/// pointer.
 #[tracing::instrument(name = "BranchMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     enforce_write_permission: bool,
@@ -70,7 +79,6 @@ pub async fn handler(
     // PROTECT-set gate below needs it once both metadata blobs are
     // deserialized.
     let extensions = request.extensions().clone();
-    let req = request.into_inner();
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
@@ -82,6 +90,10 @@ pub async fn handler(
             repository_id: repository_id.data(),
         },
     )?;
+    // Upstream v0.13's explicit action check, after admission (R-BLOCK-2) and
+    // before any governed prepare write.
+    require_action(authorizer, &request, Action::Write).await?;
+    let req = request.into_inner();
 
     let branch_id = BranchId::from(req.id);
     if branch_id == BranchId::default() {
@@ -117,7 +129,7 @@ pub async fn handler(
     let expected: Hash = req.expected.into();
     let updated: Hash = req.updated.into();
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
@@ -179,12 +191,8 @@ pub async fn handler(
             // requires `admin` (branch protection is an admin act); any
             // other metadata write requires `write`. No-op when auth is
             // OFF or the flag is disabled.
-            let protect_changed = current_metadata
-                .get_bool(branch::PROTECT)
-                .unwrap_or_default()
-                != proposed_metadata
-                    .get_bool(branch::PROTECT)
-                    .unwrap_or_default();
+            let protect_changed = changes_protection(&current_metadata, &proposed_metadata);
+
             let required_permission = if protect_changed { "admin" } else { "write" };
             require_permission(
                 &extensions,
@@ -194,6 +202,15 @@ pub async fn handler(
             )?;
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
+            if protect_changed {
+                require_repository_administration(
+                    authorizer,
+                    &extensions,
+                    repository.clone(),
+                    &user_id,
+                )
+                .await?;
+            }
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;
 
             let (metadata_key, key_type) = branch::mutable_key(

@@ -19,6 +19,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedBranchDelete;
 use crate::domain::GovernedScope;
@@ -31,14 +33,17 @@ use crate::grpc::get_authorization_optional;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -53,7 +58,6 @@ pub async fn handler(
     let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let req = request.into_inner();
 
     let admitted = admit_at_entry(
         domain_context,
@@ -63,6 +67,10 @@ pub async fn handler(
             repository_id: repository_id.data(),
         },
     )?;
+    // Upstream v0.13's explicit action check, after admission (R-BLOCK-2) and
+    // before any governed prepare write.
+    require_action(authorizer, &request, Action::Write).await?;
+    let req = request.into_inner();
     let governed = if admitted.is_some() {
         let digest = canonical_intent_digest(&CanonicalIntent::BranchDelete {
             repository_id: repository_id.data(),
@@ -95,6 +103,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             if let Some(governed) = governed {

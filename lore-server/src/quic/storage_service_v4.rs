@@ -21,7 +21,9 @@ use lore_transport::quic::storage_service::command_name;
 use tracing::Span;
 use tracing::debug;
 
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
+use crate::auth::jwt::decode_unsigned_identity;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
@@ -106,7 +108,7 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 #[lore_macro::test_pub]
 pub struct StorageServiceV4 {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
+    token_verification: Arc<TokenVerification>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -119,7 +121,7 @@ pub struct StorageServiceV4 {
 
 impl StorageServiceV4 {
     pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
@@ -128,7 +130,7 @@ impl StorageServiceV4 {
         user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         Self {
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
             immutable_store,
             local_store,
@@ -158,7 +160,7 @@ impl StorageServiceV4 {
         operation: &'static str,
     ) -> Result<(), MessageHandleError> {
         if crate::auth::jwt::write_permission_granted(
-            self.jwt_verifier.is_some(),
+            self.token_verification.verifier().is_some(),
             self.enforce_write_permission,
             permissions,
         ) {
@@ -251,10 +253,10 @@ impl QuicService for StorageServiceV4 {
                 };
                 let mut user_id = String::new();
                 let mut permissions: Vec<String> = Vec::new();
-                let mut grants = None;
+                let grants;
                 let mut token = None;
 
-                if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
+                if let Some(jwt_verifier) = self.token_verification.verifier() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
                         MessageHandleError::AuthorizationFailure(format!(
                             "invalid token encoding: {err}"
@@ -284,6 +286,27 @@ impl QuicService for StorageServiceV4 {
                     permissions =
                         crate::auth::jwt::matching_permissions(&authorization, repository);
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
+                } else {
+                    if let TokenVerification::TrustUnsigned = *self.token_verification
+                        && !auth_token.is_empty()
+                    {
+                        let claims = std::str::from_utf8(&auth_token)
+                            .map_err(|err| err.to_string())
+                            .and_then(|token| {
+                                decode_unsigned_identity(token).map_err(|err| err.to_string())
+                            })
+                            .map_err(MessageHandleError::AuthorizationFailure)?;
+                        user_id = claims.identity().to_string();
+                    }
+                    // Enumerated without a token too, so each command is a set
+                    // lookup rather than an authorizer call.
+                    grants = self
+                        .repository_authorizer
+                        .granted_access(None, repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
                 }
 
                 let session_map = self.session_map.clone();
@@ -329,6 +352,13 @@ impl QuicService for StorageServiceV4 {
                 opcode,
                 payload,
             } => {
+                // Parse the storage command payload using v4-aware parsers — Copy carries an
+                // extra `target_context` field on the wire that the legacy parser cannot decode.
+                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
+                    tracing::warn!("Failed to parse v4 storage command: {err}");
+                    MessageHandleError::InternalError
+                })?;
+
                 let session_map = self.session_map.clone();
                 let session = session_map
                     .get(session_id)
@@ -342,14 +372,15 @@ impl QuicService for StorageServiceV4 {
                 let authorized_sources = session.authorized_sources.clone();
                 let declared = session.declared;
                 let expired = session.is_expired_at(now_unix_secs());
-                drop(session);
 
-                // Parse the storage command payload using v4-aware parsers — Copy carries an
-                // extra `target_context` field on the wire that the legacy parser cannot decode.
-                let parsed = parse_message_for_opcode_v4(opcode, payload).map_err(|err| {
-                    tracing::warn!("Failed to parse v4 storage command: {err}");
-                    MessageHandleError::InternalError
-                })?;
+                // Answered from the session's grants while they are borrowed, so
+                // the per-command check copies nothing. `Some(None)`: the
+                // authorizer could not enumerate, so it is asked below, after
+                // the fork's expiry, admission and write gates.
+                let action = parsed.required_action();
+                let enumerated = action
+                    .map(|action| session.grants.as_ref().map(|grants| grants.permits(action)));
+                drop(session);
 
                 // Write-path permission gate (read ≠ write). The session has no
                 // per-request token; enforcement runs against the permissions
@@ -415,6 +446,27 @@ impl QuicService for StorageServiceV4 {
                     | Req::MutableLoad(_)
                     | Req::Connect(_)
                     | Req::Correlate(_) => {}
+                }
+
+                // Upstream v0.13 (483c96ff): the command's explicit action on the
+                // session's partition. After the fork gates above, so an expired
+                // token (status 201) and an undeclared write (status 200) keep
+                // answering first and never reach the authorizer.
+                let permitted = match (action, enumerated) {
+                    (Some(action), Some(None)) => {
+                        let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                        self.repository_authorizer
+                            .check_repository_access(verified.as_ref(), repository, action)
+                            .await
+                            .is_ok()
+                    }
+                    (_, Some(Some(permitted))) => permitted,
+                    _ => true,
+                };
+                if !permitted {
+                    return Err(MessageHandleError::AuthorizationFailure(
+                        "Action not permitted".to_string(),
+                    ));
                 }
 
                 // Dispatch to standalone handler functions with explicit session context
@@ -483,7 +535,7 @@ impl QuicService for StorageServiceV4 {
                                 .check_repository_access(
                                     verified.as_ref(),
                                     copy.source_repository,
-                                    None,
+                                    Action::Read,
                                 )
                                 .await
                                 .map_err(|status| {

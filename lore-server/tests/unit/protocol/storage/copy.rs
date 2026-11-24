@@ -15,6 +15,7 @@ use lore_base::types::Partition;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -32,6 +33,7 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use rand::random;
 
+use crate::store::test_support::SlowDownImmutableStore;
 use crate::store::test_support::test_store_create;
 
 fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
@@ -49,7 +51,7 @@ impl RepositoryAuthorizer for FixedPartitionsAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), tonic::Status> {
         if self.0.contains(&repository_id) {
             Ok(())
@@ -518,6 +520,30 @@ async fn test_handle_fragment_not_found() {
                 Err(MessageHandleError::FragmentNotFound) => (),
                 Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
                 Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
+            }
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn test_handle_slow_down() {
+    let message = make_copy_message();
+
+    let destination_repository = random::<RepositoryId>();
+    let context_map = Arc::new(AttributeMap::default());
+    context_map.insert(destination_repository);
+
+    let store: Arc<dyn ImmutableStore> = Arc::new(SlowDownImmutableStore);
+
+    let (_unused_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            match message.handle(context_map, store, allow_all()).await {
+                Err(MessageHandleError::SlowDown) => (),
+                Err(e) => panic!("Expected SlowDown error, got {e:?}"),
+                Ok(_) => panic!("Expected SlowDown error, got Ok"),
             }
         })
         .await;

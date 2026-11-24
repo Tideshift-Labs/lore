@@ -8,6 +8,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::lore::repository::v1::RepositoryMetadataGetRequest;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::repository::v1::repository_metadata_get::*;
@@ -28,7 +29,7 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
         &self,
         token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         // FORK-LOCAL (Tideshift, CR-011): the check is asked about the
         // BODY repository id, with no token on this tokenless request.
@@ -38,10 +39,10 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
     }
 }
 
-/// Permits, recording that the handler asked with `action: None`.
+/// Permits, recording the action the handler asked.
 #[derive(Default)]
 struct RecordingPermitAuthorizer {
-    called_with_action_none: std::sync::atomic::AtomicBool,
+    asked: std::sync::Mutex<Option<String>>,
 }
 
 #[async_trait::async_trait]
@@ -50,10 +51,9 @@ impl RepositoryAuthorizer for RecordingPermitAuthorizer {
         &self,
         _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
-        self.called_with_action_none
-            .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+        self.asked.lock().unwrap().replace(action.to_string());
         Ok(())
     }
 }
@@ -135,11 +135,7 @@ async fn auth_configured_with_access_allows_operation() {
             handler(request, authorizer.clone(), immutable, mutable)
                 .await
                 .unwrap();
-            assert!(
-                authorizer
-                    .called_with_action_none
-                    .load(std::sync::atomic::Ordering::SeqCst)
-            );
+            assert_eq!(authorizer.asked.lock().unwrap().as_deref(), Some("read"));
         })
         .await;
 }

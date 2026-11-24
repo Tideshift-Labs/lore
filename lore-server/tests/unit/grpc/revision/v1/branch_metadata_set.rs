@@ -11,6 +11,8 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_server::grpc::get_write_token;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::branch_metadata_set::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -52,6 +54,7 @@ async fn enforcing_cell_rejects_before_v1_metadata_cas_body() {
             Hash::default(),
             Hash::default(),
         ),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
         false,
@@ -117,6 +120,7 @@ async fn cas_hit_swaps_pointer_and_returns_updated() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -165,6 +169,7 @@ async fn cas_miss_returns_current_pointer_in_band() {
 
         let response = handler(
             make_request(repository_id, branch_id, stale_expected, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -206,6 +211,7 @@ async fn rejects_modification_of_read_only_name() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -244,6 +250,7 @@ async fn rejects_modification_of_read_only_category() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -280,6 +287,7 @@ async fn rejects_removal_of_read_only_creator() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -318,6 +326,7 @@ async fn allows_protect_modification() {
 
         let response = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -340,6 +349,7 @@ async fn rejects_unknown_branch_with_not_found() {
     Box::pin(LORE_CONTEXT.scope(execution, async move {
         let err = handler(
             make_request(repository_id, branch_id, Hash::default(), Hash::default()),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -397,11 +407,12 @@ async fn cas_succeeds_on_deleted_branch() {
             repository.clone(),
             main_id,
             state_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("seed main")
@@ -443,6 +454,7 @@ async fn cas_succeeds_on_deleted_branch() {
 
         let response = handler(
             make_request(repository_id, child_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -476,6 +488,7 @@ async fn rejects_garbage_updated_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, garbage),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -515,6 +528,7 @@ async fn rejects_garbage_expected_hash() {
 
         let err = handler(
             make_request(repository_id, branch_id, garbage, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -556,6 +570,7 @@ async fn rejects_dangling_address_reference() {
 
         let err = handler(
             make_request(repository_id, branch_id, current, updated),
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store,
             mutable_store,
             false,
@@ -582,6 +597,7 @@ async fn rejects_zero_branch_id() {
             Hash::default(),
             Hash::default(),
         ),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
         false,
@@ -603,9 +619,16 @@ async fn rejects_missing_repository_id() {
         expected: Hash::default().into(),
         updated: Hash::default().into(),
     });
-    let err = handler(request, immutable_store, mutable_store, false, None)
-        .await
-        .expect_err("missing repository must fail");
+    let err = handler(
+        request,
+        &crate::util::test_support::allow_all_authorizer(),
+        immutable_store,
+        mutable_store,
+        false,
+        None,
+    )
+    .await
+    .expect_err("missing repository must fail");
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
@@ -617,6 +640,12 @@ fn with_perms(
     repository: RepositoryId,
     perms: &[&str],
 ) -> Request<BranchMetadataSetRequest> {
+    // Fork claim readers read only a verified token: claims travel with their raw token.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request
         .extensions_mut()
         .insert(lore_server::auth::jwt::AuthorizationToken {
@@ -667,9 +696,16 @@ async fn protect_change_with_write_only_token_is_denied() {
             repository_id,
             &["read", "write"],
         );
-        let err = handler(request, immutable_store, mutable_store, true, None)
-            .await
-            .expect_err("toggling protect requires admin");
+        let err = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            true,
+            None,
+        )
+        .await
+        .expect_err("toggling protect requires admin");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }))
     .await;
@@ -695,9 +731,18 @@ async fn protect_change_with_admin_token_is_accepted() {
             repository_id,
             &["read", "write", "admin"],
         );
-        let response = handler(request, immutable_store, mutable_store, true, None)
-            .await
-            .expect("admin may toggle protect");
+        // A verified token reaches upstream's repository-administration rule, which
+        // asks the authorizer for `admin` (`AllowAll` grants only read/write).
+        let response = handler(
+            request,
+            &crate::util::test_support::permit_every_action_authorizer(),
+            immutable_store,
+            mutable_store,
+            true,
+            None,
+        )
+        .await
+        .expect("admin may toggle protect");
         assert_eq!(Hash::from(response.into_inner().metadata), updated);
     }))
     .await;
@@ -730,9 +775,16 @@ async fn non_protect_change_needs_only_write() {
             repository_id,
             &["read", "write"],
         );
-        let response = handler(request, immutable_store, mutable_store, true, None)
-            .await
-            .expect("a write token may set non-protect metadata");
+        let response = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            true,
+            None,
+        )
+        .await
+        .expect("a write token may set non-protect metadata");
         assert_eq!(Hash::from(response.into_inner().metadata), updated);
     }))
     .await;
@@ -765,9 +817,16 @@ async fn read_only_token_cannot_write_metadata() {
             repository_id,
             &["read"],
         );
-        let err = handler(request, immutable_store, mutable_store, true, None)
-            .await
-            .expect_err("a read-only token must not write metadata");
+        let err = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            true,
+            None,
+        )
+        .await
+        .expect_err("a read-only token must not write metadata");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }))
     .await;
@@ -789,15 +848,24 @@ async fn protect_change_allowed_when_enforcement_disabled() {
         let (current, updated) = branch_with_protect_toggle(repository.clone(), branch_id).await;
 
         // Read-only token would be denied under enforcement, but the
-        // flag is off → the request is accepted (instant rollback).
+        // flag is off → the fork's claim gate is skipped (instant rollback).
+        // The authorizer permits everything so upstream's own checks (write,
+        // repository administration) stay out of the way of what is under test.
         let request = with_perms(
             make_request(repository_id, branch_id, current, updated),
             repository_id,
             &["read"],
         );
-        let response = handler(request, immutable_store, mutable_store, false, None)
-            .await
-            .expect("enforcement disabled lets any token through");
+        let response = handler(
+            request,
+            &crate::util::test_support::permit_every_action_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await
+        .expect("enforcement disabled lets any token through");
         assert_eq!(Hash::from(response.into_inner().metadata), updated);
     }))
     .await;

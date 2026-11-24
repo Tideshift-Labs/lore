@@ -12,6 +12,8 @@ use tracing::debug;
 
 use super::jwt::JwtVerifier;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::TokenVerification;
+use crate::auth::jwt::decode_unsigned_identity;
 use crate::authnz::repository_authorizer::RawToken;
 
 fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
@@ -68,19 +70,17 @@ fn service_org_after_verification(token: &str) -> Option<VerifiedServiceOrg> {
 /// the verified halves to the handler as extensions ([`RawToken`] for the raw token
 /// string, and [`AuthorizationToken`] for the parsed claims).
 ///
-/// With no verifier (no `[server.auth]`), every request passes through untouched: no
-/// bearer token is required, one that is present is not read, and no extension is
-/// inserted.
+/// Under [`TokenVerification::TrustUnsigned`] it inserts the claims of an unsigned token
+/// and no [`RawToken`]. The claims then name the caller, while authorization still sees a
+/// request without a verified token.
 #[derive(Clone)]
 pub struct JWTInterceptor {
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
 }
 
 impl JWTInterceptor {
-    pub fn new(jwt_verifier: Option<&JwtVerifier>) -> Self {
-        Self {
-            jwt_verifier: jwt_verifier.cloned(),
-        }
+    pub fn new(token_verification: TokenVerification) -> Self {
+        Self { token_verification }
     }
 }
 
@@ -89,25 +89,40 @@ impl Interceptor for JWTInterceptor {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
-        let Some(jwt_verifier) = &self.jwt_verifier else {
-            return Ok(request);
-        };
+        match &self.token_verification {
+            TokenVerification::Ignore => Ok(request),
+            TokenVerification::TrustUnsigned => {
+                let Some(token) = extract_bearer_token(request.metadata()) else {
+                    return Ok(request);
+                };
+                let claims = decode_unsigned_identity(&token).map_err(|e| {
+                    debug!(error = ?e, "Rejecting request: unsigned token is malformed");
+                    tonic::Status::unauthenticated("Malformed bearer token")
+                })?;
+                add_auth_fields_to_current_span(&claims);
+                request.extensions_mut().insert(claims);
+                Ok(request)
+            }
+            TokenVerification::Verify(jwt_verifier) => {
+                let token = extract_bearer_token(request.metadata()).ok_or(
+                    tonic::Status::unauthenticated("authorization header required"),
+                )?;
 
-        let token = extract_bearer_token(request.metadata()).ok_or(
-            tonic::Status::unauthenticated("authorization header required"),
-        )?;
+                let authorization = authorize(jwt_verifier, &token)?;
+                add_auth_fields_to_current_span(&authorization);
 
-        let authorization = authorize(jwt_verifier, &token)?;
-        add_auth_fields_to_current_span(&authorization);
+                // FORK-LOCAL (Tideshift, CR-029): only a verified bearer
+                // yields a service org; an unsigned token never does.
+                if let Some(org) = service_org_after_verification(&token) {
+                    request.extensions_mut().insert(org);
+                }
 
-        if let Some(org) = service_org_after_verification(&token) {
-            request.extensions_mut().insert(org);
+                request.extensions_mut().insert(RawToken(token));
+                request.extensions_mut().insert(authorization);
+
+                Ok(request)
+            }
         }
-
-        request.extensions_mut().insert(RawToken(token));
-        request.extensions_mut().insert(authorization);
-
-        Ok(request)
     }
 }
 

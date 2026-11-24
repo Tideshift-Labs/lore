@@ -12,6 +12,7 @@ use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::JwtVerifier;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::auth::jwt_interceptor::JWTInterceptor;
 use lore_server::auth::jwt_interceptor::VerifiedServiceOrg;
 use tonic::service::Interceptor;
@@ -38,7 +39,7 @@ impl JWKService for CachedKey {
 }
 
 fn interceptor() -> JWTInterceptor {
-    JWTInterceptor::new(Some(&JwtVerifier {
+    JWTInterceptor::new(TokenVerification::Verify(JwtVerifier {
         jwk_service: Arc::new(CachedKey),
         jwt_issuer: Some(vec!["https://issuer.example".into()]),
         jwt_audience: Some(vec!["lore".into()]),

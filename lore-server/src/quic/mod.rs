@@ -24,6 +24,7 @@ pub mod client_monitor;
 // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): test builds only; see the module docs.
 #[cfg(feature = "failure_generator")]
 pub mod faults;
+pub mod initial_cwnd;
 pub mod quinn;
 pub mod replication_store_service;
 pub mod storage_service;
@@ -307,7 +308,7 @@ pub mod tests {
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
                         let storage_protocol = StorageService::new(
-                            Arc::new(None),
+                            Arc::new(crate::auth::jwt::TokenVerification::Ignore),
                             Arc::new(AllowAllRepositoryAuthorizer),
                             immutable_store.clone(),
                             immutable_store.clone(),
@@ -336,7 +337,7 @@ pub mod tests {
                     Box::new(move |context: Arc<AttributeMap>| {
                         contexts.lock().push(context.clone());
                         let v4_service = StorageServiceV4::new(
-                            Arc::new(None),
+                            Arc::new(crate::auth::jwt::TokenVerification::Ignore),
                             Arc::new(AllowAllRepositoryAuthorizer),
                             immutable_store.clone(),
                             immutable_store.clone(),

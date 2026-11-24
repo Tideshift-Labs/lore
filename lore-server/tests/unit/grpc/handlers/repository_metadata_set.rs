@@ -10,6 +10,7 @@ use lore_proto::RepositoryMetadataSetRequest;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::domain::test_support::context as build_domain_context;
@@ -115,13 +116,20 @@ async fn valid_carriage_with_a_coordinator_present_is_admitted_and_never_touches
         new_hash: vec![1u8; 32].into(),
     });
     insert_valid_domain_operation_headers(&mut request);
+    // A verified caller: the domain admission gate refuses carriage from anyone else.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request
         .extensions_mut()
         .insert(AuthorizationToken::default());
 
+    // A verified token is asked for `admin`, which `AllowAll` never grants.
     let err = handler(
         request,
-        Arc::new(AllowAllRepositoryAuthorizer),
+        Arc::new(RecordingPermitAuthorizer::default()),
         immutable,
         Arc::new(PanicOnAnyCallMutableStore),
         Some(&domain_context),
@@ -170,7 +178,7 @@ impl RepositoryAuthorizer for PanicOnAnyCallAuthorizer {
         &self,
         _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         panic!("admission must decide before any authorization side effect")
     }
@@ -185,7 +193,7 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
         &self,
         token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         // FORK-LOCAL (Tideshift, CR-011): the check is asked about the
         // BODY repository id, with no token on this tokenless request.
@@ -198,7 +206,7 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
 /// Permits, recording the action of every question the handler asked.
 #[derive(Default)]
 struct RecordingPermitAuthorizer {
-    actions: std::sync::Mutex<Vec<Option<String>>>,
+    actions: std::sync::Mutex<Vec<Action>>,
 }
 
 #[async_trait::async_trait]
@@ -207,9 +215,9 @@ impl RepositoryAuthorizer for RecordingPermitAuthorizer {
         &self,
         _token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        action: Option<&str>,
+        action: Action,
     ) -> Result<(), Status> {
-        self.actions.lock().unwrap().push(action.map(str::to_owned));
+        self.actions.lock().unwrap().push(action);
         Ok(())
     }
 }
@@ -321,11 +329,13 @@ async fn auth_configured_with_access_allows_operation() {
             handler(request, authorizer.clone(), immutable, mutable, None)
                 .await
                 .unwrap();
-            // Reachability first, then the admin action, on an authorizer
-            // that cannot enumerate grants.
+            // FORK: reachability (`read`) first, then the action the repository's setting
+            // needs. With no verified token (a no-auth server) that is upstream's `write`
+            // (v0.13 `RepositoryAdministration`); `admin_required` below keeps the admin
+            // requirement for a verified token.
             assert_eq!(
                 *authorizer.actions.lock().unwrap(),
-                vec![None, Some("admin".to_owned())]
+                vec![Action::Read, Action::Write]
             );
         })
         .await;

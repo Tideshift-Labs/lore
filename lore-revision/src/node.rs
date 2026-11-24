@@ -43,6 +43,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
+use crate::util::path::resolves_elsewhere;
 
 /// Identifier of a node within a revision tree.
 pub type NodeID = u32;
@@ -361,7 +362,8 @@ pub struct Node {
     pub size: u64,
     /// Node content address
     /// - For files this is the content payload (content hash and file ID).
-    /// - For directories the hash of all child node content hashes (sorted by node name hash in ascending order).
+    /// - For directories the hash of every child's name and content, in ascending order of name
+    ///   hash; see [`rehash_directory`](crate::commit::rehash_directory).
     /// - For a submodule this is the target revision hash and repository ID.
     pub address: Address,
 }
@@ -465,6 +467,13 @@ impl Node {
     /// Check if the node is a directory
     pub fn is_directory(&self) -> bool {
         !self.is_file() && !self.is_link()
+    }
+
+    /// Whether the filter is asked about a path a command names as a directory, where the tree
+    /// holds `node` there: unless it is a file, a link counting as the directory it mounts, and
+    /// where the tree holds nothing.
+    pub fn asked_as_directory(node: Option<&Node>) -> bool {
+        node.is_none_or(|node| !node.is_file())
     }
 
     pub fn node_type(&self) -> LoreNodeType {
@@ -587,6 +596,32 @@ impl Node {
             node: self.child,
             repository: self.address.context.into(),
             revision: self.address.hash,
+        }
+    }
+
+    /// The node a link mounts in the revision it pins. `None` for anything else, whose `child`
+    /// addresses the local tree instead and says nothing about a mount.
+    pub fn mount_source(&self) -> Option<NodeID> {
+        self.is_link().then_some(self.child)
+    }
+
+    /// Node ids are only comparable within one revision, so this answers for two nodes pinning
+    /// the same one. Their shared [`address`](Self::address) cannot express the difference.
+    pub fn mounts_same_source(&self, other: &Node) -> bool {
+        self.mount_source() == other.mount_source()
+    }
+
+    /// Whether a link mounts the root of the revision it pins, which is the same node in every
+    /// revision, so its mount needs no revision read to compare or carry.
+    pub fn mounts_root(&self) -> bool {
+        self.mount_source() == Some(ROOT_NODE)
+    }
+
+    /// A link's `child` names the subtree it mounts, so it has to travel with the address it is
+    /// resolved against. Anything else keeps its `child`, which addresses the local tree.
+    pub fn take_mount_source(&mut self, other: &Node) {
+        if let Some(mount_source) = other.mount_source() {
+            self.child = mount_source;
         }
     }
 
@@ -1071,10 +1106,11 @@ pub enum NodeNameError {
     Oversized,
 }
 
-/// The content rules a name is held to on both the read and the write path: no traversal, no
-/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
+/// The content rules a name is held to on both the read and the write path, alike on every
+/// platform: nothing a filesystem resolves elsewhere, no leading NUL, and not the repository's own
+/// directory in any spelling.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
-    if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
+    if name.starts_with('\0') || resolves_elsewhere(name) {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
         }
@@ -1240,22 +1276,40 @@ impl NodeBlock {
     /// Read only node access without keeping lock, data returned by clone
     pub fn node_name_clone(&self, node_index: usize) -> Result<String, NodeNameError> {
         let guard = self.data.read();
-        let node = &guard.data.node[node_index];
+        let name =
+            std::str::from_utf8(Self::name_bytes(&guard, node_index)?).internal("Node name")?;
+        validate_node_name(name)?;
+        Ok(name.to_string())
+    }
+
+    /// A copy of the node at `node_index`, with the bytes of the name it stores appended to
+    /// `name`, unchecked against the name rules. No lock is held on return.
+    pub fn node_and_name_bytes(
+        &self,
+        node_index: usize,
+        name: &mut Vec<u8>,
+    ) -> Result<Node, NodeNameError> {
+        let guard = self.data.read();
+        name.extend_from_slice(Self::name_bytes(&guard, node_index)?);
+        Ok(guard.data.node[node_index])
+    }
+
+    /// The bytes of the name the node at `node_index` stores in the name table of `data`,
+    /// unchecked against the name rules.
+    fn name_bytes(data: &NodeBlockRuntimeData, node_index: usize) -> Result<&[u8], NodeNameError> {
+        let node = &data.data.node[node_index];
         let offset = node.name_offset as usize;
         let length = node.name_length as usize;
-        if guard.name.len() < (offset + length) {
+        if data.name.len() < (offset + length) {
             return Err(InvalidArguments {
                 reason: format!(
                     "node name offset {offset} + length {length} exceeds name table size {}",
-                    guard.name.len()
+                    data.name.len()
                 ),
             }
             .into());
         }
-        let name =
-            std::str::from_utf8(&guard.name[offset..(offset + length)]).internal("Node name")?;
-        validate_node_name(name)?;
-        Ok(name.to_string())
+        Ok(&data.name[offset..(offset + length)])
     }
 
     /// Returns the node name as a lock guard that holds a read lock on the block data.
@@ -1283,20 +1337,8 @@ impl NodeBlock {
         guard: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, NodeBlockRuntimeData>,
         node_index: usize,
     ) -> Result<NodeNameLock, NodeNameError> {
-        let node = &guard.data.node[node_index];
-        let offset = node.name_offset as usize;
-        let length = node.name_length as usize;
-        if guard.name.len() < (offset + length) {
-            return Err(InvalidArguments {
-                reason: format!(
-                    "node name offset {offset} + length {length} exceeds name table size {}",
-                    guard.name.len()
-                ),
-            }
-            .into());
-        }
         let name_str =
-            std::str::from_utf8(&guard.name[offset..(offset + length)]).internal("Node name")?;
+            std::str::from_utf8(Self::name_bytes(&guard, node_index)?).internal("Node name")?;
         validate_node_name(name_str)?;
         let name: *const str = name_str;
         Ok(NodeNameLock {
@@ -1329,6 +1371,11 @@ impl NodeBlock {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// The address of the block's name table fragment, for prefetching it in bulk.
+    pub fn name_table_hash(&self) -> Hash {
+        self.read().lock.data.name_table
     }
 
     pub async fn deserialize_nametable(

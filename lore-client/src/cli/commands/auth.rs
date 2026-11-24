@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::DateTime;
@@ -77,6 +78,9 @@ pub struct AuthLoginArgs {
     /// Avoid opening a browser to login
     #[clap(long = "no-browser")]
     no_browser: bool,
+    /// Keep the stored login instead of logging in again while its session is valid
+    #[clap(long = "reuse-session", conflicts_with_all = ["token_type", "token", "client_id"])]
+    reuse_session: bool,
 }
 
 #[derive(Args)]
@@ -205,6 +209,7 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
             no_browser: if args.no_browser { 1 } else { 0 },
+            reuse_session: args.reuse_session.into(),
         };
         run_command(globals, args.into(), callback) as u8
     }
@@ -424,9 +429,13 @@ pub fn handle_clear_command(globals: LoreGlobalArgs) -> u8 {
 }
 
 pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u8 {
+    let token_ids = Mutex::new(HashSet::new());
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::AuthUserInfo(data) => {
+                if token_ids.lock().contains(data.id.as_str()) {
+                    return;
+                }
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -441,6 +450,7 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 );
             }
             LoreEvent::AuthUserToken(user_token) => {
+                token_ids.lock().insert(user_token.id.to_string());
                 println!(
                     "{}ID:{} {}",
                     CommonStyles::HEADERS,
@@ -472,12 +482,27 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                         time.to_rfc2822()
                     );
                 }
-                println!(
-                    "{}Token:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    user_token.token.as_str()
-                );
+                if user_token.refresh_expires > 0
+                    && let Some(time) =
+                        DateTime::from_timestamp_millis(user_token.refresh_expires as i64)
+                {
+                    println!(
+                        "{}Refreshable until:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        time.to_rfc2822()
+                    );
+                } else if user_token.refreshable != 0 {
+                    println!("Refreshable");
+                }
+                if !user_token.token.is_empty() {
+                    println!(
+                        "{}Token:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        user_token.token.as_str()
+                    );
+                }
             }
             LoreEvent::AuthIdentity(data) => {
                 println!(

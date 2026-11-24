@@ -54,6 +54,7 @@ use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client;
 use lore_transport::quic::client::ClientCerts;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::storage_service::client::StorageClient;
@@ -76,6 +77,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::oidc::advertised_oidc;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -539,7 +541,15 @@ async fn listen_for_termination(termination_tx: tokio::sync::watch::Sender<u32>)
 
 impl From<QuicSettings> for QuinnConfigBuilder {
     fn from(settings: QuicSettings) -> Self {
-        let mut builder = QuinnConfigBuilder::default().num_listeners(settings.num_listeners);
+        let mut builder = QuinnConfigBuilder::default();
+
+        if let Some(v) = settings.num_listeners {
+            builder = builder.num_listeners(v);
+        };
+
+        if let Some(v) = settings.num_sockets {
+            builder = builder.num_sockets(v);
+        };
 
         if let Some(v) = settings.idle_timeout {
             builder = builder.idle_timeout(Duration::from_millis(v));
@@ -561,6 +571,10 @@ impl From<QuicSettings> for QuinnConfigBuilder {
             builder = builder.transport_rtt(v);
         }
 
+        if let Some(v) = settings.initial_cwnd_bytes {
+            builder = builder.initial_cwnd(v);
+        }
+
         builder
     }
 }
@@ -579,6 +593,7 @@ async fn launch_quinn_server(
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
     metrics_frequency: Duration,
     quic_settings: QuicSettings,
+    congestion_algorithm: CongestionAlgorithm,
     generate_ephemeral_cert: bool,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     connection_registry: Arc<QuinnConnectionRegistry>,
@@ -618,7 +633,8 @@ async fn launch_quinn_server(
             .client_cert_verifier(client_verifier)
             .stream_handler_factory(stream_handler_factory)
             .metrics_frequency(metrics_frequency)
-            .connection_registry(connection_registry.clone());
+            .connection_registry(connection_registry.clone())
+            .congestion_algorithm(congestion_algorithm);
 
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
@@ -687,7 +703,7 @@ async fn launch_grpc_server(
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     domain_context: Option<Arc<crate::domain::DomainContext>>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     repository_catalog: Arc<dyn RepositoryCatalog>,
     settings: Settings,
@@ -707,7 +723,7 @@ async fn launch_grpc_server(
         .ok_or(anyhow!("Missing gRPC settings"))?;
     let service_settings = settings.server.grpc_public_services.clone();
     // Enforce the JWT permission vector on write RPCs (default ON; ADR-00011).
-    // No-op when auth is OFF — `with_jwt_verifier` gates it on token presence.
+    // No-op when auth is OFF — `with_token_verification` gates it on token presence.
     let enforce_write_permission = settings
         .server
         .auth
@@ -722,7 +738,7 @@ async fn launch_grpc_server(
     info!(
         "Starting Lore GRPC Server: {}, Auth: {} Locks: {}",
         &addr,
-        jwt_verifier.as_ref().map_or("disabled", |_| "enabled"),
+        token_verification.describe(),
         if locks { "enabled" } else { "disabled" },
     );
 
@@ -738,7 +754,7 @@ async fn launch_grpc_server(
                 .as_ref()
                 .and_then(|environment| environment.endpoint.as_ref())
                 .and_then(|endpoint| endpoint.auth_url.as_deref()),
-            jwt_verifier.is_some(),
+            token_verification.verifier().is_some(),
         );
     let mut features_list = compiled_features(
         domain_operation_service_available,
@@ -810,8 +826,8 @@ async fn launch_grpc_server(
         )
         .with_caller_capability_policy(grpc_settings.caller_capability_policy)
         .with_drain_state(graceful_drain.then(|| drain_state.clone()))
-        .with_jwt_verifier(
-            jwt_verifier,
+        .with_token_verification(
+            token_verification,
             enforce_write_permission,
             repository_authorizer,
             repository_catalog,
@@ -889,6 +905,7 @@ async fn launch_grpc_internal_server(
     user_agent_filter: Arc<UserAgentFilter>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     domain_context: Option<Arc<crate::domain::DomainContext>>,
@@ -927,12 +944,17 @@ async fn launch_grpc_internal_server(
             ))?,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             settings.environment.clone().unwrap_or_default(),
             domain_context,
             jwt_verifier,
             repository_authorizer,
+            settings.feature.as_ref().map_or(
+                crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
+                crate::grpc::server::FeatureSettings::branch_list_concurrency,
+            ),
         )?
         .with_stream_reset_service(stream_reset_service)
         .with_tls_config(cert_path, key_path, cert_chain_path)?
@@ -1014,7 +1036,7 @@ async fn launch_http_server(
     settings: LoreHttpServerSettings,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
-    jwt_verifier: Option<JwtVerifier>,
+    token_verification: TokenVerification,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     facets: HttpSurfaceFacets,
@@ -1031,7 +1053,7 @@ async fn launch_http_server(
         settings,
         immutable_store,
         mutable_store,
-        jwt_verifier,
+        token_verification,
         repository_authorizer,
         Some(drain_state.clone()),
         crate::http::server::HealthFacets {
@@ -1126,7 +1148,7 @@ impl QuicPublicStreamHandler {
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         enforce_write_permission: bool,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
@@ -1139,11 +1161,11 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>,
+             token_verification: TokenVerification,
              repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
@@ -1165,7 +1187,7 @@ impl QuicPublicStreamHandler {
                 immutable_store.clone(),
                 local_store.clone(),
                 mutable_store.clone(),
-                jwt_verifier.clone(),
+                token_verification.clone(),
                 repository_authorizer.clone(),
             ),
         );
@@ -1173,14 +1195,14 @@ impl QuicPublicStreamHandler {
             let immutable_store = immutable_store.clone();
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
-                        Arc::new(jwt_verifier.clone()),
+                        Arc::new(token_verification.clone()),
                         repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
@@ -2065,6 +2087,7 @@ async fn configure_replicated_immutable_store(
     if let Some(expected_rtt_ms) = settings.expected_rtt_ms {
         factory.transport_config.expected_rtt_ms = expected_rtt_ms;
     }
+    factory.transport_config.initial_cwnd = Some(settings.initial_cwnd_bytes.get());
     factory.user_agent = Some(make_user_agent_with_component(
         user_agent_product(),
         "replicated-immutable-store",
@@ -2197,6 +2220,7 @@ async fn configure_composite_store(
         factory.quic_monitor_interval =
             Duration::from_secs(factory_settings.quic_client_monitor_interval_seconds);
         factory.enable_same_region_write = factory_settings.enable_same_region_write;
+        factory.initial_cwnd_bytes = factory_settings.initial_cwnd_bytes;
 
         composite_store_builder = composite_store_builder.with_replica_builder(Arc::new(factory));
     }
@@ -2949,6 +2973,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         }
         None => None,
     };
+    let token_verification = TokenVerification::new(
+        jwt_verifier.clone(),
+        settings.server.trust_unsigned_identity,
+    )?;
 
     if let Some(auth) = settings.server.auth.as_ref() {
         let auth_url = settings
@@ -3165,7 +3193,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let repository_catalog = repository_catalog.clone();
             let settings = settings.clone();
@@ -3188,7 +3216,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 mutable_store,
                 lock_store,
                 domain_context,
-                jwt_verifier,
+                token_verification,
                 repository_authorizer,
                 repository_catalog,
                 settings,
@@ -3223,6 +3251,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 let user_agent_filter = user_agent_filter.clone();
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
+                let lock_store = lock_store.clone();
                 let notification_sender = notification.clone();
                 let hook_dispatcher = hook_dispatcher.clone();
                 let jwt_verifier = jwt_verifier.clone();
@@ -3239,6 +3268,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     user_agent_filter,
                     immutable_store,
                     mutable_store,
+                    lock_store,
                     notification_sender,
                     hook_dispatcher,
                     internal_domain_context,
@@ -3287,7 +3317,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
-            let jwt_verifier = jwt_verifier.clone();
+            let token_verification = token_verification.clone();
             let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -3326,7 +3356,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
             info!(
                 "Lore Public QUIC Server: Auth: {}",
-                jwt_verifier.as_ref().map_or("no", |_| "yes")
+                token_verification.describe()
             );
 
             // Same read≠write gate as the gRPC surface (default ON; a token must
@@ -3343,7 +3373,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     local_immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     enforce_write_permission,
                     repository_authorizer,
                     limits,
@@ -3352,6 +3382,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
+                CongestionAlgorithm::Bbr,
                 // User-facing endpoint: generate an ephemeral certificate when
                 // none is configured so the server runs with zero config.
                 true,
@@ -3429,6 +3460,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
+                // Cubic only shrinks the window on packet loss, so a peer that goes quiet
+                // between replication bursts doesn't come back to a window BBR has drained
+                // and stall the next large get or put.
+                CongestionAlgorithm::Cubic,
                 generate_ephemeral_cert,
                 shutdown_rx,
                 connection_registry,
@@ -3470,7 +3505,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     lore_http_settings,
                     immutable_store,
                     mutable_store,
-                    jwt_verifier,
+                    token_verification,
                     repository_authorizer,
                     shutdown_rx,
                     HttpSurfaceFacets {

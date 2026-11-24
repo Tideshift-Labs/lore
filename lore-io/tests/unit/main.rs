@@ -8,6 +8,10 @@
 
 mod driver;
 #[cfg(target_family = "windows")]
+mod find;
+#[cfg(target_family = "windows")]
 mod iocp;
 mod pool;
 mod psync;
+#[cfg(target_family = "windows")]
+mod stat;

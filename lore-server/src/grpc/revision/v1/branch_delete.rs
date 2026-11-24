@@ -20,6 +20,8 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedBranchDelete;
 use crate::domain::GovernedScope;
@@ -32,9 +34,12 @@ use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchDelete` handler.
@@ -45,14 +50,15 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
-// The eighth argument is the domain coordinator, threaded from the service the
-// same way every other governed v1 handler takes it. Collapsing the store and
-// hook arguments into a struct to stay under the limit would change a shape
-// shared with every sibling handler in this module.
+// The domain coordinator argument is threaded from the service the same way
+// every other governed v1 handler takes it. Collapsing the store and hook
+// arguments into a struct to stay under the limit would change a shape shared
+// with every sibling handler in this module.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -66,7 +72,6 @@ pub async fn handler(
     // headers and the verified principal both live outside the message body.
     let request_metadata = request.metadata().clone();
     let request_authorization = get_authorization_optional(request.extensions());
-    let req = request.into_inner();
 
     let admitted = admit_at_entry(
         domain_context,
@@ -76,6 +81,10 @@ pub async fn handler(
             repository_id: caller_context.repository_id.data(),
         },
     )?;
+    // Upstream v0.13's explicit action check, after admission (R-BLOCK-2) and
+    // before any governed prepare write.
+    require_action(authorizer, &request, Action::Write).await?;
+    let req = request.into_inner();
     let governed = if admitted.is_some() {
         let digest = canonical_intent_digest(&CanonicalIntent::BranchDelete {
             repository_id: caller_context.repository_id.data(),
@@ -171,6 +180,7 @@ async fn branch_delete_local(
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = caller_context.repository_id;
     let user_id = caller_context.user_id;
+    let is_service_account = caller_context.is_service_account;
     let correlation_id = caller_context.correlation_id;
     let branch_id = BranchId::from(req.id);
 
@@ -183,19 +193,31 @@ async fn branch_delete_local(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let hook_ctx = HookContext::builder()
-                .correlation_id(correlation_id)
-                .hook_point(HookPoint::BranchDelete)
-                .repository(repository_id)
-                .user(user_id)
-                .branch(branch_id)
-                .build();
-
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
-                .map_err(hook_error_to_status)?;
-
+            // FORK-LOCAL (Tideshift, CR-029): an admitted governed delete
+            // commits through the domain coordinator. Upstream v0.13 loads the
+            // branch before the pre-hook to name it; here that read is
+            // best-effort, so a governed delete's outcome never depends on it.
             if let Some(governed) = governed {
+                let branch_name = branch::metadata(repository.clone(), branch_id)
+                    .await
+                    .ok()
+                    .and_then(|metadata| branch::name(&metadata).ok().map(str::to_string))
+                    .unwrap_or_default();
+                let hook_ctx = HookContext::builder()
+                    .correlation_id(correlation_id)
+                    .hook_point(HookPoint::BranchDelete)
+                    .repository(repository_id)
+                    .user(user_id)
+                    .branch(branch_id)
+                    .metadata(METADATA_BRANCH_NAME, branch_name)
+                    .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string())
+                    .build();
+
+                hook_dispatcher
+                    .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
+                    .await
+                    .map_err(hook_error_to_status)?;
+
                 let committed = governed
                     .commit_branch(repository.clone(), branch_id)
                     .await?;
@@ -225,6 +247,24 @@ async fn branch_delete_local(
                 .await
                 .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
+
+            let hook_ctx = HookContext::builder()
+                .correlation_id(correlation_id)
+                .hook_point(HookPoint::BranchDelete)
+                .repository(repository_id)
+                .user(user_id)
+                .branch(branch_id)
+                .metadata(
+                    METADATA_BRANCH_NAME,
+                    branch::name(&pre_metadata).unwrap_or_default(),
+                )
+                .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string())
+                .build();
+
+            hook_dispatcher
+                .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
+                .await
+                .map_err(hook_error_to_status)?;
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 

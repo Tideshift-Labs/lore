@@ -4,7 +4,7 @@ import json
 import os
 
 import pytest
-from error_types import LoreException
+from error_types import LocalChanges, LoreException
 from link_helpers import assert_crr_clean, make_parent_with_link, make_repo
 from lore_parsers import parse_status_json
 
@@ -267,13 +267,10 @@ def test_link_reset_refuses_a_staged_file_inside_a_link(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
-    """A directory rule naming a link mount excludes the content mounted there.
-
-    The mount node is a link, not a directory, so the rule does not match the
-    node itself. It matches the mount path, which is what the content below it
-    sits in, and every walk folds the mount path that way. Reset has to reach
-    the same verdict or it restores files the filter excludes.
+def test_link_reset_purge_ignores_a_directory_rule_naming_the_mount(new_lore_repo):
+    """`lore reset --purge .` restores the committed content mounted at a link and
+    deletes the untracked files in the mount and beside it, whatever the ignore
+    rules say, even one naming the mount as a directory.
     """
     repo: Lore = new_lore_repo()
 
@@ -302,25 +299,26 @@ def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
     mounted_file = f"{link_path}/{link_file}"
     assert repo.compare_file(repo, mounted_file)
 
-    # A rooted directory rule naming the mount, the shape a sparse view uses.
     with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
-        ignore_file.write(f"/{link_path}/\n")
+        ignore_file.write(f"/{link_path}/\n*.tmp\n")
 
     with repo.open_file(mounted_file, "w+") as output_file:
         output_file.writelines(["inside modified\n"])
     with repo.open_file(outside_file, "w+") as output_file:
         output_file.writelines(["outside modified\n"])
+    untracked = [f"{link_path}/untracked.txt", f"{link_path}/build.tmp", "build.tmp"]
+    repo.write_files({path: "untracked\n" for path in untracked})
 
-    repo.reset(".")
+    repo.reset(".", purge=True)
 
     with repo.open_file(outside_file, "r") as f:
-        assert "outside original" in f.read(), (
-            "Reset should restore a file the filter does not exclude"
-        )
+        assert "outside original" in f.read(), "Reset should restore a committed file"
     with repo.open_file(mounted_file, "r") as f:
-        assert "inside modified" in f.read(), (
-            "Reset should not descend into a link mount the filter excludes"
+        assert "inside original" in f.read(), (
+            "Reset should restore the committed file mounted at the link"
         )
+    for path in untracked:
+        assert not repo.file_exists(path), f"The purge kept the untracked {path}"
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +473,80 @@ def test_link_reset_staged_remove(new_lore_repo):
         assert main_repo.compare_file(
             source_repo, p, other_file_path=source_relative
         ), f"Restored content of {p} must match source repo content"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("staged", [True, False], ids=["staged", "unstaged"])
+def test_link_reset_puts_back_a_link_a_file_replaced(new_lore_repo, staged):
+    """`reset` of a link whose mount a file replaced puts the link back, in the registry and
+    on disk, whether the file was staged or not."""
+    linked = {"shared/linked.txt": "linked\n", "shared/sub/deep.txt": "deep\n"}
+    parent, link_repo = make_parent_with_link(
+        new_lore_repo,
+        "shared",
+        {path.removeprefix("shared/"): content for path, content in linked.items()},
+    )
+
+    parent.rmtree("shared")
+    parent.write_files({"shared": "file\n"})
+    if staged:
+        parent.stage("shared", scan=True)
+    parent.reset("shared")
+
+    assert_crr_clean(
+        parent,
+        expected_files_present=[],
+        expected_files_absent=[],
+        expected_link_registry={link_repo.get_id(): True},
+    )
+    for path, content in linked.items():
+        with parent.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the linked content"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("change", "refused"),
+    [
+        ("add-edited", True),
+        ("add-untracked", False),
+        ("replaced", True),
+        ("removed-then-folder", False),
+        ("added-then-replaced", False),
+    ],
+)
+def test_link_unstage_keeps_local_work_at_the_mount(new_lore_repo, change, refused):
+    """`unstage` of a staged link change keeps the local work standing at the mount: it refuses
+    where restoring the link would overwrite that work, and otherwise leaves it in place."""
+    parent = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    link_repo = make_repo(new_lore_repo, {"linked.txt": "linked\n"})
+    parent.link_add("shared", link_repo.get_id(), "/")
+    if change in ("replaced", "removed-then-folder"):
+        parent.commit("Add link")
+        parent.push()
+
+    local = {
+        "add-edited": "shared/linked.txt",
+        "add-untracked": "shared/own.txt",
+        "replaced": "shared",
+        "removed-then-folder": "shared/own.txt",
+        "added-then-replaced": "shared",
+    }[change]
+    if change == "removed-then-folder":
+        parent.link_remove("shared")
+    if local == "shared":
+        parent.rmtree("shared")
+    parent.write_files({local: "local\n"})
+    if change in ("replaced", "removed-then-folder", "added-then-replaced"):
+        parent.stage("shared", scan=True)
+
+    if refused:
+        with pytest.raises(LocalChanges):
+            parent.unstage("shared")
+    else:
+        parent.unstage("shared")
+    with parent.open_file(local) as f:
+        assert f.read() == "local\n", f"unstage must keep {local}"
 
 
 @pytest.mark.smoke

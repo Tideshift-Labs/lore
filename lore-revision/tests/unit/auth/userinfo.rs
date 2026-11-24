@@ -81,6 +81,10 @@ async fn supplied_token_describes_only_the_identity_the_call_acts_as() {
         Some(ALICE_TOKEN),
         "the identity the call acts as is described by the supplied token"
     );
+    assert_eq!(
+        resolved[0].refresh_expires, None,
+        "a supplied token is never refreshed"
+    );
     assert_eq!(resolved[1].id, "bob");
     assert!(
         resolved[1].local_user_info.is_none(),
@@ -104,4 +108,54 @@ fn strip_removes_every_occurrence_of_current_user() {
         vec!["other".to_string()],
         "every occurrence of the current user must be stripped"
     );
+}
+
+const PAST: u64 = 1;
+const FUTURE: u64 = i64::MAX as u64;
+
+fn identity(expires: u64, refresh_expires: Option<u64>) -> ResolvedIdentity {
+    ResolvedIdentity {
+        id: "alice".to_string(),
+        name: "Alice".to_string(),
+        local_user_info: Some(lore_credential::UserInfo {
+            expires,
+            ..Default::default()
+        }),
+        refresh_expires,
+    }
+}
+
+#[test]
+fn session_with_unexpired_token_is_valid() {
+    assert!(identity(FUTURE, None).session_valid());
+    assert!(identity(FUTURE, Some(PAST)).session_valid());
+}
+
+#[test]
+fn session_with_expired_token_is_valid_while_refresh_token_is() {
+    assert!(identity(PAST, Some(FUTURE)).session_valid());
+}
+
+#[test]
+fn session_with_expired_token_and_refresh_token_without_deadline_is_valid() {
+    assert!(identity(PAST, Some(0)).session_valid());
+}
+
+#[test]
+fn session_with_expired_token_and_expired_refresh_token_is_expired() {
+    assert!(!identity(PAST, Some(PAST)).session_valid());
+}
+
+#[test]
+fn session_with_expired_token_and_no_refresh_token_is_expired() {
+    assert!(!identity(PAST, None).session_valid());
+}
+
+#[test]
+fn session_without_token_is_expired() {
+    let resolved = ResolvedIdentity {
+        local_user_info: None,
+        ..identity(FUTURE, Some(FUTURE))
+    };
+    assert!(!resolved.session_valid());
 }

@@ -137,9 +137,9 @@ mod remote_store_tests {
                     None,
                 )
                 // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
-                // regardless (see `with_jwt_verifier`'s doc comment) -- `false` for clarity.
-                .with_jwt_verifier(
-                    None,
+                // regardless -- `false` for clarity.
+                .with_token_verification(
+                    lore_server::auth::jwt::TokenVerification::Ignore,
                     false,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     repository_catalog,

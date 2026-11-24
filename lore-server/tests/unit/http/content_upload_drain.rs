@@ -51,7 +51,7 @@ async fn harness(policy: CallerCapabilityPolicy, drain: Option<Arc<DrainState>>)
     let state = ServerState {
         immutable_store: immutable_store.clone(),
         mutable_store,
-        jwt_verifier: None,
+        token_verification: lore_server::auth::jwt::TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 1024,
         presign_config: None,

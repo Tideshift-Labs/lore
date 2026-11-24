@@ -190,11 +190,15 @@ async fn push_revision(
         repository.clone(),
         branch_id,
         revision,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         branch::DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+            lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+            Default::default(),
+        ),
     )
     .await
     .expect("push")

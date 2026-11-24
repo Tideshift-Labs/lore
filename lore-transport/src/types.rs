@@ -211,6 +211,20 @@ pub struct RevisionListResponse {
     pub previous_revision: Hash,
 }
 
+impl RevisionListResponse {
+    /// The items from the revision `anchor` down to the oldest in the page.
+    ///
+    /// A page holds the anchor it was asked for, but not necessarily first: a page aligned on
+    /// a wider boundary also holds revisions newer than the anchor, which are not its
+    /// ancestors. Empty when the page does not hold `anchor`.
+    pub fn items_from(&self, anchor: Hash) -> &[RevisionItem] {
+        self.items
+            .iter()
+            .position(|item| item.signature == anchor)
+            .map_or(&[], |first| &self.items[first..])
+    }
+}
+
 #[derive(Debug)]
 pub struct RevisionItem {
     pub number: u64,
@@ -347,6 +361,9 @@ pub struct AuthenticationToken {
     /// token without re-authenticating. `None` if the auth backend does not
     /// support refresh. A backend may return the same value or rotate it.
     pub refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch. 0
+    /// if there is no refresh token, or if the provider did not give a deadline.
+    pub refresh_expires_ms: u64,
     /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
     /// it. `None` when the backend reports no scope.
     pub scope: Option<String>,
@@ -354,7 +371,7 @@ pub struct AuthenticationToken {
 
 /// Authorization token scoped to a specific resource.
 ///
-/// Returned from `exchange_for_repository` or `exchange_for_custom_resource`.
+/// Returned from `exchange_for_repository` or `exchange_for_custom_resources`.
 /// Shorter-lived than the authentication token and re-obtained via exchange
 /// when expired.
 #[derive(Clone, Debug)]

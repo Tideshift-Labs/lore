@@ -143,7 +143,17 @@ impl PsyncDriver {
                     .read(true)
                     .to_std_blocking()
                     .open(path)?;
-                let len = file.metadata()?.len() as usize;
+                let metadata = file.metadata()?;
+                // A directory opens for reading on Unix, and its size is whatever the filesystem
+                // reports, zero on some, so reading it by that size could answer with an empty
+                // file rather than an error.
+                if metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::IsADirectory,
+                        "is a directory, not a file",
+                    ));
+                }
+                let len = metadata.len() as usize;
                 crate::driver::check_whole_file_len(len)?;
                 // SAFETY: every byte up to `len` is filled before returning, and a file that
                 // shrank returns an error rather than the buffer.
@@ -295,6 +305,16 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        SyscallPool::global().submit(move || stat_impl(&path)).await
+    }
+
+    pub(crate) async fn symlink_stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        SyscallPool::global()
+            .submit(move || symlink_stat_impl(&path))
+            .await
+    }
+
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
         SyscallPool::global()
             .submit(move || holds_name_exactly_impl(&path))
@@ -345,9 +365,15 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn make_owner_writable(&self, path: PathBuf) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || make_owner_writable_impl(&path))
+            .await
+    }
+
     pub(crate) async fn read_dir(&self, path: PathBuf) -> std::io::Result<crate::DirStream> {
         SyscallPool::global()
-            .submit(move || Ok(crate::DirStream::start(std::fs::read_dir(path)?)))
+            .submit(move || crate::dir::open(path))
             .await
     }
 
@@ -372,6 +398,17 @@ impl PsyncDriver {
     pub(crate) async fn remove_dir_all(&self, path: PathBuf) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || std::fs::remove_dir_all(path))
+            .await
+    }
+
+    pub(crate) async fn remove_dir_all_keeping(
+        &self,
+        path: PathBuf,
+        boundary: &'static str,
+        reserved: impl Fn(&str) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        SyscallPool::global()
+            .submit(move || remove_tree_keeping(path, boundary, &reserved))
             .await
     }
 
@@ -406,6 +443,119 @@ fn forgive_existing_dir(
     }
 }
 
+/// Removes the tree at `path` as `std::fs::remove_dir_all` does, but keeps each directory that
+/// holds a directory named `boundary`, with all it holds and the directories leading to it, and
+/// each entry whose name `reserved` answers for, with the directories leading to it. A path that
+/// does not exist is `Ok`, as is an entry removed by someone else during the walk.
+fn remove_tree_keeping(
+    mut path: PathBuf,
+    boundary: &str,
+    reserved: &impl Fn(&str) -> bool,
+) -> std::io::Result<()> {
+    let file_type = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata.file_type(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    forgive_missing(remove_entry_keeping(
+        &mut path,
+        file_type,
+        boundary,
+        reserved,
+        &mut Vec::new(),
+    ))
+    .map(drop)
+}
+
+/// Removes the entry of `file_type` at `path` as [`remove_tree_keeping`] does, and answers whether
+/// it is gone. A link is removed, not followed.
+///
+/// A directory is listed in full before anything in it is removed, since the boundary can be its
+/// last entry. `entries` is one stack every level shares, holding the listings of the directories
+/// on the current path, and a call's caller truncates what the call leaves on it. `path` is one
+/// buffer each name is pushed onto and popped off.
+fn remove_entry_keeping(
+    path: &mut PathBuf,
+    file_type: std::fs::FileType,
+    boundary: &str,
+    reserved: &impl Fn(&str) -> bool,
+    entries: &mut Vec<(std::ffi::OsString, std::fs::FileType)>,
+) -> std::io::Result<bool> {
+    if !file_type.is_dir() {
+        remove_non_directory(path, file_type)?;
+        return Ok(true);
+    }
+    let start = entries.len();
+    let mut removed_all = true;
+    for entry in std::fs::read_dir(&*path)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && name == boundary {
+            return Ok(false);
+        }
+        if name.to_str().is_some_and(reserved) {
+            removed_all = false;
+            continue;
+        }
+        entries.push((name, file_type));
+    }
+    while entries.len() > start {
+        let index = entries.len() - 1;
+        let file_type = entries[index].1;
+        path.push(&entries[index].0);
+        let removed = remove_entry_keeping(path, file_type, boundary, reserved, entries);
+        path.pop();
+        entries.truncate(index);
+        removed_all &= forgive_missing(removed)?;
+    }
+    if removed_all {
+        std::fs::remove_dir(&*path)?;
+    }
+    Ok(removed_all)
+}
+
+/// Answers an entry that is not there as removed.
+fn forgive_missing(removed: std::io::Result<bool>) -> std::io::Result<bool> {
+    match removed {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        removed => removed,
+    }
+}
+
+/// Removes the file or link at `path`. Windows removes a link to a directory as a directory, and a
+/// read-only file once its flag is cleared, as `std::fs::remove_dir_all` does.
+fn remove_non_directory(
+    path: &std::path::Path,
+    file_type: std::fs::FileType,
+) -> std::io::Result<()> {
+    #[cfg(target_family = "windows")]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        if file_type.is_symlink_dir() {
+            return std::fs::remove_dir(path);
+        }
+        match std::fs::remove_file(path) {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                let mut permissions = std::fs::symlink_metadata(path)?.permissions();
+                if !permissions.readonly() {
+                    return Err(err);
+                }
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions)?;
+                std::fs::remove_file(path)
+            }
+            removed => removed,
+        }
+    }
+    #[cfg(not(target_family = "windows"))]
+    {
+        let _ = file_type;
+        std::fs::remove_file(path)
+    }
+}
+
 // A case-sensitive filesystem holds the name it was given, so a path that
 // resolves is a path spelled the way the filesystem holds it, and one that does
 // not is a name it does not hold - either way an answer. Following links matches
@@ -433,28 +583,78 @@ fn is_pattern_unit(unit: u16) -> bool {
     u8::try_from(unit).is_ok_and(|byte| matches!(byte, b'*' | b'?' | b'<' | b'>' | b'"'))
 }
 
-/// Units of path the lookup is willing to build.
+/// Units of path the Win32 path calls here are willing to build.
 ///
-/// A plain path is capped at `MAX_PATH` by the call itself: past that it wants
-/// the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
+/// A plain path is capped at `MAX_PATH` by the calls themselves: past that they
+/// want the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
 /// longer buffer - `lore_base::fs::win_path` does that, and lore-io does not
 /// depend on lore-base. A path that arrives already verbatim may be longer, so
-/// there is room for one, and anything past even that goes unanswered and is
-/// left to the directory read, which `std` prefixes on its own.
+/// there is room for one, and anything past even that is left to what `std`
+/// answers, since `std` prefixes on its own.
 #[cfg(target_family = "windows")]
-const PATH_UNITS: usize = 512;
+pub(crate) const PATH_UNITS: usize = 512;
 
-/// The path length the plain lookup is defined for, terminator included. Past it
+/// The path length a plain path call is defined for, terminator included. Past it
 /// the call fails on a path that is perfectly well there, which is a fact about
-/// the call and not about the name - so a longer path is declined rather than
+/// the call and not about the path - so a longer path is declined rather than
 /// answered, and only a verbatim one is carried through.
 #[cfg(target_family = "windows")]
 const MAX_PATH_UNITS: usize = 260;
 
+/// Why a path cannot be handed to a Win32 path call as it stands.
+#[cfg(target_family = "windows")]
+pub(crate) enum Unencodable {
+    /// The path holds a null, which would end the path the call sees early and make it
+    /// answer about a different one. No path a filesystem holds carries one.
+    Null,
+    /// The path holds [`PATH_UNITS`] units or more, or [`MAX_PATH_UNITS`] or more without the
+    /// verbatim prefix that lifts that limit.
+    Long,
+}
+
+/// Writes `path` followed by `suffix` into `wide` as the null-terminated UTF-16 a Win32 path
+/// call takes.
+///
+/// A path that arrives with the verbatim prefix is written as it is and is not held to
+/// `MAX_PATH`; one without it is, and rewriting it into a verbatim one is not this
+/// function's to do. The limits hold for the whole of what is written, `suffix` included.
+#[cfg(target_family = "windows")]
+pub(crate) fn encode_wide_path(
+    path: &std::path::Path,
+    suffix: &[u16],
+    wide: &mut [u16; PATH_UNITS],
+) -> Result<(), Unencodable> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut length = 0;
+    for unit in path.as_os_str().encode_wide().chain(suffix.iter().copied()) {
+        if length == wide.len() - 1 {
+            return Err(Unencodable::Long);
+        }
+        if unit == 0 {
+            return Err(Unencodable::Null);
+        }
+        wide[length] = unit;
+        length += 1;
+    }
+    wide[length] = 0;
+
+    let verbatim = matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    );
+    if !verbatim && length >= MAX_PATH_UNITS {
+        return Err(Unencodable::Long);
+    }
+    Ok(())
+}
+
 // `FindFirstFileExW` resolves the path and reports the name as the filesystem
 // holds it, which is compared in place: the caller wants a verdict, and building
 // an `OsString` to compare and drop is the allocation this exists to avoid.
-// `FindExInfoBasic` leaves the 8.3 name it would otherwise fill in unqueried.
+// `FindExInfoBasic` leaves the 8.3 name it would otherwise fill in unqueried. A
+// path holding a null names nothing, and one the call cannot take as it stands
+// says nothing about the name.
 #[cfg(target_family = "windows")]
 fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
     use std::os::windows::ffi::OsStrExt;
@@ -482,32 +682,10 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
     }
 
     let mut wide = [0u16; PATH_UNITS];
-    let mut length = 0;
-    for unit in path.as_os_str().encode_wide() {
-        // Longer than the lookup is built for, which says nothing about the name.
-        if length == wide.len() - 1 {
-            return None;
-        }
-        // An interior null would truncate the path the call sees, which would
-        // make it answer about a different path than the one it was handed -
-        // and no path a filesystem holds carries one.
-        if unit == 0 {
-            return Some(false);
-        }
-        wide[length] = unit;
-        length += 1;
-    }
-    wide[length] = 0;
-
-    // A path that arrives with the verbatim prefix is handed to the call as it
-    // is and is not held to `MAX_PATH`; one without it is, and rewriting it into
-    // a verbatim one is not this function's to do.
-    let verbatim = matches!(
-        path.components().next(),
-        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
-    );
-    if !verbatim && length >= MAX_PATH_UNITS {
-        return None;
+    match encode_wide_path(path, &[], &mut wide) {
+        Ok(()) => {}
+        Err(Unencodable::Null) => return Some(false),
+        Err(Unencodable::Long) => return None,
     }
 
     let mut found = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
@@ -538,14 +716,9 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
         found
     };
 
-    let end = found
-        .cFileName
-        .iter()
-        .position(|unit| *unit == 0)
-        .unwrap_or(found.cFileName.len());
     Some(
         name.encode_wide()
-            .eq(found.cFileName[..end].iter().copied()),
+            .eq(crate::find::record_name(&found).iter().copied()),
     )
 }
 
@@ -556,6 +729,133 @@ fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
 #[cfg(not(any(target_os = "linux", target_family = "windows")))]
 fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
     None
+}
+
+/// Adds the owner's write permission to the directory `path` names itself, through a handle that
+/// `O_NOFOLLOW` keeps from opening a symbolic link and `O_DIRECTORY` from opening anything but a
+/// directory.
+#[cfg(target_family = "unix")]
+fn make_owner_writable_impl(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)?;
+    let mode = directory.metadata()?.permissions().mode();
+    if mode & 0o200 != 0 {
+        return Ok(());
+    }
+    directory.set_permissions(std::fs::Permissions::from_mode((mode & 0o7777) | 0o200))
+}
+
+/// Clears the read-only attribute of the name `path` through a handle opened without following a
+/// reparse point, as `std` sets permissions on a name it does not follow.
+#[cfg(target_family = "windows")]
+fn make_owner_writable_impl(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    let file = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut permissions = file.metadata()?.permissions();
+    if !permissions.readonly() {
+        return Ok(());
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    permissions.set_readonly(false);
+    file.set_permissions(permissions)
+}
+
+/// What `std::fs::metadata` answers for `path`.
+pub(crate) fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
+}
+
+#[cfg(not(target_family = "windows"))]
+fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std_stat(path)
+}
+
+/// What [`attribute_stat`] answers for `path`, following a reparse point, and what [`std_stat`]
+/// answers where it declines.
+#[cfg(target_family = "windows")]
+fn stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    attribute_stat(path, true).unwrap_or_else(|| std_stat(path))
+}
+
+/// What `std::fs::symlink_metadata` answers for `path`, the name itself.
+#[cfg(not(target_family = "windows"))]
+fn symlink_stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    std::fs::symlink_metadata(path).map(|metadata| crate::Stat::from(&metadata))
+}
+
+/// What [`attribute_stat`] answers for `path`, the name itself, and where it declines what
+/// `std::fs::symlink_metadata` answers, with the kind the name's attributes give.
+#[cfg(target_family = "windows")]
+fn symlink_stat_impl(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    use std::os::windows::fs::MetadataExt;
+
+    attribute_stat(path, false).unwrap_or_else(|| {
+        std::fs::symlink_metadata(path).map(|metadata| crate::Stat {
+            kind: crate::stat::attribute_kind(metadata.file_attributes()),
+            ..crate::Stat::from(&metadata)
+        })
+    })
+}
+
+/// What one `GetFileAttributesExW` answers for `path`, which it queries without a handle and
+/// without following a reparse point, or `None` where the answer could differ from what `std`
+/// gives: for a relative path, which `std` resolves first; a path the call cannot take as it
+/// stands; a reparse point where `follow` asks for what it stands for; a time `SystemTime` cannot
+/// hold; and every failure but the name not being there, which the two report with the same code.
+#[lore_macro::test_pub]
+#[cfg(target_family = "windows")]
+fn attribute_stat(path: &std::path::Path, follow: bool) -> Option<std::io::Result<crate::Stat>> {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    use windows_sys::Win32::Storage::FileSystem::GetFileAttributesExW;
+    use windows_sys::Win32::Storage::FileSystem::GetFileExInfoStandard;
+    use windows_sys::Win32::Storage::FileSystem::WIN32_FILE_ATTRIBUTE_DATA;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut wide = [0u16; PATH_UNITS];
+    encode_wide_path(path, &[], &mut wide).ok()?;
+
+    let mut data = std::mem::MaybeUninit::<WIN32_FILE_ATTRIBUTE_DATA>::uninit();
+    // SAFETY: the path is null-terminated, and the structure is writable for the size the
+    // standard information level fills in.
+    let queried = unsafe {
+        GetFileAttributesExW(
+            wide.as_ptr(),
+            GetFileExInfoStandard,
+            data.as_mut_ptr().cast(),
+        )
+    };
+    if queried == 0 {
+        let error = std::io::Error::last_os_error();
+        let absent = matches!(
+            error.raw_os_error(),
+            Some(code) if code == ERROR_FILE_NOT_FOUND as i32 || code == ERROR_PATH_NOT_FOUND as i32
+        );
+        return absent.then_some(Err(error));
+    }
+    // SAFETY: the call succeeded, so it filled the structure in.
+    let data = unsafe { data.assume_init() };
+    if follow && data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return None;
+    }
+    crate::stat::from_attribute_data(&data).map(Ok)
 }
 
 #[cfg(target_family = "unix")]

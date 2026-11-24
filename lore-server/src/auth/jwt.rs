@@ -17,6 +17,7 @@ use tracing::warn;
 
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
+use crate::authnz::repository_authorizer::Action;
 
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
@@ -91,20 +92,27 @@ impl ResourceMatcher {
             .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
     }
 
-    /// Whether some entry matching `repository` grants `action`. The
-    /// per-question form of [`merged_permissions`](Self::merged_permissions):
-    /// it visits the entries in place rather than building the merged set.
+    /// Whether some entry matching `repository` grants `action`. Any matching
+    /// entry grants `read`. The per-question form of
+    /// [`merged_permissions`](Self::merged_permissions): it visits the entries
+    /// in place rather than building the merged set.
     pub fn permits(
         &self,
         resources: &[ResourcePermission],
         repository: lore_base::types::RepositoryId,
-        action: &str,
+        action: Action,
     ) -> bool {
         let resource_id = self.resource_for(repository);
         resources
             .iter()
             .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
-            .any(|entry| entry.permission.iter().any(|granted| granted == action))
+            .any(|entry| {
+                action == crate::authnz::repository_authorizer::Action::Read
+                    || entry
+                        .permission
+                        .iter()
+                        .any(|granted| granted == action.as_str())
+            })
     }
 
     /// The actions granted on `repository`, merged across every matching
@@ -365,6 +373,69 @@ impl JwtVerifier {
         warn!("Rejecting token: the `typ` header is absent or not an accepted type");
         Err(JwtVerifierError::TypNotAccepted)
     }
+}
+
+/// How every transport treats a bearer token, chosen once from `[server.auth]` and
+/// `server.trust_unsigned_identity`.
+#[derive(Clone, Default)]
+pub enum TokenVerification {
+    /// No `[server.auth]`: a bearer token is not required, and one that is present is not
+    /// read.
+    #[default]
+    Ignore,
+    /// `server.trust_unsigned_identity`: a bearer token is not required. One that is present
+    /// is decoded by [`decode_unsigned_identity`], and only its claims are kept, so the
+    /// caller is named but holds no verified token.
+    TrustUnsigned,
+    Verify(JwtVerifier),
+}
+
+impl TokenVerification {
+    pub fn new(
+        verifier: Option<JwtVerifier>,
+        trust_unsigned_identity: bool,
+    ) -> anyhow::Result<Self> {
+        match (verifier, trust_unsigned_identity) {
+            (Some(_), true) => anyhow::bail!(
+                "trust_unsigned_identity applies only to a server without [server.auth]"
+            ),
+            (Some(verifier), false) => Ok(Self::Verify(verifier)),
+            (None, true) => Ok(Self::TrustUnsigned),
+            (None, false) => Ok(Self::Ignore),
+        }
+    }
+
+    pub fn verifier(&self) -> Option<&JwtVerifier> {
+        match self {
+            Self::Verify(verifier) => Some(verifier),
+            Self::Ignore | Self::TrustUnsigned => None,
+        }
+    }
+
+    /// The startup log's description of the mode.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Ignore => "disabled",
+            Self::TrustUnsigned => "disabled, trusting unsigned identity",
+            Self::Verify(_) => "enabled",
+        }
+    }
+}
+
+/// Decode `token` without checking its signature, issuer, audience or expiry,
+/// for `server.trust_unsigned_identity`. The claims still have to parse as an
+/// [`AuthorizationToken`] and name an identity.
+pub fn decode_unsigned_identity(token: &str) -> Result<AuthorizationToken, JwtVerifierError> {
+    let header = decode_header(token)?;
+    let mut validation = Validation::new(header.alg);
+    validation.insecure_disable_signature_validation();
+    validation.validate_aud = false;
+    validation.validate_exp = false;
+    validation.required_spec_claims.clear();
+    let mut claims =
+        decode::<AuthorizationToken>(token, &DecodingKey::from_secret(&[]), &validation)?.claims;
+    claims.identity = resolve_identity(&claims)?;
+    Ok(claims)
 }
 
 /// The identity `claims` name: the first of `identity`, its namespaced alias

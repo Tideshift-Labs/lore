@@ -76,6 +76,7 @@ fn complete() -> PollAnswer {
         expires_ms: 0,
         acceptable_root_domains: Vec::new(),
         refresh_token: None,
+        refresh_expires_ms: 0,
         scope: None,
     }))
 }
@@ -173,11 +174,11 @@ impl Authentication for ScriptedAuth {
         Err(ProtocolError::internal("the stub only serves polls"))
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(ProtocolError::internal("the stub only serves polls"))

@@ -131,7 +131,7 @@ async fn unavailable_store_is_still_ok_on_lb_health_but_not_on_health_check() {
     let test_shared_state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: lore_server::auth::jwt::TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 100,
         presign_config: None,

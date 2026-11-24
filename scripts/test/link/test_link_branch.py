@@ -3,11 +3,13 @@
 import re
 
 import pytest
+from error_types import LinkDivergedError
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
     make_parent_with_link,
     make_repo,
+    remote_branch_entries,
 )
 from lore_parsers import parse_jsonl
 
@@ -747,23 +749,25 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     )
 
 
-def _remote_branch_entries(repo: Lore) -> list[dict]:
-    """Remote branch list entries for a repository.
+@pytest.mark.smoke
+def test_link_push_onto_a_moved_link_branch_fails_as_diverged(new_lore_repo):
+    """A link push onto a linked branch that moved on fails as a diverged link.
 
-    Archived branches are deliberately not requested. The remote leg reports
-    every entry as unarchived and the client asks for archived branches to be
-    excluded, so an archived branch is absent from this list entirely rather than
-    present with a flag set — its absence is the signal, and asking for archived
-    entries would only cost an extra scan.
-
-    Read from JSON rather than the text parser because the text form drops the
-    branch id, and the id is what branch creation shares between a parent branch
-    and the branch it creates in a linked repository.
+    Linked `main` moves on from another clone, so the commit made through the
+    mount is not a fast-forward of it.
     """
-    output = repo.branch_list(json=True)
-    return [
-        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
-    ]
+    parent, link_repo = make_parent_with_link(new_lore_repo)
+    link_repo.clone().write_commit_push(
+        "Move linked main", {"linked.txt": "moved on upstream\n"}
+    )
+
+    mounted_file = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+    parent.write_files({mounted_file: "edited through the mount\n"})
+    parent.stage(mounted_file)
+    parent.commit("Edit through the mount")
+
+    with pytest.raises(LinkDivergedError):
+        parent.push()
 
 
 @pytest.mark.smoke
@@ -779,7 +783,7 @@ def test_link_branch_archive_leaves_child_branch(new_lore_repo):
     parent.branch_create("feature")
     parent_branch_id = parent.branch_info("feature").id
 
-    cascaded = [e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"]
+    cascaded = [e for e in remote_branch_entries(link_repo) if e["name"] == "feature"]
     assert len(cascaded) == 1, (
         f"Branch create should cascade one 'feature' branch into the linked "
         f"repository, got {cascaded}"
@@ -797,7 +801,7 @@ def test_link_branch_archive_leaves_child_branch(new_lore_repo):
         "Archived branch should be gone from the parent's branch list"
     )
 
-    survivor = [e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"]
+    survivor = [e for e in remote_branch_entries(link_repo) if e["name"] == "feature"]
     assert len(survivor) == 1, (
         f"The linked repository should keep its branch when the parent "
         f"archives, got {survivor}"
@@ -830,7 +834,7 @@ def test_link_archived_parent_branch_does_not_disturb_link_resolution(new_lore_r
     parent.branch_switch("main")
     parent.branch_archive("feature")
 
-    assert any(e["name"] == "feature" for e in _remote_branch_entries(link_repo)), (
+    assert any(e["name"] == "feature" for e in remote_branch_entries(link_repo)), (
         "Precondition: the linked branch outlives the parent's archive"
     )
 

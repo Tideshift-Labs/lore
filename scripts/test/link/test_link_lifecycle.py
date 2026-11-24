@@ -7,7 +7,14 @@ import shutil
 
 import pytest
 from error_types import LocalChanges, PathExistChildrenLinkError, PathExistLinkError
-from link_helpers import DEFAULT_LINK_MOUNT, make_parent_with_link, make_repo
+from link_helpers import (
+    DEFAULT_LINK_MOUNT,
+    assert_mount_exposes,
+    make_parent_with_link,
+    make_parent_with_remount,
+    make_repo,
+    make_repo_renumbering_folder,
+)
 from lore_parsers import parse_jsonl, parse_status_json
 from test_utils import unstaged_entries
 
@@ -1228,6 +1235,89 @@ def test_link_update_subdirectory_source(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_update_keeps_the_mount_where_node_ids_shift(new_lore_repo):
+    """Updating a subtree link's pin keeps it on the same path, wherever the new revision numbers it.
+
+    A revision numbers its nodes afresh, so the node the mount stood at can name another folder.
+    """
+    link_path = "linked/repo"
+    source_repo, pin_one, pin_two = make_repo_renumbering_folder(new_lore_repo)
+
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "sub", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
+
+    repo.link_update(link_path, pin=pin_two)
+    repo.commit("Update the pin")
+    repo.push()
+
+    assert_mount_exposes(repo, link_path, "sub", ["a.txt"])
+    clone = repo.clone()
+    assert_mount_exposes(clone, link_path, "sub", ["a.txt"])
+    with clone.open_file(f"{link_path}/a.txt") as f:
+        assert f.read() == "two\n", "the mount should expose the updated revision"
+
+
+@pytest.mark.smoke
+def test_link_update_replaces_a_directory_with_a_file(new_lore_repo):
+    """A pin move that turns a directory into a file leaves the file in place.
+
+    The directory is deleted before the file is written, so clearing the directories the move
+    emptied must spare a path it writes again.
+    """
+    link_path = "linked/repo"
+    source_repo = make_repo(new_lore_repo, {"foo/inner.txt": "inner\n"})
+    pin_one = source_repo.branch_info().local_latest
+    source_repo.rmtree("foo")
+    source_repo.stage(scan=True)
+    source_repo.commit("Drop the directory")
+    source_repo.push()
+    source_repo.write_commit_push("Add a file in its place", {"foo": "file\n"})
+    pin_two = source_repo.branch_info().local_latest
+
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "/", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
+
+    repo.link_update(link_path, pin=pin_two)
+
+    with repo.open_file(f"{link_path}/foo") as f:
+        assert f.read() == "file\n", "the mount should hold the file the new pin has"
+
+
+@pytest.mark.smoke
+def test_link_remount_realized_by_branch_switch(new_lore_repo):
+    """A remount commits, and switching across it materializes the subtree each branch exposes.
+
+    Narrowed from the root, so the subtree the mount lands on sits in a directory the wider mount
+    also exposed and the realize carries its content out only after attempting to delete it.
+    """
+    link_path = "linked/repo"
+    source_path = "sub"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {
+            "root-file.txt": "root source content\n",
+            f"{source_path}/link-file.txt": "subtree source content\n",
+        },
+        "/",
+        source_path,
+        link_path,
+    )
+    assert_mount_exposes(
+        repo.clone(branch="feature-branch"), link_path, source_path, ["link-file.txt"]
+    )
+
+    repo.branch_switch("main")
+    assert_mount_exposes(repo, link_path, "/", ["root-file.txt", source_path])
+
+    repo.branch_switch("feature-branch")
+    assert_mount_exposes(repo, link_path, source_path, ["link-file.txt"])
+
+
+@pytest.mark.smoke
 def test_link_stage_move_on_mount_is_refused(new_lore_repo):
     """Renaming a link mount is refused, and the link survives the attempt.
 
@@ -1476,3 +1566,45 @@ def test_link_stage_move_inside_a_link_is_refused(new_lore_repo):
     assert "Links not yet implemented" in output, (
         f"A move across a link boundary should be refused, got: {output}"
     )
+
+
+@pytest.mark.smoke
+def test_link_update_takes_a_case_variant_of_a_file_the_update_deletes(new_lore_repo):
+    """A file spelled in another case holding the pinned content goes with its directory."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
+    )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+    parent_repo.link_update(link_path)
+
+    assert not parent_repo.path_exists(f"{link_path}/deep")
+
+
+@pytest.mark.smoke
+def test_link_update_keeps_a_modified_case_variant_of_a_file_the_update_deletes(
+    new_lore_repo,
+):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
+    )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalChanges):
+        parent_repo.link_update(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"

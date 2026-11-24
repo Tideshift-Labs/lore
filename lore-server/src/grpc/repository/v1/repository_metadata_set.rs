@@ -21,6 +21,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedMetadataCas;
@@ -118,13 +119,16 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // FORK-LOCAL (Tideshift): admin, not any grant; see the v0 handler.
+            // FORK-LOCAL (Tideshift): admin, not any grant; `write` without a
+            // verified token (no-auth server). See the v0 handler.
+            let token = get_verified_token(&extensions);
+            let action = if token.is_some() {
+                Action::Admin
+            } else {
+                Action::Write
+            };
             authorizer
-                .require_action(
-                    get_verified_token(&extensions).as_ref(),
-                    repository_id.into(),
-                    "admin",
-                )
+                .require_action(token.as_ref(), repository_id.into(), action)
                 .await?;
 
             let current_metadata = if !expected.is_zero() {

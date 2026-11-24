@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Poll;
 
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
 use aws_sdk_dynamodb::operation::delete_item::DeleteItemOutput;
@@ -73,6 +75,8 @@ pub(crate) enum Fault {
     StateRead,
     StateReadTimeout,
     StateReadBroken,
+    /// Batch reads fail as if their keys were still unprocessed after the resend limit.
+    BatchReadUnprocessed,
     StateWrite,
     StateDelete,
     AssociationWrite,
@@ -96,6 +100,7 @@ pub(crate) struct Storage {
     /// in the window that follows.
     pub(crate) association_deleted: Option<oneshot::Sender<()>>,
     pub(crate) object_reads: usize,
+    pub(crate) state_get_items: usize,
     pub(crate) objects: HashMap<Vec<u8>, StoredObject>,
     /// Objects returned by `get_object` exactly once before being removed. Not visible to
     /// `head_object`, so a test can make `head_fragment` fail while `load` still succeeds.
@@ -136,6 +141,10 @@ impl Fake {
 
     pub(crate) fn object_reads(&self) -> usize {
         self.lock().object_reads
+    }
+
+    pub(crate) fn state_get_items(&self) -> usize {
+        self.lock().state_get_items
     }
 
     pub(crate) fn object(&self, hash: Hash) -> Option<StoredObject> {
@@ -420,8 +429,9 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
             }
         }
 
-        let storage = f.lock();
+        let mut storage = f.lock();
         let found = if &**table == FRAGMENT_STATE_TABLE_NAME {
+            storage.state_get_items += 1;
             storage.state.get(&blob(&item, "hash")).cloned()
         } else if &**table == FRAGMENT_METADATA_TABLE_NAME {
             storage.legacy_metadata.get(&blob(&item, "hash")).cloned()
@@ -442,6 +452,12 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     dynamodb
         .expect_batch_get_item()
         .returning(move |table, keys, _| {
+            if f.failing(Fault::BatchReadUnprocessed) {
+                return Err(AwsError::UnprocessedKeys {
+                    remaining: keys.len(),
+                });
+            }
+
             let storage = f.lock();
 
             // Routed by table, like the single-item read above. Reading the state table - and
@@ -675,6 +691,12 @@ pub(crate) async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsIm
             Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings))
         })
         .await
+}
+
+/// Polls `future` once. The mocked tables answer on the first poll, so a store call that is still
+/// pending after one is waiting on something other than them.
+pub(crate) async fn poll_once<F: Future + ?Sized>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
 }
 
 pub(crate) fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {

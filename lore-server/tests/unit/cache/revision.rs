@@ -16,6 +16,8 @@ use lore_revision::state::State;
 use lore_revision::state::StateData;
 use lore_server::cache::revision::*;
 use lore_server::grpc::get_write_token;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::server::RevisionListAcceleration;
 use lore_storage::StoreError;
 use rand::random;
@@ -695,11 +697,12 @@ mod resolve_revision_number {
                 repository.clone(),
                 branch,
                 serialized,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 STEP_ONE_HUNDRED,
                 BOTH,
+                &mut PushReport::new(PushHandler::Legacy, Default::default()),
             )
             .await
             .expect("push revision")
@@ -727,11 +730,12 @@ mod resolve_revision_number {
             repository.clone(),
             branch,
             serialized,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             STEP_ONE_HUNDRED,
             BOTH,
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push jump revision");

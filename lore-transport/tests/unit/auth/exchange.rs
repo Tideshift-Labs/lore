@@ -88,6 +88,92 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
     assert_eq!(identity, "alice");
 }
 
+#[tokio::test]
+async fn no_auth_endpoint_with_an_identity_sends_an_unsigned_identity_token() {
+    let (authentication_token, authorization_token, identity) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+
+    assert_eq!(authentication_token, authorization_token);
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_without_an_identity_sends_no_token() {
+    let tokens = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(tokens, (String::new(), String::new(), String::new()));
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_access_token_over_an_unsigned_one() {
+    let (_, authorization_token, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id"),
+        "",
+        "supplied-authz",
+    )
+    .await;
+    assert_eq!(authorization_token, "supplied-authz");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_an_unsigned_identity_token_for_a_custom_resource() {
+    let (_, authorization_token, identity) = auth_exchange_custom_resource(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "some-resource",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_identity_token_over_an_unsigned_one() {
+    let (authentication_token, _, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "supplied-authn",
+        "",
+    )
+    .await;
+    assert_ne!(
+        lore_credential::identity_from_token(&authentication_token),
+        "alice",
+        "the supplied token is not replaced with an unsigned one"
+    );
+}
+
 /// Without one, the same call fails: nothing about the short circuit above
 /// leaks into the normal path.
 #[tokio::test]
@@ -273,11 +359,11 @@ impl Authentication for TestAuthentication {
         })
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         self.custom_resource_calls.fetch_add(1, Ordering::SeqCst);
@@ -346,6 +432,7 @@ fn authentication_token(token: String, identity: &str) -> AuthenticationToken {
         expires_ms: u64::MAX,
         acceptable_root_domains: Vec::new(),
         refresh_token: Some("refresh-new".to_string()),
+        refresh_expires_ms: 0,
         scope: None,
     }
 }
@@ -357,6 +444,7 @@ async fn store_pair(auth_url: &str, identity: &str, token: &str) {
         token,
         vec!["example.com".to_string()],
         Some("refresh-old"),
+        0,
         None,
     )
     .await
@@ -1010,11 +1098,11 @@ impl Authentication for DelayedAuthentication {
         })
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(ProtocolError::internal("repository exchanges only"))
@@ -1358,11 +1446,11 @@ impl Authentication for FailingAuthentication {
         Err((self.make_error)())
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _auth_url: &str,
         _authn_token: &str,
-        _resource_id: &str,
+        _resource_ids: &[&str],
         _correlation_id: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(ProtocolError::internal("repository exchanges only"))
@@ -1929,11 +2017,11 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
             Err((self.0)())
         }
 
-        async fn exchange_for_custom_resource(
+        async fn exchange_for_custom_resources(
             &self,
             _auth_url: &str,
             _authn_token: &str,
-            _resource_id: &str,
+            _resource_ids: &[&str],
             _correlation_id: &str,
         ) -> Result<AuthorizationToken, ProtocolError> {
             Err((self.0)())
@@ -2060,6 +2148,7 @@ fn oidc_jwt(subject: &str, audience: &str, exp: u64) -> String {
 }
 
 const EXPIRED: u64 = 1_000_000_000;
+const REFRESHED_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
 
 fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::AuthenticationToken {
     lore_transport::types::AuthenticationToken {
@@ -2069,13 +2158,14 @@ fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::Authent
         expires_ms: 2_000_000_000_000,
         acceptable_root_domains: Vec::new(),
         refresh_token: Some(refresh_token.to_owned()),
+        refresh_expires_ms: REFRESHED_REFRESH_EXPIRES,
         scope: None,
     }
 }
 
 /// A stored login whose token has expired is refreshed while an identity is picked, so the
-/// identity is found and authenticated without a new login. The new token is stored, so the
-/// next derivation presents no refresh token.
+/// identity is found and authenticated without a new login. The new token is stored with the
+/// new refresh token's deadline, so the next derivation presents no refresh token.
 #[tokio::test]
 async fn an_expired_stored_login_is_refreshed() {
     // FORK-LOCAL (Tideshift): the CR-020 tests repoint the store's environment.
@@ -2087,6 +2177,7 @@ async fn an_expired_stored_login_is_refreshed() {
         &oidc_jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -2108,6 +2199,10 @@ async fn an_expired_stored_login_is_refreshed() {
         assert_eq!(identity, "alice");
     }
     assert_eq!(stub.presented(), ["refresh-1"]);
+    assert_eq!(
+        token_store::load_refresh_expires(AUTH_URL, "alice").await,
+        Some(REFRESHED_REFRESH_EXPIRES)
+    );
 }
 
 /// A refused refresh token skips the identity, as an expired login did before, and is not
@@ -2123,6 +2218,7 @@ async fn an_expired_stored_login_whose_refresh_is_refused_is_skipped() {
         &oidc_jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -2166,6 +2262,7 @@ async fn a_stored_refresh_credential_survives_internal_and_not_unauthenticated()
             &oidc_jwt("alice", "example.com", EXPIRED),
             vec!["example.com".to_owned()],
             Some("refresh-1"),
+            0,
             None,
         )
         .await
@@ -2204,6 +2301,7 @@ async fn a_refreshed_token_for_another_domain_is_not_handed_out() {
         &oidc_jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -2248,6 +2346,7 @@ async fn an_expired_supplied_identity_token_is_not_refreshed() {
         &supplied,
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -2282,6 +2381,7 @@ async fn an_exchange_refreshes_an_expired_stored_login_first() {
         &oidc_jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -2343,6 +2443,7 @@ async fn only_an_unsent_refresh_is_tried_again() {
             &oidc_jwt("alice", "example.com", EXPIRED),
             vec!["example.com".to_owned()],
             Some("refresh-1"),
+            0,
             None,
         )
         .await
@@ -2380,6 +2481,7 @@ async fn a_cancelled_caller_does_not_stop_the_refresh() {
         &oidc_jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await

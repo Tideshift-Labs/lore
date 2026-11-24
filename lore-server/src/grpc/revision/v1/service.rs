@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,6 +83,7 @@ pub struct LoreRevisionV1Service {
     acceleration: crate::grpc::server::RevisionListAcceleration,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
+    branch_list_concurrency: NonZeroUsize,
     enforce_write_permission: bool,
     /// `Some` only when `enforce_locks_on_push` is on AND a lock store exists;
     /// see `LoreRevisionService::push_lock_enforcement`.
@@ -103,6 +105,7 @@ impl LoreRevisionV1Service {
         acceleration: crate::grpc::server::RevisionListAcceleration,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        branch_list_concurrency: NonZeroUsize,
         enforce_write_permission: bool,
         push_lock_enforcement: Option<crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
         domain_context: Option<Arc<DomainContext>>,
@@ -138,6 +141,7 @@ impl LoreRevisionV1Service {
             acceleration,
             forwarded_requests,
             rpc_timeout,
+            branch_list_concurrency,
             enforce_write_permission,
             push_lock_enforcement,
             domain_context,
@@ -184,6 +188,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_create::handler_with_domain(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -211,6 +216,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_delete::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
@@ -251,6 +257,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             &self.forwarded_requests,
+            self.branch_list_concurrency,
         )
         .await
     }
@@ -308,6 +315,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.rpc_timeout,
             branch_metadata_set::handler(
                 request,
+                &self.repository_authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.enforce_write_permission,

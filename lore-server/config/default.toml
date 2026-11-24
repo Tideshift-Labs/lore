@@ -50,9 +50,17 @@ verify_client_certs = false
 idle_timeout = 30_000
 keep_alive = 500
 max_bidi_streams = 8
-num_listeners = 10
+# Accept tasks per socket. Unset: 1.
+# num_listeners = 1
+# UDP sockets on the port, each with its own QUIC endpoint; Linux spreads clients across them.
+# Used on Linux and Android only; other platforms bind one socket.
+# Unset: 16, or one per processor on a machine with fewer.
+# num_sockets = 16
 transport_bits_per_second = 1_073_741_824  # 1 gbit/s
 transport_rtt = 100  # 100 ms
+# Window each connection starts sending responses with. Unset, the congestion controller's own
+# default applies.
+# initial_cwnd_bytes = 262_144
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.
@@ -69,9 +77,17 @@ port = 41340
 idle_timeout = 30_000
 keep_alive = 500
 max_bidi_streams = 8
-num_listeners = 10
+# Few peers, and each peer's traffic stays on one socket, so a handful is enough.
+# Used on Linux and Android only; other platforms bind one socket.
+num_sockets = 4
 transport_bits_per_second = 10_737_418_240  # 10 gbit/s
-transport_rtt = 100  # 100 ms
+# Sizes each connection's receive and send windows, which cap how much a client may have in
+# flight and how much of a response the server holds until it is acknowledged. The same value
+# applies to clients in this region and other regions, so it is sized for the most distant peers.
+# Each connection may buffer up to one window in each direction.
+transport_rtt = 220  # 220 ms
+# Window each connection starts sending responses with. Defaults to 1 MiB.
+# initial_cwnd_bytes = 1_048_576
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.
@@ -171,3 +187,6 @@ history_step_size = 100
 
 # Parallel history-walk permits used by revision::diff3 to bound conflict resolution.
 # revision_diff_history_walk_concurrency = 24
+
+# Branches a v1 BranchList request loads from the store at once. Must be at least 1.
+# branch_list_concurrency = 100

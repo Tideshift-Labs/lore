@@ -38,6 +38,7 @@ pin-project = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -100,6 +101,7 @@ aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-to
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-credential = { workspace = true }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 tempfile = "3.21"
@@ -110,12 +112,10 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
 # Paused/advanceable clock for deterministic drain-loop tests (drain.rs) that
 # would otherwise need real multi-second sleeps to cross DRAIN_TICK/stall
-# windows.
+# windows, and `start_paused` for the tests that time push phases on a virtual clock.
 tokio = { workspace = true, features = ["test-util"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 lore-server = { workspace = true, features = ["test-util", "mock-replication-client"] }
-# The client's identity decode, compared with the server's lock owner in tests/unit/auth/jwt.rs.
-lore-credential = { workspace = true }
 # FORK: the test JWKS fixtures sign with PEM keys, and the workspace drops `use_pem`
 # (upstream 5bca99d6), so the tests turn it back on.
 jsonwebtoken = { workspace = true, features = ["use_pem"] }

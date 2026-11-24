@@ -183,8 +183,8 @@ fn require_free_destination(held: FileInfo, destination: &Path) -> Result<(), Wr
 
 /// What the host filesystem holds at `destination`, for a destination no operation covers.
 async fn host_file_info(destination: &Path) -> Result<FileInfo, WriteError> {
-    match lore_io::IoDriver::global().metadata(destination).await {
-        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
+    match lore_io::IoDriver::global().stat(destination).await {
+        Ok(stat) => Ok(FileInfo::from_stat(&stat)),
         Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
         Err(err) => Err(WriteError::internal_with_context(
             err,
@@ -306,15 +306,12 @@ pub(crate) async fn write_file(
                     .internal("Failed to write file")?,
             };
 
-            let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-            if node_executable != util::fs::file_is_executable(&metadata) {
-                util::fs::metadata_set_executable(
-                    destination.as_path(),
-                    &metadata,
-                    node_executable,
-                )
-                .await;
-            }
+            util::fs::metadata_set_executable(
+                destination.as_path(),
+                Some(&metadata),
+                node.mode & NodeFileMode::Executable == NodeFileMode::Executable,
+            )
+            .await;
         }
     }
 

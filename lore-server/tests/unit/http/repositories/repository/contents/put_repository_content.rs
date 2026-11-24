@@ -15,6 +15,7 @@ use axum_test::TestServer;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -47,17 +48,21 @@ async fn put_status(
         .scope(execution, async move {
             let repository = random::<Context>();
             let (url, calls) = start_stub(vec![(urc(repository.into()), stub_grants)]).await;
-            let (jwt_verifier, repository_authorizer): (_, Arc<dyn RepositoryAuthorizer>) =
+            let (token_verification, repository_authorizer): (_, Arc<dyn RepositoryAuthorizer>) =
                 match authorizer {
-                    AuthorizerKind::AuthClient => {
-                        (Some(verifier()), Arc::new(AuthClientAuthorizer::new(url)))
-                    }
-                    AuthorizerKind::AuthOff => (None, Arc::new(AllowAllRepositoryAuthorizer)),
+                    AuthorizerKind::AuthClient => (
+                        TokenVerification::Verify(verifier()),
+                        Arc::new(AuthClientAuthorizer::new(url)),
+                    ),
+                    AuthorizerKind::AuthOff => (
+                        TokenVerification::Ignore,
+                        Arc::new(AllowAllRepositoryAuthorizer),
+                    ),
                 };
             let state = ServerState {
                 immutable_store: immutable_store.clone(),
                 mutable_store,
-                jwt_verifier,
+                token_verification,
                 repository_authorizer,
                 max_file_size: 1024,
                 presign_config: None,
@@ -138,8 +143,10 @@ async fn a_write_claim_uploads_content() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// With the fork write gate off, upstream v0.13's own `http_permits(.., Action::Write)`
+/// still refuses a read-only claim (483c96ff: every partition write checks an action).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn enforcement_off_lets_a_read_only_claim_upload() {
+async fn enforcement_off_still_needs_the_upstream_write_action() {
     let (status, _) = put_status(
         AuthorizerKind::AuthClient,
         vec![],
@@ -147,7 +154,7 @@ async fn enforcement_off_lets_a_read_only_claim_upload() {
         false,
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,7 +189,7 @@ async fn put_under_resource_grants(
             let state = ServerState {
                 immutable_store: immutable_store.clone(),
                 mutable_store,
-                jwt_verifier: Some(verifier()),
+                token_verification: TokenVerification::Verify(verifier()),
                 repository_authorizer: resource_grants_authorizer(),
                 max_file_size: 1024,
                 presign_config: None,

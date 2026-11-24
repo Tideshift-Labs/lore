@@ -15,6 +15,7 @@ use axum_test::TestServer;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_revision::fragment;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
@@ -58,7 +59,7 @@ async fn an_identity_token_reads_content_only_where_the_auth_service_grants_read
             let state = ServerState {
                 immutable_store: immutable_store.clone(),
                 mutable_store,
-                jwt_verifier: Some(verifier()),
+                token_verification: TokenVerification::Verify(verifier()),
                 repository_authorizer: Arc::new(AuthClientAuthorizer::new(url)),
                 max_file_size: 1024,
                 presign_config: None,

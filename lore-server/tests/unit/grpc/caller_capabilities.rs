@@ -290,6 +290,7 @@ fn inventory_matches_every_method_in_registered_proto_services() {
             if method.starts_with("/urc.notification.")
                 || method.starts_with("/lore.repository.v1.ForwardedRepositoryService/")
                 || method.starts_with("/lore.revision.v1.ForwardedRevisionService/")
+                || method.starts_with("/urc.lock.ForwardedLockService/")
             {
                 assert_eq!(classify_rpc(&method), None);
             } else {

@@ -287,7 +287,7 @@ impl ProbeFactory {
                 // Auth off, strict policy: the slice-1 server as a strict cell runs it, minus
                 // the token, which these tests do not need.
                 let inner = StorageServiceV4::new(
-                    Arc::new(None),
+                    Arc::new(lore_server::auth::jwt::TokenVerification::Ignore),
                     Arc::new(AllowAllRepositoryAuthorizer),
                     immutable.clone(),
                     immutable.clone(),
@@ -417,8 +417,8 @@ pub(crate) async fn start_grpc_backend(
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(
-                    None,
+                .with_token_verification(
+                    lore_server::auth::jwt::TokenVerification::Ignore,
                     false,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     repository_catalog,

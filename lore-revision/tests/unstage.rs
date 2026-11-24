@@ -21,6 +21,7 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::stage::StageOptions;
@@ -267,5 +268,92 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// Unstaging a staged file a directory-only view rule names unstages it: the view is asked
+    /// about the path as the file the tree holds there. The ignore file leaves out no staged node.
+    #[tokio::test]
+    async fn unstaging_a_file_a_directory_only_view_rule_names_unstages_it() {
+        in_execution(async {
+            let (repository, tempdir) =
+                committed_repository("", &["src/Intermediate".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            test_file_write(root.join("src/Intermediate").as_path(), b"modified");
+            stage_paths(&repository, &root, &["src/Intermediate"], false, false).await;
+            assert!(
+                next_node(&repository, "src/Intermediate").await.is_staged(),
+                "the stage of src/Intermediate staged nothing"
+            );
+            test_file_write(
+                root.join(repository::DOT_LORE)
+                    .join(repository::VIEW_FILTER)
+                    .as_path(),
+                b"Intermediate/\n",
+            );
+            let viewed = Arc::new(
+                repository
+                    .to_filter_context(repository::load_filter(&root).expect("Load filter failed")),
+            );
+            unstage::unstage(
+                viewed.clone(),
+                viewed
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                path_arguments(&root, &["src/Intermediate"]),
+                UnstageOptions::default(),
+            )
+            .await
+            .expect("Unstage failed");
+            assert!(
+                !next_node(&viewed, "src/Intermediate").await.is_staged(),
+                "unstage left src/Intermediate staged"
+            );
+        })
+        .await;
+    }
+
+    /// Unstaging a path a staged type change holds unstages both its nodes: the directory staged
+    /// for delete stays in the tree, and the file staged for add stays as a dirty add.
+    #[tokio::test]
+    async fn unstaging_a_staged_type_change_unstages_both_nodes() {
+        in_execution(async {
+            let (repository, tempdir) =
+                committed_repository("", &["shared/a.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            std::fs::remove_dir_all(root.join("shared")).expect("Failed to delete directory");
+            test_file_write(root.join("shared").as_path(), b"file");
+            stage_paths(&repository, &root, &["shared"], true, false).await;
+
+            unstage::unstage(
+                repository.clone(),
+                repository
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                path_arguments(&root, &["shared"]),
+                UnstageOptions::default(),
+            )
+            .await
+            .expect("Unstage failed");
+
+            let tree = next_tree(&repository).await;
+            let mut nodes = Vec::new();
+            for id in children_named(&repository, &tree, ROOT_NODE, "shared").await {
+                nodes.push(
+                    tree.node(repository.clone(), id)
+                        .await
+                        .expect("Failed to read a node"),
+                );
+            }
+            assert_eq!(nodes.len(), 2, "shared holds the directory and the file");
+            assert!(nodes.iter().all(|node| !node.is_staged()), "{nodes:?}");
+            assert!(nodes.iter().any(|node| node.is_directory()), "{nodes:?}");
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.is_file() && node.is_dirty_add()),
+                "{nodes:?}"
+            );
+        })
+        .await;
     }
 }

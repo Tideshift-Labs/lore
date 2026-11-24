@@ -13,6 +13,7 @@ use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_base::types::BranchMetadata;
 use lore_error_set::prelude::*;
+use lore_storage::CopyOutcome;
 use lore_transport::BranchPushResponse;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
@@ -52,6 +53,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::Collection;
+use crate::state::LinkReference;
 use crate::state::State;
 use crate::store::StoreMatch;
 use crate::util::request_tracker::StoreRequestTracker;
@@ -278,6 +280,7 @@ pub enum PushError {
     DeleteProtected,
     Divergent,
     IdenticalMetadata,
+    LinkDivergent,
     LinkPathNotFound,
     LocalModifications,
     LockNotFound,
@@ -675,15 +678,13 @@ fn push_links(
             if link_local_latest.is_zero() {
                 continue;
             }
-            let link_state = State::deserialize(link_repository.clone(), link_local_latest)
-                .await
-                .forward::<PushError>("deserializing link state")?;
-
-            collect_fragments_and_push(
-                link_repository,
+            push_link(
+                repository,
                 token,
                 options,
-                link_state,
+                &state_current,
+                link_reference,
+                link_repository,
                 link_branch_id,
                 link_local_latest,
                 attempts.clone(),
@@ -1275,6 +1276,7 @@ fn collect_fragments_and_push(
             &branch_metadata,
             &full_local_history,
             remote_latest,
+            repository.is_link() && !current_branch_remote_history.is_empty(),
             &attempts,
             &runner,
         )
@@ -1285,6 +1287,9 @@ fn collect_fragments_and_push(
 /// Push each revision of `history` to the peer, oldest first: upload what it holds, offer those on
 /// `branch` as the branch's latest revision, then record the last one the peer accepts as the
 /// branch's local latest revision.
+///
+/// `diverged` is whether the peer holds revisions on `branch` that `history` does not, so that a
+/// revision the peer refuses fails as [`Divergent`].
 ///
 /// Its own future: inline, what each revision's push holds across its awaits would be reserved
 /// in every state of [`collect_fragments_and_push`].
@@ -1300,6 +1305,7 @@ async fn push_local_history(
     branch_metadata: &BranchMetadata,
     history: &[Hash],
     mut remote_latest: Hash,
+    diverged: bool,
     attempts: &Option<Arc<dyn AttemptStore>>,
     runner: &Option<Arc<ManagedPushRunner>>,
 ) -> Result<(), PushError> {
@@ -1402,7 +1408,8 @@ async fn push_local_history(
                     ))
                 },
             )
-            .await?;
+            .await
+            .map_err(|err| refused_offer(err, diverged))?;
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
@@ -1524,6 +1531,18 @@ async fn push_local_history(
 /// Forward what the peer answered a branch push with, naming the fragment where it refused for
 /// a missing one.
 #[track_caller]
+/// The error of a revision offer that failed with `err`. The peer refuses an offer as an internal
+/// error, which is [`Divergent`] when `diverged`: the peer holds revisions on the branch that the
+/// local history does not.
+#[lore_macro::test_pub]
+fn refused_offer(err: PushError, diverged: bool) -> PushError {
+    if !diverged || !err.is_internal() {
+        return err;
+    }
+    let context = format!("remote refused the revision: {err}");
+    PushError::Divergent(Divergent.chain_err_from(err, &context))
+}
+
 fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
     match result {
         Err(ProtocolError::AddressNotFound(missing)) => {
@@ -1714,29 +1733,26 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_fragments_and_push_recurse(
+fn collect_fragments_and_push_recurse<'a>(
     repository: Arc<RepositoryContext>,
-    token: RepositoryWriteToken,
-    options: PushOptions,
+    token: &'a RepositoryWriteToken,
+    options: &'a PushOptions,
     state: Arc<State>,
     branch: BranchId,
     local_latest: Hash,
     attempts: Option<Arc<dyn AttemptStore>>,
     runner: Option<Arc<ManagedPushRunner>>,
-) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send>> {
-    Box::pin(async move {
-        collect_fragments_and_push(
-            repository,
-            &token,
-            &options,
-            state,
-            branch,
-            local_latest,
-            attempts,
-            runner,
-        )
-        .await
-    })
+) -> Pin<Box<dyn Future<Output = Result<(), PushError>> + Send + 'a>> {
+    Box::pin(collect_fragments_and_push(
+        repository,
+        token,
+        options,
+        state,
+        branch,
+        local_latest,
+        attempts,
+        runner,
+    ))
 }
 
 pub const RETRY_START_DURATION: u64 = 100;
@@ -1917,41 +1933,45 @@ async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fra
 ///
 /// The source names no context because the query did not say which one the peer matched under —
 /// only that the partition holds the hash — and that is exactly what a zero source context asks
-/// for. A refusal costs the round trip and leaves the payload to be uploaded as before.
+/// for. A refusal costs the round trip and leaves the payload to be uploaded.
 ///
-/// A lost answer is not a refusal: the Copy may have applied, and the fallback upload would be a
-/// second mutation for the same address, a resend under another name that an obliterate in
-/// between makes unsafe (`MutableNoReplay`). An unknown outcome and an unjournaled managed
-/// Copy's lost answer both fail the push instead; see [`copy_failure_allows_upload`].
+/// [`lore_storage::remote_copy_retry`] retries a `SlowDown` with the same back-off as an upload
+/// (upstream `9edea916`); a copy still throttled when the retries run out fails the push with
+/// `SlowDown` rather than uploading, since an upload would send the throttling peer the whole
+/// payload.
+///
+/// FORK-LOCAL (Tideshift, WP-120): a lost answer is not a refusal. The Copy may have applied, and
+/// the fallback upload would be a second mutation for the same address, a resend under another
+/// name that an obliterate in between makes unsafe (`MutableNoReplay`). An unknown outcome and an
+/// unjournaled managed Copy's lost answer both fail the push instead; see
+/// [`copy_failure_allows_upload`].
+#[lore_macro::test_pub]
 async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
-    storage: &Arc<StorageSession>,
+    storage: &StorageSession,
     address: Address,
     stats: &PushStats,
-) -> Result<bool, ProtocolError> {
-    if !storage.can_copy_from(repository.id).await {
-        return Ok(false);
-    }
-    // The `_outcome` form (WP-120): the plain one collapses a lost QUIC answer into
-    // `Disconnected`, which would read here as a refusal and send the fallback upload. The id
-    // only names the attempt in an unknown outcome's message; it is never sent or journaled.
-    let attempt = lore_transport::AttemptId::new();
-    if let Err(err) = storage
-        .copy_outcome(
-            repository.id,
-            Address::zero_context_hash(address.hash),
-            address.context,
-        )
-        .await
-        .and_then(|outcome| lore_transport::resolve(outcome, "lore-storage/0.4 Copy", &attempt))
+) -> Result<bool, PushError> {
+    match lore_storage::remote_copy_retry(
+        storage,
+        repository.id,
+        Address::zero_context_hash(address.hash),
+        address.context,
+    )
+    .await
     {
-        if !copy_failure_allows_upload(&err) {
-            return Err(err);
+        Ok(CopyOutcome::Copied) => {}
+        Ok(CopyOutcome::Refused) => return Ok(false),
+        // The peer is still asking for back-off, and an upload would send it the whole payload.
+        Ok(CopyOutcome::Throttled) => return Err(PushError::from(SlowDown)),
+        Err(err) => {
+            if !copy_failure_allows_upload(&err) {
+                return Err(err).forward::<PushError>("duplicating association");
+            }
+            lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
+            return Ok(false);
         }
-        lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
-        return Ok(false);
     }
-
     stats.copied();
     mark_stored_durable(repository, address).await;
     Ok(true)
@@ -2077,9 +2097,7 @@ pub(crate) async fn push_fragments(
             tasks,
             lore_transport::with_optional_caller_operation(caller_operation, async move {
                 if duplicable
-                    && duplicate_association(&repository, &storage, address, &stats)
-                        .await
-                        .forward::<PushError>("duplicating association")?
+                    && duplicate_association(&repository, &storage, address, &stats).await?
                 {
                     return Ok(());
                 }
@@ -2189,33 +2207,96 @@ async fn push_revision_links(
         let link_id = link_reference.repository;
         let link_repository = repository.to_link_context(link_id).await;
         let link_signature = link_reference.signature;
-        let link_state = State::deserialize(link_repository.clone(), link_signature)
-            .await
-            .forward::<PushError>("deserializing link state")?;
-
         let link_branch_id = link_reference.resolve_branch(branch);
 
         lore_debug!(
             "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
         );
 
-        // Forwarded rather than flattened to an internal error, so an unknown
+        // `push_link` forwards rather than flattens to an internal error, so an unknown
         // outcome in a linked push reaches the caller as one (WP-120).
-        collect_fragments_and_push_recurse(
+        push_link(
+            repository,
+            token,
+            options,
+            state,
+            link_reference,
             link_repository,
-            token.share(),
-            options.clone(),
-            link_state,
             link_branch_id,
-            link_reference.signature,
+            link_signature,
             attempts.clone(),
             runner.clone(),
         )
-        .await
-        .forward::<PushError>("pushing linked repository")?;
+        .await?;
     }
 
     Ok(())
+}
+
+/// Push the revision `link_latest` of the link `state` holds as `link_reference`, to `link_branch`
+/// of `link_repository`, naming the link if that fails.
+#[allow(clippy::too_many_arguments)]
+async fn push_link(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    state: &Arc<State>,
+    link_reference: &LinkReference,
+    link_repository: Arc<RepositoryContext>,
+    link_branch: BranchId,
+    link_latest: Hash,
+    attempts: Option<Arc<dyn AttemptStore>>,
+    runner: Option<Arc<ManagedPushRunner>>,
+) -> Result<(), PushError> {
+    let pushed = async move {
+        let link_state = State::deserialize(link_repository.clone(), link_latest)
+            .await
+            .forward::<PushError>("deserializing link state")?;
+        collect_fragments_and_push_recurse(
+            link_repository,
+            token,
+            options,
+            link_state,
+            link_branch,
+            link_latest,
+            attempts,
+            runner,
+        )
+        .await
+    }
+    .await;
+    if let Err(err) = pushed {
+        return failed_link_push(err, repository, state, link_reference, link_branch).await;
+    }
+    Ok(())
+}
+
+/// Fail the push of the link `state` holds as `link_reference` with `err`, naming its mount,
+/// repository and branch. A push that [`Divergent`] refused fails as [`LinkDivergent`].
+async fn failed_link_push(
+    err: PushError,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    link_reference: &LinkReference,
+    link_branch: BranchId,
+) -> Result<(), PushError> {
+    let local_node = link_reference.local_node();
+    let link_id = link_reference.repository();
+    let path = match state.node_path(repository.clone(), local_node).await {
+        Ok(path) if !path.is_empty() => path,
+        _ => format!("node {local_node}"),
+    };
+    let link_repository = repository.to_link_context(link_id).await;
+    let branch = load_branch_metadata(&link_repository, link_branch)
+        .await
+        .map_or_else(|_| link_branch.to_string(), |metadata| metadata.name);
+    let context = format!("pushing the link at {path} (repository {link_id}) to branch {branch}");
+    if err.is_divergent() {
+        return Err(PushError::LinkDivergent(
+            LinkDivergent { path, branch }.chain_err_from(err, &context),
+        ));
+    }
+    Err(err).forward::<PushError>(&context)
 }
 
 /// Upload what `state` holds that its first parent does not, of the addresses `collection`

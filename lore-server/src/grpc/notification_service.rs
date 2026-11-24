@@ -21,6 +21,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::authorization_timeout_status;
@@ -83,7 +84,11 @@ impl lore_notification::NotificationService for NotificationService {
         // thing the check reports.
         tokio::time::timeout(self.authorization_timeout, async {
             self.authorizer
-                .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository,
+                    Action::Read,
+                )
                 .await
                 // FORK-LOCAL (Tideshift): an auth service that did not answer
                 // in time is passed on, not reported as a denial.

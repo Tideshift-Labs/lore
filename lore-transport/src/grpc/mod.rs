@@ -57,7 +57,6 @@ use tonic::body::Body;
 use tonic::codegen::InterceptedService;
 use tonic::metadata::MetadataValue;
 use tonic::service::Interceptor;
-use tonic::transport::ClientTlsConfig;
 use tower::Layer;
 use tower::Service;
 use tower::ServiceBuilder;
@@ -73,6 +72,7 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::connection::authenticates_server;
 use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptQuery;
@@ -82,6 +82,7 @@ use crate::outcome::GrpcRpc;
 use crate::outcome::grpc_replay_class;
 use crate::outcome::outcome_unknown;
 use crate::replay::ReplayClass;
+use crate::tls::grpc_client_tls_config;
 use crate::traits::*;
 use crate::types::*;
 
@@ -1022,12 +1023,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
 
     if remote.starts_with("https://") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_webpki_roots()
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .internal_with(|| format!("configuring TLS for {remote}"))?;
     }
     let user_agent = crate::user_agent();
@@ -1083,8 +1079,7 @@ pub(crate) fn grpc_endpoint(remote_url: &str) -> Result<Url, ProtocolError> {
         .host_str()
         .ok_or_else(|| ProtocolError::internal(format!("remote {remote_url} is invalid")))?;
 
-    // Possible HTTPS schemes: urcs, grpcs, lores
-    let (scheme, default_port) = if parsed_url.scheme().ends_with("s") {
+    let (scheme, default_port) = if authenticates_server(&parsed_url) {
         ("https", GRPCS_PORT_DEFAULT)
     } else {
         ("http", GRPC_PORT_DEFAULT)
@@ -2410,6 +2405,18 @@ impl Revision for GRPCRevision {
             &self.connection,
             GrpcRpc::RevisionBranchList,
             || async { self.client.read().await.branch_list().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_list_bounded(limit).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

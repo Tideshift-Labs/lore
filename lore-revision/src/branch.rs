@@ -803,6 +803,15 @@ pub async fn load_latest(
     }
 }
 
+/// Reads the latest revision of `branch` from the mutable store alone, reporting an absent value
+/// as `BranchNotFound` even for a branch that exists.
+pub fn load_latest_local(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<Hash, BranchError>> {
+    mutable_load(repository, LATEST, branch)
+}
+
 pub async fn load_latest_divergent(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -2168,6 +2177,23 @@ pub async fn list_remote(
         .forward::<BranchError>("Failed to list branches on remote")?;
 
     Ok(response.list)
+}
+
+/// Return `None` when remote enumeration exceeds the caller's branch budget.
+pub(crate) async fn list_remote_bounded(
+    remote: Arc<Connection>,
+    repository: RepositoryId,
+    limit: usize,
+) -> Result<Option<Vec<BranchMetadata>>, BranchError> {
+    let remote = remote
+        .revision(repository)
+        .await
+        .forward::<BranchError>("Failed to connect to remote revision service")?;
+    let response = remote
+        .branch_list_bounded(limit)
+        .await
+        .forward::<BranchError>("Failed to list branches on remote")?;
+    Ok(response.map(|response| response.list))
 }
 
 pub async fn list_output(

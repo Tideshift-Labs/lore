@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
+use lore_base::error::InvalidPath;
 use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
@@ -48,6 +49,7 @@ use crate::util::path::RelativePath;
 pub enum FsError {
     FileNotFound,
     InvalidArguments,
+    InvalidPath,
     LocalModifications,
 }
 
@@ -83,18 +85,21 @@ pub enum FileInfo {
 }
 
 impl FileInfo {
+    /// What `metadata` measured at a path, read as [`from_stat`](Self::from_stat) reads it.
     pub fn from_metadata(metadata: &Metadata) -> Self {
-        if metadata.is_dir() {
-            return FileInfo::Directory;
-        }
-        if !metadata.is_file() {
-            return FileInfo::NotExist;
-        }
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
-        FileInfo::File {
-            executable: crate::util::fs::file_executable_observed(metadata),
-            size,
-            mtime,
+        Self::from_stat(&lore_io::Stat::from(metadata))
+    }
+
+    /// What `stat` measured at a path.
+    pub fn from_stat(stat: &lore_io::Stat) -> Self {
+        match stat.kind {
+            lore_io::StatKind::Directory => FileInfo::Directory,
+            lore_io::StatKind::Other => FileInfo::NotExist,
+            lore_io::StatKind::File => FileInfo::File {
+                executable: crate::util::fs::mode_executable_observed(stat.mode),
+                size: stat.len,
+                mtime: crate::util::fs::modified_millis(stat.modified),
+            },
         }
     }
 
@@ -226,6 +231,9 @@ pub struct StageIntent {
 pub enum FilesystemDiffIntent {
     /// Report them, leaving the trees untouched.
     Report,
+    /// Report them as [`Report`](Self::Report) does, leaving out each entry `from` lacks that
+    /// `current` does not track, which is what a reset to `from` leaves alone.
+    ReportTracked,
     /// Set and clear `Dirty` on each node as the walk settles it.
     MarkDirty,
     /// Mark as [`MarkDirty`](Self::MarkDirty) does and record the staged action too.
@@ -262,12 +270,17 @@ pub struct FilesystemDiffContext {
     /// The path as the file system spells it, which parts from the mappings' own spelling only
     /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
-    /// The filter's verdict at `filesystem_path`, which each child steps from rather
-    /// than refolding the ancestors it already accounts for.
+    /// The filter's verdict at `filesystem_path`, or at its parent where `asks_path` is set,
+    /// which each child steps from rather than refolding the ancestors it already accounts for.
     pub states: FilterStates,
     /// The same verdict on the `from` side, which diverges from `states` once a move
     /// puts the two sides at different paths.
     pub from_states: FilterStates,
+    /// Whether the walk asks the filter about `filesystem_path` itself once it reads what the
+    /// working tree holds there, `states` and `from_states` then being the verdict at its parent.
+    /// A walk over a path a caller names does; below it, each listing asks about the entries it
+    /// lists.
+    pub asks_path: bool,
     pub filter_mode: FilterMode,
     pub intent: FilesystemDiffIntent,
     pub layer_mounts: Arc<Vec<LayerMountInfo>>,
@@ -658,14 +671,20 @@ pub trait InstanceOperation: Send + Sync {
     /// Delete a file or empty directory.
     fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
+    /// Delete the directory at `path`, which fails where `path` holds entries or is no directory.
+    fn remove_empty_directory(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<(), FsError>> + Send;
+
     /// Delete a directory and all contents.
     fn remove_recursive(
         &self,
         path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
-    /// Write `node`'s content to `path`, creating the directory above it, applying the node's
-    /// mode, and reporting what the file looks like once written.
+    /// Write `node`'s content to `path`, creating the directory above it where it is missing,
+    /// applying the node's mode, and reporting what the file looks like once written.
     ///
     /// One call rather than four because the steps are never useful apart, and each one asked
     /// separately resolves the same name against the root again.
@@ -920,6 +939,27 @@ impl InstanceOperationImpl {
         self.holds_state
     }
 
+    /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
+    /// keeps each nested repository in it, with the directories leading to one. An SWFS mount
+    /// deletes nothing on disk, so there the two are the same.
+    pub async fn remove_recursive_keeping_repositories(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.remove_recursive_keeping_repositories(path).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_recursive(path).await,
+        }
+    }
+
     /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
     /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
     /// stands at, its local changes refused, kept or overwritten as `options` asks
@@ -1116,6 +1156,19 @@ impl InstanceOperation for InstanceOperationImpl {
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.remove(path).await,
+        }
+    }
+
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        if self.dry_run {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => this.remove_empty_directory(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.remove_empty_directory(path).await,
         }
     }
 
@@ -1496,6 +1549,10 @@ pub mod test_util {
         }
 
         async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
+            panic!("Test operation unimplemented except finalize")
+        }
+
+        async fn remove_empty_directory(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 

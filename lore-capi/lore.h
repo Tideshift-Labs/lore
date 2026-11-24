@@ -66,7 +66,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.11.1-nightly"
+#define LORE_INTERFACE_VERSION "0.12.1-nightly"
 
 // The status an operation reports when a mutation was dispatched and its outcome is not known
 // (WP-120).
@@ -239,6 +239,16 @@ typedef enum lore_file_audit_outcome_t {
   // arrives on the completion event.
   LORE_FILE_AUDIT_OUTCOME_UNRESOLVED = 7,
 } lore_file_audit_outcome_t;
+
+// Phase of an instance delete operation.
+typedef enum lore_repository_instance_delete_phase_t {
+  // Unmounting the SWFS instance
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_UNMOUNTING = 0,
+  // Removing instance keys from mutable store
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DEREGISTERING = 1,
+  // Deleting external directories or repository directory
+  LORE_REPOSITORY_INSTANCE_DELETE_PHASE_DELETING_FILES = 2,
+} lore_repository_instance_delete_phase_t;
 
 // Which authentication path a client takes if a server advertises both its
 // gRPC auth service and an OIDC issuer. A path the server does not
@@ -573,14 +583,22 @@ typedef struct lore_auth_user_token_event_data_t {
   struct lore_string_t id;
   // Display name for the user
   struct lore_string_t name;
-  // The token string
+  // The token string, or empty when the caller did not ask for it
   struct lore_string_t token;
   // Preferred username from the token
   struct lore_string_t preferred_username;
   // Non-zero if the identity is a service account
   uint8_t flag_service_account;
-  // Expiry time in milliseconds since UNIX epoch, or 0 if unavailable
+  // Expiry time of `token` in milliseconds since UNIX epoch, or 0 if unavailable
   uint64_t expires;
+  // When the stored refresh token stops working, in milliseconds since the UNIX epoch. 0
+  // if there is no refresh token, or if the provider did not give a deadline.
+  uint64_t refresh_expires;
+  // Non-zero if a refresh token is stored for the identity
+  uint8_t refreshable;
+  // Non-zero if `token` has not expired, or if it has but the stored refresh token can still
+  // renew it
+  uint8_t session_valid;
 } lore_auth_user_token_event_data_t;
 
 // Event data describing a stored authentication identity.
@@ -3322,9 +3340,10 @@ typedef struct lore_fragment_stats_data_t {
   // asked for. Branch latest history is one such write, which the server does
   // not store, so a commit against a remote has exactly one.
   uint64_t local_only_writes;
-  // Fragments whose upload did not land, leaving them stored only locally for
-  // a later push to offer again. Their payloads are counted under
-  // `local_payload_writes` too, indistinguishably from those kept by request.
+  // Fragments stored only locally for a later push to offer again. Either the
+  // upload failed or the peer throttled the copy and no upload was attempted.
+  // Their payloads also count toward `local_payload_writes`, which does not
+  // distinguish them from payloads kept locally by request.
   uint64_t remote_upload_failed;
 } lore_fragment_stats_data_t;
 
@@ -3438,6 +3457,48 @@ typedef struct lore_file_audit_event_data_t {
   // What the range resolved to, or why it did not resolve.
   enum lore_file_audit_outcome_t outcome;
 } lore_file_audit_event_data_t;
+
+// Event data for the start of an instance delete operation.
+typedef struct lore_repository_instance_delete_begin_event_data_t {
+  // Identifier of the instance being deleted
+  struct lore_instance_id_t instance_id;
+  // Filesystem path of the instance
+  struct lore_string_t path;
+  // Whether this is a SWFS-backed instance
+  uint8_t is_swfs;
+  // Whether this is a dry-run (preview only)
+  uint8_t dry_run;
+} lore_repository_instance_delete_begin_event_data_t;
+
+// Event data for progress during an instance delete operation.
+typedef struct lore_repository_instance_delete_progress_event_data_t {
+  // Current phase of the delete operation
+  enum lore_repository_instance_delete_phase_t phase;
+} lore_repository_instance_delete_progress_event_data_t;
+
+// Event data for the completion of an instance delete operation.
+typedef struct lore_repository_instance_delete_complete_event_data_t {
+  // Identifier of the deleted instance
+  struct lore_instance_id_t instance_id;
+} lore_repository_instance_delete_complete_event_data_t;
+
+// Event data for the start of an instance move operation.
+typedef struct lore_repository_instance_move_begin_event_data_t {
+  // Identifier of the instance being moved
+  struct lore_instance_id_t instance_id;
+  // Original filesystem path of the instance
+  struct lore_string_t source_path;
+  // New filesystem path for the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_begin_event_data_t;
+
+// Event data for the completion of an instance move operation.
+typedef struct lore_repository_instance_move_complete_event_data_t {
+  // Identifier of the moved instance
+  struct lore_instance_id_t instance_id;
+  // New filesystem path of the instance
+  struct lore_string_t target_path;
+} lore_repository_instance_move_complete_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3920,6 +3981,16 @@ enum lore_event_id_t {
   LORE_EVENT_STORAGE_GET_FRAGMENT,
   // One range of a file's lines, attributed to the revision that last changed them.
   LORE_EVENT_FILE_AUDIT,
+  // The start of an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_BEGIN,
+  // Progress during an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_PROGRESS,
+  // The completion of an instance delete operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_DELETE_COMPLETE,
+  // The start of an instance move operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_BEGIN,
+  // The completion of an instance move operation.
+  LORE_EVENT_REPOSITORY_INSTANCE_MOVE_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -4164,6 +4235,11 @@ typedef struct lore_event_t {
     struct lore_auth_pending_event_data_t auth_pending;
     struct lore_storage_get_fragment_event_data_t storage_get_fragment;
     struct lore_file_audit_event_data_t file_audit;
+    struct lore_repository_instance_delete_begin_event_data_t repository_instance_delete_begin;
+    struct lore_repository_instance_delete_progress_event_data_t repository_instance_delete_progress;
+    struct lore_repository_instance_delete_complete_event_data_t repository_instance_delete_complete;
+    struct lore_repository_instance_move_begin_event_data_t repository_instance_move_begin;
+    struct lore_repository_instance_move_complete_event_data_t repository_instance_move_complete;
   };
 } lore_event_t;
 
@@ -4364,7 +4440,7 @@ typedef struct lore_auth_local_user_info_args_t {
   struct lore_string_t auth_endpoint;
   // User identities to resolve; empty resolves the current user
   struct lore_string_array_t user_ids;
-  // Emit cached identity token details for identities with a local token
+  // Include the cached identity token string in `AuthUserToken` events
   uint8_t with_identity_token;
   // Emit the repository's authorization (access) token. Requires running
   // inside a repository
@@ -4377,6 +4453,8 @@ typedef struct lore_auth_login_interactive_args_t {
   struct lore_string_t remote_url;
   // Emit the login URL instead of opening a browser
   uint8_t no_browser;
+  // Return the stored login instead of starting a new one while its session is valid
+  uint8_t reuse_session;
 } lore_auth_login_interactive_args_t;
 
 // Arguments for creating a new branch with the given name and category.
@@ -4713,13 +4791,15 @@ typedef struct lore_file_metadata_set_args_t {
   struct lore_uint32_array_t entries;
 } lore_file_metadata_set_args_t;
 
-// Arguments for resetting files to a revision, optionally purging untracked files.
+// Arguments for resetting files to a revision, optionally deleting what the revision does not
+// hold.
 typedef struct lore_file_reset_args_t {
   // Pointer to an array of paths
   struct lore_string_array_t paths;
   // Revision to reset files into
   struct lore_string_t revision;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
 } lore_file_reset_args_t;
 
@@ -4729,7 +4809,8 @@ typedef struct lore_file_reset_to_last_merged_args_t {
   struct lore_string_array_t paths;
   // Branch whose last merged revision to reset to
   struct lore_string_t branch;
-  // Purge untracked files
+  // Delete what the revision does not hold within the view: untracked files, whatever the
+  // ignore file says, and files the view excludes. Nested repositories stay
   uint8_t purge;
   // Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
   uint32_t merge_side;
@@ -6099,6 +6180,17 @@ typedef struct lore_repository_instance_prune_args_t {
   int _unused;
 } lore_repository_instance_prune_args_t;
 
+// Arguments for deleting the current repository instance.
+typedef struct lore_repository_instance_delete_args_t {
+  int _unused;
+} lore_repository_instance_delete_args_t;
+
+// Arguments for moving the current repository instance to a new path.
+typedef struct lore_repository_instance_move_args_t {
+  // Target path for the instance.
+  struct lore_string_t target_path;
+} lore_repository_instance_move_args_t;
+
 // Arguments for updating the recorded path of the current repository instance.
 typedef struct lore_repository_update_path_args_t {
   int _unused;
@@ -6593,9 +6685,10 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // ID. For remote resolution with proper authorization, use
 // `lore_auth_user_info` which queries the remote authentication service.
 //
-// When `with_identity_token` is set, identities with a locally stored token
-// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-// token instead of `AUTH_USER_INFO`.
+// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+// `token` holds the cached identity token when `with_identity_token` is set,
+// and is empty otherwise.
 //
 // When `with_access_token` is set, the call requires a repository and
 // additionally emits one `AUTH_IDENTITY` event carrying the
@@ -6623,7 +6716,7 @@ void lore_auth_clear_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 // | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 int32_t lore_auth_local_user_info(const struct lore_global_args_t *globals,
                                   const struct lore_auth_local_user_info_args_t *args,
@@ -6635,6 +6728,10 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
                                      struct lore_event_callback_config_t callback);
 
 // Authenticate interactively via a browser-based login flow.
+//
+// With `reuse_session` set, a stored login whose session is still valid, as
+// `session_valid` in `lore_auth_user_token_event_data_t` reports it, is
+// returned without starting a new login.
 //
 // # Events
 //
@@ -6657,7 +6754,7 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
                                     const struct lore_auth_login_interactive_args_t *args,
                                     struct lore_event_callback_config_t callback);
@@ -6685,7 +6782,7 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
                                        const struct lore_auth_login_interactive_args_t *args,
                                        struct lore_event_callback_config_t callback);
@@ -12787,6 +12884,32 @@ int32_t lore_repository_instance_prune(const struct lore_global_args_t *globals,
 void lore_repository_instance_prune_async(const struct lore_global_args_t *globals,
                                           const struct lore_repository_instance_prune_args_t *args,
                                           struct lore_event_callback_config_t callback);
+
+// Delete the current repository instance: unmount (if SWFS and in service),
+// deregister from the mutable store, and delete associated directories.
+// With `dry_run` set in `globals`, emits events describing what would be deleted
+// without performing any changes.
+int32_t lore_repository_instance_delete(const struct lore_global_args_t *globals,
+                                        const struct lore_repository_instance_delete_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_delete`.
+void lore_repository_instance_delete_async(const struct lore_global_args_t *globals,
+                                           const struct lore_repository_instance_delete_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Move the current repository instance to a new path: update registry metadata
+// and remap mount (for SWFS in service context) or move directory (for regular
+// instances).
+// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+int32_t lore_repository_instance_move(const struct lore_global_args_t *globals,
+                                      const struct lore_repository_instance_move_args_t *args,
+                                      struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_repository_instance_move`.
+void lore_repository_instance_move_async(const struct lore_global_args_t *globals,
+                                         const struct lore_repository_instance_move_args_t *args,
+                                         struct lore_event_callback_config_t callback);
 
 // Update the recorded path of the current repository instance to its present
 // location.

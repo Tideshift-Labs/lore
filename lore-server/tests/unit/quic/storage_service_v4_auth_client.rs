@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::fragment;
 use lore_revision::lore::RepositoryId;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::MessageHandleError;
@@ -67,7 +68,7 @@ async fn an_identity_token_reads_but_cannot_put() {
             let (url, calls) =
                 start_stub(vec![(urc(repository), vec!["read", "write", "owner"])]).await;
             let service = StorageServiceV4::new(
-                Arc::new(Some(verifier())),
+                Arc::new(TokenVerification::Verify(verifier())),
                 Arc::new(AuthClientAuthorizer::new(url)),
                 immutable_store.clone(),
                 immutable_store,

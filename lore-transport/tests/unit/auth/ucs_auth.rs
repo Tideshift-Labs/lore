@@ -178,7 +178,8 @@ fn authentication_token_maps_identity_and_expiry() {
             token.user_name.as_str(),
             token.expires_ms,
         ),
-        ("authn-token", "user-1", "User One", 1_234)
+        // `expires_at` 1_234 is seconds on the wire (upstream v0.13 `seconds_to_ms`).
+        ("authn-token", "user-1", "User One", 1_234_000)
     );
 }
 
@@ -340,7 +341,7 @@ async fn auth_call_against_a_closed_port_errors_promptly() {
     drop(listener);
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+        UcsAuthentication.exchange_for_custom_resources(&url, "token", &["urc-x"], "corr"),
     )
     .await
     .expect("a refused connection must not hang");
@@ -360,7 +361,7 @@ async fn auth_call_against_an_endpoint_that_never_handshakes_errors_at_the_rpc_t
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(45),
-        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+        UcsAuthentication.exchange_for_custom_resources(&url, "token", &["urc-x"], "corr"),
     )
     .await
     .expect("the auth channel must bound a handshake that never completes");
@@ -381,7 +382,7 @@ async fn auth_call_against_an_unanswering_server_errors_at_the_rpc_timeout() {
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(45),
-        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+        UcsAuthentication.exchange_for_custom_resources(&url, "token", &["urc-x"], "corr"),
     )
     .await
     .expect("the per-RPC timeout must end the call");

@@ -103,6 +103,39 @@ def test_link_remove_force_discards_local_edit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_remove_takes_a_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding the pinned content is no local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+
+    parent_repo.link_remove(link_path)
+
+    assert "No links found in this repository" in parent_repo.link_list()
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_a_modified_case_variant_of_a_pinned_file(new_lore_repo):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"
+
+
+@pytest.mark.smoke
 def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
     """The guard scans the whole working tree, so it must filter to the mount."""
     link_path = "libs/shared"
@@ -191,3 +224,22 @@ def test_link_remove_of_committed_link_deletes_the_mount_directory(new_lore_repo
     assert not parent_repo.file_exists(link_path), (
         "Removing a committed link must delete the mount directory"
     )
+
+
+@pytest.mark.smoke
+def test_link_remove_then_replace_at_the_mount_commits(new_lore_repo):
+    """Removing a link and staging a folder at its mount commits both in one revision."""
+    replacement = {"shared/a.txt": "folder\n", "shared/sub/b.txt": "nested\n"}
+    parent, _ = make_parent_with_link(new_lore_repo, "shared")
+
+    parent.link_remove("shared")
+    parent.write_files(replacement)
+    parent.stage("shared", scan=True)
+    parent.commit("Replace the link")
+    parent.push()
+
+    clone = parent.clone()
+    for path, content in replacement.items():
+        with clone.open_file(path) as f:
+            assert f.read() == content, f"{path} must hold the replacement content"
+    assert "No links found" in clone.link_list()

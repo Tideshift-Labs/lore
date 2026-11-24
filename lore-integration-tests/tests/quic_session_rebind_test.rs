@@ -322,7 +322,7 @@ mod quic_session_rebind_tests {
                 log,
                 None,
                 None,
-                Arc::new(None),
+                Arc::new(lore_server::auth::jwt::TokenVerification::Ignore),
             )
         }
 
@@ -338,7 +338,7 @@ mod quic_session_rebind_tests {
                 log,
                 sever,
                 None,
-                Arc::new(None),
+                Arc::new(lore_server::auth::jwt::TokenVerification::Ignore),
             )
         }
 
@@ -354,7 +354,7 @@ mod quic_session_rebind_tests {
                 log,
                 None,
                 Some(hold_answered_error),
-                Arc::new(None),
+                Arc::new(lore_server::auth::jwt::TokenVerification::Ignore),
             )
         }
 
@@ -365,7 +365,7 @@ mod quic_session_rebind_tests {
             immutable_store: Arc<dyn ImmutableStore>,
             mutable_store: Arc<dyn MutableStore>,
             log: Log,
-            jwt_verifier: Arc<Option<JwtVerifier>>,
+            jwt_verifier: Arc<lore_server::auth::jwt::TokenVerification>,
             hold: Option<HoldAnsweredError>,
         ) -> Self {
             Self::with_controls(
@@ -384,9 +384,9 @@ mod quic_session_rebind_tests {
             log: Log,
             sever: Option<SeverResponse>,
             hold_answered_error: Option<HoldAnsweredError>,
-            jwt_verifier: Arc<Option<JwtVerifier>>,
+            jwt_verifier: Arc<lore_server::auth::jwt::TokenVerification>,
         ) -> Self {
-            let repository_authorizer = production_authorizer(jwt_verifier.as_ref().is_some());
+            let repository_authorizer = production_authorizer(jwt_verifier.verifier().is_some());
             let mut service_store = ServiceStore::default();
             service_store.add_service(
                 TEST_PROTOCOL_V4,
@@ -545,14 +545,16 @@ mod quic_session_rebind_tests {
     /// A verifier with the audience pinned and the issuer left open, so the only thing it can
     /// reject a well-formed token for is the one B4 arm 1 cares about: an expired `exp`. A
     /// `resources` list that does not cover the repository is refused by the authorizer instead.
-    fn test_jwt_verifier() -> Arc<Option<JwtVerifier>> {
-        Arc::new(Some(JwtVerifier {
-            jwk_service: Arc::new(StaticJwkService),
-            jwt_issuer: None,
-            jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
-            // Upstream v0.10.1 field: no `typ` check (v0.11.0 dropped `identity_claim`).
-            jwt_typ: None,
-        }))
+    fn test_jwt_verifier() -> Arc<lore_server::auth::jwt::TokenVerification> {
+        Arc::new(lore_server::auth::jwt::TokenVerification::Verify(
+            JwtVerifier {
+                jwk_service: Arc::new(StaticJwkService),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
+                // Upstream v0.10.1 field: no `typ` check (v0.11.0 dropped `identity_claim`).
+                jwt_typ: None,
+            },
+        ))
     }
 
     fn unix_now_secs() -> u64 {
@@ -737,8 +739,8 @@ mod quic_session_rebind_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(
-                    None,
+                .with_token_verification(
+                    lore_server::auth::jwt::TokenVerification::Ignore,
                     false,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     repository_catalog,

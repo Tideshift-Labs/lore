@@ -21,6 +21,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedMetadataCas;
@@ -175,12 +176,17 @@ pub async fn handler(
         .scope(execution, async move {
             // FORK-LOCAL (Tideshift): repository settings are an admin act,
             // as the platform's own rail rates them. Any grant is not enough.
+            // Without a verified token (a server with no auth) there is no
+            // identity to hold `admin`; upstream's administration rule
+            // (`RepositoryAdministration::Permitted`) then accepts `write`.
+            let token = get_verified_token(&extensions);
+            let action = if token.is_some() {
+                Action::Admin
+            } else {
+                Action::Write
+            };
             authorizer
-                .require_action(
-                    get_verified_token(&extensions).as_ref(),
-                    repository_id.into(),
-                    "admin",
-                )
+                .require_action(token.as_ref(), repository_id.into(), action)
                 .await?;
 
             // Deserialize current and proposed blobs for validation

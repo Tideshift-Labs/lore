@@ -997,9 +997,18 @@ async fn server_info_returns_the_advertised_version_and_features_with_no_reposit
     let captured = server
         .captured("admin.server_info")
         .expect("server_info must have been recorded");
-    assert_eq!(
-        captured.authorization, None,
-        "no repository authorization token was exchanged for this call"
+    // Upstream v0.13 (`unsigned_identity_tokens`): with no auth endpoint, a named identity and no
+    // supplied credential, the client sends one unsigned identity token in the authorization
+    // slot. No repository authorization token was *exchanged* (no auth endpoint exists), and the
+    // authn bearer header stays absent.
+    let authorization = captured
+        .authorization
+        .as_deref()
+        .expect("an unsigned identity token is carried as the authorization");
+    assert!(
+        authorization.starts_with("Bearer ") && authorization != expected_authz_header(),
+        "the carried authorization must be the unsigned identity token, not an exchanged one: \
+         {authorization}"
     );
     assert_eq!(captured.authn_bearer, None);
 }

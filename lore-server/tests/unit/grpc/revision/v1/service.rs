@@ -50,6 +50,7 @@ fn service_with(
         lore_server::grpc::server::RevisionListAcceleration::default(),
         None,
         Duration::from_secs(60),
+        lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
         enforce,
         None,
         None,
@@ -64,6 +65,12 @@ fn insert_token<T>(
     perms: &[&str],
     service_account: bool,
 ) {
+    // Fork claim readers read only a verified token: claims travel with their raw token.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request.extensions_mut().insert(AuthorizationToken {
         user_id: "test-user".into(),
         is_service_account: Some(service_account),

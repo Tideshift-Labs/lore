@@ -321,7 +321,7 @@ mod tests {
                     format!("initial content {index}").as_bytes(),
                 );
             }
-            stage_paths(
+            stage_fixture_paths(
                 repository.clone(),
                 &write_token,
                 file_names.iter().map(|name| root.join(name)).collect(),
@@ -366,7 +366,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("Failed to write fixture file {}", path.display()));
     }
 
-    async fn stage_paths(
+    async fn stage_fixture_paths(
         repository: Arc<RepositoryContext>,
         write_token: &RepositoryWriteToken,
         paths: Vec<PathBuf>,
@@ -648,7 +648,7 @@ mod tests {
             let binary_path = fixture.root.join("binary.bin");
             write_file(&text_path, b"updated text owner");
             write_file(&binary_path, b"updated binary owner");
-            stage_paths(
+            stage_fixture_paths(
                 fixture.repository.clone(),
                 &fixture.write_token,
                 vec![text_path.clone(), binary_path.clone()],

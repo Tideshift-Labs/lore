@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -51,7 +52,7 @@ use tracing::warn;
 use super::caller_capabilities::CallerCapabilityLayer;
 use super::caller_capabilities::CallerCapabilityPolicy;
 use super::lock_service::LoreLockService;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::rebac::GrpcRepositoryOperationAuthorizationVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -278,6 +279,17 @@ pub struct FeatureSettings {
     /// Naive present-tense model; superseded by the successor-locks LEP when it
     /// lands.
     pub enforce_locks_on_push: Option<bool>,
+    /// Number of branches the v1 `BranchList` handler loads at once.
+    /// Defaults to 100.
+    pub branch_list_concurrency: Option<NonZeroUsize>,
+}
+
+impl FeatureSettings {
+    /// The configured `branch_list_concurrency`, or its default when unset.
+    pub fn branch_list_concurrency(&self) -> NonZeroUsize {
+        self.branch_list_concurrency
+            .unwrap_or(crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY)
+    }
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -776,13 +788,18 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         )
     }
 
-    pub fn with_jwt_verifier(
+    pub fn with_token_verification(
         self,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         enforce_write_permission: bool,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
+        // FORK: only a verified token counts. An unsigned identity (upstream
+        // `trust_unsigned_identity`) names the caller but proves nothing, so it
+        // neither satisfies the required caller capability policy nor arms the
+        // fork write gate or push-lock enforcement below.
+        let jwt_verifier = token_verification.verifier().cloned();
         anyhow::ensure!(
             self.0.caller_capability_policy != CallerCapabilityPolicy::RequireOutcomeUnknownV1
                 || jwt_verifier.is_some(),
@@ -931,7 +948,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
 
         let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_jwt_verifier(jwt_verifier.clone());
+        admin_svc.set_auth(
+            token_verification.verifier().cloned(),
+            repository_authorizer.clone(),
+        );
         admin_svc.set_rpc_timeout(rpc_timeout);
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
@@ -956,6 +976,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            self.0.feature.branch_list_concurrency(),
             enforce_write_permission,
             push_lock_enforcement,
             self.0.domain_context.clone(),
@@ -1026,10 +1047,11 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     .and_then(|domain| domain.lock_coordinator().cloned());
                 Some(
                     LoreLockService::new(
-                        lock_store.clone(),
+                        lock_store,
                         self.0.notification_sender.clone(),
                         self.0.hook_dispatcher.clone(),
                         repository_authorizer.clone(),
+                        self.0.forwarded_requests.clone(),
                         rpc_timeout,
                         enforce_write_permission,
                     )
@@ -1041,8 +1063,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         let notification_service = self.0.notification_service;
 
-        let authenticated = jwt_verifier.is_some();
-        let jwt_interceptor = JWTInterceptor::new(jwt_verifier.as_ref());
+        let authenticated = token_verification.verifier().is_some();
+        let jwt_interceptor = JWTInterceptor::new(token_verification);
 
         if check_enabled(&services.admin_service, "admin_service") {
             router = router.add_service(AdminServiceServer::new(admin_svc));

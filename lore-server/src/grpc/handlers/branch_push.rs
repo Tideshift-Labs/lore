@@ -4,6 +4,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use lore_base::error::AddressNotFound;
 use lore_base::lore_drain_tasks;
@@ -24,14 +25,15 @@ use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::branch::LATEST;
 use lore_revision::branch::PROTECT;
-use lore_revision::branch::load_latest;
-use lore_revision::branch::metadata;
 use lore_revision::branch::push;
+use lore_revision::interface::ExecutionContext;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
+use lore_revision::metadata::Metadata;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryMetadata;
 use lore_revision::state;
 use lore_revision::state::State;
 use lore_revision::state::StateError;
@@ -42,23 +44,29 @@ use lore_storage::StoreMatchResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
+use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::address_not_found_status;
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use parking_lot::Mutex;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::Instrument;
 use tracing::Level;
 use tracing::debug;
+use tracing::info;
 use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
 use super::push_lock_guard;
 use super::push_lock_guard::PushLockEnforcement;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache::revision::store_history_step;
 use crate::domain::AdmittedOperation;
@@ -76,10 +84,13 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::none_or_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
 use crate::util::setup_execution;
 
 struct BranchPushInstrumentProvider;
@@ -99,6 +110,19 @@ static FRAGMENT_LOOKUPS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("fragment_lookups", count_boundaries())
 });
 
+static PEAK_METADATA_READS_IN_FLIGHT: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider
+        .length_histogram("peak_metadata_reads_in_flight", doubling_boundaries())
+});
+
+// Zero gets a bucket of its own, for the pushes whose walk read no metadata blob.
+static METADATA_READS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "metadata_reads",
+        vec![0., 1., 10., 100., 1_000., 10_000., 100_000., 1_000_000.],
+    )
+});
+
 static CONCURRENT_QUERY_BATCHES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("concurrent_query_batches", peak_boundaries())
 });
@@ -107,11 +131,59 @@ static COLLECTED_ADDRESSES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     BranchPushInstrumentProvider.length_histogram("collected_addresses", count_boundaries())
 });
 
+static PHASE_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("phase_duration"));
+
+static CANCELLED_PHASE: LazyLock<Counter<u64>> =
+    LazyLock::new(|| BranchPushInstrumentProvider.counter("cancelled_phase"));
+
+static STORE_LATEST_ATTEMPTS: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "store_latest_attempts",
+        vec![1., 2., 3., 5., 10., 25., 50., 100.],
+    )
+});
+
+static VERIFY_COLLECT_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("verify_collect_duration"));
+
+static VERIFY_EXIST_DURATION: LazyLock<Histogram<f64>> =
+    LazyLock::new(|| push_duration_histogram("verify_exist_duration"));
+
+static FAST_FORWARD_MERGE_CHANGES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    BranchPushInstrumentProvider.length_histogram(
+        "fast_forward_merge_changes",
+        vec![
+            0., 1., 2., 5., 10., 50., 100., 1_000., 10_000., 100_000., 1_000_000.,
+        ],
+    )
+});
+
+/// A push that takes at least this long is logged at info with its breakdown, as is every
+/// cancelled or failed push.
+const SLOW_PUSH_LOG_THRESHOLD: Duration = Duration::from_secs(10);
+
+/// A millisecond histogram for a part of a push. Its buckets are dense from 30 s up so that, for
+/// a push near the handler timeout, each part's share of the time stays visible.
+fn push_duration_histogram(name: &'static str) -> Histogram<f64> {
+    BranchPushInstrumentProvider.latency_histogram_ms_with_boundaries(
+        name,
+        vec![
+            10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 20_000., 30_000., 40_000.,
+            45_000., 50_000., 55_000., 60_000., 90_000., 120_000., 150_000., 180_000.,
+        ],
+    )
+}
+
 fn peak_boundaries() -> Vec<f64> {
     vec![
         1., 10., 50., 100., 250., 500., 1_000., 2_500., 5_000., 10_000., 25_000., 50_000.,
         100_000., 250_000.,
     ]
+}
+
+fn doubling_boundaries() -> Vec<f64> {
+    (0..=16).map(|power| f64::from(1u32 << power)).collect()
 }
 
 fn count_boundaries() -> Vec<f64> {
@@ -120,49 +192,411 @@ fn count_boundaries() -> Vec<f64> {
     ]
 }
 
-/// The store requests one push makes to verify its fragments, recorded once when dropped, so a
-/// push that fails or is cancelled part-way still reports what it made.
-///
-/// `lookups` counts the per-address fragment lookups the collection spawns, across every
-/// verification the push runs. The address and batch counts are those of its latest
-/// verification, since a push verifies again only for the same revision.
-#[derive(Default)]
-#[lore_macro::test_pub]
-struct PushStoreRequests {
-    lookups: Arc<StoreRequestTracker>,
-    collected_addresses: Option<u64>,
-    concurrent_query_batches: Option<u64>,
-    /// Whether the push returned, with success or an error, rather than being dropped part-way
-    /// as a cancelled request is.
-    finished: bool,
+/// The service a push arrived through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushHandler {
+    Legacy,
+    V1,
 }
 
-impl Drop for PushStoreRequests {
+impl PushHandler {
+    fn label(self) -> &'static str {
+        match self {
+            PushHandler::Legacy => "legacy",
+            PushHandler::V1 => "v1",
+        }
+    }
+}
+
+/// A stage of a push timed by [`PushReport`]. Steps a push runs concurrently stay within one
+/// phase. The response hooks' repository metadata, read beside the whole push, is not a phase
+/// of its own: a wait for it once the push returns falls in `Respond`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushPhase {
+    /// Authorization, loading the branch, its head and the incoming revision, the pre-hooks,
+    /// and the protection check.
+    Prepare,
+    /// The branch name check beside deciding how the head moves and, when it moves, loading the
+    /// incoming revision's parents and verifying the fragments it adds.
+    Verify,
+    /// Building a merge revision onto a head that moved since the client branched.
+    FastForwardMerge,
+    /// Rewriting the incoming revision when its number is wrong, storing the new head, and its
+    /// history step.
+    Commit,
+    /// From the push returning, with success or an error, to the response: the wait for the
+    /// response hooks' repository metadata and the hooks themselves.
+    Respond,
+}
+
+impl PushPhase {
+    /// Every phase, in the order a push can pass through them.
+    pub const ALL: [PushPhase; 5] = [
+        PushPhase::Prepare,
+        PushPhase::Verify,
+        PushPhase::FastForwardMerge,
+        PushPhase::Commit,
+        PushPhase::Respond,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            PushPhase::Prepare => 0,
+            PushPhase::Verify => 1,
+            PushPhase::FastForwardMerge => 2,
+            PushPhase::Commit => 3,
+            PushPhase::Respond => 4,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PushPhase::Prepare => "prepare",
+            PushPhase::Verify => "verify",
+            PushPhase::FastForwardMerge => "fast_forward_merge",
+            PushPhase::Commit => "commit",
+            PushPhase::Respond => "respond",
+        }
+    }
+}
+
+// Each phase's `index` is its position in `ALL`, which orders the per-phase durations.
+const _: () = {
+    let mut i = 0;
+    while i < PushPhase::ALL.len() {
+        assert!(PushPhase::ALL[i].index() == i);
+        i += 1;
+    }
+};
+
+/// How a push timed by [`PushReport`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The handler returned a response.
+    Completed,
+    /// The push left the head where it was for the client to resolve: not a fast-forward and
+    /// not forced, or a fast-forward merge with conflicts.
+    Declined,
+    /// The handler returned an error status for anything else, including a request rejected by
+    /// authorization or for a zero revision, or it panicked. A request without a valid repository
+    /// header is rejected before its report exists and is not recorded.
+    Error,
+    /// The handler future was dropped before it returned, such as by the handler timeout or a
+    /// server shutting down. A client that disconnects does not drop it: the handler runs on to
+    /// completion on the core runtime.
+    Cancelled,
+}
+
+impl PushOutcome {
+    /// How something that returned, or was dropped before it returned, ended. A push declined
+    /// and answered with an error status is declined.
+    #[lore_macro::test_pub]
+    fn of(finished: bool, declined: bool, errored: bool) -> Self {
+        match (finished, declined, errored) {
+            // Dropped while unwinding: it failed, rather than being cut off from outside.
+            (false, _, _) if std::thread::panicking() => PushOutcome::Error,
+            (false, _, _) => PushOutcome::Cancelled,
+            (true, true, _) => PushOutcome::Declined,
+            (true, false, true) => PushOutcome::Error,
+            (true, false, false) => PushOutcome::Completed,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            PushOutcome::Completed => "completed",
+            PushOutcome::Declined => "declined",
+            PushOutcome::Error => "error",
+            PushOutcome::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// The time one push spends in each [`PushPhase`] and the store requests its fragment
+/// verification makes, recorded once when dropped, so a push cancelled part-way still reports
+/// what it did and the phase it was in.
+pub struct PushReport {
+    handler: PushHandler,
+    repository: RepositoryId,
+    target: Option<(BranchId, Hash)>,
+    started: Instant,
+    phase: PushPhase,
+    phase_started: Instant,
+    /// When the push returned, `None` while it runs or once it is dropped part-way.
+    finished_at: Option<Instant>,
+    phase_durations: [Option<Duration>; PushPhase::ALL.len()],
+    store_latest_attempts: u64,
+    fast_forward_merge_changes: Option<u64>,
+    /// The fragment lookups and metadata blob reads the verification's tree walk makes.
+    store_requests: Arc<StoreRequestTracker>,
+    collected_addresses: Option<u64>,
+    concurrent_query_batches: Option<u64>,
+    /// When the verification's tree walk started. It runs until the existence checks start.
+    collect_started: Option<Instant>,
+    /// When the verification's existence checks, slow-down retries included, started.
+    exist_started: Option<Instant>,
+    /// When the verification returned, with success or an error.
+    verified_at: Option<Instant>,
+    verification_failed: bool,
+    errored: bool,
+    /// Whether the push left the head where it was for the client to resolve.
+    declined: bool,
+}
+
+/// A snapshot of a [`PushReport`], with the running phase counted up to the moment it was taken.
+pub struct PushSummary {
+    pub outcome: PushOutcome,
+    pub elapsed: Duration,
+    /// The phase the push was in when the snapshot was taken, or ended in.
+    pub phase: PushPhase,
+    phase_durations: [Option<Duration>; PushPhase::ALL.len()],
+    pub store_latest_attempts: u64,
+    /// The changes in the latest fast-forward merge diff computed without conflicts, whether or
+    /// not that merge reaches the branch head. `None` without one, or once a later diff finds
+    /// conflicts.
+    pub fast_forward_merge_changes: Option<u64>,
+    pub num_lookups: u64,
+    pub peak_lookups_in_flight: u64,
+    pub num_metadata_reads: u64,
+    pub peak_metadata_reads_in_flight: u64,
+    /// The time the verification's tree walk took, counted up to the snapshot while it runs.
+    /// `None` if it never started.
+    pub verify_collect: Option<Duration>,
+    /// The time the verification's existence checks took, counted up to the snapshot while they
+    /// run. `None` if they never started.
+    pub verify_exist: Option<Duration>,
+}
+
+impl PushSummary {
+    /// The time spent in `phase`, `None` if the push never entered it.
+    pub fn phase_duration(&self, phase: PushPhase) -> Option<Duration> {
+        self.phase_durations[phase.index()]
+    }
+}
+
+impl PushReport {
+    /// Starts timing a push to `repository` in [`PushPhase::Prepare`].
+    pub fn new(handler: PushHandler, repository: RepositoryId) -> Self {
+        let now = Instant::now();
+        Self {
+            handler,
+            repository,
+            target: None,
+            started: now,
+            phase: PushPhase::Prepare,
+            phase_started: now,
+            finished_at: None,
+            phase_durations: [None; PushPhase::ALL.len()],
+            store_latest_attempts: 0,
+            fast_forward_merge_changes: None,
+            store_requests: Arc::default(),
+            collected_addresses: None,
+            concurrent_query_batches: None,
+            collect_started: None,
+            exist_started: None,
+            verified_at: None,
+            verification_failed: false,
+            errored: false,
+            declined: false,
+        }
+    }
+
+    /// Names the branch and revision pushed in the slow or cancelled push log.
+    pub fn set_target(&mut self, branch: BranchId, revision: Hash) {
+        self.target = Some((branch, revision));
+    }
+
+    /// Closes the running phase and starts `phase`.
+    pub fn enter(&mut self, phase: PushPhase) {
+        let now = Instant::now();
+        self.close_phase(now);
+        self.phase = phase;
+        self.phase_started = now;
+    }
+
+    /// Runs `body` in `execution` with the report, and marks the push completed or errored by
+    /// what `body` returns. A future dropped before then drops the report unfinished, which
+    /// records the push as cancelled.
+    pub async fn run<T, E>(
+        mut self,
+        execution: Arc<ExecutionContext>,
+        body: impl AsyncFnOnce(&mut PushReport) -> Result<T, E>,
+    ) -> Result<T, E> {
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let result = body(&mut self).await;
+                self.errored = result.is_err();
+                self.finish();
+                result
+            })
+            .await
+    }
+
+    /// Closes the running phase and marks the push as returned rather than cancelled.
+    pub fn finish(&mut self) {
+        let now = Instant::now();
+        self.close_phase(now);
+        self.finished_at = Some(now);
+    }
+
+    /// What the report holds now, as the drop records it.
+    pub fn summary(&self) -> PushSummary {
+        let mut phase_durations = self.phase_durations;
+        let end = if let Some(finished_at) = self.finished_at {
+            finished_at
+        } else {
+            let now = Instant::now();
+            add_phase_time(&mut phase_durations, self.phase, now - self.phase_started);
+            now
+        };
+        let outcome = PushOutcome::of(self.finished_at.is_some(), self.declined, self.errored);
+        let verify_end = self.verified_at.unwrap_or(end);
+        let verify_collect = self
+            .collect_started
+            .map(|started| self.exist_started.unwrap_or(verify_end) - started);
+        let verify_exist = self.exist_started.map(|started| verify_end - started);
+        PushSummary {
+            outcome,
+            elapsed: end - self.started,
+            phase: self.phase,
+            phase_durations,
+            store_latest_attempts: self.store_latest_attempts,
+            fast_forward_merge_changes: self.fast_forward_merge_changes,
+            num_lookups: self.store_requests.lookups(),
+            peak_lookups_in_flight: self.store_requests.peak_lookups_in_flight(),
+            num_metadata_reads: self.store_requests.metadata_reads(),
+            peak_metadata_reads_in_flight: self.store_requests.peak_metadata_reads_in_flight(),
+            verify_collect,
+            verify_exist,
+        }
+    }
+
+    fn close_phase(&mut self, now: Instant) {
+        if self.finished_at.is_none() {
+            add_phase_time(
+                &mut self.phase_durations,
+                self.phase,
+                now - self.phase_started,
+            );
+        }
+    }
+}
+
+fn add_phase_time(
+    durations: &mut [Option<Duration>; PushPhase::ALL.len()],
+    phase: PushPhase,
+    time: Duration,
+) {
+    let duration = &mut durations[phase.index()];
+    *duration = Some(duration.unwrap_or_default() + time);
+}
+
+impl Drop for PushReport {
     fn drop(&mut self) {
-        let num_lookups = self.lookups.requests();
-        // A push that never walks its fragments, such as one rejected as not a fast-forward,
-        // would only skew the distributions.
-        if num_lookups == 0 {
-            return;
+        let summary = self.summary();
+        let outcome = summary.outcome.label();
+        let handler = KeyValue::new("handler", self.handler.label());
+        let handler_and_outcome = [handler.clone(), KeyValue::new("outcome", outcome)];
+        self.record_verification(&summary, &handler);
+
+        for phase in PushPhase::ALL {
+            if let Some(duration) = summary.phase_duration(phase) {
+                let [handler, outcome] = handler_and_outcome.clone();
+                PHASE_DURATION.record(
+                    duration.as_secs_f64() * 1000.,
+                    &[KeyValue::new("phase", phase.label()), handler, outcome],
+                );
+            }
+        }
+        let cancelled = summary.outcome == PushOutcome::Cancelled;
+        if cancelled {
+            CANCELLED_PHASE.add(1, &[KeyValue::new("phase", summary.phase.label()), handler]);
+        }
+        if summary.store_latest_attempts != 0 {
+            STORE_LATEST_ATTEMPTS.record(summary.store_latest_attempts, &handler_and_outcome);
+        }
+        if let Some(changes) = summary.fast_forward_merge_changes {
+            FAST_FORWARD_MERGE_CHANGES.record(changes, &handler_and_outcome);
         }
 
-        let peak_lookups_in_flight = self.lookups.peak_in_flight();
-        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(peak_lookups_in_flight, &[]);
-        FRAGMENT_LOOKUPS.record(num_lookups, &[]);
+        if cancelled
+            || summary.outcome == PushOutcome::Error
+            || summary.elapsed >= SLOW_PUSH_LOG_THRESHOLD
+        {
+            let (branch, revision) = self.target.unzip();
+            let millis = |phase| summary.phase_duration(phase).map(|d| d.as_millis());
+            info!(
+                handler = self.handler.label(),
+                {REPOSITORY_ID} = %self.repository,
+                {BRANCH_ID} = branch.map(tracing::field::display),
+                {REVISION} = revision.map(tracing::field::display),
+                outcome,
+                cancelled_in = cancelled.then(|| summary.phase.label()),
+                elapsed_ms = summary.elapsed.as_millis(),
+                prepare_ms = millis(PushPhase::Prepare),
+                verify_ms = millis(PushPhase::Verify),
+                verify_collect_ms = summary.verify_collect.map(|d| d.as_millis()),
+                verify_exist_ms = summary.verify_exist.map(|d| d.as_millis()),
+                fast_forward_merge_ms = millis(PushPhase::FastForwardMerge),
+                commit_ms = millis(PushPhase::Commit),
+                respond_ms = millis(PushPhase::Respond),
+                store_latest_attempts = summary.store_latest_attempts,
+                fast_forward_merge_changes = summary.fast_forward_merge_changes,
+                num_lookups = summary.num_lookups,
+                peak_lookups_in_flight = summary.peak_lookups_in_flight,
+                num_metadata_reads = summary.num_metadata_reads,
+                peak_metadata_reads_in_flight = summary.peak_metadata_reads_in_flight,
+                num_collected_addresses = self.collected_addresses,
+                num_concurrent_query_batches = self.concurrent_query_batches,
+                "Slow, cancelled or failed branch push"
+            );
+        }
+    }
+}
+
+impl PushReport {
+    /// Records the verification's timings, labelled with how the verification itself ended, and
+    /// its store requests.
+    fn record_verification(&self, summary: &PushSummary, handler: &KeyValue) {
+        let outcome = PushOutcome::of(self.verified_at.is_some(), false, self.verification_failed);
+        let completed_with_nothing_collected =
+            outcome == PushOutcome::Completed && self.collected_addresses.unwrap_or(0) == 0;
+        let attributes = [handler.clone(), KeyValue::new("outcome", outcome.label())];
+
+        // A verification that completed having collected and looked up nothing had nothing to
+        // verify, and would only skew the timings. One that failed or was cut off is recorded
+        // whatever it reached, since its time is what explains the push's end.
+        if !(completed_with_nothing_collected && summary.num_lookups == 0) {
+            if let Some(collect) = summary.verify_collect {
+                VERIFY_COLLECT_DURATION.record(collect.as_secs_f64() * 1000., &attributes);
+            }
+            // A verification that completed without collecting an address asked the store nothing.
+            if let Some(exist) = summary.verify_exist
+                && !completed_with_nothing_collected
+            {
+                VERIFY_EXIST_DURATION.record(exist.as_secs_f64() * 1000., &attributes);
+            }
+        }
+
+        // A verification that made no lookup, such as one for a revision that adds no fragment,
+        // would only skew the lookup distributions, which carry no outcome to filter on.
+        if summary.num_lookups == 0 {
+            return;
+        }
+        PEAK_FRAGMENT_LOOKUPS_IN_FLIGHT.record(summary.peak_lookups_in_flight, &[]);
+        FRAGMENT_LOOKUPS.record(summary.num_lookups, &[]);
+        METADATA_READS.record(summary.num_metadata_reads, &[]);
+        // A walk that read no metadata blob has no peak to report, and would only skew the peaks
+        // toward zero.
+        if summary.num_metadata_reads != 0 {
+            PEAK_METADATA_READS_IN_FLIGHT.record(summary.peak_metadata_reads_in_flight, &[]);
+        }
         if let Some(collected_addresses) = self.collected_addresses {
             COLLECTED_ADDRESSES.record(collected_addresses, &[]);
         }
         if let Some(concurrent_query_batches) = self.concurrent_query_batches {
             CONCURRENT_QUERY_BATCHES.record(concurrent_query_batches, &[]);
         }
-        debug!(
-            peak_lookups_in_flight,
-            num_lookups,
-            num_collected_addresses = self.collected_addresses,
-            num_concurrent_query_batches = self.concurrent_query_batches,
-            finished = self.finished,
-            "Branch push store requests"
-        );
     }
 }
 
@@ -184,8 +618,8 @@ pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
     request.remote_addr().map(|socket_addr| socket_addr.ip())
 }
 
-#[tracing::instrument(name = "BranchPush::handle", skip_all)]
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(name = "BranchPush::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchPushRequest>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
@@ -199,72 +633,79 @@ pub async fn handler(
     lock_enforcement: Option<&PushLockEnforcement>,
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
-    let request_metadata = request.metadata().clone();
-    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
-
-    // The `push-protected` action waives branch protection, which is how mirroring pushes.
-    let bypass_protection = authorizer
-        .permits(request.extensions(), repository, "push-protected")
-        .await;
-
-    let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
-    let req = request.into_inner();
-
-    let admitted = admit_at_entry(
-        domain_context,
-        &request_metadata,
-        request_authorization.as_ref(),
-        GovernedScope::TargetRepository {
-            repository_id: repository.data(),
-        },
-    )?;
-    let branch = BranchId::from(req.branch);
-    let revision = Hash::from(req.revision);
-    let force = req.force;
-    let fast_forward_merge = req.fast_forward_merge;
-
-    // Request validation precedes witness capture: a zero-revision request is
-    // malformed, not a CR-019 bypass, and must not pay for a database read
-    // before it is rejected (INV-EE P2-10).
-    if revision.is_zero() {
-        warn!("Invalid branch push request, revision is zero");
-        return Err(carried_push_preparation_error(
-            admitted.as_ref(),
-            Status::invalid_argument("Invalid revision"),
-        ));
-    }
-
-    let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
-    let governed_push = prepare_governed_push(
-        domain_context,
-        admitted,
-        repository,
-        branch,
-        revision,
-        force,
-        fast_forward_merge,
-    )
-    .await?;
-
-    debug!({REVISION} = %revision, bypass_protection, {BRANCH_ID} = %branch, force, fast_forward_merge,
-        "Handling branch push request",
-    );
-
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository,
-    ));
-
-    let repository_id: RepositoryId = repository.id;
-
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
-    LORE_CONTEXT
-        .scope(execution, async move {
+    PushReport::new(PushHandler::Legacy, repository)
+        .run(execution, async move |report| {
+            let request_metadata = request.metadata().clone();
+            let request_authorization =
+                crate::grpc::get_authorization_optional(request.extensions());
+            let access = PushAccess::of(&authorizer, request.extensions(), repository).await?;
+
+            let client_ip: Option<String> =
+                extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
+            let req = request.into_inner();
+
+            // FORK-LOCAL (Tideshift, CR-029): the one shared reader of the
+            // domain-operation headers.
+            let admitted = admit_at_entry(
+                domain_context,
+                &request_metadata,
+                request_authorization.as_ref(),
+                GovernedScope::TargetRepository {
+                    repository_id: repository.data(),
+                },
+            )?;
+            let branch = BranchId::from(req.branch);
+            let revision = Hash::from(req.revision);
+            let force = req.force;
+            let fast_forward_merge = req.fast_forward_merge;
+            report.set_target(branch, revision);
+
+            // Request validation precedes witness capture: a zero-revision request is
+            // malformed, not a CR-019 bypass, and must not pay for a database read
+            // before it is rejected (INV-EE P2-10).
+            if revision.is_zero() {
+                warn!("Invalid branch push request, revision is zero");
+                return Err(carried_push_preparation_error(
+                    admitted.as_ref(),
+                    Status::invalid_argument("Invalid revision"),
+                ));
+            }
+
+            let fenced_coordinator =
+                domain_context.and_then(|domain| domain.lock_coordinator().cloned());
+            let governed_push = prepare_governed_push(
+                domain_context,
+                admitted,
+                repository,
+                branch,
+                revision,
+                force,
+                fast_forward_merge,
+            )
+            .await?;
+
+            debug!(
+                {REVISION} = %revision,
+                ?access,
+                {BRANCH_ID} = %branch,
+                force,
+                fast_forward_merge,
+                "Handling branch push request",
+            );
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository,
+            ));
+
+            let repository_id: RepositoryId = repository.id;
+
             let mut ctx_builder = HookContext::builder()
                 .correlation_id(correlation_id.clone())
                 .hook_point(HookPoint::BranchPush)
@@ -279,9 +720,14 @@ pub async fn handler(
 
             let mut hook_ctx = ctx_builder.build();
 
-            let push_result = async {
+            // FORK-LOCAL (Tideshift, CR-019/CR-029/CR-030): everything from the
+            // pre-hooks to the publication is one result, so a governed push's
+            // refusal is settled against its publication receipt before it is
+            // answered.
+            let admitted_push: Result<(), Status> = async {
                 hook_dispatcher
                     .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                    .await
                     .map_err(hook_error_to_status)?;
 
                 // On a fenced cell the coordinator is the only authority that can
@@ -317,29 +763,50 @@ pub async fn handler(
                     )
                     .await?;
                 }
-
-                push_with_governance(
-                    repository.clone(),
-                    branch,
-                    revision,
-                    bypass_protection,
-                    force,
-                    fast_forward_merge,
-                    history_step_size,
-                    acceleration,
-                    governed_push.as_ref(),
-                )
-                .await
+                Ok(())
             }
             .await;
+
+            let (pushed, repository_metadata) = match admitted_push {
+                Ok(()) => {
+                    tokio::join!(
+                        async {
+                            let pushed = push_with_governance(
+                                repository.clone(),
+                                branch,
+                                revision,
+                                access,
+                                force,
+                                fast_forward_merge,
+                                history_step_size,
+                                acceleration,
+                                governed_push.as_ref(),
+                                &mut *report,
+                            )
+                            .await;
+                            report.enter(PushPhase::Respond);
+                            pushed
+                        },
+                        load_response_repository_metadata(hook_dispatcher, repository.clone()),
+                    )
+                }
+                Err(status) => {
+                    report.enter(PushPhase::Respond);
+                    (Err(status), None)
+                }
+            };
             let PushResult {
                 success,
                 advanced,
                 fast_forward_merged,
                 revision,
                 revision_number,
-            } = settle_governed_push(governed_push.as_ref(), push_result).await?;
+                branch_name,
+            } = settle_governed_push(governed_push.as_ref(), pushed).await?;
 
+            // A successful no-op push (the current head again) is answered but
+            // emits no push side effect: Lorehub reads a hook as a real branch
+            // transition.
             if advanced {
                 lore_spawn!({
                     let user_id = user_id.clone();
@@ -375,10 +842,10 @@ pub async fn handler(
                     &user_id,
                     repository_id,
                     branch,
+                    &branch_name,
                     revision,
-                    repository.clone(),
+                    repository_metadata.as_ref(),
                 )
-                .await
             } else {
                 None
             };
@@ -394,19 +861,38 @@ pub async fn handler(
         .await
 }
 
-/// Pre-computes repository and branch metadata, then dispatches response hooks
-/// to generate an optional message for the client.
+/// The repository metadata the response hooks of a push read, or `None` when no hook is
+/// registered to read it.
 ///
-/// Metadata lookup failures are silently ignored — absent metadata keys cause
-/// response hooks to return an empty response.
-pub(crate) async fn dispatch_response_message(
+/// A read that fails is `None` as well: the metadata only decorates the hook context.
+pub(crate) async fn load_response_repository_metadata(
+    hook_dispatcher: &HookDispatcher,
+    repository: Arc<RepositoryContext>,
+) -> Option<RepositoryMetadata> {
+    if !hook_dispatcher.has_hooks(HookPoint::BranchPush) {
+        return None;
+    }
+
+    // no filter_slow_down()? usage here: a throttled read leaves the hook context
+    // without the repository fields rather than failing the push.
+    let metadata_hash = repository::metadata_hash(repository.clone()).await.ok()?;
+    repository::metadata(repository, metadata_hash).await.ok()
+}
+
+/// Dispatches the response hooks of a successful push to generate an optional message for the
+/// client.
+///
+/// Without `repository_metadata`, the hook context carries no repository keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_response_message(
     hook_dispatcher: &HookDispatcher,
     correlation_id: &str,
     user_id: &str,
     repository_id: RepositoryId,
     branch: BranchId,
+    branch_name: &str,
     revision: Hash,
-    repository: Arc<RepositoryContext>,
+    repository_metadata: Option<&RepositoryMetadata>,
 ) -> Option<String> {
     let mut builder = HookContext::builder()
         .correlation_id(correlation_id)
@@ -414,14 +900,10 @@ pub(crate) async fn dispatch_response_message(
         .repository(repository_id)
         .user(user_id)
         .branch(branch)
-        .revision(revision);
+        .revision(revision)
+        .metadata(METADATA_BRANCH_NAME, branch_name);
 
-    // no filter_slow_down()? usage here: these reads only decorate the hook
-    // context, and the push they describe has already succeeded.
-    if let Ok(metadata_hash) = repository::metadata_hash(repository.clone()).await
-        && let Ok(repository_metadata) =
-            repository::metadata(repository.clone(), metadata_hash).await
-    {
+    if let Some(repository_metadata) = repository_metadata {
         builder = builder
             .metadata("repository_name", repository_metadata.name.clone())
             .metadata(
@@ -436,13 +918,6 @@ pub(crate) async fn dispatch_response_message(
                     "false"
                 },
             );
-    }
-
-    if let Ok(branch_meta) = branch::metadata(repository.clone(), branch).await
-        && let Ok(branch_meta) =
-            branch::branch_metadata(repository.clone(), branch, &branch_meta).await
-    {
-        builder = builder.metadata("branch_name", branch_meta.name);
     }
 
     let response_ctx = builder.build();
@@ -460,8 +935,9 @@ pub struct PushResult {
     pub fast_forward_merged: bool,
     pub revision: Hash,
     pub revision_number: u64,
+    /// The name the branch metadata held when the push checked it, empty when it holds none.
+    pub branch_name: String,
 }
-
 /// Return a refusal only once the exact publication receipt proves it terminal.
 #[lore_macro::test_pub]
 pub(crate) async fn settle_governed_push(
@@ -701,7 +1177,7 @@ pub(crate) async fn enforce_fenced_locks(
         return Ok(());
     }
 
-    let prior_tip = load_latest(repository.clone(), branch)
+    let prior_tip = branch::load_latest(repository.clone(), branch)
         .await
         .map_err(|error| Status::internal(format!("failed to load branch tip: {error}")))?;
     // Shared with the legacy guard so the two authorities cannot drift on the
@@ -826,87 +1302,409 @@ impl GovernedPushCommit {
     }
 }
 
+struct HeadUpdate {
+    success: bool,
+    /// FORK-LOCAL (Tideshift): whether the head moved; see [`PushResult::advanced`].
+    advanced: bool,
+    fast_forward_merged: bool,
+    /// The latest revision of the branch when the push is answered.
+    revision: Hash,
+    revision_number: u64,
+}
+
+impl HeadUpdate {
+    /// A push that leaves the head at `current` for the client to resolve.
+    fn declined(current: Hash) -> Self {
+        Self {
+            success: false,
+            advanced: false,
+            fast_forward_merged: false,
+            revision: current,
+            revision_number: 0,
+        }
+    }
+}
+
+/// Which pushes the caller may make: to an unprotected branch with `write`,
+/// to a protected one with `push-protected`.
+#[derive(Clone, Copy, Debug)]
+pub struct PushAccess {
+    pub write: bool,
+    pub push_protected: bool,
+}
+
+impl PushAccess {
+    /// Denies with [`no_repository_access_status`] when the caller may make
+    /// neither kind of push, before anything about the branch is read.
+    pub async fn of(
+        authorizer: &Arc<dyn RepositoryAuthorizer>,
+        extensions: &tonic::Extensions,
+        repository: RepositoryId,
+    ) -> Result<Self, Status> {
+        let access = Self {
+            write: authorizer
+                .permits(extensions, repository, Action::Write)
+                .await,
+            push_protected: authorizer
+                .permits(extensions, repository, Action::PushProtected)
+                .await,
+        };
+        if access.write || access.push_protected {
+            Ok(access)
+        } else {
+            Err(no_repository_access_status())
+        }
+    }
+}
+
+pub(crate) struct HeadAndIncoming {
+    /// The latest revision of the branch, zero when it has none.
+    head: Hash,
+    /// The state of the revision being pushed.
+    incoming: Arc<State>,
+}
+
+enum PreparedPush {
+    /// The push is answered without moving the head.
+    Done(HeadUpdate),
+    /// The fragments are verified, and the head moves as `head_move` says.
+    Move {
+        loaded: HeadAndIncoming,
+        head_move: HeadMove,
+        parents: VerifiedParents,
+    },
+}
+
+struct VerifiedParents {
+    parent: Arc<State>,
+    /// The second parent, set for a merge revision only.
+    other: Option<Arc<State>>,
+}
+
+/// Pushes `latest` as the latest revision of `branch`, mapping the name of a deleted branch
+/// back to it.
 #[allow(clippy::too_many_arguments)]
-#[instrument(level = "debug", skip_all, fields(branch))]
 pub async fn push(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
-    bypass_protection: bool,
+    access: PushAccess,
     force: bool,
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    report: &mut PushReport,
 ) -> Result<PushResult, Status> {
     push_with_governance(
         repository,
         branch,
         latest,
-        bypass_protection,
+        access,
         force,
         fast_forward_merge,
         history_step_size,
         acceleration,
         None,
+        report,
     )
     .await
 }
 
+/// FORK-LOCAL (Tideshift, CR-029): [`push`] with the governed publication
+/// `governed` names, which replaces the latest-pointer CAS when present.
 #[allow(clippy::too_many_arguments)]
 #[lore_macro::test_pub]
 pub(crate) async fn push_with_governance(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
-    bypass_protection: bool,
+    access: PushAccess,
     force: bool,
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     governed: Option<&GovernedPushCommit>,
+    report: &mut PushReport,
+) -> Result<PushResult, Status> {
+    let (metadata, loaded) = load_branch_and_head(repository.clone(), branch, latest).await;
+    push_loaded(
+        repository,
+        branch,
+        latest,
+        access,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+        metadata?,
+        loaded,
+        governed,
+        report,
+    )
+    .await
+}
+
+/// Loads the metadata of `branch` beside its latest revision and the state of `latest`, the
+/// reads a push makes before it checks anything.
+pub(crate) async fn load_branch_and_head(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> (Result<Metadata, Status>, Result<HeadAndIncoming, Status>) {
+    tokio::join!(
+        load_branch_metadata(repository.clone(), branch),
+        load_head_and_incoming(repository, branch, latest),
+    )
+}
+
+/// Pushes `latest` as the latest revision of `branch` from the branch `metadata` and the
+/// `loaded` head read for it, mapping the name of a deleted branch back to it.
+///
+/// The name check runs beside the fragment verification of the incoming revision. Both complete
+/// before the head moves, and a failed branch check is reported ahead of any failure of the
+/// incoming revision.
+#[allow(clippy::too_many_arguments)]
+#[instrument(level = "debug", skip_all, fields(branch))]
+pub(crate) async fn push_loaded(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    access: PushAccess,
+    force: bool,
+    fast_forward_merge: bool,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    metadata: Metadata,
+    loaded: Result<HeadAndIncoming, Status>,
+    governed: Option<&GovernedPushCommit>,
+    report: &mut PushReport,
 ) -> Result<PushResult, Status> {
     // Zero hash is never valid to push as latest pointer
     if latest.is_zero() {
         return Err(Status::failed_precondition("invalid revision signature"));
     }
 
-    // Check if branch is protected
-    let branch_metadata = metadata(repository.clone(), branch)
+    check_push_access(&metadata, access)?;
+    let branch_name = branch::name(&metadata).unwrap_or_default().to_string();
+
+    // Fragment verification starts only once protection is checked, so a push refused as
+    // protected never walks its revision.
+    report.enter(PushPhase::Verify);
+    let (name_mapped, prepared) = tokio::join!(
+        ensure_name_maps_to_branch(repository.clone(), branch, &branch_name),
+        async {
+            prepare_push(
+                repository.clone(),
+                latest,
+                loaded?,
+                force,
+                fast_forward_merge,
+                &mut *report,
+            )
+            .await
+        },
+    );
+    name_mapped?;
+
+    let update = match prepared? {
+        PreparedPush::Done(update) => {
+            // FORK-LOCAL (Tideshift, CR-029): a governed push of the current
+            // head still settles its operation at the publication boundary; the
+            // coordinator suppresses the event for the no-op.
+            if update.success
+                && let Some(governed) = governed
+            {
+                governed
+                    .publish(
+                        repository.as_ref(),
+                        branch,
+                        update.revision,
+                        update.revision,
+                    )
+                    .await?;
+            }
+            update
+        }
+        PreparedPush::Move {
+            loaded,
+            head_move: HeadMove::Store,
+            parents,
+        } => {
+            store_new_head(
+                repository,
+                branch,
+                latest,
+                loaded,
+                parents,
+                force,
+                fast_forward_merge,
+                history_step_size,
+                acceleration,
+                governed,
+                report,
+            )
+            .await?
+        }
+        PreparedPush::Move {
+            loaded,
+            head_move: HeadMove::Merge,
+            ..
+        } => {
+            try_fast_forward_merge(
+                repository,
+                branch,
+                loaded.incoming,
+                loaded.head,
+                history_step_size,
+                acceleration,
+                governed,
+                report,
+            )
+            .await?
+        }
+    };
+    report.declined = !update.success;
+
+    Ok(PushResult {
+        success: update.success,
+        advanced: update.advanced,
+        fast_forward_merged: update.fast_forward_merged,
+        revision: update.revision,
+        revision_number: update.revision_number,
+        branch_name,
+    })
+}
+
+async fn load_branch_metadata(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Metadata, Status> {
+    let metadata_hash = branch::metadata_hash(repository.clone(), branch)
         .await
         .filter_slow_down()?
-        .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))?;
+        .map_err(|_err| Status::not_found(format!("Branch {branch} not found")))?;
+    branch::load_metadata(repository, metadata_hash)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))
+}
 
-    if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
-        if bypass_protection {
-            debug!("Bypass branch protection and push to protected branch");
-        } else {
+/// Refuses a push the caller's `access` does not cover: a protected branch needs
+/// `push-protected`, any other branch `write`.
+fn check_push_access(metadata: &Metadata, access: PushAccess) -> Result<(), Status> {
+    if metadata.get_bool(PROTECT).unwrap_or_default() {
+        if !access.push_protected {
             warn!("Branch push failed, branch is protected");
             return Err(Status::permission_denied("protected"));
         }
+        debug!("Push to protected branch");
+    } else if !access.write {
+        return Err(no_repository_access_status());
     }
 
-    // Verify the branch has not been deleted by checking the name→id mapping
-    if let Ok(branch_name) = branch::name(&branch_metadata)
-        && !branch_name.is_empty()
-    {
-        let is_mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
-            .await
-            .filter_slow_down()?
-            .is_ok_and(|id| id == branch);
-        if !is_mapped {
-            debug!("Branch push rejected, name-to-id mapping missing for deleted branch");
-            return Err(Status::not_found("Branch not found"));
+    Ok(())
+}
+
+/// Ensures `name` maps to `branch`, mapping it back when no live branch claims it.
+async fn ensure_name_maps_to_branch(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    name: &str,
+) -> Result<(), Status> {
+    if name.is_empty() {
+        return Ok(());
+    }
+
+    // The `None` arm reinstates the mapping, so an unreadable name key must
+    // not reach it: that would rebind the name away from whichever branch
+    // currently owns it.
+    match none_or_status(
+        branch::load_name_to_id_local(repository.clone(), name).await,
+        BranchError::is_branch_not_found,
+    )? {
+        Some(mapped) if BranchId::from(mapped) == branch => Ok(()),
+        Some(other) => {
+            let other_id = BranchId::from(other);
+            if other_branch_still_claims_name(&repository, other_id, name).await? {
+                info!(
+                    {BRANCH_ID} = %branch,
+                    %name,
+                    claimed_by = %other_id,
+                    "Cannot reinstate deleted branch: name claimed by another branch",
+                );
+                Err(Status::already_exists(format!(
+                    "Branch name '{name}' is in use by a different branch"
+                )))
+            } else {
+                debug!(
+                    {BRANCH_ID} = %branch,
+                    %name,
+                    stale = %other_id,
+                    "Stale name → id mapping, reinstating to current branch",
+                );
+                branch::store_name_to_id(repository, branch, name)
+                    .await
+                    .filter_slow_down()?
+                    .warn_map_err(|err| {
+                        Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
+                    })
+            }
+        }
+        None => {
+            // No mapping (deleted — the underlying store treats zero
+            // values as missing — or never written). Reinstate the
+            // mapping so the pushed branch is live again.
+            debug!({BRANCH_ID} = %branch, %name, "Reinstating name → id mapping for push");
+            branch::store_name_to_id(repository, branch, name)
+                .await
+                .filter_slow_down()?
+                .warn_map_err(|err| {
+                    Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
+                })
         }
     }
+}
 
-    let current_head = load_latest(repository.clone(), branch)
+/// True iff `other_id` exists and its metadata still names it `name`. A
+/// mismatch (dead branch, missing metadata, or a rename that left an
+/// orphan name pointer) is treated as a stale mapping the caller can
+/// safely overwrite. A store that cannot answer is reported rather than
+/// read as a mismatch, so an unreadable branch never has its name
+/// reassigned.
+async fn other_branch_still_claims_name(
+    repository: &Arc<RepositoryContext>,
+    other_id: BranchId,
+    name: &str,
+) -> Result<bool, Status> {
+    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id)
         .await
         .filter_slow_down()?
-        .unwrap_or_default();
-
-    // Verify the validity of the revision to push to latest
-    let state = State::deserialize(repository.clone(), latest)
+    else {
+        return Ok(false);
+    };
+    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
+    else {
+        return Ok(false);
+    };
+    Ok(branch::name(&metadata).unwrap_or("") == name)
+}
+
+/// The latest revision of `branch`, zero when it has none, and the state of `latest`.
+async fn load_head_and_incoming(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> Result<HeadAndIncoming, Status> {
+    let (head, incoming) = tokio::join!(
+        branch::load_latest_local(repository.clone(), branch),
+        State::deserialize(repository, latest),
+    );
+    // Any failure to read the latest revision reads as none. The branch metadata check is what
+    // tells an empty branch from a missing one.
+    let head = head.filter_slow_down()?.unwrap_or_default();
+    let incoming = incoming
         .filter_slow_down()
         .map_err(|status| push_store_refusal("state_load", status))?
         .warn_map_err(|err| {
@@ -918,147 +1716,161 @@ pub(crate) async fn push_with_governance(
                 Status::internal(format!("failed to load current latest state: {err}"))
             }
         })?;
+    Ok(HeadAndIncoming { head, incoming })
+}
 
+enum HeadMove {
+    /// The incoming revision descends from the head, or the push is forced.
+    Store,
+    /// The head moved past the parent of the incoming revision, and the push asked for a
+    /// fast-forward merge.
+    Merge,
+}
+
+/// How the head moves from `current` to the incoming revision `state`, or `None` when the head
+/// moved past its parent and the push did not ask for a fast-forward merge.
+fn decide_head_move(
+    current: Hash,
+    state: &State,
+    force: bool,
+    fast_forward_merge: bool,
+) -> Result<Option<HeadMove>, Status> {
+    if force || current == state.parent_self() {
+        return Ok(Some(HeadMove::Store));
+    }
+
+    if current.is_zero() {
+        warn!("Branch push failed, branch does not exist");
+        return Err(Status::not_found("Branch not found"));
+    }
+
+    if !fast_forward_merge {
+        return Ok(None);
+    }
+
+    Ok(Some(HeadMove::Merge))
+}
+
+/// Decides how the head moves to `latest`, verifying the fragments of the incoming revision
+/// when it moves at all.
+async fn prepare_push(
+    repository: Arc<RepositoryContext>,
+    latest: Hash,
+    loaded: HeadAndIncoming,
+    force: bool,
+    fast_forward_merge: bool,
+    report: &mut PushReport,
+) -> Result<PreparedPush, Status> {
     // If the incoming revision is already the latest revision the push is a no-op
-    if current_head == latest {
-        if let Some(governed) = governed {
-            governed
-                .publish(repository.as_ref(), branch, current_head, current_head)
-                .await?;
-        }
-        return Ok(PushResult {
+    if loaded.head == latest {
+        return Ok(PreparedPush::Done(HeadUpdate {
             success: true,
             advanced: false,
             fast_forward_merged: false,
-            revision: current_head,
-            revision_number: state.revision_number(),
-        });
+            revision: loaded.head,
+            revision_number: loaded.incoming.revision_number(),
+        }));
     }
 
-    let mut store_requests = PushStoreRequests::default();
-    let result = store_new_head(
-        repository,
-        branch,
-        latest,
-        state,
-        current_head,
-        force,
-        fast_forward_merge,
-        history_step_size,
-        acceleration,
-        governed,
-        &mut store_requests,
-    )
-    .await;
-    store_requests.finished = true;
-    result
+    let Some(head_move) =
+        decide_head_move(loaded.head, &loaded.incoming, force, fast_forward_merge)?
+    else {
+        return Ok(PreparedPush::Done(HeadUpdate::declined(loaded.head)));
+    };
+
+    // Both a plain push and a fast-forward merge verify the incoming revision against its own
+    // parents, which do not depend on the head. Without this check a client could reference
+    // fragments that were never fully uploaded.
+    let parents = verify_incoming_fragments(repository, loaded.incoming.clone(), report).await?;
+
+    Ok(PreparedPush::Move {
+        loaded,
+        head_move,
+        parents,
+    })
 }
 
-/// Verifies the fragments `state` introduces and stores it as the latest revision of `branch`,
-/// retrying while the head moves underneath it.
+/// Loads the parent states of `state` and verifies that every fragment it introduces against
+/// them exists.
+async fn verify_incoming_fragments(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    report: &mut PushReport,
+) -> Result<VerifiedParents, Status> {
+    let parent = State::deserialize(repository.clone(), state.parent_self())
+        .await
+        .filter_slow_down()
+        .map_err(|status| push_store_refusal("parent_load", status))?
+        .warn_map_err(|err| Status::internal(format!("Failed to load incoming state: {err}")))?;
+
+    let other = load_other_parent_state(repository.clone(), &state)
+        .await
+        .map_err(|status| {
+            if status.code() == tonic::Code::ResourceExhausted {
+                push_store_refusal("other_parent_load", status)
+            } else {
+                status
+            }
+        })?;
+
+    let verified = verify_fragments(repository, parent.clone(), other.clone(), state, report).await;
+    report.verified_at = Some(Instant::now());
+    report.verification_failed = verified.is_err();
+    verified?;
+
+    Ok(VerifiedParents { parent, other })
+}
+
+/// Stores the verified incoming revision as the latest revision of `branch`, retrying while
+/// the head moves underneath it.
 #[allow(clippy::too_many_arguments)]
 async fn store_new_head(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     latest: Hash,
-    state: Arc<State>,
-    mut current_head: Hash,
+    loaded: HeadAndIncoming,
+    parents: VerifiedParents,
     force: bool,
     fast_forward_merge: bool,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     governed: Option<&GovernedPushCommit>,
-    store_requests: &mut PushStoreRequests,
-) -> Result<PushResult, Status> {
+    report: &mut PushReport,
+) -> Result<HeadUpdate, Status> {
+    report.enter(PushPhase::Commit);
+    let HeadAndIncoming {
+        head: mut current,
+        incoming,
+    } = loaded;
+
+    let revision_number = next_revision_number(
+        parents.parent.revision_number(),
+        parents.other.as_ref().map_or(0, |s| s.revision_number()),
+    );
+
     let mut new_head = latest;
+    if incoming.revision_number() != revision_number {
+        // Rewrite the revision with a correct revision number
+        incoming.set_revision_number(revision_number);
+        let write_token = get_write_token();
+        new_head = incoming
+            .serialize(repository.clone(), &write_token)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| Status::internal(format!("Failed to serialize state: {err}")))?;
+    }
+
     loop {
-        // Verify the current latest revision is parent of the incoming revision unless the push is forced
-        if current_head != state.parent_self() && !force {
-            if current_head.is_zero() {
-                warn!("Branch push failed, branch does not exist");
-                return Err(Status::not_found("Branch not found"));
-            }
-
-            if !fast_forward_merge {
-                return Ok(PushResult {
-                    success: false,
-                    advanced: false,
-                    fast_forward_merged: false,
-                    revision: current_head,
-                    revision_number: 0,
-                });
-            }
-
-            // Fast-forward merge: the incoming revision's parent_self no longer matches
-            // the branch head. Attempt to create a new merge revision with
-            // parent_self=current_head and parent_other=incoming_revision.
-            return try_fast_forward_merge(
-                repository.clone(),
-                branch,
-                state.clone(),
-                current_head,
-                history_step_size,
-                acceleration,
-                governed,
-                store_requests,
-            )
-            .await;
-        }
-
-        let state_parent = State::deserialize(repository.clone(), state.parent_self())
-            .await
-            .filter_slow_down()
-            .map_err(|status| push_store_refusal("parent_load", status))?
-            .warn_map_err(|err| {
-                Status::internal(format!("Failed to load incoming state: {err}"))
-            })?;
-
-        let state_other = load_other_parent_state(repository.clone(), &state)
-            .await
-            .map_err(|status| {
-                if status.code() == tonic::Code::ResourceExhausted {
-                    push_store_refusal("other_parent_load", status)
-                } else {
-                    status
-                }
-            })?;
-
-        // Verify that all new fragments exist
-        verify_fragments(
-            repository.clone(),
-            state_parent.clone(),
-            state_other.clone(),
-            state.clone(),
-            store_requests,
-        )
-        .await?;
-
-        // Verify that the revision number is valid
-        let revision_number = next_revision_number(
-            state_parent.revision_number(),
-            state_other.as_ref().map_or(0, |s| s.revision_number()),
-        );
-
-        if state.revision_number() != revision_number {
-            // Rewrite the revision with a correct revision number
-            state.set_revision_number(revision_number);
-            let write_token = get_write_token();
-            new_head = state
-                .serialize(repository.clone(), &write_token)
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to serialize state: {err}"))
-                })?;
-        }
-
+        report.store_latest_attempts += 1;
+        // FORK-LOCAL (Tideshift, CR-029): a governed push publishes through the
+        // domain coordinator, whose answer is decisive; it never retries here.
         let previous_head = if let Some(governed) = governed {
             governed
-                .publish(repository.as_ref(), branch, current_head, new_head)
+                .publish(repository.as_ref(), branch, current, new_head)
                 .await?;
-            current_head
+            current
         } else {
-            try_store_latest(repository.clone(), branch, current_head, new_head)
+            try_store_latest(repository.clone(), branch, current, new_head)
                 .await
                 .filter_slow_down()?
                 .warn_map_err(|err| {
@@ -1066,40 +1878,54 @@ async fn store_new_head(
                 })?
         };
 
-        // Check if the compare-and-swap was successful by checking match with expected value
-        if previous_head == current_head {
-            // If equal it means the value was swapped, i.e the push was successful. Set the
-            // new latest revision signature and break out of the loop to return success
-            current_head = new_head;
-
+        if previous_head == current {
             store_history_step(
                 repository.clone(),
                 branch,
                 history_step_size,
                 acceleration,
-                state_parent,
-                state.clone(),
+                parents.parent,
+                incoming.clone(),
             )
             .await;
 
-            break;
+            return Ok(HeadUpdate {
+                success: true,
+                advanced: true,
+                fast_forward_merged: false,
+                revision: new_head,
+                revision_number: incoming.revision_number(),
+            });
         }
 
-        // Latest pointer moved during the processing of this push call, loop and try again
-        current_head = previous_head;
-    }
+        // Latest pointer moved during the processing of this push call
+        current = previous_head;
 
-    Ok(PushResult {
-        success: true,
-        advanced: true,
-        fast_forward_merged: false,
-        revision: current_head,
-        revision_number: state.revision_number(),
-    })
+        // The fragments were verified against the parents of the incoming revision, which do
+        // not depend on the head, so a retry does not verify them again.
+        match decide_head_move(current, &incoming, force, fast_forward_merge)? {
+            Some(HeadMove::Store) => {}
+            None => return Ok(HeadUpdate::declined(current)),
+            Some(HeadMove::Merge) => {
+                return try_fast_forward_merge(
+                    repository,
+                    branch,
+                    incoming,
+                    current,
+                    history_step_size,
+                    acceleration,
+                    governed,
+                    report,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 /// Attempts a server-side fast-forward merge when the target branch head has moved
-/// since the client created the merge revision.
+/// since the client created the merge revision. The fragments of the incoming revision
+/// must already be verified.
 ///
 /// Creates a new merge revision with:
 /// - `parent_self` = current branch head (target branch)
@@ -1120,8 +1946,8 @@ async fn try_fast_forward_merge(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     governed: Option<&GovernedPushCommit>,
-    store_requests: &mut PushStoreRequests,
-) -> Result<PushResult, Status> {
+    report: &mut PushReport,
+) -> Result<HeadUpdate, Status> {
     let incoming_revision = incoming_state.revision();
     let original_base = incoming_state.parent_self();
 
@@ -1130,31 +1956,9 @@ async fn try_fast_forward_merge(
         "Attempting fast-forward merge"
     );
 
-    // Verify that all new fragments from the incoming revision exist in the store,
-    // matching the verification done in the normal push path. Without this check a
-    // client could reference fragments that were never fully uploaded.
-    let base_state = State::deserialize(repository.clone(), original_base)
-        .await
-        .filter_slow_down()
-        .map_err(|status| push_store_refusal("merge_base_load", status))?
-        .warn_map_err(|err| {
-            Status::internal(format!(
-                "Failed to load base state for fragment verification: {err}"
-            ))
-        })?;
-
-    let other_parent_state = load_other_parent_state(repository.clone(), &incoming_state).await?;
-
-    verify_fragments(
-        repository.clone(),
-        base_state,
-        other_parent_state,
-        incoming_state.clone(),
-        store_requests,
-    )
-    .await?;
-
     loop {
+        report.enter(PushPhase::FastForwardMerge);
+
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
         debug!(
             %original_base, %incoming_revision, %current_head,
@@ -1186,14 +1990,12 @@ async fn try_fast_forward_merge(
                 conflicts = diff_result.conflicts.len(),
                 "Fast-forward merge has conflicts, rejecting"
             );
-            return Ok(PushResult {
-                success: false,
-                advanced: false,
-                fast_forward_merged: false,
-                revision: current_head,
-                revision_number: 0,
-            });
+            report.fast_forward_merge_changes = None;
+            return Ok(HeadUpdate::declined(current_head));
         }
+        // Recorded before the merge is applied, so a push cancelled while applying or storing it
+        // still reports the size of the merge it was working on.
+        report.fast_forward_merge_changes = Some(diff_result.changes.len() as u64);
 
         // Deserialize the current head state to use as base for the new merge revision
         let state_current = State::deserialize(repository.clone(), current_head)
@@ -1290,6 +2092,8 @@ async fn try_fast_forward_merge(
             })?;
 
         // CAS: attempt to set the new revision as branch head
+        report.enter(PushPhase::Commit);
+        report.store_latest_attempts += 1;
         let previous_head = if let Some(governed) = governed {
             governed
                 .publish(repository.as_ref(), branch, current_head, new_revision)
@@ -1322,7 +2126,7 @@ async fn try_fast_forward_merge(
             )
             .await;
 
-            return Ok(PushResult {
+            return Ok(HeadUpdate {
                 success: true,
                 advanced: true,
                 fast_forward_merged: true,
@@ -1521,18 +2325,19 @@ async fn verify_fragments(
     parent_state: Arc<State>,
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
-    store_requests: &mut PushStoreRequests,
+    report: &mut PushReport,
 ) -> Result<(), Status> {
+    report.collect_started = Some(Instant::now());
     let mut new_fragments = collect_new_addresses(
         repository.clone(),
         parent_state,
         other_parent_state,
         state,
-        store_requests.lookups.clone(),
+        report.store_requests.clone(),
     )
     .await?;
-    store_requests.collected_addresses = Some(new_fragments.len() as u64);
-    store_requests.concurrent_query_batches = None;
+    report.exist_started = Some(Instant::now());
+    report.collected_addresses = Some(new_fragments.len() as u64);
 
     let mut retry = lore_revision::util::time::retry(
         push::RETRY_START_DURATION,
@@ -1578,7 +2383,7 @@ async fn verify_fragments(
         });
         // A wave after a slow-down resends only the throttled batches, so the first wave is
         // the one that holds the peak.
-        store_requests
+        report
             .concurrent_query_batches
             .get_or_insert(tasks.len() as u64);
         debug!(

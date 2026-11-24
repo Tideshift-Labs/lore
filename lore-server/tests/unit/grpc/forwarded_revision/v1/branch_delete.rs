@@ -15,6 +15,8 @@ use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_delete::*;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::hooks::HookDispatcher;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -65,11 +67,12 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         repository_context.clone(),
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push latest revision")
@@ -103,6 +106,7 @@ fn make_forwarded_request(
     CallerContext {
         repository_id: repository,
         user_id: "alice".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }

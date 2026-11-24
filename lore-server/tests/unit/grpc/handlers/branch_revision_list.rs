@@ -13,6 +13,8 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::handlers::branch_revision_list::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -61,11 +63,12 @@ async fn test_handle() {
             repository.clone(),
             main,
             first_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision")
@@ -83,11 +86,12 @@ async fn test_handle() {
             repository.clone(),
             main,
             second_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision")
@@ -105,11 +109,12 @@ async fn test_handle() {
             repository.clone(),
             main,
             third_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision")
@@ -127,11 +132,12 @@ async fn test_handle() {
             repository.clone(),
             main,
             fourth_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision")
@@ -364,11 +370,12 @@ async fn test_handle_optional_branch() {
             repository.clone(),
             main,
             first_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision");
@@ -385,11 +392,12 @@ async fn test_handle_optional_branch() {
             repository.clone(),
             main,
             second_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision");
@@ -406,11 +414,12 @@ async fn test_handle_optional_branch() {
             repository.clone(),
             main,
             third_hash,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("Failed to push head revision");

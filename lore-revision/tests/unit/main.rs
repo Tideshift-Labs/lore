@@ -9,6 +9,7 @@
 mod attempt_store;
 mod auth;
 mod branch;
+mod case_folding;
 mod change;
 mod commit;
 mod dependency;
@@ -17,14 +18,18 @@ mod event;
 mod exact_selection;
 mod file;
 mod filter;
+mod filter_walk;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
 #[path = "../helper.rs"]
 mod helper;
+mod history;
 mod immutable;
 mod infer;
 mod instance;
+mod instance_in_use_retry;
+mod instance_move_rollback;
 mod interface;
 mod link;
 #[cfg(feature = "test_seams")]
@@ -34,6 +39,7 @@ mod merge;
 mod metadata;
 mod node;
 mod notification;
+mod paged_remote;
 mod protocol;
 mod relay;
 mod repository;

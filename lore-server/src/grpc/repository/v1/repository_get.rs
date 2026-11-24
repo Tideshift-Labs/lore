@@ -35,6 +35,7 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
@@ -61,6 +62,7 @@ pub async fn handler(
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // the queried repository is named by the request
         user_id: get_user_id(request.extensions()),
+        is_service_account: get_is_service_account(request.extensions()),
         correlation_id: extract_correlation_id(&request).unwrap_or_default(),
         authorization: extract_authorization_header(&request),
     };

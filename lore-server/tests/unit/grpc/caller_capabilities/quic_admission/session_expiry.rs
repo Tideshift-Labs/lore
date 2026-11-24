@@ -72,7 +72,7 @@ fn v4_with_token(
     let verifier = if auth {
         verifier_present()
     } else {
-        Arc::new(None)
+        Arc::new(TokenVerification::Ignore)
     };
     let service = StorageServiceV4::new(
         verifier,
@@ -411,7 +411,7 @@ async fn auth_off_sessions_never_expire() {
     let stores = Stores::new().await;
     let repository = random::<RepositoryId>();
     let service = StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         stores.immutable.clone(),
         stores.local.clone(),
@@ -583,7 +583,7 @@ fn session_expired_maps_to_201_not_logged_and_unauthenticated_on_grpc() {
 
     // The v4 service answers 201 and keeps it out of the error log (an expected, retried answer).
     let stores_service = StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         Arc::new(NullImmutable),
         Arc::new(NullImmutable),
@@ -1129,7 +1129,7 @@ mod urc_0_2 {
             if verifier {
                 verifier_present()
             } else {
-                Arc::new(None)
+                Arc::new(TokenVerification::Ignore)
             },
             Arc::new(AllowAllRepositoryAuthorizer),
             stores.immutable.clone(),
@@ -1384,7 +1384,7 @@ mod urc_0_2 {
         let stores = Stores::new().await;
         let repository = random::<RepositoryId>();
         let service = StorageService::new(
-            Arc::new(Some(JwtVerifier {
+            Arc::new(TokenVerification::Verify(JwtVerifier {
                 jwk_service: Arc::new(StaticJwkService),
                 jwt_issuer: None,
                 jwt_audience: Some(vec![AUDIENCE.to_string()]),

@@ -33,9 +33,9 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
-    service_claim_path,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
+    remove_service_claim,
     service_supported,
     stop_lore_service,
 )
@@ -486,17 +486,21 @@ class TrackedServices:
         self.global_dir_name = global_dir_name
         self.environment_vars = environment_vars or {}
         self.service_processes: dict[str | None, subprocess.Popen | None] = {}
+        # The file each service's output goes to, kept after the service ends so
+        # that a test can read what it printed as it stopped.
+        self.output_paths: dict[str | None, Path] = {}
 
-    def start(self, directory: str | None = None):
-        """Starts the service, optionally with a chosen working directory. The service
-        shares the test's isolated global config so shared stores it creates land
-        where the client looks for them."""
-        process, log_path = self.launch(directory)
+    def start(self, directory: str | None = None, debug: bool = False):
+        """Starts the service, optionally with a chosen working directory, and with
+        its debug log lines in its output when `debug` is set. The service shares
+        the test's isolated global config so shared stores it creates land where
+        the client looks for them."""
+        process, log_path = self.launch(directory, debug)
         _wait_for_service_ready(process, log_path)
 
         return process
 
-    def launch(self, directory: str | None = None):
+    def launch(self, directory: str | None = None, debug: bool = False):
         """Starts the service as `start` does without waiting for it to accept
         connections, for a test that does not expect it to become ready. Returns
         the process and the file its output goes to."""
@@ -514,6 +518,8 @@ class TrackedServices:
             f"lore-service-{len(self.service_processes)}.log"
         )
         command_args = [self.lore_executable_path, "service", "run"]
+        if debug:
+            command_args.append("--debug")
         logger.info("Executing Lore service command: %s", command_args)
         with open(log_path, "w") as log_file:
             process = subprocess.Popen(
@@ -535,6 +541,7 @@ class TrackedServices:
         # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
+        self.output_paths[directory] = log_path
 
         return process, log_path
 
@@ -548,9 +555,32 @@ class TrackedServices:
         # ten seconds to end. Already-exited processes are handled by
         # send_signal, which polls first and does nothing if the process is
         # gone.
-        process.terminate()
+        #
+        # Asked to stop rather than ended outright, so that it closes its SWFS
+        # mounts on the way out: one ended without closing them leaves them to the
+        # driver, which keeps it from unloading. `lore service run` handles SIGTERM
+        # and SIGINT, and Ctrl-C and Ctrl-Break on Windows, by quitting the service,
+        # which then stops as `lore service stop` would have it: see
+        # `handle_service_run` in lore-client/src/cli/commands/service.rs. On
+        # Windows `terminate()` is TerminateProcess, so the request there is
+        # Ctrl-Break, which reaches the service alone because it runs in a process
+        # group of its own. Waited on for long enough to close a mount, which SWFS
+        # bounds at 10 seconds.
+        running = process.poll() is None
+        if sys.platform == "win32":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            process.terminate()
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=30)
+            # A service that stopped exits 0. Anything else after the request
+            # means the signal ended it outright, before it closed its mounts.
+            if running and process.returncode != 0:
+                logger.error(
+                    "Lore service exited with %s when asked to stop, rather than "
+                    "stopping: its SWFS mounts were not closed",
+                    process.returncode,
+                )
         except subprocess.TimeoutExpired:
             logger.warning("Lore service did not exit on terminate, killing it")
             process.kill()
@@ -634,8 +664,7 @@ def lore_service_socket():
     yield socket_name
 
     del os.environ[LORE_SERVICE_SOCKET_VAR]
-    if hasattr(os, "getuid"):
-        service_claim_path(socket_name).unlink(missing_ok=True)
+    remove_service_claim(socket_name)
 
 
 @pytest.fixture(autouse=True)
@@ -991,7 +1020,7 @@ MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
 
 
 def _sandbox_machine_settings(config):
-    """Keeps the machine's Lore settings out of this run.
+    """Keeps the machine's Lore settings and credentials out of this run.
 
     A developer who turns the service on for their own use — `[service]
     use_automatically` and an executable, in the user-level config — would
@@ -1000,13 +1029,20 @@ def _sandbox_machine_settings(config):
     is most of a crate's tests failing at once; here it reaches anything invoking
     Lore that is not a `Lore` object, whose own environment already isolates.
 
-    Both are set on this process's environment, since every subprocess in the
+    The token store is the machine's too. A command started from this
+    environment rather than a test's would otherwise read and write the
+    developer's credentials and OS keyring, which every run on the machine
+    shares.
+
+    These are set on this process's environment, since every subprocess in the
     suite starts from a copy of it, and the tests that load `liblore` in process
     read it directly with no environment of their own to isolate them.
 
     A test that wants the service turns it back on in its own environment, which
     is a copy of this one — see `LORE_SERVICE_ENVIRONMENT`. Under xdist each
-    worker configures separately and so gets a directory of its own.
+    worker configures separately and so gets a directory of its own. That also
+    keeps two workers from creating the token store's key at the same time:
+    nothing locks the store from reading the key to writing a new one.
     """
     os.environ["LORE_USE_SERVICE"] = "0"
     # Not the per-test global directory, which each `Lore` sets for itself. This
@@ -1015,6 +1051,10 @@ def _sandbox_machine_settings(config):
     machine_settings = tempfile.mkdtemp(prefix=MACHINE_SETTINGS_PREFIX)
     config.add_cleanup(lambda: shutil.rmtree(machine_settings, ignore_errors=True))
     os.environ["LORE_GLOBAL_PATH"] = machine_settings
+    # The token store and its key go beside it, as `lore_test_env` keeps each
+    # test's.
+    os.environ["LORE_AUTH_PATH"] = machine_settings
+    os.environ["LORE_AUTH_STORE"] = "fallback"
     logger.info("Standing in for the machine's Lore settings with %s", machine_settings)
 
 
@@ -1062,10 +1102,7 @@ def _start_shared_service(config):
     env = lore_test_env(service_dir)
     env[LORE_SERVICE_SOCKET_VAR] = socket_name
     services = TrackedServices(_lore_executable_path(config), env, service_dir)
-    if hasattr(os, "getuid"):
-        config.add_cleanup(
-            lambda: service_claim_path(socket_name).unlink(missing_ok=True)
-        )
+    config.add_cleanup(lambda: remove_service_claim(socket_name))
     config.add_cleanup(services.terminate_all)
     services.start(service_dir)
     os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name

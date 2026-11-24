@@ -119,9 +119,10 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
             metadata_reads: AtomicUsize::new(0),
             successful_metadata_reads: AtomicUsize::new(0),
             overloads: AtomicUsize::new(0),
-            // v1 first checks that the branch exists. Let that actual read and
-            // its name lookup succeed before faulting the shared push path.
-            allow_first_metadata: v1,
+            // Upstream v0.13 dropped v1's separate branch-exists pre-read: both
+            // handlers load the branch metadata once, in the shared push path,
+            // so the first metadata read is the one to fault for v0 and v1.
+            allow_first_metadata: false,
         });
         let notification: Arc<dyn NotificationSender> = Arc::new(MockNotificationSender::new());
         let result = if v1 {
@@ -182,13 +183,13 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
         assert_eq!(mutable.overloads.load(Ordering::SeqCst), 1, "v1={v1}");
         assert_eq!(
             mutable.successful_metadata_reads.load(Ordering::SeqCst),
-            usize::from(v1),
-            "v1={v1}: the eligibility read must use real metadata"
+            0,
+            "v1={v1}: the only metadata read is the injected failure"
         );
         assert_eq!(
             mutable.metadata_reads.load(Ordering::SeqCst),
-            if v1 { 2 } else { 1 },
-            "v1={v1}: eligibility must precede the injected metadata failure"
+            1,
+            "v1={v1}: the push path reads the branch metadata exactly once"
         );
         let db = direct_client(&url).await;
         let row = db.query_one("SELECT state, outcome, not_applied_reason FROM lore_domain_operation_receipts WHERE operation_id=$1", &[&operation_id.as_ref()]).await.unwrap();

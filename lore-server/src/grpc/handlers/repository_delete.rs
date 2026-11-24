@@ -4,7 +4,6 @@
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::RepositoryDeleteRequest;
 use lore_proto::RepositoryDeleteResponse;
@@ -38,7 +37,8 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
-use crate::grpc::may_delete_repository;
+use crate::grpc::may_administer_repository;
+use crate::grpc::requested_repository_id;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
@@ -69,6 +69,8 @@ pub async fn handler(
             repository_id: &req.id,
         },
     )?;
+    // Upstream v0.13 (efda7650) refuses the all-zero id; do it before the governed prepare write.
+    let id = requested_repository_id(&req.id)?;
     let governed = if admitted.is_some() {
         let digest = canonical_intent_digest(&CanonicalIntent::RepositoryDelete {
             repository_id: &req.id,
@@ -81,7 +83,6 @@ pub async fn handler(
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
-    let id: RepositoryId = Context::from(req.id).into();
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
@@ -141,7 +142,7 @@ async fn repository_delete(
     // witness). Upstream's creator-or-owner/admin check guards the ungoverned
     // path.
     if governed.is_none()
-        && !may_delete_repository(
+        && !may_administer_repository(
             authorizer,
             extensions,
             repository.id,

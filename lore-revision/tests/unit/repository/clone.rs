@@ -13,6 +13,7 @@ use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
@@ -20,18 +21,22 @@ use lore_revision::fs::os::OsFilesystem;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::Node;
+use lore_revision::node::NodeBlock;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::clone::*;
 use lore_revision::repository::prefetch::StopWhen;
 use lore_revision::stage::stage_single_node;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
+use lore_storage::hash::hash_string;
 use zerocopy::FromZeros;
 
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_execution_with;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
+use crate::repository::test_helpers::working_tree_repository_filtered;
 
 async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
     let temp = TempDir::new("lore-clone-temp-path-");
@@ -511,11 +516,10 @@ fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
     std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
 }
 
-/// A clone that fails to write a file reports that failure. Discovery is still walking the tree
-/// when writing stops, and then fails because it cannot pass on the files it finds next. The clone
-/// does not report that second failure.
+/// A clone with unavailable content reports the missing address even when discovery spans
+/// many blocks and more files than the work channel can hold.
 #[tokio::test]
-async fn a_clone_reports_a_failed_file_write_rather_than_the_stopped_discovery() {
+async fn a_clone_reports_missing_content_across_many_blocks() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             let temp = TempDir::new("lore-clone-unwritable-files-");
@@ -664,4 +668,279 @@ async fn a_tree_warm_up_told_to_stop_walks_nothing() {
     let stopped = warmed(test, nested_entries(), u32::MAX, Arc::new(|| true)).await;
 
     assert_eq!((stopped.directories, stopped.blocks), (0, 0));
+}
+
+/// A view whose re-inclusion opens with a wildcard sends discovery into every directory the view
+/// excludes. A clone creates such a directory only where content it keeps lands below it, and still
+/// creates an empty directory the view keeps.
+#[tokio::test]
+async fn a_clone_creates_no_directory_the_view_excludes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-excluded-directories-");
+            let mut filter = Filter::default();
+            filter.view.add_exclusion("/*").expect("view exclusion");
+            filter
+                .view
+                .add_inclusion("*/saved/config/")
+                .expect("view inclusion");
+            let repository = working_tree_repository_filtered(temp.path(), filter).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("game", empty_directory_node()),
+                ("game/saved", empty_directory_node()),
+                ("game/saved/config", empty_directory_node()),
+                ("game/saved/config/a.ini", empty_file),
+                ("game/saved/config/kept", empty_directory_node()),
+                ("game/saved/logs", empty_directory_node()),
+                ("game/saved/logs/l.log", empty_file),
+                ("engine", empty_directory_node()),
+                ("engine/empty", empty_directory_node()),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::empty(),
+                )
+                .await
+                .expect("stage the node");
+            }
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            clone_in_path(ctx).await.expect("clone under the view");
+
+            let exists = |path: &str| on_disk(&temp, &relative_path(path)).exists();
+            assert_eq!(
+                (
+                    exists("game/saved/config/a.ini"),
+                    exists("game/saved/config/kept"),
+                    exists("game/saved/logs"),
+                    exists("engine"),
+                ),
+                (true, true, false, false),
+                "the clone holds what the view keeps and no directory it excludes"
+            );
+        })
+        .await;
+}
+
+/// A clone creates a directory the view includes whose children the view excludes, though a
+/// re-inclusion opening with a wildcard sends discovery into each of them.
+#[tokio::test]
+async fn a_clone_creates_a_directory_the_view_includes_whose_children_it_excludes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-included-directory-");
+            let mut filter = Filter::default();
+            filter
+                .view
+                .add_exclusion("/engine/*")
+                .expect("view exclusion");
+            filter
+                .view
+                .add_inclusion("*/saved/config/")
+                .expect("view inclusion");
+            let repository = working_tree_repository_filtered(temp.path(), filter).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("engine", empty_directory_node()),
+                ("engine/saved", empty_directory_node()),
+                ("engine/saved/r.cpp", empty_file),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::empty(),
+                )
+                .await
+                .expect("stage the node");
+            }
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            clone_in_path(ctx).await.expect("clone under the view");
+
+            let exists = |path: &str| on_disk(&temp, &relative_path(path)).exists();
+            assert_eq!(
+                (exists("engine"), exists("engine/saved")),
+                (true, false),
+                "the directory the view includes is created and the one it excludes is not"
+            );
+        })
+        .await;
+}
+
+/// The missing file finishes before discovery supplies more work. Files supplied after the
+/// consumer observes that error must still be written, and the original error must survive.
+#[tokio::test]
+async fn clone_continues_after_a_missing_file() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-continue-");
+            let repository = working_tree_repository(temp.path()).await;
+            let stats = Arc::new(CloneStats::default());
+            let ctx = CloneContext {
+                operation: repository.file_system().begin_operation().await.unwrap(),
+                repository: repository.clone(),
+                state: State::new(),
+                options: Arc::default(),
+                stats: stats.clone(),
+                modified_times: Arc::default(),
+            };
+            let (tx, rx) = tokio::sync::mpsc::channel(3);
+            tx.try_send(CloneWorkItem {
+                repository: repository.clone(),
+                node: file_node(b"obliterated"),
+                repository_path: relative_path("missing.txt"),
+            })
+            .unwrap();
+            let mut consumer = std::pin::pin!(clone_execute(rx, ctx));
+            assert!(futures::poll!(&mut consumer).is_pending());
+            // Only this test polls the consumer. Reacquiring every permit waits for the
+            // missing file's task to finish without letting the consumer accept another file.
+            let permits = stats.file_inflight.available_permits() as u32
+                + stats.file_inflight_count.load(Ordering::Relaxed) as u32;
+            drop(stats.file_inflight.acquire_many(permits).await.unwrap());
+            for name in ["first.txt", "last.txt"] {
+                tx.try_send(CloneWorkItem {
+                    repository: repository.clone(),
+                    node: Node {
+                        address: Default::default(),
+                        ..file_node(b"")
+                    },
+                    repository_path: relative_path(name),
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let error = consumer
+                .await
+                .expect_err("missing content must fail the operation");
+            assert!(caused_by::<AddressNotFound>(&error));
+            for name in ["first.txt", "last.txt"] {
+                assert_eq!(std::fs::read(temp.path().join(name)).unwrap(), b"");
+            }
+            assert_eq!(stats.complete.file_complete.load(Ordering::Relaxed), 2);
+        })
+        .await;
+}
+
+/// A revision can hold a node named for a Windows drive, which a writer that skips the name rules
+/// stores. A clone skips the node, so nothing is created for it, and writes its siblings. On
+/// Windows the name would take the path out of the working tree.
+#[tokio::test]
+async fn a_clone_skips_a_node_named_for_a_drive() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-drive-name-");
+            let repository = working_tree_repository(temp.path()).await;
+            let empty_file = Node {
+                address: Default::default(),
+                ..file_node(b"")
+            };
+            let state = State::new();
+            for (name, node) in [
+                ("alpha", empty_file),
+                ("drive", empty_directory_node()),
+                ("omega", empty_file),
+            ] {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::Full,
+                )
+                .await
+                .expect("stage the node");
+            }
+
+            let planted = state
+                .find_subnode(repository.clone(), ROOT_NODE, hash_string("drive"))
+                .await
+                .expect("the placeholder resolves");
+            let block_index = NodeBlock::index(planted);
+            let block = state
+                .block_with_nametable(repository.clone(), block_index)
+                .await
+                .expect("the block reads back");
+            {
+                let mut writer = block.write();
+                let node = writer.node(Node::index(planted));
+                let (offset, length) = (node.name_offset, node.name_length);
+                node.name_hash = hash_string("C:");
+                let (offset, length) = writer
+                    .node_name_store_unchecked("C:", offset, length)
+                    .expect("the unchecked store accepts the name");
+                let node = writer.node(Node::index(planted));
+                node.name_offset = offset;
+                node.name_length = length;
+                writer.mark_dirty();
+            }
+            state.block_modified(block, block_index);
+
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+            clone_in_path(ctx)
+                .await
+                .expect("clone past the planted node");
+
+            let mut names: Vec<_> = std::fs::read_dir(temp.path())
+                .expect("list the working tree")
+                .map(|entry| entry.expect("an entry").file_name())
+                .filter(|name| name != ".lore")
+                .collect();
+            names.sort();
+            assert_eq!(names, ["alpha", "omega"]);
+        })
+        .await;
 }

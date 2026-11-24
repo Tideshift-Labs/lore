@@ -304,6 +304,10 @@ async fn armed_fenced_coordinator_serves_lock_and_unlock_with_ownership_tokens()
     let token = AuthorizationToken {
         issuer: "https://issuer.example".to_owned(),
         user_id: "wp120-released-client".to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned(), "write".to_owned()],
+        }]),
         ..Default::default()
     };
 
@@ -501,6 +505,7 @@ async fn armed_service_with(
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
         claims_authorizer(),
+        None,
         Duration::from_secs(60),
         false,
     )
@@ -733,6 +738,7 @@ async fn force_unlock_with_no_fenced_coordinator_is_refused() {
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
         claims_authorizer(),
+        None,
         Duration::from_secs(60),
         false,
     );
@@ -815,6 +821,7 @@ async fn unarmed_legacy_route_succeeds_and_appends_nothing() {
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
         claims_authorizer(),
+        None,
         Duration::from_secs(60),
         false,
     );
@@ -953,6 +960,7 @@ async fn force_unlock_permission_check_precedes_fenced_routing_disclosure() {
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
         claims_authorizer(),
+        None,
         Duration::from_secs(60),
         false,
     );
@@ -1191,6 +1199,10 @@ async fn wp120_single_branch_query_namespace_fence_advances_on_acquire_and_relea
     let token = AuthorizationToken {
         issuer: "https://issuer.example".to_owned(),
         user_id: "wp120-namespace-generation".to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned(), "write".to_owned()],
+        }]),
         ..Default::default()
     };
     let read = || async {
@@ -1335,16 +1347,18 @@ async fn wp120_legacy_route_query_carries_no_namespace_generation() {
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
         claims_authorizer(),
+        None,
         Duration::from_secs(60),
         false,
     );
     let resource = one_resource();
     service
-        .lock(request_with_repository(
+        .lock(authenticated_request(
             LockRequest {
                 resources: vec![resource.clone()],
             },
             &repository_id,
+            &read_write_permission_token("wp120-legacy-route"),
         ))
         .await
         .expect("legacy acquire must succeed");
@@ -1451,6 +1465,10 @@ async fn wp120_lock_activity_on_one_branch_does_not_move_a_sibling_branch_namesp
     let token = AuthorizationToken {
         issuer: "https://issuer.example".to_owned(),
         user_id: "wp120-cross-branch".to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned(), "write".to_owned()],
+        }]),
         ..Default::default()
     };
     let read = |branch: [u8; 16]| {
@@ -1539,6 +1557,10 @@ fn released_client(subject: &str) -> AuthorizationToken {
     AuthorizationToken {
         issuer: "https://issuer.example".to_owned(),
         user_id: subject.to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned(), "write".to_owned()],
+        }]),
         ..Default::default()
     }
 }

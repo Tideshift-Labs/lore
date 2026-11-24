@@ -61,8 +61,8 @@ async fn the_builder_binds_the_v0_repository_service_to_the_domain_context() {
             Default::default(),
             None,
         )
-        .with_jwt_verifier(
-            None,
+        .with_token_verification(
+            lore_server::auth::jwt::TokenVerification::Ignore,
             false,
             Arc::new(AllowAllRepositoryAuthorizer),
             repository_catalog,

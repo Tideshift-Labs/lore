@@ -366,7 +366,8 @@ mod quic_token_expiry_tests {
             maps: Arc<std::sync::Mutex<Vec<Arc<SessionMap>>>>,
         ) -> Self {
             let repository_authorizer = authorizer();
-            let jwt_verifier = Arc::new(Some(verifier()));
+            let jwt_verifier =
+                Arc::new(lore_server::auth::jwt::TokenVerification::Verify(verifier()));
             let mut service_store = ServiceStore::default();
             service_store.add_service(
                 TEST_PROTOCOL_V4,
@@ -493,7 +494,12 @@ mod quic_token_expiry_tests {
                         None,
                     )
                     .with_caller_capability_policy(policy)
-                    .with_jwt_verifier(Some(verifier()), true, authorizer(), repository_catalog)?
+                    .with_token_verification(
+                        lore_server::auth::jwt::TokenVerification::Verify(verifier()),
+                        true,
+                        authorizer(),
+                        repository_catalog,
+                    )?
                     .serve_with_listener(listener, signal)
                     .await
             }

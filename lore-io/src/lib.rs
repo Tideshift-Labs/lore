@@ -38,6 +38,10 @@ mod file;
 #[cfg(feature = "test-util")]
 pub mod file;
 #[cfg(all(target_family = "windows", not(feature = "test-util")))]
+mod find;
+#[cfg(all(target_family = "windows", feature = "test-util"))]
+pub mod find;
+#[cfg(all(target_family = "windows", not(feature = "test-util")))]
 mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod iocp;
@@ -51,6 +55,10 @@ pub mod pool;
 mod psync;
 #[cfg(feature = "test-util")]
 pub mod psync;
+#[cfg(not(feature = "test-util"))]
+mod stat;
+#[cfg(feature = "test-util")]
+pub mod stat;
 #[cfg(target_os = "linux")]
 mod uring;
 
@@ -70,6 +78,8 @@ pub use iocp::IocpStats;
 pub use pool::PoolStats;
 pub use pool::requested_max_threads;
 pub use pool::set_max_threads;
+pub use stat::Stat;
+pub use stat::StatKind;
 #[cfg(target_os = "linux")]
 pub use uring::UringStats;
 

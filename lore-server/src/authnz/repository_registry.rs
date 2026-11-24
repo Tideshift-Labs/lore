@@ -3,8 +3,8 @@
 use std::fmt;
 
 use lore_base::types::RepositoryId;
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
+use lore_proto::lore::user::v1::RepositoryRegisterRequest;
+use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
 use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::DeleteResourceRequest;
 use lore_revision::environment::EnvironmentConfig;
@@ -12,7 +12,7 @@ use tonic::Code;
 use tonic::Status;
 use tracing::info;
 
-use super::auth::grpc_get_user_service_client;
+use super::auth::grpc_get_repository_registry_client;
 use super::common::create_request_with_authorization;
 use super::rebac::RebacApiClient;
 use super::rebac::grpc_get_rebac_client;
@@ -26,8 +26,8 @@ pub enum RepositoryRegistry {
     Unregistered,
     /// `RebacApi.CreateResource` / `DeleteResource` at this `auth_url`.
     AuthService(String),
-    /// `lore.user.v1.UserService.PartitionAdd` / `PartitionRemove` at this
-    /// `user_url`.
+    /// `lore.user.v1.RepositoryRegistryService.RepositoryRegister` /
+    /// `RepositoryUnregister` at this `user_url`.
     UserService(String),
 }
 
@@ -67,20 +67,20 @@ impl RepositoryRegistry {
                 repository_create_auth_resource(client, authorization, repository_id, name).await
             }
             Self::UserService(user_url) => {
-                info!("Repository add partition {repository_id} with name {name}");
-                let mut client = grpc_get_user_service_client(user_url).await?;
+                info!("Repository register {repository_id} with name {name}");
+                let mut client = grpc_get_repository_registry_client(user_url).await?;
                 let request = create_request_with_authorization(
-                    PartitionAddRequest {
-                        partition: repository_id.into(),
+                    RepositoryRegisterRequest {
+                        id: repository_id.into(),
                         name: name.to_string(),
                     },
                     authorization,
                 )?;
-                match client.partition_add(request).await {
-                    // A repeated add under the same name answers `OK`, so
-                    // `ALREADY_EXISTS` is the partition listed under another name.
+                match client.repository_register(request).await {
+                    // A repeated register under the same name answers `OK`, so
+                    // `ALREADY_EXISTS` is the repository registered under another name.
                     Err(err) if err.code() == Code::AlreadyExists => {
-                        info!(auth_error = ?err, requested_repo_id = %repository_id, "Partition registered under another name");
+                        info!(auth_error = ?err, requested_repo_id = %repository_id, "Repository registered under another name");
                         Err(Status::already_exists(format!(
                             "Repository {repository_id} is registered under another name than {name}"
                         )))
@@ -89,7 +89,7 @@ impl RepositoryRegistry {
                         result.map(drop),
                         repository_id,
                         name,
-                        "user directory PartitionAdd",
+                        "repository registry RepositoryRegister",
                     ),
                 }
             }
@@ -120,17 +120,17 @@ impl RepositoryRegistry {
                 )
             }
             Self::UserService(user_url) => {
-                info!("Repository remove partition {repository_id}");
-                let mut client = grpc_get_user_service_client(user_url).await?;
+                info!("Repository unregister {repository_id}");
+                let mut client = grpc_get_repository_registry_client(user_url).await?;
                 let request = create_request_with_authorization(
-                    PartitionRemoveRequest {
-                        partition: repository_id.into(),
+                    RepositoryUnregisterRequest {
+                        id: repository_id.into(),
                     },
                     authorization,
                 )?;
                 remove_outcome(
-                    client.partition_remove(request).await.map(drop),
-                    "user directory PartitionRemove",
+                    client.repository_unregister(request).await.map(drop),
+                    "repository registry RepositoryUnregister",
                 )
             }
         }
@@ -142,7 +142,7 @@ impl fmt::Display for RepositoryRegistry {
         match self {
             Self::Unregistered => f.write_str("none"),
             Self::AuthService(url) => write!(f, "RebacApi({url})"),
-            Self::UserService(url) => write!(f, "UserService({url})"),
+            Self::UserService(url) => write!(f, "RepositoryRegistryService({url})"),
         }
     }
 }

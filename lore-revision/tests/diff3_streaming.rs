@@ -16,39 +16,47 @@ mod tests {
     use std::io::Write;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::Mutex;
 
     use lore_base::types::Hash;
+    use lore_base::types::TypedBytes;
     use lore_revision::branch;
     use lore_revision::change::FileAction;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreEvent;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::LORE_CONTEXT;
     use lore_revision::lore::RepositoryId;
     use lore_revision::lore::runtime;
     use lore_revision::node::NodeFlags;
+    use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
+    use lore_revision::state;
 
     include!("helper.rs");
 
-    /// An offline execution context, for tests that call `merge_start`.
+    /// An offline execution context sending its events to `dispatcher`, for
+    /// tests that call `merge_start`.
     ///
     /// `merge_start` reads the remote unless `globals.offline` is set, and the
     /// default test execution context is not offline. `test_store_create` still
     /// runs, because creating the stores seeds `LORE_CONTEXT`. Only the
     /// execution it returns is replaced.
-    async fn offline_execution() -> Arc<lore_revision::interface::ExecutionContext> {
+    async fn offline_execution(
+        dispatcher: EventDispatcher,
+    ) -> Arc<lore_revision::interface::ExecutionContext> {
         let _ = test_store_create().await.expect("Failed to create stores");
         Arc::new(lore_revision::interface::ExecutionContext::new_client(
             lore_revision::interface::LoreGlobalArgs::default().set_offline(),
-            lore_revision::relay::EventDispatcher::no_dispatch(),
+            dispatcher,
         ))
     }
 
@@ -420,6 +428,97 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A path both sides change differently is a conflict when it holds glob
+    /// syntax, as it is in a walk no source path filter scopes. So is a path the
+    /// source renames and changes while the target changes it.
+    ///
+    /// `dir/plain.txt` and `dir/old.txt` hold none and stand for every ordinary
+    /// path.
+    #[tokio::test]
+    async fn both_sides_changing_a_path_with_glob_syntax_conflict() {
+        const GUID: &str = "{3F2504E0-4F89-11D3-9A0C-0305E82C3301}";
+        const MOVES: [(&str, &str); 2] =
+            [("dir/old.txt", "dir/new.txt"), ("dir/[y].txt", "dir/y.txt")];
+        let mut paths = vec![
+            "dir/plain.txt".to_owned(),
+            "dir/[x].txt".to_owned(),
+            "a{b,c}.txt".to_owned(),
+            format!("{GUID}/f.txt"),
+            format!("{GUID}/[x].txt"),
+        ];
+        if cfg!(unix) {
+            paths.push("**/f.txt".to_owned());
+        }
+
+        let (_immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+                let write_all = |content: &[u8]| {
+                    let moved = MOVES.iter().map(|(from, _)| *from);
+                    for path in paths.iter().map(String::as_str).chain(moved) {
+                        fixture.write_file(path, content);
+                    }
+                };
+
+                write_all(b"base\n");
+                let base_revision = fixture.stage_and_commit("base").await;
+
+                let source_branch = fixture.create_branch("source").await;
+                write_all(b"source\n");
+                for (from, to) in MOVES {
+                    fixture.stage_move(from, to).await;
+                }
+                let source_revision = fixture.stage_and_commit("source change").await;
+
+                fixture
+                    .switch_to(fixture.main_branch_id, base_revision)
+                    .await;
+                for (_, to) in MOVES {
+                    fixture.delete_file(to);
+                }
+                let target_branch = fixture.create_branch("target").await;
+                write_all(b"target\n");
+                let target_revision = fixture.stage_and_commit("target change").await;
+
+                let diff = Box::pin(branch::diff3_collect(
+                    fixture.repository.clone(),
+                    source_branch,
+                    source_revision,
+                    target_branch,
+                    target_revision,
+                    None,
+                    false, // include_same
+                    false, // auto_resolve
+                ))
+                .await
+                .expect("diff3_collect failed");
+
+                let mut conflicts: Vec<(&str, &str)> = diff
+                    .conflicts
+                    .iter()
+                    .map(|(source, target)| (source.path().as_str(), target.path().as_str()))
+                    .collect();
+                conflicts.sort_unstable();
+                let mut expected: Vec<(&str, &str)> = paths
+                    .iter()
+                    .map(|path| (path.as_str(), path.as_str()))
+                    .chain(MOVES.iter().map(|&(from, to)| (to, from)))
+                    .collect();
+                expected.sort_unstable();
+                assert_eq!(
+                    conflicts,
+                    expected,
+                    "changes {:?}",
+                    changes_as_summary(&diff.changes)
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// A `branch merge` run under a sparse view filter must still merge
     /// changes at out-of-view paths into the tree.
     ///
@@ -429,7 +528,7 @@ mod tests {
     /// does not list the out-of-view path.
     #[tokio::test]
     async fn merge_under_view_filter_must_not_drop_out_of_view_changes() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -544,32 +643,28 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// Build a view filter that excludes `directory/` at every depth, and a
-    /// repository context that applies it.
-    fn excluded_context(fixture: &DiffFixture, directory: &str) -> Arc<RepositoryContext> {
-        let mut view_filter = lore_revision::filter::Filter::default();
-        view_filter
-            .view
-            .add_exclusion(directory)
-            .expect("view exclude");
-        view_filter
-            .view
-            .add_exclusion(&format!("{directory}/**"))
-            .expect("view exclude");
-        Arc::new(fixture.repository.to_filter_context(Arc::new(view_filter)))
+    /// A repository context whose view holds `rules`, a leading `!` re-including
+    /// as it does in a view file.
+    fn view_context(fixture: &DiffFixture, rules: &[&str]) -> Arc<RepositoryContext> {
+        Arc::new(
+            fixture
+                .repository
+                .to_filter_context(Arc::new(test_filter(&[], rules))),
+        )
     }
 
     fn engine_excluded_context(fixture: &DiffFixture) -> Arc<RepositoryContext> {
-        excluded_context(fixture, "engine")
+        view_context(fixture, &["engine", "engine/**"])
     }
 
-    /// Merge `main` into `feature` through `view_repo` and return the merged
-    /// revision.
+    /// Merge `main` into the current branch through `view_repo` and return the
+    /// merged revision, or with `no_commit` the staged state it leaves.
     async fn merge_main_under_view(
         view_repo: &Arc<RepositoryContext>,
         fixture: &DiffFixture,
         main_branch: BranchId,
         message: &str,
+        no_commit: bool,
     ) -> Hash {
         Box::pin(lore_revision::branch::merge::merge_start(
             view_repo.clone(),
@@ -578,7 +673,7 @@ mod tests {
             lore_revision::branch::merge::MergeStartOptions {
                 message: message.to_string(),
                 link_messages: std::collections::HashMap::new(),
-                no_commit: false,
+                no_commit,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
                 inherit_metadata: Default::default(),
             },
@@ -603,7 +698,7 @@ mod tests {
         const SECOND: &[u8] = b"#!/bin/sh\necho second\n";
         const FEATURE: &str = "feature.txt";
 
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -637,6 +732,7 @@ mod tests {
                     &fixture,
                     main_branch,
                     "merge main into feature",
+                    false,
                 )
                 .await;
 
@@ -686,79 +782,576 @@ mod tests {
             .collect()
     }
 
+    /// Every directory in the tree of `revision`, in path order, with its hash and
+    /// size. A directory's path ends in `/`, and the root's is `/`.
+    async fn directory_hashes(fixture: &DiffFixture, revision: Hash) -> Vec<(String, Hash, u64)> {
+        let repository = &fixture.repository;
+        let state = state::State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Failed to read the revision");
+        let tree = state
+            .tree(repository.clone())
+            .await
+            .expect("Failed to read the tree");
+        let mut directories = vec![("/".to_string(), tree.hash_root, tree.size)];
+        let mut pending = vec![("/".to_string(), lore_revision::node::ROOT_NODE)];
+        while let Some((path, node_id)) = pending.pop() {
+            for child in state
+                .node_children(repository.clone(), node_id)
+                .await
+                .expect("Failed to list a directory")
+            {
+                let node = state
+                    .node(repository.clone(), child)
+                    .await
+                    .expect("Failed to read a node");
+                if node.is_directory() {
+                    let name = state
+                        .node_name_clone(repository.clone(), child)
+                        .await
+                        .expect("Failed to read a node name");
+                    let child_path = format!("{path}{name}/");
+                    directories.push((child_path.clone(), node.address.hash, node.size));
+                    pending.push((child_path, child));
+                }
+            }
+        }
+        directories.sort_unstable();
+        directories
+    }
+
+    /// The changes the delta of `revision` records, in path order, as the path, the
+    /// `FileAction` number and the change flags. A deleted node's path is read from
+    /// the first parent, the tree that holds it.
+    async fn delta_changes(fixture: &DiffFixture, revision: Hash) -> Vec<(String, u16, u16)> {
+        let repository = &fixture.repository;
+        let merged = state::State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Failed to read the revision");
+        let parent = state::State::deserialize(repository.clone(), merged.parent_self())
+            .await
+            .expect("Failed to read the first parent");
+        let delta = merged
+            .delta_block(repository.clone())
+            .await
+            .expect("Failed to read the delta")
+            .to_aligned::<lore_revision::node::NodeDelta>();
+        let mut changes = Vec::new();
+        for entry in delta.as_type_slice::<lore_revision::node::NodeDelta>() {
+            let tree = if entry.action == FileAction::Delete as u16 {
+                &parent
+            } else {
+                &merged
+            };
+            let path = tree
+                .node_path(repository.clone(), entry.node)
+                .await
+                .expect("Failed to read a delta path");
+            changes.push((path, entry.action, entry.flags));
+        }
+        changes.sort_unstable();
+        changes
+    }
+
+    /// The history of the file at `path` from `revision`, as the path, action and
+    /// path moved from of each entry. It runs in an execution of its own, whose
+    /// events it collects: draining an execution's events closes its channel.
+    async fn file_history(
+        fixture: &DiffFixture,
+        revision: Hash,
+        path: &str,
+    ) -> Vec<(String, String, String)> {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorder = recorded.clone();
+        let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
+            lore_revision::interface::LoreGlobalArgs::default().set_offline(),
+            EventDispatcher::new(Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::FileHistory(entry) = event {
+                    recorder.lock().expect("Recorded history poisoned").push((
+                        entry.path.to_string(),
+                        format!("{:?}", entry.action),
+                        entry.from_path.to_string(),
+                    ));
+                }
+            }))),
+        ));
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                Box::pin(file::history::history(
+                    fixture.repository.clone(),
+                    fixture.repo_path.join(path).to_string_lossy().into_owned(),
+                    file::history::HistoryOptions {
+                        revision: Some(revision.to_string()),
+                        branch: None,
+                        length: 0,
+                        depth: 0,
+                    },
+                )),
+            )
+            .await
+            .expect("Failed to read the file history");
+        execution.dispatcher.drain().await;
+        std::mem::take(&mut *recorded.lock().expect("Recorded history poisoned"))
+    }
+
+    /// A change main makes in an adoption test.
+    #[derive(Clone, Copy)]
+    enum Edit {
+        /// Write a file with the content.
+        Write(&'static str, &'static [u8]),
+        /// Delete a file.
+        Delete(&'static str),
+        /// Delete a directory and everything below it.
+        DeleteDirectory(&'static str),
+        /// Move a file, keeping its identity.
+        Move(&'static str, &'static str),
+        /// Create an empty directory.
+        MakeDirectory(&'static str),
+        /// Commit what main holds so far.
+        Commit,
+    }
+
+    /// The files of an adoption test's base below `engine/`.
+    const ENGINE_BASE: &[(&str, &[u8])] = &[
+        ("engine/keep.txt", b"keep\n"),
+        ("engine/modify.txt", b"modify v1\n"),
+        ("engine/remove.txt", b"remove\n"),
+        ("engine/move.txt", b"move\n"),
+        ("engine/rename.txt", b"rename v1\n"),
+        ("engine/lib/core/util/keep.txt", b"util\n"),
+        ("engine/sub/deep/remove_deep.txt", b"remove deep\n"),
+        ("engine/sub/gone/remove_gone.txt", b"remove gone\n"),
+    ];
+
+    /// What main does to `engine/`: modifies a file, adds three (one in a new
+    /// directory, one below three otherwise unchanged directories) and an empty
+    /// directory, deletes two files and a directory, leaving `engine/sub/deep` empty,
+    /// moves a file into a new directory, and renames a file and changes its content.
+    const ENGINE_EDITS: &[Edit] = &[
+        Edit::Write("engine/modify.txt", b"modify v2\n"),
+        Edit::Write("engine/added.txt", b"added\n"),
+        Edit::Write("engine/newdir/added_deep.txt", b"added deep\n"),
+        Edit::MakeDirectory("engine/emptydir"),
+        Edit::Write("engine/lib/core/util/added.txt", b"added util\n"),
+        Edit::Delete("engine/remove.txt"),
+        Edit::Delete("engine/sub/deep/remove_deep.txt"),
+        Edit::DeleteDirectory("engine/sub/gone"),
+        Edit::Move("engine/move.txt", "engine/moved/move.txt"),
+        Edit::Move("engine/rename.txt", "engine/renamed.txt"),
+        Edit::Write("engine/renamed.txt", b"rename v2\n"),
+    ];
+
+    /// The history [`reshape_engine`] builds.
+    struct ReshapedEngine {
+        base: &'static [(&'static str, &'static [u8])],
+        main_branch: BranchId,
+        feature_rev: Hash,
+        control_branch: BranchId,
+    }
+
+    /// Build the history an adoption test merges, and leave `feature` current with
+    /// its working tree restored.
+    ///
+    /// The base holds `game/a.txt` and `base`. `feature` changes the in-view
+    /// `game/a.txt` only, so `engine/` matches the base and qualifies for
+    /// adoption, and `control` starts at the same revision for the merge with no
+    /// view. main makes `edits`.
+    async fn reshape_engine(
+        fixture: &DiffFixture,
+        base: &'static [(&'static str, &'static [u8])],
+        edits: &[Edit],
+    ) -> ReshapedEngine {
+        fixture.write_file("game/a.txt", b"base\n");
+        for (path, content) in base {
+            fixture.write_file(path, content);
+        }
+        let base_revision = fixture.stage_and_commit("base").await;
+        let main_branch = fixture.main_branch_id;
+
+        let feature_branch = fixture.create_branch("feature").await;
+        fixture.write_file("game/a.txt", b"feature change\n");
+        let feature_rev = fixture.stage_and_commit("feature change").await;
+        let control_branch = fixture.create_branch("control").await;
+
+        fixture.switch_to(main_branch, base_revision).await;
+        fixture.write_file("game/a.txt", b"base\n");
+        for edit in edits {
+            match *edit {
+                Edit::Write(path, content) => fixture.write_file(path, content),
+                Edit::Delete(path) => fixture.delete_file(path),
+                Edit::DeleteDirectory(path) => fixture.delete_dir(path),
+                Edit::Move(from, to) => {
+                    fixture.stage_all().await;
+                    fixture.stage_move(from, to).await;
+                }
+                Edit::MakeDirectory(path) => {
+                    std::fs::create_dir_all(fixture.repo_path.join(path))
+                        .expect("Failed to create a directory");
+                }
+                Edit::Commit => {
+                    fixture
+                        .stage_and_commit("main reshapes engine in steps")
+                        .await;
+                }
+            }
+        }
+        fixture.stage_and_commit("main reshapes engine").await;
+
+        let reshaped = ReshapedEngine {
+            base,
+            main_branch,
+            feature_rev,
+            control_branch,
+        };
+        restore_feature_tree(fixture, &reshaped, feature_branch).await;
+        reshaped
+    }
+
+    /// Switch to `branch` at feature's revision, with the working tree that revision
+    /// holds.
+    async fn restore_feature_tree(
+        fixture: &DiffFixture,
+        reshaped: &ReshapedEngine,
+        branch: BranchId,
+    ) {
+        fixture.switch_to(branch, reshaped.feature_rev).await;
+        fixture.delete_dir("engine");
+        fixture.write_file("game/a.txt", b"feature change\n");
+        for (path, content) in reshaped.base {
+            fixture.write_file(path, content);
+        }
+    }
+
+    /// Merge main into control with no view, from feature's revision and working
+    /// tree, and return the merged revision.
+    async fn merge_main_into_control(fixture: &DiffFixture, reshaped: &ReshapedEngine) -> Hash {
+        restore_feature_tree(fixture, reshaped, reshaped.control_branch).await;
+        Box::pin(merge_main_under_view(
+            &fixture.repository,
+            fixture,
+            reshaped.main_branch,
+            "merge main with no view",
+            false,
+        ))
+        .await
+    }
+
+    /// The action the delta entries in `delta` record for `path`.
+    fn recorded_actions(delta: &[(String, u16, u16)], path: &str) -> Vec<u16> {
+        delta
+            .iter()
+            .filter(|(entry, _, _)| entry == path)
+            .map(|(_, action, _)| *action)
+            .collect()
+    }
+
     /// Adopting an out-of-view subtree must apply every kind of change inside
-    /// it, not only modifications.
+    /// it, not only modifications, and leave the tree, the delta and the file
+    /// history a merge with no view leaves, whether the merge commits or is
+    /// staged and committed separately.
     ///
     /// Adoption reconciles the two subtrees: it skips a child whose address
     /// already matches, overwrites one that differs, creates one the other
-    /// branch added, and discards one it no longer has. A merge that only
-    /// modifies files exercises the overwrite alone, so this covers the create
-    /// and discard paths, including a new directory and a nested delete.
+    /// branch added, moves one the other branch moved, and discards one the
+    /// other branch deleted. [`ENGINE_EDITS`] covers each. Every directory, the root
+    /// included, must carry the hash and size the merge with no view gives it,
+    /// since a later diff takes a directory whose hash matches as unchanged, and
+    /// the delta must list the same changes with the same flags, since revision
+    /// info and file history read it. Both merges record a directory main adds as
+    /// an add, empty or not.
     #[tokio::test]
     async fn merge_adopts_added_and_deleted_paths_in_an_out_of_view_subtree() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                for no_commit in [false, true] {
+                    let fixture = DiffFixture::new().await;
+                    let reshaped = reshape_engine(&fixture, ENGINE_BASE, ENGINE_EDITS).await;
+                    let view_repo = engine_excluded_context(&fixture);
+                    let mut merged_rev = Box::pin(merge_main_under_view(
+                        &view_repo,
+                        &fixture,
+                        reshaped.main_branch,
+                        "merge main",
+                        no_commit,
+                    ))
+                    .await;
+                    if no_commit {
+                        merged_rev = commit::commit_boxed(
+                            view_repo.clone(),
+                            &fixture.write_token,
+                            CommitOptions {
+                                message: "merge main".to_string(),
+                                link_messages: std::collections::HashMap::new(),
+                                link: None,
+                                layer_messages: std::collections::HashMap::new(),
+                                layer: None,
+                            },
+                        )
+                        .await
+                        .expect("Failed to commit the merge");
+                    }
+                    let control_rev = merge_main_into_control(&fixture, &reshaped).await;
+
+                    assert_eq!(
+                        directory_hashes(&fixture, merged_rev).await,
+                        directory_hashes(&fixture, control_rev).await,
+                        "the merge under the view, no_commit {no_commit}, left directories \
+                         the merge with no view does not",
+                    );
+                    let merged_delta = delta_changes(&fixture, merged_rev).await;
+                    let control_delta = delta_changes(&fixture, control_rev).await;
+                    for directory in ["engine/emptydir", "engine/newdir"] {
+                        for (merge, delta) in [
+                            ("under the view", &merged_delta),
+                            ("with no view", &control_delta),
+                        ] {
+                            assert_eq!(
+                                recorded_actions(delta, directory),
+                                vec![FileAction::Add as u16],
+                                "the merge {merge}, no_commit {no_commit}, has to record the \
+                                 directory {directory} main adds as an add, delta {delta:?}",
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        merged_delta, control_delta,
+                        "the merge under the view, no_commit {no_commit}, recorded a delta \
+                         the merge with no view does not",
+                    );
+                    for path in ["engine/moved/move.txt", "engine/renamed.txt"] {
+                        assert_eq!(
+                            file_history(&fixture, merged_rev, path).await,
+                            file_history(&fixture, control_rev, path).await,
+                            "the merge under the view, no_commit {no_commit}, recorded a \
+                             history of {path} the merge with no view does not",
+                        );
+                    }
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A move across the boundary of an adopted subtree is recorded as an add and a
+    /// delete. The diff that pairs moves sees the delete outside the subtree but not
+    /// the add inside it, and the reconcile pairs only the changes inside it. The
+    /// merge leaves the tree a merge with no view leaves, which records the move.
+    #[tokio::test]
+    async fn a_move_into_an_adopted_subtree_stays_an_add_and_a_delete() {
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+                let reshaped = reshape_engine(
+                    &fixture,
+                    &[("x.txt", b"x\n"), ("engine/keep.txt", b"keep\n")],
+                    &[Edit::Move("x.txt", "engine/x.txt")],
+                )
+                .await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &engine_excluded_context(&fixture),
+                    &fixture,
+                    reshaped.main_branch,
+                    "merge main",
+                    false,
+                ))
+                .await;
+                let control_rev = merge_main_into_control(&fixture, &reshaped).await;
+
+                assert_eq!(
+                    directory_hashes(&fixture, merged_rev).await,
+                    directory_hashes(&fixture, control_rev).await,
+                    "the merge under the view left directories the merge with no view does not",
+                );
+                let actions = |delta: Vec<(String, u16, u16)>| -> Vec<(String, u16)> {
+                    delta
+                        .into_iter()
+                        .filter(|(path, _, _)| path.ends_with("x.txt"))
+                        .map(|(path, action, _)| (path, action))
+                        .collect()
+                };
+                assert_eq!(
+                    actions(delta_changes(&fixture, merged_rev).await),
+                    vec![
+                        ("engine/x.txt".to_string(), FileAction::Add as u16),
+                        ("x.txt".to_string(), FileAction::Delete as u16),
+                    ],
+                    "the merge under the view records the move into the subtree as an add \
+                     and a delete",
+                );
+                assert_eq!(
+                    actions(delta_changes(&fixture, control_rev).await),
+                    vec![("engine/x.txt".to_string(), FileAction::Move as u16)],
+                    "the merge with no view records the move",
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A move out of a directory the move otherwise leaves unchanged changes that
+    /// directory's hash. The merge under the view has to record the move, and leave
+    /// `engine/` as main holds it, since the feature branch never touched it.
+    ///
+    /// A staged move leaves the moved-from directory's hash stale (lore-g2fl), so
+    /// main also adds a file to that directory and deletes it in a later commit,
+    /// and its own tree holds the directory's new hash. The merge with no view
+    /// relinks the file the same way, and leaves the directory stale; it is not
+    /// compared here.
+    #[tokio::test]
+    async fn a_move_out_of_an_unchanged_directory_in_an_adopted_subtree() {
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = DiffFixture::new().await;
+                let reshaped = reshape_engine(
+                    &fixture,
+                    &[("engine/a/x.txt", b"x\n"), ("engine/a/y.txt", b"y\n")],
+                    &[
+                        Edit::Move("engine/a/x.txt", "engine/x.txt"),
+                        Edit::Write("engine/a/restage.txt", b"restage\n"),
+                        Edit::Commit,
+                        Edit::Delete("engine/a/restage.txt"),
+                    ],
+                )
+                .await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &engine_excluded_context(&fixture),
+                    &fixture,
+                    reshaped.main_branch,
+                    "merge main",
+                    false,
+                ))
+                .await;
+
+                let merged = state::State::deserialize(fixture.repository.clone(), merged_rev)
+                    .await
+                    .expect("Failed to read the merged revision");
+                let [_, main_rev] = merged.parents();
+                let engine = |directories: Vec<(String, Hash, u64)>| -> Vec<(String, Hash, u64)> {
+                    directories
+                        .into_iter()
+                        .filter(|(path, _, _)| path.starts_with("engine/"))
+                        .collect()
+                };
+                assert_eq!(
+                    engine(directory_hashes(&fixture, merged_rev).await),
+                    engine(directory_hashes(&fixture, main_rev).await),
+                    "the merge under the view left engine/ other than main holds it",
+                );
+                let delta = delta_changes(&fixture, merged_rev).await;
+                assert_eq!(
+                    recorded_actions(&delta, "engine/x.txt"),
+                    vec![FileAction::Move as u16],
+                    "the merge under the view has to record the move, delta {delta:?}",
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A view that excludes everything and re-includes the root entries and one
+    /// directory leaves every directory below another root directory out of
+    /// view, since `!/*` matches nothing below the first level. A merge adopts
+    /// such a subtree the branch never touched, as it adopts one an exclusion
+    /// names.
+    ///
+    /// The merge applies an adopted subtree before it counts the files it
+    /// realizes, so the merge under the view reports no file to update or
+    /// delete, where the same merge with no view reports the three files main
+    /// writes in `engine/sub` and the two it deletes. The merge under the view
+    /// also has to leave the tree the merge with no view leaves, and write
+    /// nothing out of view to the working tree.
+    #[tokio::test]
+    async fn merge_adopts_a_subtree_below_a_shallow_reinclusion() {
+        let totals = Arc::new(Mutex::new(Vec::new()));
+        let recorded = totals.clone();
+        let execution = offline_execution(EventDispatcher::new(Some(Box::new(
+            move |event: &LoreEvent| {
+                if let LoreEvent::BranchMergeStartEnd(end) = event {
+                    recorded
+                        .lock()
+                        .expect("Recorded totals poisoned")
+                        .push((end.stats.file_update_total, end.stats.file_delete_total));
+                }
+            },
+        ))))
+        .await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
                 let fixture = DiffFixture::new().await;
 
-                // 1. Base revision on main.
                 fixture.write_file("game/a.txt", b"base\n");
-                fixture.write_file("engine/keep.txt", b"v1\n");
-                fixture.write_file("engine/modify.txt", b"v1\n");
-                fixture.write_file("engine/remove.txt", b"v1\n");
-                fixture.write_file("engine/sub/remove_deep.txt", b"v1\n");
+                fixture.write_file("engine/sub/modify.txt", b"v1\n");
+                fixture.write_file("engine/sub/remove.txt", b"v1\n");
+                fixture.write_file("engine/sub/deep/remove_deep.txt", b"v1\n");
                 let base_revision = fixture.stage_and_commit("base").await;
                 let main_branch = fixture.main_branch_id;
 
-                // 2. feature changes the in-view file only, so engine/ still
-                //    matches base and qualifies for adoption.
                 let feature_branch = fixture.create_branch("feature").await;
                 fixture.write_file("game/a.txt", b"feature change\n");
                 let feature_rev = fixture.stage_and_commit("feature change").await;
+                let control_branch = fixture.create_branch("control").await;
 
-                // 3. main modifies one path, adds two (one in a new directory)
-                //    and deletes two (one nested).
                 fixture.switch_to(main_branch, base_revision).await;
                 fixture.write_file("game/a.txt", b"base\n");
-                fixture.write_file("engine/modify.txt", b"v2\n");
-                fixture.write_file("engine/added.txt", b"added\n");
-                fixture.write_file("engine/newdir/added_deep.txt", b"added deep\n");
-                fixture.delete_file("engine/remove.txt");
-                fixture.delete_file("engine/sub/remove_deep.txt");
-                let main_v2 = fixture.stage_and_commit("main reshapes engine").await;
+                fixture.write_file("engine/sub/modify.txt", b"v2\n");
+                fixture.write_file("engine/sub/added.txt", b"added\n");
+                fixture.write_file("engine/sub/newdir/added_deep.txt", b"added deep\n");
+                fixture.delete_file("engine/sub/remove.txt");
+                fixture.delete_file("engine/sub/deep/remove_deep.txt");
+                fixture.stage_and_commit("main reshapes engine/sub").await;
 
-                // 4. Back to feature, restore its working tree, and merge main
-                //    under a view that excludes engine/.
                 fixture.switch_to(feature_branch, feature_rev).await;
                 fixture.write_file("game/a.txt", b"feature change\n");
-
-                let view_repo = engine_excluded_context(&fixture);
+                fixture.delete_dir("engine/sub");
                 let merged_rev = Box::pin(merge_main_under_view(
-                    &view_repo,
+                    &view_context(&fixture, &["*", "!/*", "!game/**"]),
                     &fixture,
                     main_branch,
-                    "merge main",
+                    "merge main under the view",
+                    false,
+                ))
+                .await;
+                assert_eq!(
+                    std::fs::read_dir(fixture.repo_path.join("engine"))
+                        .expect("engine is in view")
+                        .count(),
+                    0,
+                    "nothing below engine is in view, so the merge writes nothing there"
+                );
+
+                fixture.switch_to(control_branch, feature_rev).await;
+                fixture.write_file("engine/sub/modify.txt", b"v1\n");
+                fixture.write_file("engine/sub/remove.txt", b"v1\n");
+                fixture.write_file("engine/sub/deep/remove_deep.txt", b"v1\n");
+                let control_rev = Box::pin(merge_main_under_view(
+                    &fixture.repository,
+                    &fixture,
+                    main_branch,
+                    "merge main with no view",
+                    false,
                 ))
                 .await;
 
-                // Every path under engine/ must now agree with main. A missed
-                // create or discard shows up here as a divergent path.
-                let divergent = paths_divergent_from_main(
-                    &fixture,
-                    feature_branch,
-                    merged_rev,
-                    main_branch,
-                    main_v2,
-                )
-                .await;
-                let under_engine: Vec<&String> = divergent
-                    .iter()
-                    .filter(|path| path.starts_with("engine"))
-                    .collect();
-                assert!(
-                    under_engine.is_empty(),
-                    "adopted subtree still differs from main at {under_engine:?}",
+                execution.dispatcher.drain().await;
+                assert_eq!(
+                    *totals.lock().expect("Recorded totals poisoned"),
+                    vec![(0, 0), (3, 2)],
+                    "the merge under the view adopts engine/sub, so it realizes none of the \
+                     files the merge with no view updates and deletes there"
+                );
+
+                assert_eq!(
+                    directory_hashes(&fixture, merged_rev).await,
+                    directory_hashes(&fixture, control_rev).await,
+                    "the merge under the view left directories the merge with no view does not",
                 );
             }))
             .await
@@ -775,7 +1368,7 @@ mod tests {
     /// must survive.
     #[tokio::test]
     async fn merge_does_not_adopt_a_subtree_the_branch_changed() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -803,6 +1396,7 @@ mod tests {
                     &fixture,
                     other_branch,
                     "merge other",
+                    false,
                 ))
                 .await;
 
@@ -820,6 +1414,7 @@ mod tests {
                     &fixture,
                     main_branch,
                     "merge main",
+                    false,
                 ))
                 .await;
 
@@ -864,7 +1459,7 @@ mod tests {
     /// for the two ends to sit on opposite sides of it.
     #[tokio::test]
     async fn merge_rename_from_out_of_view_to_in_view_realizes_the_file() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -912,6 +1507,7 @@ mod tests {
                     &fixture,
                     main_branch,
                     "merge main",
+                    false,
                 ))
                 .await;
 
@@ -1257,7 +1853,7 @@ mod tests {
     ///    `conflicts`.
     #[tokio::test]
     async fn history_walk_resolves_conflict() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -1361,7 +1957,7 @@ mod tests {
     }
     #[tokio::test]
     async fn moved_directory_diff_retains_independent_descendant_changes() {
-        let execution = offline_execution().await;
+        let execution = offline_execution(EventDispatcher::no_dispatch()).await;
         lore_base::lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             let fixture = DiffFixture::new().await;
             for name in [

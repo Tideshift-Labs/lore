@@ -20,6 +20,7 @@ mod repository;
 mod revision;
 mod revision_tree;
 mod sandbox_tests;
+mod service;
 mod storage;
 
 /// FORK-LOCAL (Tideshift, WP-120): names the one test a `service_env_child` child process runs.

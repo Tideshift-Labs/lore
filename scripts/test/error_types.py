@@ -43,6 +43,10 @@ class FileNotFound(NotFound):
     whether the path was never added or was deleted."""
 
 
+class AddressNotFound(NotFound):
+    """Raised when the store holds no content for an address, as after an obliterate."""
+
+
 class BranchBehindLatest(LoreException): ...
 
 
@@ -158,6 +162,14 @@ class LinkNotFoundError(LoreException): ...
 
 
 class LinkPinDivergedError(LoreException): ...
+
+
+class LinkMountDivergedError(LoreException): ...
+
+
+class LinkDivergedError(LoreException):
+    """Raised when a push stops at a link whose branch has newer revisions on
+    the remote than the local history holds."""
 
 
 class OverlappingLinkError(LoreException): ...
@@ -286,6 +298,8 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
     ("Link pin conflict at", LinkPinDivergedError),
+    ("Link mount conflict at", LinkMountDivergedError),
+    ("Can't push the link at", LinkDivergedError),
     ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
@@ -302,6 +316,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         SwfsOutsideServiceError,
     ),
     ("invalid arguments:", ImproperArgumentsError),
+    ("Address not found", AddressNotFound),
 ]
 
 

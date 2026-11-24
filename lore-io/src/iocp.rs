@@ -760,6 +760,10 @@ impl IocpDriver {
         PsyncDriver.set_permissions(path, permissions).await
     }
 
+    pub(crate) async fn make_owner_writable(&self, path: PathBuf) -> std::io::Result<()> {
+        PsyncDriver.make_owner_writable(path).await
+    }
+
     pub(crate) async fn write_file_bytes(
         &self,
         path: PathBuf,
@@ -783,6 +787,14 @@ impl IocpDriver {
 
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
+    }
+
+    pub(crate) async fn stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.stat(path).await
+    }
+
+    pub(crate) async fn symlink_stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.symlink_stat(path).await
     }
 
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {

@@ -3,11 +3,7 @@
 use std::fs::Metadata;
 use std::future::Future;
 #[cfg(target_family = "unix")]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_family = "unix")]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,55 +23,87 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::lore_debug;
 use crate::lore_trace;
-#[cfg(not(target_family = "windows"))]
 use crate::lore_warn;
 use crate::node::NodeFileMode;
+use crate::repository::DOT_LORE;
 use crate::repository::TEMP_FILE_EXTENSION;
+use crate::repository::is_reserved_node_name;
 use crate::util::time::Retry;
 use crate::util::time::RetryPolicy;
 
-#[cfg(not(target_family = "windows"))]
 const FILE_MODE_USER_EXEC: u32 = 0o100;
 #[cfg(not(target_family = "windows"))]
 const FILE_MODE_ALL_EXEC: u32 = 0o111;
 
-// On Windows we do not care about executable bit
-#[cfg(target_family = "windows")]
-#[allow(clippy::unused_async)]
-pub async fn metadata_set_executable(
-    _path: impl AsRef<Path>,
-    _metadata: &Metadata,
-    _executable: bool,
-) {
-}
-
-#[cfg(not(target_family = "windows"))]
-#[allow(unused_variables)]
+/// As [`set_executable`], logging a failure as a warning rather than returning it.
 pub async fn metadata_set_executable(
     path: impl AsRef<Path>,
-    metadata: &Metadata,
+    metadata: Option<&Metadata>,
     executable: bool,
 ) {
     let path = path.as_ref();
-    let mut permissions = metadata.permissions();
+    if let Err(err) = set_executable(path, metadata, executable).await {
+        lore_warn!(
+            "Failed to set the executable bit of {}: {err}",
+            path.display()
+        );
+    }
+}
 
-    let mode = if executable {
-        permissions.mode() | FILE_MODE_ALL_EXEC
-    } else {
-        permissions.mode() & !FILE_MODE_ALL_EXEC
+/// Does nothing: Windows has no executable bit.
+#[cfg(target_family = "windows")]
+#[allow(clippy::unused_async)]
+pub async fn set_executable(
+    _path: impl AsRef<Path>,
+    _metadata: Option<&Metadata>,
+    _executable: bool,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Gives the file at `path` the executable bit `executable` asks for, for user, group and
+/// others, where the user's bit differs from it: the bit a revision stores, read as
+/// [`file_is_executable`] reads it. The mode comes from `metadata`, or from a stat of `path`
+/// where `metadata` is `None`.
+#[cfg(not(target_family = "windows"))]
+pub async fn set_executable(
+    path: impl AsRef<Path>,
+    metadata: Option<&Metadata>,
+    executable: bool,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let permissions = match metadata {
+        Some(metadata) => executable_permissions(metadata, executable),
+        None => executable_permissions(
+            &lore_io::IoDriver::global().metadata(path).await?,
+            executable,
+        ),
     };
-    permissions.set_mode(mode);
+    match permissions {
+        Some(permissions) => {
+            lore_io::IoDriver::global()
+                .set_permissions(path, permissions)
+                .await
+        }
+        None => Ok(()),
+    }
+}
 
-    let _ = lore_io::IoDriver::global()
-        .set_permissions(path, permissions)
-        .await
-        .map_err(|err| {
-            lore_warn!(
-                "Failed to set executable mode {} for {}: {err}",
-                mode,
-                path.to_path_buf().display()
-            );
-        });
+/// The permissions that give a file with `metadata` the executable bit `executable` asks for,
+/// for user, group and others, or `None` where the user's bit already matches.
+#[cfg(not(target_family = "windows"))]
+fn executable_permissions(metadata: &Metadata, executable: bool) -> Option<std::fs::Permissions> {
+    if file_is_executable(metadata) == executable {
+        return None;
+    }
+    let mut permissions = metadata.permissions();
+    let mode = permissions.mode();
+    permissions.set_mode(if executable {
+        mode | FILE_MODE_ALL_EXEC
+    } else {
+        mode & !FILE_MODE_ALL_EXEC
+    });
+    Some(permissions)
 }
 
 /// The mode to store on a node whose mode is `previous`: the observed executable bit
@@ -98,25 +126,23 @@ pub fn mode_changed(from: u16, to: u16) -> bool {
 }
 
 pub fn file_mtime(metadata: &Metadata) -> u64 {
-    metadata
-        .modified()
-        .unwrap_or(std::time::SystemTime::now())
+    modified_millis(metadata.modified().ok())
+}
+
+/// Milliseconds from the Unix epoch to `modified`: to now where there is no time, and zero
+/// for a time before the epoch.
+pub fn modified_millis(modified: Option<std::time::SystemTime>) -> u64 {
+    modified
+        .unwrap_or_else(std::time::SystemTime::now)
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-pub fn file_size(metadata: &Metadata) -> u64 {
-    #[cfg(target_family = "windows")]
-    let size = metadata.file_size();
-    #[cfg(target_family = "unix")]
-    let size = metadata.size();
-
-    size
-}
-
-pub fn file_mtime_and_size(metadata: &Metadata) -> (u64, u64) {
-    (file_mtime(metadata), file_size(metadata))
+/// Whether the permission bits `mode` carry the user's executable bit, `None` where there are
+/// no bits to read.
+pub fn mode_executable_observed(mode: Option<u32>) -> Option<bool> {
+    mode.map(|mode| mode & FILE_MODE_USER_EXEC != 0)
 }
 
 #[cfg(target_family = "windows")]
@@ -127,19 +153,6 @@ pub fn file_is_executable(_metadata: &Metadata) -> bool {
 #[cfg(target_family = "unix")]
 pub fn file_is_executable(metadata: &Metadata) -> bool {
     (metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0
-}
-
-/// Whether the file carries the executable bit, `None` where the platform has no such
-/// bit to read. [`file_is_executable`] answers `false` for both and cannot tell them
-/// apart, which a caller updating a node's mode needs.
-#[cfg(target_family = "windows")]
-pub fn file_executable_observed(_metadata: &Metadata) -> Option<bool> {
-    None
-}
-
-#[cfg(target_family = "unix")]
-pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
-    Some(file_is_executable(metadata))
 }
 
 /// The case each directory prefix is held in on disk, resolved once for the
@@ -515,224 +528,192 @@ pub fn filesystem_path_fork<'a>(
     Box::pin(async move { filesystem_path(operation, &base, &find_path, None).await })
 }
 
-/// Removes the file or empty directory at `absolute_path`, retrying once after clearing its
-/// read-only flag, and answers `Ok` for a path that does not exist or whose metadata cannot be
-/// read.
-pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
-    let absolute_path = absolute_path.as_ref();
-    lore_trace!("Deleting {}", absolute_path.display());
-    let (is_dir, mut permissions) = match lore_io::IoDriver::global().metadata(absolute_path).await
-    {
-        Ok(metadata) => (metadata.is_dir(), metadata.permissions()),
-        Err(err) => {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after metadata query: {}",
-                    absolute_path.display()
-                );
-            } else {
-                lore_debug!(
-                    "Delete metadata query failed for {}: {}",
-                    absolute_path.display(),
-                    err
-                );
-            }
-            return Ok(());
-        }
-    };
-
-    if is_dir {
-        if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing recursively {}: {}",
-                    absolute_path.display(),
-                    err
-                );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting directory {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove recursively with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting directory with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-    } else {
-        if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing file with write permissions: {}",
-                    absolute_path.display()
-                );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting file {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove file with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting file with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-        lore_trace!("Deleted file {}", absolute_path.display(),);
-    }
-
-    Ok(())
+/// Removes the file or empty directory at `absolute_path`, a symbolic link as a link, retrying
+/// once where [`Removal::retries`] says a retry can succeed, and answers `Ok` for a path that does
+/// not exist or cannot be stat'd.
+pub fn unlink<P: AsRef<Path>>(absolute_path: P) -> impl Future<Output = tokio::io::Result<()>> {
+    unlink_as(absolute_path, Removal::EmptyDirectory)
 }
 
-pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
-    let absolute_path = absolute_path.as_ref();
-    lore_trace!("Deleting {}", absolute_path.display());
-    let metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
+/// Removes the file, or the directory and everything below it, at `absolute_path`, a symbolic
+/// link as a link, retrying once where [`Removal::retries`] says a retry can succeed, and answers
+/// `Ok` for a path that does not exist or cannot be stat'd.
+pub fn unlink_recursive<P: AsRef<Path>>(
+    absolute_path: P,
+) -> impl Future<Output = tokio::io::Result<()>> {
+    unlink_as(absolute_path, Removal::Tree)
+}
 
-    if let Err(err) = metadata {
-        if err.kind() == tokio::io::ErrorKind::NotFound {
-            lore_trace!(
-                "Path does not exist anymore after metadata query: {}",
-                absolute_path.display()
-            );
+/// Removes what `absolute_path` names, a directory as `directory` says and anything else as a
+/// file, through [`unlink_retrying`].
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn unlink_as<P: AsRef<Path>>(
+    absolute_path: P,
+    directory: Removal,
+) -> impl Future<Output = tokio::io::Result<()>> {
+    async move {
+        let Some(is_dir) = removal_is_dir(absolute_path.as_ref()).await else {
             return Ok(());
-        } else {
-            lore_trace!(
-                "Delete metadata query failed for {}: {}",
-                absolute_path.display(),
-                err
-            );
-            return Ok(());
-        }
+        };
+        let removal = if is_dir { directory } else { Removal::File };
+        unlink_retrying(absolute_path.as_ref(), removal).await
     }
+}
 
-    let metadata = metadata.unwrap();
-    if metadata.is_dir() {
-        if let Err(err) = lore_io::IoDriver::global()
-            .remove_dir_all(absolute_path)
+/// Whether the name `absolute_path` is a directory, which decides how a removal removes it, or
+/// `None` for a path that does not exist or cannot be stat'd, which a removal takes as nothing to
+/// remove. A symbolic link is not followed, so a removal takes the link and leaves what it stands
+/// for: on Unix a link is removed as a file, and on Windows a link made to a directory is removed
+/// as a directory, which removes the link alone.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn removal_is_dir(absolute_path: &Path) -> impl Future<Output = Option<bool>> + '_ {
+    async move {
+        lore_trace!("Deleting {}", absolute_path.display());
+        match lore_io::IoDriver::global()
+            .symlink_stat(absolute_path)
             .await
         {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing recursively {}: {}",
+            Ok(stat) => Some(stat.kind == lore_io::StatKind::Directory),
+            Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                lore_trace!("Path to delete does not exist: {}", absolute_path.display());
+                None
+            }
+            Err(err) => {
+                lore_debug!(
+                    "Stat of path to delete {} failed: {}",
                     absolute_path.display(),
                     err
                 );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting directory {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global()
-                .remove_dir_all(absolute_path)
-                .await
-            {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove recursively with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting directory with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
+                None
             }
         }
-        lore_trace!("Recursively deleted directory {}", absolute_path.display(),);
-    } else {
-        if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-            if err.kind() == tokio::io::ErrorKind::NotFound {
-                lore_trace!(
-                    "Path does not exist anymore after removing file with write permissions: {}",
-                    absolute_path.display()
-                );
-                return Ok(());
-            }
-            lore_debug!(
-                "Error deleting file {}: {} - retry after setting write permission",
-                absolute_path.display(),
-                err
-            );
-
-            let mut permissions = metadata.permissions();
-            #[allow(clippy::permissions_set_readonly_false)]
-            permissions.set_readonly(false);
-            let _ = lore_io::IoDriver::global()
-                .set_permissions(absolute_path, permissions)
-                .await;
-            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
-                if err.kind() == tokio::io::ErrorKind::NotFound {
-                    lore_trace!(
-                        "Path does not exist anymore after trying remove file with write permissions: {}",
-                        absolute_path.display()
-                    );
-                    return Ok(());
-                } else {
-                    lore_debug!(
-                        "Error deleting file with write permissions {}: {}",
-                        absolute_path.display(),
-                        err
-                    );
-                }
-                return Err(err);
-            }
-        }
-        lore_trace!("Deleted file {}", absolute_path.display(),);
     }
+}
 
-    Ok(())
+/// What a removal removes, which decides the call that removes it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A file.
+    File,
+    /// An empty directory. One that holds entries is not retried, since no retry can let it be
+    /// removed.
+    EmptyDirectory,
+    /// A directory and everything below it.
+    Tree,
+}
+
+impl Removal {
+    /// Whether a refused removal can succeed after [`make_removable`]: on Windows every removal,
+    /// a read-only attribute refusing a directory's, and on Unix only a tree's, since there a
+    /// name's own permissions decide nothing but whether a directory's entries can go.
+    fn retries(self) -> bool {
+        cfg!(target_family = "windows") || self == Removal::Tree
+    }
+}
+
+/// Removes what `absolute_path` names as `removal` says, retrying once after [`make_removable`]
+/// where [`Removal::retries`] says a retry can succeed, and answers `Ok` for a path that is
+/// already gone.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn unlink_retrying(
+    absolute_path: &Path,
+    removal: Removal,
+) -> impl Future<Output = tokio::io::Result<()>> + '_ {
+    async move {
+        let mut retry = false;
+        loop {
+            if retry {
+                make_removable(absolute_path).await;
+            }
+            let removed = match removal {
+                Removal::File => lore_io::IoDriver::global().remove_file(absolute_path).await,
+                Removal::EmptyDirectory => {
+                    lore_io::IoDriver::global().remove_dir(absolute_path).await
+                }
+                Removal::Tree => {
+                    lore_io::IoDriver::global()
+                        .remove_dir_all(absolute_path)
+                        .await
+                }
+            };
+            match removed {
+                Ok(()) => {
+                    lore_trace!("Deleted {}", absolute_path.display());
+                    return Ok(());
+                }
+                Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => {
+                    lore_trace!("Path to delete does not exist: {}", absolute_path.display());
+                    return Ok(());
+                }
+                Err(err)
+                    if retry
+                        || !removal.retries()
+                        || (removal == Removal::EmptyDirectory
+                            && err.kind() == tokio::io::ErrorKind::DirectoryNotEmpty) =>
+                {
+                    lore_debug!("Error deleting {}: {}", absolute_path.display(), err);
+                    return Err(err);
+                }
+                Err(err) => {
+                    lore_debug!(
+                        "Error deleting {}: {} - retry after making it removable",
+                        absolute_path.display(),
+                        err
+                    );
+                }
+            }
+            retry = true;
+        }
+    }
+}
+
+/// Makes the name `absolute_path` itself writable by its owner, for a failed removal to retry, as
+/// [`lore_io::IoDriver::make_owner_writable`] does: on Unix a directory gains its owner's write
+/// permission, and on Windows the read-only attribute is cleared, a symbolic link never followed.
+/// A name that cannot be changed is left as it is.
+///
+/// Only a failed removal retries, a cold path, so the change is boxed: inline, it would make every
+/// removal's future as large as its own.
+fn make_removable(absolute_path: &Path) -> crate::BoxFuture<'_, ()> {
+    Box::pin(async move {
+        let _ = lore_io::IoDriver::global()
+            .make_owner_writable(absolute_path)
+            .await;
+    })
+}
+
+/// Removes what `absolute_path` holds as [`unlink_recursive`] does, but keeps each nested
+/// repository in it, a directory holding `.lore`, and each entry [`is_reserved_node_name`] answers
+/// for, such as `.lore` or `.urc`, with the directories leading to them. A legacy `.urc` is no
+/// boundary, as `state::is_nested_repository_root` describes, so the entries beside it go. A failed
+/// removal is retried once after [`make_removable`].
+pub async fn unlink_recursive_keeping_repositories(absolute_path: &Path) -> tokio::io::Result<()> {
+    let driver = lore_io::IoDriver::global();
+    let Err(err) = driver
+        .remove_dir_all_keeping(absolute_path, DOT_LORE, is_reserved_node_name)
+        .await
+    else {
+        lore_trace!(
+            "Deleted {} around nested repositories",
+            absolute_path.display()
+        );
+        return Ok(());
+    };
+    lore_debug!(
+        "Error deleting {}: {} - retry after making it removable",
+        absolute_path.display(),
+        err
+    );
+    make_removable(absolute_path).await;
+    driver
+        .remove_dir_all_keeping(absolute_path, DOT_LORE, is_reserved_node_name)
+        .await
 }
 
 pub fn file_unlink_retry() -> Retry {

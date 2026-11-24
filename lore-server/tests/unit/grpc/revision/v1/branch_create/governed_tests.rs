@@ -206,6 +206,10 @@ async fn authenticated_handler_persists_creator_from_exact_repository_permission
                     "wildcard" => "urc-*".into(),
                     _ => unreachable!(),
                 };
+                // Fork claim readers read only a verified token: claims travel with their raw token.
+                request.extensions_mut().insert(
+                    lore_server::authnz::repository_authorizer::RawToken("raw.jwt".to_string()),
+                );
                 request.extensions_mut().insert(AuthorizationToken {
                     user_id: "verified".into(),
                     resources: Some(vec![ResourcePermission {
@@ -216,6 +220,7 @@ async fn authenticated_handler_persists_creator_from_exact_repository_permission
                 });
                 let response = lore_server::grpc::revision::v1::branch_create::handler(
                     request,
+                    &crate::util::test_support::allow_all_authorizer(),
                     immutable,
                     mutable,
                     Arc::new(notifications),

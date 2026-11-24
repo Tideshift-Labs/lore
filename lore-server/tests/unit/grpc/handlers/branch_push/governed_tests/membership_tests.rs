@@ -1004,7 +1004,7 @@ async fn unchanged_fast_path_publishes_while_fragment_and_association_tables_are
         fixture.store.resume.notify_one();
     };
     let result = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut operation = std::pin::pin!(operation);
+        let mut operation = Box::pin(operation);
         until_paused(operation.as_mut(), &fixture.store).await;
         tokio::join!(operation, gate)
     })

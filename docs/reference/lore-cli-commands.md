@@ -1930,7 +1930,9 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
@@ -2089,6 +2091,7 @@ Authenticate the CLI
 * `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 
 
@@ -2238,6 +2241,7 @@ Authenticate the CLI
 * `--client-secret <CLIENT_SECRET>` — Client secret for --client-id. Read from `LORE_CLIENT_SECRET` when omitted. Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 
 
@@ -2556,7 +2560,9 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed

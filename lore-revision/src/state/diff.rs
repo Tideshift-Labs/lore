@@ -16,6 +16,7 @@ use tokio::task::JoinSet;
 
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::change;
+use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
@@ -41,8 +42,10 @@ use crate::state::StateChildrenNodes;
 use crate::state::StateError;
 use crate::state::StateNamedNode;
 use crate::state::add_change;
+use crate::state::compute_change_flags;
 use crate::state::emit_change;
 use crate::state::named_node_sort;
+use crate::state::stream::emit;
 use crate::util::path::RelativePath;
 
 /// Decides whether a source subtree can be adopted whole during a merge.
@@ -206,6 +209,10 @@ impl DiffWalkStats {
 /// begins and where both sides' filters are in hand, so deriving them anywhere
 /// else would only be a second answer to the same question.
 ///
+/// Each side asks about `path` as the node it holds there, a link as a directory, and as the other
+/// side's node where it holds none, so a type change asks its delete side and its add side each as
+/// what it is.
+///
 /// Returns [`diff_subtree_walk`]'s future itself, seeded when called, or a ready one
 /// where both sides drop `path`: a future of its own would hold the sides again
 /// beside the walk they are moved into.
@@ -217,11 +224,73 @@ pub fn diff_subtree(
     changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> impl Future<Output = Result<DiffWalkStats, StateError>> {
+    // A repository's root carries no staged or dirty flag, so a walk rooted at one keeps it. A
+    // root only the from side holds is one the to side was built on, and one staged is tracked;
+    // where the root is only marked dirty, the to side's tree is asked whether it tracks it, on a
+    // cold path of its own, and only where the ignore rules would leave it out.
+    let changed = to.flags.contains(NodeFlags::Staged) || !to.mapping.node.is_valid_node_id();
+    if !changed
+        && filter_mode.contains(FilterMode::KeepTracked)
+        && to.flags.contains(NodeFlags::Dirty)
+    {
+        let to_filter = &to.mapping.repository.filter;
+        let (_, to_is_directory) = root_kinds(&from, &to);
+        if to_filter
+            .child_excludes_tree(
+                to_filter.parent_exclusion_states(&path),
+                &path,
+                to_is_directory,
+                filter_mode.at(false),
+            )
+            .1
+        {
+            let changes = changes.clone();
+            return Either::Right(Box::pin(async move {
+                let tracked = to
+                    .mapping
+                    .state
+                    .holds_tracked_change(&to.mapping.repository, to.mapping.node, to.flags)
+                    .await?;
+                seeded_subtree(from, to, path, graft, &changes, filter_mode, tracked).await
+            })
+                as std::pin::Pin<
+                    Box<dyn Future<Output = Result<DiffWalkStats, StateError>> + Send>,
+                >);
+        }
+    }
+    Either::Left(seeded_subtree(
+        from,
+        to,
+        path,
+        graft,
+        changes,
+        filter_mode,
+        changed,
+    ))
+}
+
+/// [`diff_subtree`] once whether the root holds a tracked change, `root_changed`, is settled.
+fn seeded_subtree(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    path: RelativePath,
+    graft: Option<Arc<GraftOracle>>,
+    changes: &ChangeSender,
+    filter_mode: FilterMode,
+    root_changed: bool,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> {
     let from_filter = &from.mapping.repository.filter;
     let to_filter = &to.mapping.repository.filter;
     let flags = DiffFlags::between(from_filter, to_filter);
-    let (from_states, to_states, excluded) =
-        seed_sides(from_filter, to_filter, &path, flags, filter_mode);
+    let kinds = root_kinds(&from, &to);
+    let (from_states, to_states, excluded) = seed_sides(
+        from_filter,
+        to_filter,
+        &path,
+        kinds,
+        flags,
+        filter_mode.at(root_changed),
+    );
     if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
         return Either::Left(std::future::ready(Ok(DiffWalkStats::default())));
@@ -256,9 +325,10 @@ pub fn diff_subtree(
 /// The verdicts a walk over `path` starts from, one per side, and whether the walk
 /// drops `path`.
 ///
-/// One filter held by both sides is asked once: the same rules put the same
-/// question about the same path answer the same way, and every caller that is not
-/// moving the view holds one filter.
+/// One filter held by both sides is asked once where both sides ask about `path` as the same
+/// kind: the same rules put the same question about the same path answer the same way, and every
+/// caller that is not moving the view holds one filter. `kinds` says whether the from side and the
+/// to side ask about `path` as a directory.
 ///
 /// `path` is dropped where both sides exclude it, and only there is the exclusion
 /// announced. The to side is asked last, and in the announcing form only once the
@@ -268,20 +338,38 @@ fn seed_sides(
     from_filter: &Arc<Filter>,
     to_filter: &Arc<Filter>,
     path: &RelativePath,
+    kinds: (bool, bool),
     flags: DiffFlags,
     mode: FilterMode,
 ) -> (FilterStates, FilterStates, bool) {
-    let two_views = flags.contains(DiffFlags::TwoViews);
-    let from_seed = two_views.then(|| seed_states(from_filter, path, false, mode));
+    let (from_is_directory, to_is_directory) = kinds;
+    let separate = flags.contains(DiffFlags::TwoViews) || from_is_directory != to_is_directory;
+    let from_seed =
+        separate.then(|| seed_states(from_filter, path, from_is_directory, false, mode));
     let announce = from_seed.is_none_or(|(_, excluded)| excluded);
-    let to_seed = seed_states(to_filter, path, announce, mode);
+    let to_seed = seed_states(to_filter, path, to_is_directory, announce, mode);
     let (from_states, from_excluded) = from_seed.unwrap_or(to_seed);
     (from_states, to_seed.0, from_excluded && to_seed.1)
 }
 
+/// Whether the from side and the to side of a walk's root ask about its path as a directory: each
+/// as the node it holds, a link as a directory, and as the other side's node where it holds none.
+fn root_kinds(from: &NodeChangeState, to: &NodeChangeState) -> (bool, bool) {
+    let from_directory = !from.flags.contains(NodeFlags::File);
+    let to_directory = !to.flags.contains(NodeFlags::File);
+    match (
+        from.mapping.node.is_valid_or_root_node_id(),
+        to.mapping.node.is_valid_or_root_node_id(),
+    ) {
+        (true, false) => (from_directory, from_directory),
+        (false, true) => (to_directory, to_directory),
+        _ => (from_directory, to_directory),
+    }
+}
+
 /// The states a walk rooted at `path` threads into its children, and whether
-/// `filter` excludes `path` with everything below it. `path` is taken as a
-/// directory, which is what a walk rooted at one stands in.
+/// `filter` excludes `path` with everything below it. `is_directory` is whether
+/// `path` names a directory.
 ///
 /// `path`'s own ancestors are folded here, since a walk starting at it has none
 /// behind it.
@@ -291,14 +379,15 @@ fn seed_sides(
 fn seed_states(
     filter: &Filter,
     path: &RelativePath,
+    is_directory: bool,
     announce: bool,
     mode: FilterMode,
 ) -> (FilterStates, bool) {
     let parent = filter.parent_exclusion_states(path);
     if announce {
-        filter.child_emit_excludes(parent, path, true, mode)
+        filter.child_emit_excludes(parent, path, is_directory, mode)
     } else {
-        filter.child_excludes_tree(parent, path, true, mode)
+        filter.child_excludes_tree(parent, path, is_directory, mode)
     }
 }
 
@@ -620,19 +709,6 @@ fn diff_subtree_node_walk(
         };
         let mut to_index = 0;
         for from_named_node in from_nodes.children.iter() {
-            stats.queried();
-            let Some((from_node_search, from_node_states)) = get_filtered_node_and_path(
-                from_nodes,
-                from_named_node.node,
-                &paths.from,
-                states.from,
-                filter_mode,
-            )
-            .await?
-            else {
-                continue;
-            };
-
             while to_index < to_nodes.children.len()
                 && to_nodes.children[to_index].name < from_named_node.name
             {
@@ -640,21 +716,41 @@ fn diff_subtree_node_walk(
                 to_index += 1;
             }
 
-            if to_index >= to_nodes.children.len()
-                || to_nodes.children[to_index].name > from_named_node.name
-            {
-                add_change_for_solo_from_node(
-                    context,
-                    from_named_node,
-                    to,
-                    &from_node_search,
-                    from_node_states,
-                )
-                .await?;
-            } else {
-                let to_named_node = &to_nodes.children[to_index];
-                to_index += 1;
+            let paired = to_nodes
+                .children
+                .get(to_index)
+                .filter(|to_named_node| to_named_node.name == from_named_node.name);
+            stats.queried();
+            let Some((from_node_search, from_node_states)) = get_filtered_node_and_path(
+                from_nodes,
+                from_named_node.node,
+                &paths.from,
+                states.from,
+                filter_mode,
+                // The from side is the tree the to side was built on, so its node is tracked,
+                // and what is staged or marked on its counterpart is the change below it.
+                async |flags: NodeFlags| match paired {
+                    _ if flags.intersects(NodeFlags::Staged | NodeFlags::Dirty) => Ok(true),
+                    Some(to_named_node) => {
+                        to_nodes
+                            .state
+                            .holds_tracked_change(
+                                &to_nodes.repository,
+                                to_named_node.node,
+                                to_named_node.flags,
+                            )
+                            .await
+                    }
+                    None => Ok(false),
+                },
+            )
+            .await?
+            else {
+                continue;
+            };
 
+            if let Some(to_named_node) = paired {
+                to_index += 1;
                 add_change_for_paired_nodes(
                     work,
                     flags,
@@ -662,6 +758,15 @@ fn diff_subtree_node_walk(
                     context,
                     to_named_node,
                     from_named_node.node,
+                    &from_node_search,
+                    from_node_states,
+                )
+                .await?;
+            } else {
+                add_change_for_solo_from_node(
+                    context,
+                    from_named_node,
+                    to,
                     &from_node_search,
                     from_node_states,
                 )
@@ -792,6 +897,12 @@ async fn add_change_for_solo_to_node(
         &paths.to,
         states.to,
         filter_mode,
+        async |flags: NodeFlags| {
+            to_nodes
+                .state
+                .holds_tracked_change(&to_nodes.repository, to_named_node.node, flags)
+                .await
+        },
     )
     .await?
     else {
@@ -1023,6 +1134,31 @@ fn views_diverge_below(
     !(covers(from_filter, states.from) && covers(to_filter, states.to))
 }
 
+/// The add or the delete of a paired directory alone, where the two views place it on disk
+/// differently.
+///
+/// A directory a view excludes stands on disk only for content below it. The walk below reports
+/// that content, and its writes and deletes create and empty the directory. Where either revision
+/// holds the directory with no children, one side has nothing below it to answer for it, so it is
+/// reported here: added where the target view takes it in, deleted where the target view leaves it
+/// out. A delete of a directory still holding something keeps it. The change carries no hierarchy.
+fn presence_change(
+    from_node: &Node,
+    to_node: &Node,
+    from_states: FilterStates,
+    to_states: FilterStates,
+    mode: FilterMode,
+) -> Option<change::FileAction> {
+    if from_node.child().is_some() && to_node.child().is_some() {
+        return None;
+    }
+    match (from_states.excluded(mode), to_states.excluded(mode)) {
+        (true, false) => Some(change::FileAction::Add),
+        (false, true) => Some(change::FileAction::Delete),
+        _ => None,
+    }
+}
+
 /// Report the change between the two nodes the walk paired by name, and descend where both are
 /// directories.
 ///
@@ -1066,10 +1202,13 @@ async fn add_change_for_paired_nodes(
     let from_address = from_node.address;
     let to_address = to_node.address;
     let hash_equal = from_address == to_address;
+    // Node ids only compare within one revision, so across a pin move the mounts are compared by
+    // path below.
+    let mount_equal = !hash_equal || from_node.mounts_same_source(&to_node);
     let from_mode = from_node.mode;
     let to_mode = to_node.mode;
     let mode_equal = from_mode == to_mode;
-    let is_modify = !hash_equal || !mode_equal;
+    let is_modify = !hash_equal || !mode_equal || !mount_equal;
     // What the walk measured of the content, which the action states nothing about: a node can be
     // moved and modified at once, or moved with the content it had.
     let measured = if is_modify {
@@ -1163,6 +1302,19 @@ async fn add_change_for_paired_nodes(
         }
         drop(to_name);
 
+        // The to side passes the ignore rules where its tree tracks a change at or below the
+        // node, which is asked only where the rules would leave the node out.
+        let to_filter_mode = to_nodes
+            .repository
+            .filter
+            .tracked_mode(states.to, &subpath, !to_node.is_file(), filter_mode, || {
+                to_nodes.state.holds_tracked_change(
+                    &to_nodes.repository,
+                    to_named_node.node,
+                    NodeFlags::from_bits_retain(to_node.flags),
+                )
+            })
+            .await?;
         let (to_subtree_states, to_excludes_subtree) = to_subtree_verdict(
             &to_nodes.repository.filter,
             states.to,
@@ -1170,7 +1322,7 @@ async fn add_change_for_paired_nodes(
             from_type == LoreNodeType::File,
             to_type == LoreNodeType::File,
             flags,
-            filter_mode,
+            to_filter_mode,
             stats,
         );
         if to_excludes_subtree {
@@ -1229,6 +1381,24 @@ async fn add_change_for_paired_nodes(
             };
             let child_depth = paths.depth + 1;
 
+            if to_type == LoreNodeType::Directory
+                && let Some(action) = presence_change(
+                    from_node,
+                    &to_node,
+                    from_node_states,
+                    to_subtree_states,
+                    filter_mode,
+                )
+            {
+                emit(changes, || NodeChange {
+                    action,
+                    flags: compute_change_flags(&to_node),
+                    from: from.clone(),
+                    to: to.clone(),
+                })
+                .await?;
+            }
+
             // A conflict on a directory node is at the path itself, and the
             // walk below it reports nothing that carries it.
             let conflicted_directory =
@@ -1248,6 +1418,7 @@ async fn add_change_for_paired_nodes(
                 .await?;
             }
             if !hash_equal
+                || !mount_equal
                 || is_staged
                 || is_staged_merge
                 || is_dirty
@@ -1285,7 +1456,17 @@ async fn add_change_for_paired_nodes(
                             .node_has_staged_children(linked_repository.clone(), to_node.child)
                             .await?;
 
-                        if is_staged { has_staged_children } else { true }
+                        // The two subtrees of a remount, or of a link replaced by one to another
+                        // repository, don't correspond, so the link node is reported instead.
+                        (!is_staged || has_staged_children)
+                            && !(from_node.is_link()
+                                && crate::link::link_remounted(
+                                    &linked_repository,
+                                    from_node,
+                                    &to_node,
+                                    &linked_state,
+                                )
+                                .await?)
                     };
 
                     if !recurse_link {
@@ -1381,7 +1562,7 @@ async fn add_change_for_paired_nodes(
             let (to_node_states, to_node_excluded) = to_nodes
                 .repository
                 .filter
-                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), filter_mode);
+                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), to_filter_mode);
             // Reported where a relocated staged directory now stands; elsewhere
             // this is `from_path` itself.
             let mut deleted = from.clone();
@@ -1461,6 +1642,7 @@ async fn find_sorted_children(
             from_nodes.children.push(StateNamedNode {
                 node: from.mapping.node,
                 name: node.name_hash,
+                flags: NodeFlags::from_bits_retain(node.flags),
             });
         }
 
@@ -1480,6 +1662,7 @@ async fn find_sorted_children(
             to_nodes.children.push(StateNamedNode {
                 node: to.mapping.node,
                 name: node.name_hash,
+                flags: NodeFlags::from_bits_retain(node.flags),
             });
         }
         directory_paths.from.pop();
@@ -1624,27 +1807,41 @@ async fn get_node_and_path(
 /// [`get_node_and_path`] for a walk standing in `path`: `parent_states` is the
 /// filter's verdict for it, and the child's own is returned alongside the node
 /// for the walk to carry below.
-pub async fn get_filtered_node_and_path(
+///
+/// The node is asked about in the mode [`FilterMode::at`] answers, past the ignore rules where
+/// `tracked` answers, from the node's flags, that its tree tracks a change at or below it. It is
+/// asked only where the rules would leave the node out.
+pub async fn get_filtered_node_and_path<F>(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
     parent_states: FilterStates,
     filter_mode: FilterMode,
-) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError> {
-    Ok(get_node_and_path(nodes, node_id, path)
-        .await?
-        .and_then(|result| {
-            let (states, excluded) = nodes.repository.filter.child_emit_excludes(
-                parent_states,
-                &result.path,
-                result.node.is_directory(),
-                filter_mode,
-            );
-            if excluded {
-                lore_trace!("Path excluded by filter: {}", path);
-                None
-            } else {
-                Some((result, states))
-            }
-        }))
+    tracked: impl FnOnce(NodeFlags) -> F,
+) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError>
+where
+    F: Future<Output = Result<bool, StateError>>,
+{
+    let Some(result) = get_node_and_path(nodes, node_id, path).await? else {
+        return Ok(None);
+    };
+    let filter = &nodes.repository.filter;
+    let is_directory = result.node.is_directory();
+    let flags = NodeFlags::from_bits_retain(result.node.flags);
+    let mode = filter
+        .tracked_mode(
+            parent_states,
+            &result.path,
+            is_directory,
+            filter_mode,
+            || tracked(flags),
+        )
+        .await?;
+    let (states, excluded) =
+        filter.child_emit_excludes(parent_states, &result.path, is_directory, mode);
+    if excluded {
+        lore_trace!("Path excluded by filter: {}", path);
+        return Ok(None);
+    }
+    Ok(Some((result, states)))
 }

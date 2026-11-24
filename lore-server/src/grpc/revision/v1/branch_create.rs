@@ -22,15 +22,20 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::Action;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_action;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// Decode only the durable response; no later branch state may replace receipt evidence.
@@ -385,9 +390,11 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchCreate::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -397,6 +404,7 @@ pub async fn handler(
 ) -> Result<Response<BranchCreateResponse>, Status> {
     handler_with_domain(
         request,
+        authorizer,
         immutable_store,
         mutable_store,
         notification_sender,
@@ -411,6 +419,7 @@ pub async fn handler(
 #[allow(clippy::too_many_arguments)]
 pub async fn handler_with_domain(
     request: Request<BranchCreateRequest>,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
@@ -439,6 +448,9 @@ pub async fn handler_with_domain(
             repository_id: caller_context.repository_id.data(),
         },
     )?;
+    // Upstream v0.13's explicit action check, after admission (R-BLOCK-2) and
+    // before any governed prepare write.
+    require_action(authorizer, &request, Action::Write).await?;
     let mut req = request.into_inner();
     if let Some(admitted) = admitted {
         if forwarded_requests
@@ -495,6 +507,7 @@ pub async fn handler_with_domain(
                     .build();
                 hook_dispatcher
                     .dispatch_pre(HookPoint::BranchCreate, &hook)
+                    .await
                     .map_err(hook_error_to_status)?;
                 let response = governed_branch_create(
                     &governed,
@@ -600,19 +613,25 @@ pub async fn branch_create_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            validate_create_input(&name, &category, &creator)?;
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(&context.correlation_id)
                 .hook_point(HookPoint::BranchCreate)
                 .repository(context.repository_id)
                 .user(&context.user_id)
                 .branch(branch)
+                .metadata(METADATA_BRANCH_NAME, &name)
+                .metadata(
+                    METADATA_IS_SERVICE_ACCOUNT,
+                    context.is_service_account.to_string(),
+                )
                 .build();
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::BranchCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
-
-            validate_create_input(&name, &category, &creator)?;
 
             debug!({BRANCH_ID} = %branch, branch_name = %name, stack = ?stack, "Creating branch");
 

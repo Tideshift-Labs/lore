@@ -119,8 +119,8 @@ async fn a_new_connect_is_refused_while_an_old_stream_holds_its_connection() {
             Default::default(),
             None,
         )
-        .with_jwt_verifier(
-            None,
+        .with_token_verification(
+            lore_server::auth::jwt::TokenVerification::Ignore,
             false,
             Arc::new(AllowAllRepositoryAuthorizer),
             repository_catalog,
@@ -198,12 +198,14 @@ async fn the_internal_listener_refuses_a_new_connect_while_an_old_stream_holds_i
             immutable.clone(),
             immutable,
             mutable,
+            None,
             notification_sender,
             Arc::new(HookDispatcher::empty()),
             EnvironmentConfig::default(),
             None,
             None,
             Arc::new(AllowAllRepositoryAuthorizer),
+            lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
         )
         .expect("the test store is local")
         .with_tls_config(None, None, None)

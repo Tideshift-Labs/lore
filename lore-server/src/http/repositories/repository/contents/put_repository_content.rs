@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::Path;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
@@ -26,6 +27,8 @@ use tracing::info;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::matching_permissions;
 use crate::auth::jwt::write_permission_granted;
+use crate::auth::jwt_axum_middleware::http_permits;
+use crate::authnz::repository_authorizer::Action;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -49,15 +52,20 @@ struct ResponseSuccess {
 /// (`require_write`) surfaces: the token's own `resources` claim must grant
 /// `write` on this repository. Auth off (no verifier, no token) and
 /// `enforce_write_permission = false` stay open, as on those surfaces.
+///
+/// Runs in addition to upstream v0.13's `http_permits(.., Action::Write)`
+/// below; both must pass. Under upstream's `trust_unsigned_identity` (auth
+/// off) there is no verifier, so unsigned claims are not read here.
 fn write_permitted(
     state: &ServerState,
     repository_id: &str,
     user_info: Option<&AuthorizationToken>,
 ) -> bool {
+    let has_verifier = state.token_verification.verifier().is_some();
     let Some(token) = user_info else {
         // The route layer inserts a token whenever a verifier is configured,
         // so no token means auth is off.
-        return state.jwt_verifier.is_none();
+        return !has_verifier;
     };
     let Ok(repository) = repository_id.parse::<Context>() else {
         // Not a repository at all: the handler answers 400 before any write,
@@ -65,7 +73,7 @@ fn write_permitted(
         return true;
     };
     write_permission_granted(
-        state.jwt_verifier.is_some(),
+        has_verifier,
         state.enforce_write_permission,
         &matching_permissions(token, repository.into()),
     )
@@ -75,6 +83,7 @@ pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path(repository_id): Path<String>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    extensions: Extensions,
     headers: HeaderMap,
     data: Bytes,
 ) -> Response {
@@ -104,6 +113,22 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             let repository = match repository_id.parse::<Context>() {
+                Ok(repository_id)
+                    if !http_permits(
+                        state.repository_authorizer.as_ref(),
+                        &extensions,
+                        repository_id.into(),
+                        Action::Write,
+                    )
+                    .await =>
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        header_error,
+                        Body::from("Not permitted"),
+                    )
+                        .into_response();
+                }
                 Ok(repository_id) => Arc::new(RepositoryContext::new_server_context(
                     state.immutable_store.clone(),
                     state.mutable_store.clone(),

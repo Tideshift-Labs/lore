@@ -260,6 +260,31 @@ impl NodeChange {
             .then_some(&self.from.mapping.path)
     }
 
+    /// The path the node stood at where the change leaves it at another: a move's source, or the
+    /// path a node stood at below a directory a move renamed. `None` for a node that stays where it
+    /// stood, and for one the change adds.
+    pub fn relocated_from(&self) -> Option<&RelativePath> {
+        let from = &self.from.mapping.path;
+        (self.from.mapping.node.is_valid_node_id()
+            && !from.is_empty()
+            && from.as_str() != self.path().as_str())
+        .then_some(from)
+    }
+
+    /// Whether the change is a move whose source differs from its destination in case alone.
+    pub fn is_case_only_move(&self) -> bool {
+        self.move_source()
+            .is_some_and(|source| source.as_lowercase_str() == self.path().as_lowercase_str())
+    }
+
+    /// Whether a walk against the working tree found a file under a case variant of its name,
+    /// holding what the node holds.
+    pub fn is_case_variant(&self) -> bool {
+        self.is_case_only_move()
+            && !self.flags.contains(Flags::Modify)
+            && self.from.flags.contains(NodeFlags::File)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {

@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicBool;
 use axum::http::StatusCode;
 use axum::routing;
 use axum_test::TestServer;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::drain::DrainState;
 use lore_server::http::server::LoreHttpServerSettings;
@@ -29,7 +30,7 @@ async fn test_server_is_up_and_listening() {
     let test_shared_state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 100,
         presign_config: None,
@@ -64,7 +65,7 @@ async fn test_unavailable_store_server_is_not_healthy() {
     let test_shared_state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 100,
         presign_config: None,
@@ -222,7 +223,7 @@ async fn test_draining_takes_priority_over_unavailable_store() {
     let test_shared_state = ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: lore_server::auth::jwt::TokenVerification::Ignore,
         repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         max_file_size: 100,
         presign_config: None,
@@ -283,7 +284,7 @@ async fn health_only_bypasses_invalid_presign_configuration() {
                 &settings,
                 immutable_store.clone(),
                 mutable_store.clone(),
-                None,
+                TokenVerification::Ignore,
                 Arc::new(AllowAllRepositoryAuthorizer),
             )
             .expect("health-only must not parse presign configuration");
@@ -298,7 +299,7 @@ async fn health_only_bypasses_invalid_presign_configuration() {
                     &settings,
                     immutable_store,
                     mutable_store,
-                    None,
+                    TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                 )
                 .is_err(),
@@ -328,7 +329,7 @@ async fn check_http_server_lifetime(health_only: bool, cancel: bool) {
                     settings,
                     immutable_store,
                     mutable_store,
-                    None,
+                    TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     None,
                     Default::default(),

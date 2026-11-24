@@ -37,8 +37,6 @@ use quinn::IdleTimeout;
 use quinn::VarInt;
 use quinn::congestion;
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::RootCertStore;
-use rustls_native_certs::load_native_certs;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -46,7 +44,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::sync::oneshot;
 use url::Url;
-use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::MAX_RTT_MS;
 use super::PACKET_THRESHOLD;
@@ -58,12 +55,14 @@ use super::response_reader::ResponseReader;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
+use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
 use crate::replay::ATTEMPT_BUDGET;
 use crate::replay::DispatchState;
 use crate::replay::MutableOutcome;
 use crate::replay::OutcomeUnknown;
 use crate::replay::ReplayClass;
+use crate::tls::client_root_store;
 use crate::tls::load_certs;
 use crate::tls::load_private_key;
 
@@ -112,11 +111,10 @@ const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
 #[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
-/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
-/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
-/// datagram that arrives while it is full is lost.
-#[lore_macro::test_pub]
-const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
+/// The UDP receive buffer a QUIC socket asks for, client or server. Linux allocates twice the request,
+/// 1 MiB, which is intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s
+/// transfer, and every datagram that arrives while it is full is lost.
+pub const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -238,10 +236,41 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub enum CongestionAlgorithm {
     Bbr,
     Cubic,
+}
+
+impl CongestionAlgorithm {
+    /// The quinn controller factory for this algorithm, seeding its congestion window with
+    /// `initial_window` when given. `send_window` is the connection's send window, which caps the
+    /// BBR window.
+    pub fn controller_factory(
+        self,
+        initial_window: Option<u64>,
+        send_window: u64,
+    ) -> Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> {
+        match self {
+            CongestionAlgorithm::Bbr => {
+                let mut bbr = congestion::BbrConfig::default();
+                if let Some(cwnd) = initial_window {
+                    bbr.initial_window(cwnd);
+                }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
+                Arc::new(bbr)
+            }
+            CongestionAlgorithm::Cubic => {
+                let mut cubic = congestion::CubicConfig::default();
+                if let Some(cwnd) = initial_window {
+                    cubic.initial_window(cwnd);
+                }
+                Arc::new(cubic)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1535,31 +1564,12 @@ fn client_crypto_config(
             .dangerous()
             .with_custom_certificate_verifier(insecure_client_auth::SkipServerVerification::new())
     } else {
-        let mut cert_store = RootCertStore::empty();
-
-        // load built in webpki certs
-        cert_store.extend(TLS_SERVER_ROOTS.iter().cloned());
-
-        // load native certs
-        let native_certs = load_native_certs();
-        if native_certs.certs.is_empty() {
-            lore_warn!(
-                "no certificates loaded from the OS trust store, continuing with the built-in webpki roots: {:?}",
-                native_certs.errors
-            );
-        }
-        for cert in native_certs.certs {
-            let _ = cert_store.add(cert);
-        }
-
-        // load custom ca
+        let mut cert_store = client_root_store();
         if let Some(ca_path) = &certificate_settings.custom_ca {
             let ca_certs = load_certs(ca_path).forward_with::<ProtocolError, _>(|| {
                 format!("loading CA certificate from {}", ca_path.display())
             })?;
-            for cert in ca_certs {
-                let _ = cert_store.add(cert);
-            }
+            Arc::make_mut(&mut cert_store).add_parsable_certificates(ca_certs);
         }
 
         rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -1625,7 +1635,7 @@ pub async fn connect(
     let remote_addrs = interleave_socket_addrs(remote_addrs);
     let server_name = config.sni_override.as_deref().unwrap_or(host.as_str());
 
-    let validate_certificate = url.scheme().ends_with("s");
+    let validate_certificate = authenticates_server(&url);
     let crypto_config = client_crypto_config(alpn, certificate_settings, validate_certificate)?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
@@ -1669,28 +1679,11 @@ pub async fn connect(
         .max_rtt(Duration::from_millis(MAX_RTT_MS))
         .ack_frequency_config(Some(ack_freq_config));
 
-    let congestion_controller: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> =
-        match transport.congestion_algorithm {
-            CongestionAlgorithm::Bbr => {
-                let mut bbr = congestion::BbrConfig::default();
-                if let Some(cwnd) = transport.initial_cwnd {
-                    bbr.initial_window(cwnd);
-                }
-                // quinn never has more than the send window unacknowledged, so a larger
-                // congestion window would only raise the pacing rate.
-                bbr.max_window(send_window);
-                Arc::new(bbr)
-            }
-            CongestionAlgorithm::Cubic => {
-                let mut cubic = congestion::CubicConfig::default();
-                if let Some(cwnd) = transport.initial_cwnd {
-                    cubic.initial_window(cwnd);
-                }
-
-                Arc::new(cubic)
-            }
-        };
-    transport_config.congestion_controller_factory(congestion_controller);
+    transport_config.congestion_controller_factory(
+        transport
+            .congestion_algorithm
+            .controller_factory(transport.initial_cwnd, send_window),
+    );
 
     lore_debug!("QUIC transport config: {transport_config:?}");
 
@@ -1809,8 +1802,7 @@ where
 /// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
 /// that size alone. The OS may grant less than asked: Linux caps the request at
 /// `net.core.rmem_max`, and allocates and reports twice what it grants.
-#[lore_macro::test_pub]
-fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+pub fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
     let socket = socket2::SockRef::from(socket);
     if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
         return;

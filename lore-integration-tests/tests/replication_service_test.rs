@@ -155,6 +155,7 @@ mod replication_service_tests {
                 immutable.clone(),
                 immutable,
                 mutable,
+                None,
                 notification,
                 hooks,
                 lore_revision::environment::EnvironmentConfig::default(),
@@ -168,6 +169,7 @@ mod replication_service_tests {
                 // repository service reads either, and this suite never calls it.
                 None,
                 Arc::new(AllowAllRepositoryAuthorizer),
+                lore_server::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY,
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),

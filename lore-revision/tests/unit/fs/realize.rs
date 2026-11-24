@@ -6,6 +6,7 @@ use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::change::NodeChangeState;
+use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::realize::*;
@@ -26,7 +27,9 @@ use lore_storage::hash;
 use zerocopy::FromZeros;
 
 use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
+use crate::repository::test_helpers::working_tree_repository_filtered;
 
 async fn with_execution<F: Future>(body: F) -> F::Output {
     let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
@@ -87,7 +90,8 @@ async fn write_working_file(
 ) {
     lore_io::IoDriver::global()
         .write_file_bytes(
-            path.to_absolute_path(repository.require_path().expect("working tree")),
+            path.to_absolute_path(repository.require_path().expect("working tree"))
+                .expect("a path below the root"),
             bytes::Bytes::copy_from_slice(content),
             false,
         )
@@ -164,6 +168,7 @@ async fn verify_action(
         false,
         Arc::default(),
         FilterMode::Full,
+        &IncomingMoves::new(Arc::default()),
     ))
     .await?;
 
@@ -346,7 +351,9 @@ async fn a_target_side_change_the_tree_already_holds_is_dropped() {
 /// The executable bit the working tree holds at `path`.
 #[cfg(target_family = "unix")]
 async fn working_executable(repository: &Arc<RepositoryContext>, path: &RelativePath) -> bool {
-    let absolute = path.to_absolute_path(repository.require_path().expect("working tree"));
+    let absolute = path
+        .to_absolute_path(repository.require_path().expect("working tree"))
+        .expect("a path below the root");
     let metadata = lore_io::IoDriver::global()
         .metadata(absolute)
         .await
@@ -358,12 +365,10 @@ async fn working_executable(repository: &Arc<RepositoryContext>, path: &Relative
 /// user running `chmod +x` leaves: a bit no revision gave the file.
 #[cfg(target_family = "unix")]
 async fn make_working_executable(repository: &Arc<RepositoryContext>, path: &RelativePath) {
-    let absolute = path.to_absolute_path(repository.require_path().expect("working tree"));
-    let metadata = lore_io::IoDriver::global()
-        .metadata(&absolute)
-        .await
-        .expect("working file metadata");
-    util::fs::metadata_set_executable(&absolute, &metadata, true).await;
+    let absolute = path
+        .to_absolute_path(repository.require_path().expect("working tree"))
+        .expect("a path below the root");
+    util::fs::metadata_set_executable(&absolute, None, true).await;
 }
 
 /// A node addressing `content` and carrying the executable bit.
@@ -531,44 +536,9 @@ async fn a_local_mode_is_not_reverted_over_the_incoming_content() {
     .await;
 }
 
-/// Store `content` under a fragment list cut at boundaries this build never cuts at,
-/// as a client of another version left it, and return the node addressing it.
-async fn stored_under_a_list(repository: &Arc<RepositoryContext>, content: &[u8]) -> Node {
-    use zerocopy::IntoBytes;
-
-    let mut list = Vec::new();
-    let mut offset = 0;
-    while offset < content.len() {
-        let end = (offset + 17 * 1024).min(content.len());
-        list.push(lore_base::types::FragmentReference {
-            hash: hash::hash_slice(&content[offset..end]),
-            offset_content: offset as u64,
-        });
-        offset = end;
-    }
-
-    let payload = bytes::Bytes::copy_from_slice(list.as_slice().as_bytes());
-    let address = lore_base::types::Address::zero_context_hash(hash::hash_slice(&payload));
-    lore_revision::immutable::store_raw_store_retry(
-        repository.immutable_store(),
-        repository.id,
-        address,
-        lore_base::types::Fragment {
-            flags: lore_base::types::FragmentFlags::PayloadFragmented.bits(),
-            size_payload: payload.len() as u32,
-            size_content: content.len() as u64,
-        },
-        Some(payload),
-    )
-    .await
-    .expect("store the fragment list");
-
-    let mut node = Node::new_zeroed();
-    node.flags = NodeFlags::File.bits();
-    node.address = address;
-    node.size = content.len() as u64;
-    node
-}
+/// A leaf length this build never cuts a fragment list at, as a client of another version left
+/// one.
+const FOREIGN_LEAF_LEN: usize = 17 * 1024;
 
 /// The reported shape: the current revision addresses the file as a fragment list some
 /// other version of the client cut, and the file is untouched. The list is what answers
@@ -583,7 +553,7 @@ async fn a_clean_file_addressed_as_a_list_is_overwritten() {
         let source_content = pseudo_random_bytes(150 * 1024, 1);
         write_working_file(&repository, &path, &content).await;
 
-        let listed = stored_under_a_list(&repository, &content).await;
+        let listed = stored_as_list(&repository, &content, FOREIGN_LEAF_LEN).await;
         assert_ne!(
             listed.address.hash,
             hash::hash_slice(&content),
@@ -692,6 +662,769 @@ async fn a_move_of_unchanged_content_is_realized() {
     .await;
 }
 
+/// The directory the directory tests delete, and the file below it they track.
+const PLUGIN: &str = "Plugin";
+const SOURCE: &str = "Plugin/Source";
+const TRACKED: &str = "Plugin/Source/Plugin.Build.cs";
+const VARIANT: &str = "Plugin/Source/Plugin.build.cs";
+
+fn relative(path: &str) -> RelativePath {
+    RelativePath::new_from_initial_path(path).unwrap()
+}
+
+fn is_local_modifications<T>(result: &Result<T, SyncError>) -> bool {
+    matches!(result, Err(SyncError::LocalModifications(_)))
+}
+
+/// A state holding `files`, below [`SOURCE`], with its directories staged before them, unfiltered as
+/// a revision is.
+async fn plugin_tree(repository: &Arc<RepositoryContext>, files: &[(&str, &[u8])]) -> Arc<State> {
+    let state = State::new();
+    state.set_revision(lore_base::types::Hash::from([1; 32]));
+    let directories = [(PLUGIN, Node::new_zeroed()), (SOURCE, Node::new_zeroed())];
+    let files = files
+        .iter()
+        .map(|(path, content)| (*path, file_node(content)));
+    for (path, node) in directories.into_iter().chain(files) {
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            state.clone(),
+            relative(path),
+            node,
+            Arc::default(),
+            None,
+            FilterMode::empty(),
+        )
+        .await
+        .expect("stage the node");
+    }
+    state
+}
+
+/// Writes `files` into the working tree, creating their directories.
+async fn write_working_files(repository: &Arc<RepositoryContext>, files: &[(&str, &[u8])]) {
+    for (path, content) in files {
+        let path = relative(path);
+        let absolute = path
+            .to_absolute_path(repository.require_path().unwrap())
+            .expect("a path below the root");
+        lore_io::IoDriver::global()
+            .create_dir_all(absolute.parent().unwrap())
+            .await
+            .unwrap();
+        write_working_file(repository, &path, content).await;
+    }
+}
+
+async fn working_file(repository: &Arc<RepositoryContext>, path: &str) -> Vec<u8> {
+    lore_io::IoDriver::global()
+        .read_file_bytes(
+            relative(path)
+                .to_absolute_path(repository.require_path().unwrap())
+                .expect("a path below the root"),
+        )
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+async fn working_path_exists(repository: &Arc<RepositoryContext>, path: &str) -> bool {
+    lore_io::IoDriver::global()
+        .metadata(
+            relative(path)
+                .to_absolute_path(repository.require_path().unwrap())
+                .expect("a path below the root"),
+        )
+        .await
+        .is_ok()
+}
+
+/// The delete of `node`, which `state` holds at `path`.
+async fn delete_of(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &str,
+    node: NodeID,
+) -> NodeChange {
+    let path = relative(path);
+    let node_flags = state.node(repository.clone(), node).await.unwrap().flags;
+    let from = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: path.clone(),
+            node,
+        },
+        observed: None,
+        flags: NodeFlags::from_bits_retain(node_flags),
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Delete,
+        flags: change::Flags::None,
+        to: from.invalid(path),
+        from,
+    }
+}
+
+/// The delete of the node `state` holds at `path`.
+async fn delete_change(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &str,
+) -> NodeChange {
+    let node = state
+        .find_node_link(repository.clone(), path)
+        .await
+        .unwrap()
+        .node;
+    delete_of(repository, state, path, node).await
+}
+
+/// Verifies `change` against the working tree standing on `state` as a sync does, `incoming`
+/// holding the rest of the change set.
+async fn verify_change(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    mut change: NodeChange,
+    incoming: &[NodeChange],
+) -> Result<Option<NodeChange>, SyncError> {
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    let realize = Box::pin(verify_filesystem(
+        &mut change,
+        repository.clone(),
+        operation,
+        NodeMapping::root(repository.clone(), state.clone()),
+        false,
+        false,
+        Arc::default(),
+        FilterMode::View,
+        &IncomingMoves::new(Arc::new(incoming.to_vec())),
+    ))
+    .await?;
+    Ok(realize.then_some(change))
+}
+
+async fn verify_delete(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &str,
+    incoming: &[NodeChange],
+) -> Result<Option<NodeChange>, SyncError> {
+    let change = delete_change(repository, state, path).await;
+    Box::pin(verify_change(repository, state, change, incoming)).await
+}
+
+/// Realizes `changes`, verified first where `verify` asks for it as a sync does and a forced one
+/// does not.
+async fn realize_verified(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    changes: Vec<NodeChange>,
+    verify: bool,
+) -> Result<(), SyncError> {
+    let mut realized = Vec::new();
+    for change in changes {
+        if !verify {
+            realized.push(change);
+        } else if let Some(change) = Box::pin(verify_change(repository, state, change, &[])).await?
+        {
+            realized.push(change);
+        }
+    }
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    realize_changes(
+        repository.clone(),
+        operation,
+        Arc::new(realized),
+        None,
+        false,
+        false,
+        Arc::default(),
+    )
+    .await
+}
+
+/// Deletes [`PLUGIN`] with [`SOURCE`] and the `files` `state` holds below it.
+async fn delete_plugin(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    files: &[&str],
+    verify: bool,
+) -> Result<(), SyncError> {
+    let mut changes = Vec::new();
+    for path in [PLUGIN, SOURCE].iter().chain(files) {
+        changes.push(delete_change(repository, state, path).await);
+    }
+    Box::pin(realize_verified(repository, state, changes, verify)).await
+}
+
+/// A working tree spelling a tracked name in another case holds the tree's own file where the
+/// content agrees, which deleting its directory loses nothing of.
+#[tokio::test]
+async fn a_deleted_directory_holding_an_unmodified_case_variant_is_realized() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(VARIANT, &content)]).await;
+
+        assert!(
+            Box::pin(verify_delete(&repository, &state, PLUGIN, &[]))
+                .await
+                .expect("a case variant holding the tree's content is no local change")
+                .is_some()
+        );
+    }))
+    .await;
+}
+
+/// A directory spelled in another case is local work, which the delete of its directory refuses to
+/// lose, leaving the working tree as it was.
+#[tokio::test]
+async fn a_deleted_directory_holding_a_case_variant_directory_is_refused() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let variant = "Plugin/source/Plugin.Build.cs";
+        write_working_files(&repository, &[(variant, &content)]).await;
+
+        assert!(is_local_modifications(
+            &Box::pin(delete_plugin(&repository, &state, &[TRACKED], true)).await
+        ));
+        assert_eq!(working_file(&repository, variant).await, content);
+    }))
+    .await;
+}
+
+/// A case variant holding content neither revision holds is local work.
+#[tokio::test]
+async fn a_deleted_directory_holding_a_modified_case_variant_is_refused() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let state = plugin_tree(&repository, &[(TRACKED, &pseudo_random_bytes(1174, 0))]).await;
+        write_working_files(&repository, &[(VARIANT, &pseudo_random_bytes(1174, 1))]).await;
+
+        assert!(is_local_modifications(
+            &Box::pin(verify_delete(&repository, &state, PLUGIN, &[])).await
+        ));
+    }))
+    .await;
+}
+
+/// A file holding the content the incoming revision moves it out of the directory with matches
+/// the target, so the delete loses nothing of it.
+#[tokio::test]
+async fn a_deleted_directory_holding_the_content_the_target_moves_away_is_realized() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let incoming_content = pseudo_random_bytes(1174, 1);
+        let state = plugin_tree(&repository, &[(TRACKED, &pseudo_random_bytes(1174, 0))]).await;
+        write_working_files(&repository, &[(TRACKED, &incoming_content)]).await;
+
+        let destination = relative("Plugin.Build.cs");
+        let moved = state_holding(&repository, &destination, file_node(&incoming_content), 2).await;
+        let node = state
+            .find_node_link(repository.clone(), TRACKED)
+            .await
+            .unwrap()
+            .node;
+        let base = Staged {
+            state: state.clone(),
+            node,
+            address: file_node(&pseudo_random_bytes(1174, 0)).address,
+            mode: 0,
+        };
+        let incoming = [NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::Modify,
+            from: side(&repository, &base, relative(TRACKED)),
+            to: side(&repository, &moved, destination),
+        }];
+
+        assert!(
+            Box::pin(verify_delete(&repository, &state, PLUGIN, &incoming))
+                .await
+                .expect("a file holding the target's content is no local change")
+                .is_some()
+        );
+        assert!(
+            is_local_modifications(
+                &Box::pin(verify_delete(&repository, &state, PLUGIN, &[])).await
+            ),
+            "Without the move the file holds content neither revision holds"
+        );
+    }))
+    .await;
+}
+
+/// A file the view keeps out of the change set stays when its directory is deleted, though its
+/// name folds to that of a file the tree holds there, verified or forced.
+#[tokio::test]
+async fn a_deleted_directory_keeps_a_case_variant_of_a_file_the_view_excludes() {
+    Box::pin(with_execution(async {
+        for verify in [true, false] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let mut filter = Filter::default();
+            filter.view.add_exclusion("/Plugin/Secret.cfg").unwrap();
+            let repository = working_tree_repository_filtered(dir.path(), filter).await;
+            let other = "Plugin/other.txt";
+            let state = plugin_tree(
+                &repository,
+                &[("Plugin/Secret.cfg", b"tracked secret"), (other, b"other")],
+            )
+            .await;
+            let mine = "Plugin/secret.cfg";
+            write_working_files(&repository, &[(other, b"other"), (mine, b"my own work")]).await;
+
+            Box::pin(delete_plugin(&repository, &state, &[other], verify))
+                .await
+                .expect("the delete realizes");
+            assert_eq!(
+                working_file(&repository, mine).await,
+                b"my own work",
+                "The user's file stays, verified: {verify}"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A directory holding the source of a move is removed once the move has carried it out,
+/// verified or forced.
+#[tokio::test]
+async fn a_deleted_directory_a_move_empties_is_removed() {
+    Box::pin(with_execution(async {
+        for verify in [true, false] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let content = pseudo_random_bytes(1174, 0);
+            let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+            write_working_files(&repository, &[(TRACKED, &content)]).await;
+
+            let destination = "Plugin.Build.cs";
+            let moved =
+                state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+            let source = Staged {
+                state: state.clone(),
+                node: state
+                    .find_node_link(repository.clone(), TRACKED)
+                    .await
+                    .unwrap()
+                    .node,
+                address: moved.address,
+                mode: 0,
+            };
+            let changes = vec![
+                delete_change(&repository, &state, PLUGIN).await,
+                delete_change(&repository, &state, SOURCE).await,
+                NodeChange {
+                    action: FileAction::Move,
+                    flags: change::Flags::None,
+                    from: side(&repository, &source, relative(TRACKED)),
+                    to: side(&repository, &moved, relative(destination)),
+                },
+            ];
+
+            Box::pin(realize_verified(&repository, &state, changes, verify))
+                .await
+                .expect("the move realizes");
+            assert_eq!(working_file(&repository, destination).await, content);
+            assert!(
+                !working_path_exists(&repository, PLUGIN).await,
+                "The emptied directory goes, verified: {verify}"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A second spelling beside the tracked file is judged against the node as the tracked one is.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_second_spelling_beside_the_tracked_file_is_judged_against_its_node() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(TRACKED, &content), (VARIANT, &content)]).await;
+
+        Box::pin(delete_plugin(&repository, &state, &[TRACKED], true))
+            .await
+            .expect("a second spelling holding the tree's content is no local change");
+        assert!(!working_path_exists(&repository, PLUGIN).await);
+
+        write_working_files(
+            &repository,
+            &[
+                (TRACKED, &content),
+                (VARIANT, &pseudo_random_bytes(1174, 1)),
+            ],
+        )
+        .await;
+        assert!(
+            is_local_modifications(
+                &Box::pin(verify_delete(&repository, &state, PLUGIN, &[])).await
+            ),
+            "A second spelling holding other content is local work"
+        );
+    }))
+    .await;
+}
+
+/// A case-sensitive file system keeps a case variant the delete of the tracked spelling misses,
+/// which the directory delete then removes, verified or forced.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_directory_takes_an_unchanged_case_variant_with_it() {
+    Box::pin(with_execution(async {
+        for verify in [true, false] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let content = pseudo_random_bytes(1174, 0);
+            let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+            write_working_files(&repository, &[(VARIANT, &content)]).await;
+
+            Box::pin(delete_plugin(&repository, &state, &[TRACKED], verify))
+                .await
+                .expect("the delete realizes");
+            assert!(
+                !working_path_exists(&repository, PLUGIN).await,
+                "The directory goes with the variant, verified: {verify}"
+            );
+        }
+    }))
+    .await;
+}
+
+/// An untracked file keeps the deleted directory, the case variant beside it going.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_directory_keeps_an_untracked_file_beside_a_case_variant() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let untracked = "Plugin/Source/notes.txt";
+        write_working_files(&repository, &[(VARIANT, &content), (untracked, b"notes")]).await;
+
+        Box::pin(delete_plugin(&repository, &state, &[TRACKED], false))
+            .await
+            .expect("the delete realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert!(working_path_exists(&repository, untracked).await);
+    }))
+    .await;
+}
+
+/// Among many files the deleted directory holds, only the case variant of a file deleted directly
+/// in it goes, not one folding to a file deleted in its parent.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_directory_removes_only_the_case_variants_among_its_files() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let readme = "Plugin/Readme.txt";
+        let state = plugin_tree(&repository, &[(TRACKED, &content), (readme, b"readme")]).await;
+        let unrelated: Vec<String> = (0..512)
+            .map(|index| format!("{SOURCE}/unrelated-{index}.txt"))
+            .collect();
+        let parent_variant = "Plugin/Source/readme.TXT";
+        let files: Vec<(&str, &[u8])> = unrelated
+            .iter()
+            .map(|path| (path.as_str(), b"mine".as_slice()))
+            .chain([(VARIANT, content.as_slice()), (parent_variant, b"mine")])
+            .collect();
+        write_working_files(&repository, &files).await;
+
+        Box::pin(delete_plugin(
+            &repository,
+            &state,
+            &[TRACKED, readme],
+            false,
+        ))
+        .await
+        .expect("the delete realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert!(working_path_exists(&repository, parent_variant).await);
+        for path in &unrelated {
+            assert!(working_path_exists(&repository, path).await, "{path} stays");
+        }
+    }))
+    .await;
+}
+
+/// A directory named as a variant of a deleted file, and a file named as a variant of a deleted
+/// directory, are no files the revision deletes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_directory_keeps_entries_of_another_type_under_a_case_variant_name() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let readme = "Plugin/Source/Readme.txt";
+        let state = plugin_tree(&repository, &[(TRACKED, &content), (readme, b"readme")]).await;
+        let directory = "Plugin/Source/readme.TXT";
+        let file = "Plugin/source";
+        write_working_files(&repository, &[(VARIANT, &content), (file, b"mine")]).await;
+        lore_io::IoDriver::global()
+            .create_dir_all(
+                relative(directory)
+                    .to_absolute_path(dir.path())
+                    .expect("a path below the root"),
+            )
+            .await
+            .unwrap();
+
+        Box::pin(delete_plugin(
+            &repository,
+            &state,
+            &[TRACKED, readme],
+            false,
+        ))
+        .await
+        .expect("the delete realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert!(working_path_exists(&repository, directory).await);
+        assert_eq!(working_file(&repository, file).await, b"mine");
+    }))
+    .await;
+}
+
+/// The delete of a link takes the mount it names, not a directory spelled as a case variant of it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_link_keeps_a_directory_under_a_case_variant_of_its_mount() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let work = "libs/shared/mywork.txt";
+        write_working_files(&repository, &[(work, b"untracked work")]).await;
+        let mount = relative("libs/Shared");
+        let from = NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: State::new(),
+                path: mount.clone(),
+                node: NodeID::new_zeroed(),
+            },
+            observed: None,
+            flags: NodeFlags::Link,
+            address: Default::default(),
+            mode: 0,
+        };
+        let deleted = NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::None,
+            to: from.invalid(mount),
+            from,
+        };
+
+        Box::pin(realize_verified(
+            &repository,
+            &State::new(),
+            vec![deleted],
+            false,
+        ))
+        .await
+        .expect("the delete realizes");
+        assert_eq!(working_file(&repository, work).await, b"untracked work");
+    }))
+    .await;
+}
+
+/// Adds a file holding `content` at [`VARIANT`] to `state`, beside the one at [`TRACKED`].
+#[cfg(target_os = "linux")]
+async fn track_variant(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    content: &[u8],
+) -> NodeID {
+    let source = state
+        .find_node_link(repository.clone(), SOURCE)
+        .await
+        .unwrap()
+        .node;
+    let name = "Plugin.build.cs";
+    let mut node = file_node(content);
+    node.name_hash = hash::hash_string(name);
+    state
+        .node_add(repository.clone(), source, node, name)
+        .await
+        .unwrap()
+}
+
+/// A tree holding two spellings of one name tracks the one on disk, which the delete of the
+/// other leaves alone.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_delete_leaves_a_second_tracked_spelling_alone() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let deleted = delete_change(&repository, &state, TRACKED).await;
+        track_variant(&repository, &state, &content).await;
+        write_working_files(&repository, &[(VARIANT, &content)]).await;
+
+        Box::pin(realize_verified(&repository, &state, vec![deleted], true))
+            .await
+            .expect("the delete realizes");
+        assert!(working_path_exists(&repository, VARIANT).await);
+    }))
+    .await;
+}
+
+/// A file a move carries out of the deleted directory is judged against that move's target, not
+/// against the target of a move from another spelling of its name, whichever spelling the working
+/// tree holds and in either order of the moves.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_deleted_directory_judges_a_file_against_the_move_of_its_own_spelling() {
+    Box::pin(with_execution(async {
+        let tracked = pseudo_random_bytes(1174, 0);
+        let variant = pseudo_random_bytes(1174, 1);
+        let edited = pseudo_random_bytes(1174, 2);
+        for edits_variant in [true, false] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let state = plugin_tree(&repository, &[(TRACKED, &tracked)]).await;
+            let tracked_node = state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node;
+            let variant_node = track_variant(&repository, &state, &variant).await;
+            let tracked_move = (TRACKED, tracked_node, &tracked, "Tracked.cs");
+            let variant_move = (VARIANT, variant_node, &variant, "Variant.cs");
+            let (edited_path, sources) = if edits_variant {
+                (VARIANT, [variant_move, tracked_move])
+            } else {
+                (TRACKED, [tracked_move, variant_move])
+            };
+            write_working_files(&repository, &[(edited_path, &edited)]).await;
+
+            let mut moves = Vec::new();
+            for (index, (source, node, content, destination)) in sources.into_iter().enumerate() {
+                let from = Staged {
+                    state: state.clone(),
+                    node,
+                    address: file_node(content).address,
+                    mode: 0,
+                };
+                let carried = if index == 0 { content } else { &edited };
+                let destination = relative(destination);
+                let to = state_holding(&repository, &destination, file_node(carried), 2).await;
+                moves.push(NodeChange {
+                    action: FileAction::Move,
+                    flags: change::Flags::None,
+                    from: side(&repository, &from, relative(source)),
+                    to: side(&repository, &to, destination),
+                });
+            }
+
+            for _ in 0..2 {
+                assert!(
+                    is_local_modifications(
+                        &Box::pin(verify_delete(&repository, &state, PLUGIN, &moves)).await
+                    ),
+                    "The edit of {edited_path} goes with the move of its own spelling, which \
+                     carries other content"
+                );
+                moves.reverse();
+            }
+        }
+    }))
+    .await;
+}
+
+/// A forced delete keeps a file spelled as a case variant of a deleted file where it holds other
+/// content of the same size, and the directory with it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_forced_delete_keeps_a_case_variant_holding_other_content() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let mine = pseudo_random_bytes(1174, 1);
+        write_working_files(&repository, &[(TRACKED, &content), (VARIANT, &mine)]).await;
+
+        Box::pin(delete_plugin(&repository, &state, &[TRACKED], false))
+            .await
+            .expect("the delete realizes");
+        assert!(!working_path_exists(&repository, TRACKED).await);
+        assert_eq!(working_file(&repository, VARIANT).await, mine);
+    }))
+    .await;
+}
+
+/// A merge verifies under the ignore file, which can let an edited case variant of a committed
+/// file it ignores reach the realize. Deleting the directory keeps the edited file.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored_file() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.ignore.add_exclusion("*.cs").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let state = plugin_tree(&repository, &[(TRACKED, &pseudo_random_bytes(1174, 0))]).await;
+        let edited = pseudo_random_bytes(1174, 1);
+        write_working_files(&repository, &[(VARIANT, &edited)]).await;
+
+        let mut changes = Vec::new();
+        let mut refused = false;
+        for path in [PLUGIN, SOURCE, TRACKED] {
+            let mut change = delete_change(&repository, &state, path).await;
+            let operation = repository.file_system().begin_operation().await.unwrap();
+            refused |= Box::pin(verify_filesystem(
+                &mut change,
+                repository.clone(),
+                operation,
+                NodeMapping::root(repository.clone(), state.clone()),
+                false,
+                false,
+                Arc::default(),
+                FilterMode::Full,
+                &IncomingMoves::new(Arc::default()),
+            ))
+            .await
+            .is_err();
+            changes.push(change);
+        }
+        if !refused {
+            let operation = repository.file_system().begin_operation().await.unwrap();
+            realize_changes(
+                repository.clone(),
+                operation,
+                Arc::new(changes),
+                None,
+                false,
+                true,
+                Arc::default(),
+            )
+            .await
+            .expect("the merge realizes");
+        }
+        assert_eq!(working_file(&repository, VARIANT).await, edited);
+    }))
+    .await;
+}
+
 /// A file addressed as a list nothing in the store holds, so no hash check can
 /// establish anything about it.
 ///
@@ -733,6 +1466,67 @@ async fn an_unresolvable_chunking_is_refused_until_a_recorded_time_answers() {
                 .is_some(),
             "The time recorded against the current revision spares the file the hash check"
         );
+    }))
+    .await;
+}
+
+/// A directory that cannot be materialized fails before the consumer can schedule the
+/// following files. That failure must not prevent independent additions from being written.
+#[tokio::test]
+async fn sync_continues_after_a_materialization_error() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-sync-continue-");
+        let repository = working_tree_repository(temp.path()).await;
+        let blocked = RelativePath::new_from_initial_path("blocked").unwrap();
+        write_working_file(&repository, &blocked, b"local file blocks directory").await;
+        let mut changes = Vec::new();
+        for (name, node) in [
+            ("blocked", Node::new_zeroed()),
+            (
+                "first.txt",
+                Node {
+                    address: Default::default(),
+                    ..file_node(b"")
+                },
+            ),
+            (
+                "last.txt",
+                Node {
+                    address: Default::default(),
+                    ..file_node(b"")
+                },
+            ),
+        ] {
+            let path = RelativePath::new_from_initial_path(name).unwrap();
+            let staged = state_holding(&repository, &path, node, 1).await;
+            changes.push(NodeChange {
+                action: FileAction::Add,
+                flags: change::Flags::None,
+                from: side(&repository, &staged, path.clone()),
+                to: side(&repository, &staged, path),
+            });
+        }
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        let result = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes),
+            None,
+            false,
+            false,
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "the obstructed directory must fail the operation"
+        );
+        for name in ["first.txt", "last.txt"] {
+            let path = RelativePath::new_from_initial_path(name).unwrap();
+            let info = operation.file_info(&path).await.unwrap();
+            assert!(info.exists(), "available file {name} was not materialized");
+            assert_eq!(info.size(), 0);
+        }
     }))
     .await;
 }

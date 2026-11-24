@@ -2,16 +2,19 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
 use lore_base::lore_spawn_net;
+use lore_proto::lock::forwarded_lock_service_server::ForwardedLockServiceServer;
 use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
 use lore_revision::environment::EnvironmentConfig;
+use lore_revision::lock::LockStore;
 use lore_revision::notification::NotificationSender;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -31,6 +34,7 @@ use crate::domain::DomainContext;
 use crate::event_relay::reset_service::StreamResetHandler;
 use crate::event_relay::reset_wire::StreamResetServiceServer;
 use crate::grpc;
+use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
@@ -86,12 +90,14 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         local_immutable_store: Arc<dyn ImmutableStore>,
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
+        lock_store: Option<Arc<dyn LockStore>>,
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         environment: EnvironmentConfig,
         domain_context: Option<Arc<DomainContext>>,
         jwt_verifier: Option<JwtVerifier>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+        branch_list_concurrency: NonZeroUsize,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -102,12 +108,14 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             local_immutable_store,
             immutable_store,
             mutable_store,
+            lock_store,
             notification_sender,
             hook_dispatcher,
             environment,
             domain_context,
             jwt_verifier,
             repository_authorizer,
+            branch_list_concurrency,
         }))
     }
 }
@@ -119,12 +127,14 @@ pub struct WantsTlsConfig {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
     domain_context: Option<Arc<DomainContext>>,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -195,12 +205,14 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             local_immutable_store: self.0.local_immutable_store,
             immutable_store: self.0.immutable_store,
             mutable_store: self.0.mutable_store,
+            lock_store: self.0.lock_store,
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
             environment: self.0.environment,
             domain_context: self.0.domain_context,
             jwt_verifier: self.0.jwt_verifier,
             repository_authorizer: self.0.repository_authorizer,
+            branch_list_concurrency: self.0.branch_list_concurrency,
             tls_config,
         }))
     }
@@ -211,12 +223,14 @@ pub struct WantsHttp2Config {
     local_immutable_store: Arc<dyn ImmutableStore>,
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
+    lock_store: Option<Arc<dyn LockStore>>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     environment: EnvironmentConfig,
     domain_context: Option<Arc<DomainContext>>,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    branch_list_concurrency: NonZeroUsize,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -260,6 +274,7 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.notification_sender.clone(),
                 self.0.hook_dispatcher.clone(),
                 rpc_timeout,
+                self.0.branch_list_concurrency,
             ),
         ));
 
@@ -278,6 +293,12 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
 
         if let Some(stream_reset_service) = self.0.stream_reset_service {
             router = router.add_service(StreamResetServiceServer::from_arc(stream_reset_service));
+        }
+
+        if let Some(lock_store) = self.0.lock_store {
+            router = router.add_service(ForwardedLockServiceServer::new(
+                LoreForwardedLockService::new(lock_store, rpc_timeout),
+            ));
         }
 
         Ok(GrpcInternalServerBuilder(WantsAddress { router }))

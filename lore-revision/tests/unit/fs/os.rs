@@ -9,13 +9,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::FragmentFlags;
+use lore_revision::fs::filesystem_provider::FileInfo;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::*;
+use lore_revision::node::Node;
+use lore_revision::node::NodeFileMode;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::util::path::RelativePath;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::store_fragment;
+use crate::repository::test_helpers::stored_as_list;
+use crate::repository::test_helpers::working_tree_repository;
 
 fn temp_dir() -> lore_base::test_util::TempDir {
     lore_base::test_util::TempDir::new("lore-fs-os-test-")
@@ -161,7 +170,7 @@ fn a_listed_name_that_is_not_text_is_reported() {
 
     let listed = file_list_item(Ok(lore_io::DirEntry {
         file_name: name_that_is_not_text(),
-        metadata: Some(metadata),
+        metadata: Some(lore_io::Stat::from(&metadata)),
         is_symlink: false,
     }));
 
@@ -184,7 +193,7 @@ async fn list_path_describes_a_file_by_its_own_name() {
         panic!("a file must be described, not listed");
     };
     assert_eq!(item.name, "lonely.txt");
-    assert_eq!(item.metadata.len(), 4);
+    assert_eq!(item.metadata.len, 4);
 }
 
 #[tokio::test]
@@ -224,8 +233,8 @@ async fn a_name_is_held_only_in_the_case_variation_on_disk() {
     );
     assert_eq!(
         operation.holds_name_exactly(&relative("Test.file.")).await,
-        verdict(false),
-        "a trailing dot names a file that is not there"
+        Some(false),
+        "no node may be named with a trailing dot, so every platform holds it in no spelling"
     );
     assert_eq!(
         operation
@@ -462,6 +471,53 @@ async fn infer_is_conflicted_reads_the_content_at_the_path() {
         .await;
 }
 
+/// A file is not moved onto a directory: the rename is refused as unsupported and both keep what
+/// they hold.
+#[tokio::test]
+async fn rename_refuses_a_file_onto_a_directory() {
+    let dir = temp_dir();
+    let file = dir.path().join("file");
+    let directory = dir.path().join("directory");
+    std::fs::write(&file, b"kept").expect("write the file");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+
+    let refused = rename_unifying(&file, &directory)
+        .await
+        .expect_err("a file is not moved onto a directory");
+
+    assert_eq!(std::io::ErrorKind::Unsupported, refused.kind());
+    assert_eq!(Some(b"kept".to_vec()), std::fs::read(&file).ok());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(directory.join("entry")).ok()
+    );
+}
+
+/// A directory is not moved onto a file on Unix, whose rename refuses it: the rename is refused as
+/// unsupported and both keep what they hold.
+#[tokio::test]
+#[cfg(unix)]
+async fn rename_refuses_a_directory_onto_a_file() {
+    let dir = temp_dir();
+    let file = dir.path().join("file");
+    let directory = dir.path().join("directory");
+    std::fs::write(&file, b"kept").expect("write the file");
+    std::fs::create_dir(&directory).expect("create the directory");
+    std::fs::write(directory.join("entry"), b"kept").expect("write the entry");
+
+    let refused = rename_unifying(&directory, &file)
+        .await
+        .expect_err("a directory is not moved onto a file");
+
+    assert_eq!(std::io::ErrorKind::Unsupported, refused.kind());
+    assert_eq!(Some(b"kept".to_vec()), std::fs::read(&file).ok());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(directory.join("entry")).ok()
+    );
+}
+
 /// A move between two filesystems is no rename, so the content is copied and the source
 /// unlinked, whether or not the destination is already taken. The source is reached through a
 /// link, the two paths an operation names lying under one root.
@@ -576,4 +632,282 @@ async fn rename_refuses_a_destination_of_another_kind() {
         dir.path().join("to").is_dir(),
         "the destination must survive"
     );
+}
+
+/// The content each fragment of a list [`stored_node`] stores holds, in bytes.
+const LEAF_LEN: usize = 16 * 1024;
+
+/// A file node holding `content`, stored as one fragment or, where `listed` asks for it, as a
+/// list of fragments, and carrying the executable bit where `executable` asks for it.
+///
+/// The two shapes reach the file differently: one fragment is written whole and its write
+/// captures the file's metadata, and a list streams into the file and captures none.
+async fn stored_node(
+    repository: &Arc<RepositoryContext>,
+    content: &[u8],
+    listed: bool,
+    executable: bool,
+) -> Node {
+    let mut node = if listed {
+        stored_as_list(repository, content, LEAF_LEN).await
+    } else {
+        let mut node = file_node(content);
+        node.address = store_fragment(
+            repository,
+            content,
+            FragmentFlags::empty(),
+            content.len() as u64,
+        )
+        .await;
+        node
+    };
+    if executable {
+        node.mode = NodeFileMode::Executable.bits();
+    }
+    node
+}
+
+/// A written node answers what a stat of the file it left reads, whichever shape the content
+/// is stored in, and on Unix the file carries the executable bit the node does.
+#[tokio::test]
+async fn a_written_node_answers_what_the_file_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for (name, listed, executable) in [
+                ("whole", false, false),
+                ("whole.sh", false, true),
+                ("listed", true, false),
+                ("listed.sh", true, true),
+            ] {
+                let node = stored_node(&repository, &content, listed, executable).await;
+                let info = operation
+                    .write_node(repository.clone(), &node, &relative(name))
+                    .await
+                    .expect("writing the node");
+
+                let path = dir.path().join(name);
+                assert_eq!(
+                    content,
+                    std::fs::read(&path).expect("read the file"),
+                    "{name} holds the node's content"
+                );
+                assert_eq!(
+                    FileInfo::from_metadata(&std::fs::metadata(&path).expect("stat the file")),
+                    info,
+                    "{name} answers what a stat reads"
+                );
+                if cfg!(unix) {
+                    assert_eq!(
+                        Some(executable),
+                        info.executable(),
+                        "{name} carries the node's executable bit"
+                    );
+                }
+            }
+        })
+        .await;
+}
+
+/// A node written below directories that are not there creates them, one level or several
+/// deep, whichever shape the content is stored in, and a node written into a directory that is
+/// there lands beside what it holds.
+#[tokio::test]
+async fn a_node_written_below_missing_directories_creates_them() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for (name, listed) in [
+                ("whole/file", false),
+                ("listed/file", true),
+                ("whole/deeper/below/file", false),
+                ("listed/deeper/below/file", true),
+                ("whole/beside", false),
+                ("listed/beside", true),
+            ] {
+                let node = stored_node(&repository, &content, listed, false).await;
+                let info = operation
+                    .write_node(repository.clone(), &node, &relative(name))
+                    .await
+                    .unwrap_or_else(|err| panic!("writing {name}: {err}"));
+
+                let path = dir.path().join(name);
+                assert_eq!(
+                    content,
+                    std::fs::read(&path).expect("read the file"),
+                    "{name} holds the node's content"
+                );
+                assert_eq!(
+                    FileInfo::from_metadata(&std::fs::metadata(&path).expect("stat the file")),
+                    info,
+                    "{name} answers what a stat reads"
+                );
+            }
+            for directory in ["whole", "listed"] {
+                let mut names: Vec<_> = std::fs::read_dir(dir.path().join(directory))
+                    .expect("list the directory")
+                    .map(|entry| entry.expect("an entry").file_name())
+                    .collect();
+                names.sort();
+                assert_eq!(
+                    names,
+                    ["beside", "deeper", "file"],
+                    "{directory} holds what was written and nothing else"
+                );
+            }
+        })
+        .await;
+}
+
+/// A node written where a file stands in for the directory above it fails at once, and leaves
+/// that file as it was.
+#[tokio::test]
+async fn a_node_written_below_a_file_fails() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let blocker = dir.path().join("blocker");
+            std::fs::write(&blocker, b"kept").expect("write the blocking file");
+            let content: Vec<u8> = (0..40 * 1024).map(|index| (index % 251) as u8).collect();
+
+            for listed in [false, true] {
+                let node = stored_node(&repository, &content, listed, false).await;
+                let path = relative("blocker/file");
+                let write = operation.write_node(repository.clone(), &node, &path);
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), write)
+                    .await
+                    .expect("the write fails without waiting out the retries");
+
+                assert!(result.is_err(), "a node cannot land below a file");
+                assert_eq!(
+                    std::fs::read(&blocker).expect("read the blocking file"),
+                    b"kept",
+                    "the file is left as it was"
+                );
+            }
+        })
+        .await;
+}
+
+/// A node without the executable bit clears it from the file it overwrites, whose mode the
+/// write keeps.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_written_node_clears_an_executable_bit_it_does_not_carry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let repository = working_tree_repository(dir.path()).await;
+            let operation = repository
+                .file_system()
+                .begin_operation()
+                .await
+                .expect("beginning an operation over the working tree");
+            let path = dir.path().join("tool");
+            std::fs::write(&path, b"#!/bin/sh\n").expect("write the file");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("set the file's mode");
+
+            let node = stored_node(&repository, b"plain content", false, false).await;
+            let info = operation
+                .write_node(repository.clone(), &node, &relative("tool"))
+                .await
+                .expect("writing the node");
+
+            let mode = std::fs::metadata(&path)
+                .expect("stat the file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o644, "the bit is cleared for everyone");
+            assert_eq!(Some(false), info.executable());
+        })
+        .await;
+}
+
+/// An operation creates, writes and removes nothing at a path that reaches anywhere but an entry
+/// below its root on some platform: one that steps up, one that opens with a Windows drive, which
+/// on this platform names a place inside the root, and one that names the root itself.
+#[tokio::test]
+async fn an_operation_touches_nothing_at_a_path_that_leaves_its_root() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let dir = temp_dir();
+            let root = dir.path().join("root");
+            std::fs::create_dir(&root).expect("create the root");
+            let operation = os_operation(&root).await;
+
+            let up = RelativePath::new().join("..").join("escape");
+            let drive = RelativePath::new().join("Q:").join("planted");
+            for (path, lands) in [(&up, dir.path().join("escape")), (&drive, root.join("Q:"))] {
+                assert!(
+                    operation
+                        .create_dir_all(path)
+                        .await
+                        .is_err_and(|err| err.is_invalid_path()),
+                    "{path} must be refused"
+                );
+                assert!(
+                    operation
+                        .write_file(path, bytes::Bytes::from_static(b"planted"))
+                        .await
+                        .is_err_and(|err| err.is_invalid_path()),
+                    "{path} must be refused"
+                );
+                assert!(!lands.exists(), "nothing lands at {}", lands.display());
+            }
+
+            let victim = dir.path().join("victim");
+            std::fs::write(&victim, b"kept").expect("write the file outside the root");
+            let kept = root.join("kept");
+            std::fs::write(&kept, b"kept").expect("write the file in the root");
+            let up = RelativePath::new().join("..").join("victim");
+            let itself = RelativePath::new().join(".");
+            assert!(
+                operation
+                    .remove(&up)
+                    .await
+                    .is_err_and(|err| err.is_invalid_path()),
+                "{up} must be refused"
+            );
+            assert!(
+                operation
+                    .remove_recursive(&itself)
+                    .await
+                    .is_err_and(|err| err.is_invalid_path()),
+                "{itself} must be refused"
+            );
+            for file in [&victim, &kept] {
+                assert_eq!(
+                    std::fs::read(file).expect("read the file"),
+                    b"kept",
+                    "{} is left as it was",
+                    file.display()
+                );
+            }
+        })
+        .await;
 }

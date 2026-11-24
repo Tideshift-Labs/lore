@@ -95,7 +95,7 @@ mod tests {
         let filter = load_filter(&dir).expect("filter should load");
         // The ignore filter should contain user-defined rules from .urcignore
         // One user rule plus eight generated exclusions, including the bootstrap lock.
-        assert_eq!(filter.ignore.lines.len(), 9);
+        assert_eq!(filter.ignore.len(), 9);
         assert_ignored(&filter, "secret.txt", false, true);
         assert_ignored(&filter, "a.txt", false, false);
         assert_ignored(&filter, ".lore-workflow", true, true);
@@ -116,7 +116,7 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // Two primary-file rules plus eight generated exclusions.
-        assert_eq!(filter.ignore.lines.len(), 10);
+        assert_eq!(filter.ignore.len(), 10);
         assert_ignored(&filter, "a.txt", false, true);
         assert_ignored(&filter, "b.txt", false, true);
         assert_ignored(&filter, "secret.txt", false, false);
@@ -139,7 +139,7 @@ mod tests {
 
         let filter = load_filter(&dir).expect("filter should load");
         // Legacy repositories receive the same eight generated exclusions.
-        assert_eq!(filter.ignore.lines.len(), 9);
+        assert_eq!(filter.ignore.len(), 9);
         assert_ignored(&filter, "secret.txt", false, true);
         assert_ignored(&filter, "a.txt", false, false);
         assert_ignored(&filter, ".lore-workflow", true, true);

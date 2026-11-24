@@ -117,7 +117,7 @@ async fn drain_status_is_reachable_through_the_full_app_router_without_a_token()
     let shared_state = lore_server::http::server::ServerState {
         immutable_store,
         mutable_store,
-        jwt_verifier: None,
+        token_verification: lore_server::auth::jwt::TokenVerification::Ignore,
         repository_authorizer: std::sync::Arc::new(
             lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
         ),

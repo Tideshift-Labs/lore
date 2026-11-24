@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_server::auth::jwt::TokenVerification;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::protocol::attribute_map::AttributeMap;
@@ -26,7 +28,7 @@ fn make_service(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> StorageServiceV4 {
     StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
         immutable_store.clone(),
         immutable_store.clone(),
@@ -279,7 +281,7 @@ mod authorized_session {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
         StorageServiceV4::new(
-            Arc::new(Some(verifier())),
+            Arc::new(TokenVerification::Verify(verifier())),
             Arc::new(AuthClientAuthorizer::new(
                 "https://auth.invalid".to_string(),
             )),
@@ -324,12 +326,12 @@ mod authorized_session {
         assert_eq!(session.token.as_ref().unwrap().raw, token);
         assert!(
             session
-                .permits(&*service.repository_authorizer, "migrate")
+                .permits(&*service.repository_authorizer, Action::Migrate)
                 .await
         );
         assert!(
             !session
-                .permits(&*service.repository_authorizer, "obliterate")
+                .permits(&*service.repository_authorizer, Action::Obliterate)
                 .await
         );
     }
@@ -401,6 +403,75 @@ mod authorized_session {
         assert!(matches!(err, MessageHandleError::FragmentNotFound));
     }
 
+    /// Each command asks the action it performs, from the grants stored at
+    /// session start: an in-partition copy is a write, so a `read`-only
+    /// session is refused before the store, and a `write`-only one reaches
+    /// it, where the absent address is the only failure.
+    #[tokio::test]
+    async fn a_command_needs_its_own_action_on_the_session() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let resource = format!("urc-{repository}");
+
+        let read_only = start_session(&service, repository, &signed_token(&[&resource], &["read"]))
+            .await
+            .unwrap();
+        let err = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(read_only, repository),
+            )
+            .await
+            .expect_err("a copy needs `write`");
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+
+        let write_only = start_session(
+            &service,
+            repository,
+            &signed_token(&[&resource], &["write"]),
+        )
+        .await
+        .unwrap();
+        let err = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(write_only, repository),
+            )
+            .await
+            .expect_err("the absent address must be the only failure");
+        assert!(matches!(err, MessageHandleError::FragmentNotFound));
+    }
+
+    /// Any grant on the session's partition permits a read command.
+    #[tokio::test]
+    async fn any_grant_on_the_session_permits_a_read_command() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let resource = format!("urc-{repository}");
+        let write_only = start_session(
+            &service,
+            repository,
+            &signed_token(&[&resource], &["write"]),
+        )
+        .await
+        .unwrap();
+
+        let result = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::StorageCommand {
+                    session_id: write_only,
+                    opcode: Command::Query as u8,
+                    payload: Bytes::from(vec![0u8; 48]),
+                },
+            )
+            .await;
+        assert!(
+            !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+            "{result:?}"
+        );
+    }
+
     /// A repeated cross-partition copy from a source the session's token
     /// already cleared reuses the cached decision instead of re-asking the
     /// authorizer — the per-session form of the retired connection-wide
@@ -423,7 +494,7 @@ mod authorized_session {
                 &self,
                 token: Option<&VerifiedToken<'_>>,
                 repository_id: lore_revision::lore::RepositoryId,
-                _action: Option<&str>,
+                _action: Action,
             ) -> Result<(), Status> {
                 if repository_id == self.watched {
                     self.source_checks.fetch_add(1, Ordering::Relaxed);
@@ -442,7 +513,7 @@ mod authorized_session {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
         let service = StorageServiceV4::new(
-            Arc::new(Some(verifier())),
+            Arc::new(TokenVerification::Verify(verifier())),
             Arc::new(CountingAuthorizer {
                 watched: repo_a,
                 source_checks: source_checks.clone(),
@@ -621,11 +692,11 @@ mod require_write_dispatch_gate {
         }
     }
 
-    /// A `jwt_verifier` that is `Some(..)` — i.e. "a verifier is configured" —
+    /// A `TokenVerification::Verify` — i.e. "a verifier is configured" —
     /// without needing a real JWKS/signing setup, for tests exercising
     /// `require_write`'s dispatch-time gate on a directly-seeded session.
-    fn verifier_present() -> Arc<Option<JwtVerifier>> {
-        Arc::new(Some(JwtVerifier {
+    fn verifier_present() -> Arc<TokenVerification> {
+        Arc::new(TokenVerification::Verify(JwtVerifier {
             jwk_service: Arc::new(UnusedJwkService),
             jwt_issuer: None,
             jwt_audience: None,
@@ -647,13 +718,13 @@ mod require_write_dispatch_gate {
     }
 
     async fn service_with(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         enforce_write_permission: bool,
     ) -> StorageServiceV4 {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
         StorageServiceV4::new(
-            jwt_verifier,
+            token_verification,
             Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             immutable_store,
@@ -746,11 +817,11 @@ mod require_write_dispatch_gate {
 
     #[tokio::test]
     async fn read_only_session_allowed_when_auth_is_off() {
-        // jwt_verifier = None ("auth off"): has_verifier is false, so the
+        // TokenVerification::Ignore ("auth off"): has_verifier is false, so the
         // gate is a no-op regardless of enforce_write_permission or the
         // (here, still empty — no token to derive permissions from)
         // session permissions.
-        let service = service_with(Arc::new(None), true).await;
+        let service = service_with(Arc::new(TokenVerification::Ignore), true).await;
         let session_id = seed_session(&service, vec![]);
 
         service
@@ -991,4 +1062,88 @@ mod caller_declaration {
                 .is_err()
         );
     }
+}
+
+/// Without a verifier the session still stores the allow-all grants, so a
+/// command is a set lookup rather than an authorizer call.
+#[tokio::test]
+async fn session_start_without_a_verifier_stores_the_allow_all_grants() {
+    use lore_server::authnz::repository_authorizer::ALLOW_ALL_ACTIONS;
+    use lore_server::authnz::repository_authorizer::Grants;
+    use lore_server::protocol::attribute_map::AttributeMap;
+
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = make_service(immutable_store, mutable_store);
+    let response = service
+        .run_request_handler(
+            AttributeMap::default().into(),
+            ParsedStorageRequestV4::AuthorizeStart {
+                repository: random(),
+                correlation_id: "corr".to_string(),
+                auth_token: vec![],
+                caller_capabilities: None,
+            },
+        )
+        .await
+        .expect("session start");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+
+    let session = service.session_map.get(session_id).unwrap();
+    assert_eq!(
+        session.grants,
+        Some(Grants::Actions(
+            ALLOW_ALL_ACTIONS.iter().map(ToString::to_string).collect()
+        ))
+    );
+}
+
+#[tokio::test]
+async fn session_start_trusting_unsigned_identity_names_the_caller_without_a_token() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let service = StorageServiceV4::new(
+        Arc::new(TokenVerification::TrustUnsigned),
+        Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        immutable_store.clone(),
+        immutable_store,
+        mutable_store,
+        false,
+        Arc::new(UserAgentFilter::default()),
+    );
+    let start = |auth_token: Vec<u8>| {
+        service.run_request_handler(
+            AttributeMap::default().into(),
+            ParsedStorageRequestV4::AuthorizeStart {
+                repository: random(),
+                correlation_id: "corr".to_string(),
+                auth_token,
+                caller_capabilities: None,
+            },
+        )
+    };
+
+    let token = lore_credential::unsigned_identity_token("alice").expect("encodes");
+    let response = start(token.into_bytes()).await.expect("session start");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+    let session = service.session_map.get(session_id).unwrap();
+    assert_eq!(session.user_id, "alice");
+    assert!(session.token.is_none());
+    drop(session);
+
+    let response = start(vec![]).await.expect("a token is not required");
+    let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+    assert!(
+        service
+            .session_map
+            .get(session_id)
+            .unwrap()
+            .user_id
+            .is_empty()
+    );
+
+    let error = start(b"not.a.jwt".to_vec())
+        .await
+        .expect_err("a malformed token is refused");
+    assert!(matches!(error, MessageHandleError::AuthorizationFailure(_)));
 }

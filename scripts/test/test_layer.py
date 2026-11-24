@@ -1607,16 +1607,18 @@ def test_layer_stage_is_filtered_by_the_mount_path(new_lore_repo):
     """A rule naming the mount excludes what is below it from staging.
 
     Ignore rules are written against the working tree, so `thr/**` — which matches nothing the
-    layer repository spells — must still exclude the file the layer draws.
+    layer repository spells — must still exclude a new file below the mount. The file has to be
+    new: a rule has no say over one the layer already tracks (ADR-00027).
     """
     repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
 
     with repo.open_file(repo.ignore_file(), "w+") as out:
         out.write("thr/**\n")
-    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+    new_file = os.path.join("thr", "new_in_layer.txt")
+    with repo.open_file(new_file, mode="wb") as out:
         out.write(b"excluded by the mount rule")
 
-    staged = parse_jsonl(repo.stage(THR_MOUNT_FILE, json=True), "fileStageFile")
+    staged = parse_jsonl(repo.stage(new_file, json=True), "fileStageFile")
     assert staged == [], (
         f"Expected the rule on the mount path to exclude the file from `stage`, got: {staged}"
     )
@@ -1902,6 +1904,109 @@ def test_layer_sync_reset_restores_a_layer_mounted_away_from_its_source(new_lore
         assert out.read() == original, (
             "Expected --reset to restore the layer's pinned content at the mount"
         )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("command", ["sync", "branch switch"])
+def test_layer_reset_carries_ignored_files_in_the_mount(new_lore_repo, command):
+    """`lore sync --reset` and `lore branch switch --reset` carry a layer's revision over the
+    files in its mount that an ignore rule matches: they restore an edited committed file and
+    apply the layer's delete of another. They leave untracked files in the mount alone, whether
+    an ignore rule matches them or not."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(
+        None,
+        {
+            LAYER_FILE: b"layer content v1",
+            "lay/cfg.tmp": b"committed",
+            "lay/gone.tmp": b"committed",
+        },
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\n"})
+    if command == "branch switch":
+        repo.branch_create("feature")
+        repo.push()
+        repo.branch_switch("feature")
+
+    layer_repo.remove_file("lay/gone.tmp")
+    layer_repo.stage("lay/gone.tmp")
+    layer_repo.commit("Delete gone.tmp")
+    layer_repo.push()
+    repo.write_files(
+        {
+            "lay/cfg.tmp": b"local\n",
+            "lay/build.tmp": b"untracked\n",
+            "lay/notes.txt": b"untracked\n",
+        }
+    )
+
+    if command == "sync":
+        repo.sync(reset=True)
+    else:
+        repo.branch_switch("main", reset=True)
+
+    expected = {
+        LAYER_FILE: b"layer content v1",
+        "lay/cfg.tmp": b"committed",
+        "lay/build.tmp": b"untracked\n",
+        "lay/notes.txt": b"untracked\n",
+    }
+    for path, content in expected.items():
+        with repo.open_file(path, mode="rb") as out:
+            assert out.read() == content, f"{command}: {path} does not hold {content!r}"
+    assert not repo.file_exists("lay/gone.tmp"), f"{command}: lay/gone.tmp survived"
+
+
+@pytest.mark.smoke
+def test_layer_reset_purge_keeps_committed_layer_content(new_lore_repo):
+    """`lore reset --purge .` resets a layer's committed content in its mount
+    and deletes the untracked files there and in the parent, whatever the
+    ignore rules say. It leaves a layer file the working tree did not change in
+    place."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(
+        None,
+        {
+            LAYER_FILE: b"layer content v1",
+            "lay/cfg.tmp": b"committed",
+            "lay/stable.txt": b"committed",
+        },
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\n"})
+    stable = os.stat(os.path.join(repo.path, "lay", "stable.txt")).st_ino
+
+    untracked = ["lay/build.tmp", "lay/notes.txt", "build.tmp"]
+    repo.write_files(
+        {
+            LAYER_FILE: "local\n",
+            "lay/cfg.tmp": "local\n",
+            **{path: "untracked\n" for path in untracked},
+        }
+    )
+
+    repo.reset(".", purge=True)
+
+    for path, content in {
+        LAYER_FILE: b"layer content v1",
+        "lay/cfg.tmp": b"committed",
+        "lay/stable.txt": b"committed",
+        MAIN_FILE: b"main content",
+    }.items():
+        with repo.open_file(path, mode="rb") as out:
+            assert out.read() == content, f"{path} does not hold {content!r}"
+    for path in untracked:
+        assert not repo.file_exists(path), f"The purge kept the untracked {path}"
+    assert os.stat(os.path.join(repo.path, "lay", "stable.txt")).st_ino == stable, (
+        "The purge deleted the unchanged layer file and wrote it back"
+    )
 
 
 @pytest.mark.smoke
@@ -3277,3 +3382,31 @@ def test_layer_dry_run_adds_and_removes_nothing(new_lore_repo):
     assert os.path.isfile(layer_file), (
         "layer remove --dry-run removed the layer's files"
     )
+
+
+@pytest.mark.smoke
+def test_layer_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo):
+    """Status lists a change staged with `--force` in a layer drawn from a repository's
+    root and mounted below a directory the ignore file names."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    with repo.open_file(repo.ignore_file(), "w+") as f:
+        f.write("vendor/\n")
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+    with layer_repo.open_file("a.txt", "w+") as f:
+        f.write("layer\n")
+    layer_repo.stage(scan=True)
+    layer_repo.commit()
+    layer_repo.push()
+
+    repo.layer_add("vendor/x", layer_repo, "/")
+    with repo.open_file("vendor/x/a.txt", "w+") as f:
+        f.write("edited\n")
+    repo.stage("vendor/x/a.txt", force=True)
+
+    entries = parse_status_json(repo.status(json=True))
+    assert [(e.get("path"), e.get("action"), e.get("flagStaged")) for e in entries] == [
+        ("vendor/x/a.txt", "keep", True)
+    ], f"status lists {entries}"

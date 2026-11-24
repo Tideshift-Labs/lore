@@ -12,6 +12,8 @@ pub mod outcome;
 pub mod quic;
 pub mod replay;
 pub mod session;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod tls;
 pub mod traits;
 pub mod types;

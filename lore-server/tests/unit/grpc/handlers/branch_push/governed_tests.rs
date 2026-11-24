@@ -385,11 +385,15 @@ async fn push_revision(
         repository.clone(),
         branch,
         revision,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         branch::DEFAULT_HISTORY_STEP_SIZE,
         RevisionListAcceleration::default(),
+        &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+            lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+            Default::default(),
+        ),
     )
     .await
     .expect("push")
@@ -854,6 +858,7 @@ async fn push_refusal_requires_exact_terminal_not_applied_and_preserves_original
                 fast_forward_merged: false,
                 revision: Hash::hash_buffer(b"refused"),
                 revision_number: 7,
+                branch_name: String::new(),
             })
         } else {
             Err(Status::resource_exhausted("original overload"))
@@ -923,6 +928,7 @@ async fn successful_push_and_ungoverned_errors_do_not_terminalize_again() {
         fast_forward_merged: false,
         revision: Hash::hash_buffer(b"applied"),
         revision_number: 9,
+        branch_name: String::new(),
     };
     assert_eq!(
         settle_governed_push(Some(&governed), Ok(push))
@@ -1231,12 +1237,16 @@ async fn idempotent_no_op_branch_surfaces_a_lost_cas_as_aborted_with_no_retry() 
                 repository_ctx,
                 branch_id,
                 tip,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 branch::DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
                 Some(&governed),
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await
         }
@@ -1282,12 +1292,16 @@ async fn advancing_branch_surfaces_a_lost_cas_as_aborted_with_no_retry() {
                 repository_ctx,
                 branch_id,
                 next,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 branch::DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
                 Some(&governed),
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await
         }
@@ -1317,12 +1331,16 @@ async fn ungoverned_push_is_unchanged_by_governance() {
                 repository_ctx.clone(),
                 branch_id,
                 tip,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 branch::DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
                 None,
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await;
 
@@ -1331,12 +1349,16 @@ async fn ungoverned_push_is_unchanged_by_governance() {
                 repository_ctx,
                 branch_id,
                 next,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 branch::DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
                 None,
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await;
             (no_op, advancing)
@@ -1605,6 +1627,12 @@ async fn prepare_and_build_push_request_with_options(
         .metadata_mut()
         .insert_bin(PREPARE_TOKEN_KEY, BinaryMetadataValue::from_bytes(&token));
     request.extensions_mut().insert(pusher_token.clone());
+    // Fork claim readers accept only a verified token: claims travel with their raw token.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request
 }
 

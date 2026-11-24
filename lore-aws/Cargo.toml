@@ -36,11 +36,13 @@ lore-macro = { workspace = true }
 lore-telemetry = { workspace = true }
 
 [dev-dependencies]
+lore-aws = { workspace = true, features = ["test-util"] }
 mockall = { workspace = true }
 rand = { workspace = true }
 serde_json = { workspace = true }
 serial_test = "3.3.1"
 temp-env = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 tracing-test = { workspace = true }
 uuid = { workspace = true }
@@ -49,6 +51,7 @@ lore-proto = { workspace = true }
 [features]
 default = []
 mocks = []
+test-util = []
 
 [lints]
 workspace = true

@@ -40,6 +40,7 @@ from lore_parsers import (
     parse_branch_info,
     parse_branch_list,
     parse_file_info,
+    parse_jsonl,
     parse_lock_acquire,
     parse_lock_query,
     parse_lock_release,
@@ -72,6 +73,11 @@ def lore_test_env(global_dir: str) -> dict[str, str]:
     # developer or CI already exports would win and the command would read
     # that store.
     env["LORE_AUTH_PATH"] = global_dir
+    # Keep the token store's key in that directory as well, as the Rust tests
+    # do, rather than in the OS keyring: a headless run started over ssh holds a
+    # session keyring that is revoked when the login ends, and a live keyring
+    # would share one key across every test.
+    env["LORE_AUTH_STORE"] = "fallback"
     return env
 
 
@@ -549,6 +555,32 @@ class Lore:
 
     def repository_gc(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "gc"], **kwargs)
+
+    def repository_instance_list(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "list"], **kwargs)
+
+    def repository_instance_prune(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["repository", "instance", "prune"], **kwargs)
+
+    def repository_instance_delete(
+        self, dry_run: bool = False, **kwargs: Unpack[GlobalOptions]
+    ):
+        return self.run(
+            ["repository", "instance", "delete"] + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
+
+    def repository_instance_move(
+        self,
+        target_path: str,
+        dry_run: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["repository", "instance", "move", target_path]
+            + (["--dry-run"] if dry_run else []),
+            **kwargs,
+        )
 
     def repository_store(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["repository", "store"], **kwargs)
@@ -1777,6 +1809,13 @@ class Lore:
             ["auth", "info", "--with-token"],
             **kwargs,
         )
+
+    def auth_user_token_event(self) -> dict:
+        """The data of the one `authUserToken` event `auth info` emits for the
+        current user."""
+        output = self.run(["auth", "info", "--with-identity-token"], json=True)
+        [data] = parse_jsonl(output, "authUserToken")
+        return data
 
     def _capi_driver_output(
         self, library_path: str, command: str, *args: str

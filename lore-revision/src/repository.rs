@@ -54,8 +54,8 @@ use crate::filter;
 use crate::filter::Filter;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
+use crate::fs::mount_manager_state::MountManagerState;
 use crate::fs::os::OsFilesystem;
-use crate::fs::swfs::mount_manager_state::MountManagerState;
 use crate::global::GlobalConfig;
 use crate::hash;
 use crate::instance::InstanceId;
@@ -188,6 +188,8 @@ pub struct RepositoryConfig {
     pub store: Option<StoreConfig>,
     pub file: Option<FileConfig>,
     pub vfs: Option<VfsConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SyncConfig>,
 }
 
 impl RepositoryConfig {
@@ -327,6 +329,15 @@ impl Default for FileConfig {
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
+pub struct SyncConfig {
+    /// Fetch every tree block and name table of the target in bulk before a sync walks it,
+    /// rather than each as the walk reaches it. It fetches the whole tree whatever the view, so
+    /// it suits instances whose syncs walk most of a large tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefetch_tree: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct SharedStoreToUseConfig {
     #[serde(alias = "use_global_store")]
     pub use_shared_store: Option<bool>,
@@ -397,6 +408,8 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
+    /// Prefetch a sync target's tree in bulk, from `[sync] prefetch_tree`
+    pub prefetch_tree: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -405,6 +418,7 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
+            prefetch_tree: AtomicBool::new(false),
         }
     }
 }
@@ -415,6 +429,7 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
+            prefetch_tree: AtomicBool::new(self.prefetch_tree.load(Ordering::Relaxed)),
         }
     }
 
@@ -429,6 +444,10 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.prefetch_tree.store(
+            source.prefetch_tree.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -1181,6 +1200,16 @@ impl RepositoryContext {
             .store(direct, Ordering::Relaxed);
     }
 
+    pub fn prefetch_tree(&self) -> bool {
+        self.settings.prefetch_tree.load(Ordering::Relaxed)
+    }
+
+    pub fn set_prefetch_tree(&self, prefetch: bool) {
+        self.settings
+            .prefetch_tree
+            .store(prefetch, Ordering::Relaxed);
+    }
+
     pub async fn flush(&self, sync_data: bool) -> Result<(), RepositoryError> {
         let immutable_store = self.immutable_store.clone();
         let immutable_result = immutable_store.flush(sync_data).await;
@@ -1474,14 +1503,51 @@ pub const SERVICE: &str = "service";
 pub const DOT_URCIGNORE: &str = ".urcignore";
 pub const DOT_LOREIGNORE: &str = ".loreignore";
 
-/// Whether `name` is the repository's own directory, in any ASCII case.
+/// Whether `name` is the repository's own directory: in any ASCII case, with the trailing dots and
+/// spaces Windows drops, as the 8.3 short name Windows gives it, such as `LORE~1`, or with a stream
+/// of it after a colon, such as `.lore::$INDEX_ALLOCATION`.
 ///
 /// No node carries such a name: a writer refuses it, a per-node read refuses it, and a walk
 /// skips the node, so content in a revision never stands in for the control directory, on a
 /// filesystem that folds case as much as on one that does not.
+///
+/// Every such spelling opens with the directory's name or its short name, so a name opening with
+/// neither is answered from its first bytes.
 #[inline]
 pub fn is_reserved_node_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(DOT_URC) || name.eq_ignore_ascii_case(DOT_LORE)
+    let name = name.as_bytes();
+    [DOT_URC, DOT_LORE].into_iter().any(|dot| {
+        strip_prefix_ignore_ascii_case(name, dot.as_bytes())
+            .or_else(|| strip_short_name(name, dot.trim_start_matches('.').as_bytes()))
+            .is_some_and(names_the_stem_on_windows)
+    })
+}
+
+/// `name` past `prefix`, which it opens with in any ASCII case.
+fn strip_prefix_ignore_ascii_case<'a>(name: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let (head, tail) = name.split_at_checked(prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then_some(tail)
+}
+
+/// `name` past the 8.3 short name Windows makes from `stem`, which it opens with: the stem, a
+/// tilde and a number, in any ASCII case.
+fn strip_short_name<'a>(name: &'a [u8], stem: &[u8]) -> Option<&'a [u8]> {
+    let tail = strip_prefix_ignore_ascii_case(name, stem)?.strip_prefix(b"~")?;
+    let digits = tail.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    (digits > 0).then_some(&tail[digits..])
+}
+
+/// Whether Windows reads a name ending in `tail` as the name before it, or as a stream of it:
+/// `tail` is dots and spaces, then anything after a colon.
+fn names_the_stem_on_windows(tail: &[u8]) -> bool {
+    for &byte in tail {
+        match byte {
+            b':' => return true,
+            b'.' | b' ' => {}
+            _ => return false,
+        }
+    }
+    true
 }
 
 pub const SALT_URC: &[u8] = b"urc";
@@ -2778,6 +2844,13 @@ pub async fn load_and_connect_with_token(
     repository.set_disable_cache(!(global.cache() || config.is_swfs()));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
+    repository.set_prefetch_tree(
+        config
+            .sync
+            .as_ref()
+            .and_then(|sync| sync.prefetch_tree)
+            .unwrap_or_default(),
+    );
 
     if global.local() {
         repository.set_disable_upload(true);
@@ -3848,7 +3921,7 @@ async fn layer_branch_switch(
 
         // Sync layer files from current to target revision
         if layer_revision != layer.current {
-            let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
+            let mount_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
                 .forward::<RepositoryError>("Failed to switch branch in layer")?;
             let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
                 .forward::<RepositoryError>("Failed to switch branch in layer")?;
@@ -3870,7 +3943,7 @@ async fn layer_branch_switch(
                 layer_repository,
                 layer_current,
                 layer_target,
-                target_path.clone(),
+                mount_path.clone(),
                 source_path,
                 sync_options,
             ))

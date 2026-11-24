@@ -52,6 +52,7 @@ async fn enforcing_cell_rejects_before_legacy_metadata_cas_body() {
             Hash::default(),
             Hash::default(),
         ),
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
         false,
@@ -120,9 +121,16 @@ async fn set_custom_key_succeeds() {
         let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
         let request = make_request(repository_id, branch_id, current_hash, new_hash);
-        let response = handler(request, immutable_store, mutable_store, false, None)
-            .await
-            .expect("Handler failed");
+        let response = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await
+        .expect("Handler failed");
 
         let inner = response.into_inner();
         assert!(inner.success);
@@ -157,7 +165,15 @@ async fn rejects_modification_of_read_only_name() {
         let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
         let request = make_request(repository_id, branch_id, current_hash, new_hash);
-        let result = handler(request, immutable_store, mutable_store, false, None).await;
+        let result = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
         let status = result.unwrap_err();
@@ -191,7 +207,15 @@ async fn rejects_removal_of_read_only_creator() {
         let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
         let request = make_request(repository_id, branch_id, current_hash, new_hash);
-        let result = handler(request, immutable_store, mutable_store, false, None).await;
+        let result = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
         let status = result.unwrap_err();
@@ -227,9 +251,16 @@ async fn allows_modification_of_protect_field() {
         let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
         let request = make_request(repository_id, branch_id, current_hash, new_hash);
-        let response = handler(request, immutable_store, mutable_store, false, None)
-            .await
-            .expect("Handler failed — protect should be writable");
+        let response = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await
+        .expect("Handler failed — protect should be writable");
 
         assert!(response.into_inner().success);
     }))
@@ -263,7 +294,15 @@ async fn cas_fails_on_stale_expected_hash() {
         // Use a bogus expected hash
         let stale_hash = Hash::from(random::<[u8; 32]>());
         let request = make_request(repository_id, branch_id, stale_hash, new_hash);
-        let result = handler(request, immutable_store, mutable_store, false, None).await;
+        let result = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await;
 
         // CAS should fail because expected_hash doesn't match (it can't be deserialized)
         assert!(result.is_err());
@@ -284,7 +323,15 @@ async fn rejects_missing_branch_id() {
         Hash::default(),
         Hash::default(),
     );
-    let result = handler(request, immutable_store, mutable_store, false, None).await;
+    let result = handler(
+        request,
+        &crate::util::test_support::allow_all_authorizer(),
+        immutable_store,
+        mutable_store,
+        false,
+        None,
+    )
+    .await;
 
     assert!(result.is_err());
     assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -316,7 +363,15 @@ async fn rejects_modification_of_read_only_category() {
         let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
         let request = make_request(repository_id, branch_id, current_hash, new_hash);
-        let result = handler(request, immutable_store, mutable_store, false, None).await;
+        let result = handler(
+            request,
+            &crate::util::test_support::allow_all_authorizer(),
+            immutable_store,
+            mutable_store,
+            false,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
         let status = result.unwrap_err();

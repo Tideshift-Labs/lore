@@ -31,7 +31,8 @@ use tracing::debug;
 use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
@@ -39,6 +40,7 @@ use crate::grpc::caller_capabilities::admit_quic;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::UserAgentValue;
+use crate::protocol::storage::connect::connection_permits;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -305,6 +307,31 @@ pub enum ParsedStorageRequest {
     MutableCas(requests::MutableCas),
 }
 
+impl ParsedStorageRequest {
+    /// The action this command needs on the connection's partition beyond
+    /// reaching it, which connect already checked. `None` for reads, which
+    /// reaching the partition permits, and for the commands that set up the
+    /// connection. Exhaustive, so a new command cannot skip the decision.
+    pub fn required_action(&self) -> Option<Action> {
+        match self {
+            Self::Connect(_)
+            | Self::Correlate(_)
+            | Self::Get(_)
+            | Self::GetMetadata(_)
+            | Self::GetResolved(_)
+            | Self::Query(_)
+            | Self::MutableLoad(_) => None,
+            // Healing drops the server's index entries for a corrupt fragment.
+            Self::Verify(verify) => (verify.heal != 0).then_some(Action::Write),
+            Self::Put(_)
+            | Self::PutResolved(_)
+            | Self::Copy(_)
+            | Self::MutableStoreOp(_)
+            | Self::MutableCas(_) => Some(Action::Write),
+        }
+    }
+}
+
 fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
     match message_error {
         // FORK-LOCAL (Tideshift): a refused domain key is a permission refusal.
@@ -465,7 +492,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 }
 
 pub struct StorageService {
-    jwt_verifier: Arc<Option<JwtVerifier>>,
+    token_verification: Arc<TokenVerification>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -476,7 +503,7 @@ pub struct StorageService {
 
 impl StorageService {
     pub fn new(
-        jwt_verifier: Arc<Option<JwtVerifier>>,
+        token_verification: Arc<TokenVerification>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
@@ -484,7 +511,7 @@ impl StorageService {
         enforce_write_permission: bool,
     ) -> Self {
         Self {
-            jwt_verifier,
+            token_verification,
             repository_authorizer,
             immutable_store,
             local_store,
@@ -514,7 +541,7 @@ impl StorageService {
         context: &Arc<AttributeMap>,
         operation: &'static str,
     ) -> Result<(), MessageHandleError> {
-        if self.jwt_verifier.is_none() || !self.enforce_write_permission {
+        if self.token_verification.verifier().is_none() || !self.enforce_write_permission {
             return Ok(());
         }
         let Some(repository) = context.get::<RepositoryId>() else {
@@ -567,7 +594,7 @@ impl QuicService for StorageService {
         // FORK-LOCAL (Tideshift, WP-124): the connection's token is checked per command, against
         // the same `exp` plus leeway the verifier uses, before any other check. urc/0.2 has no
         // session to rebind, so the refusal is the ordinary `NotAuthorized`.
-        if self.jwt_verifier.is_some()
+        if self.token_verification.verifier().is_some()
             && token_expiry_gates(&request)
             && context.get::<AuthorizationToken>().is_some_and(|token| {
                 token.expires.saturating_add(TOKEN_EXP_LEEWAY_SECS) < now_unix_secs()
@@ -601,13 +628,23 @@ impl QuicService for StorageService {
             | ParsedStorageRequest::Connect(_)
             | ParsedStorageRequest::Correlate(_) => {}
         }
+        // Upstream v0.13 (483c96ff): every partition write also asks the shared authorizer for its
+        // explicit action. Runs after the fork gates above, so their refusals answer first.
+        if let Some(action) = request.required_action()
+            && connection_permits(&context, self.repository_authorizer.as_ref(), action).await
+                == Some(false)
+        {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "Action not permitted".to_string(),
+            ));
+        }
 
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
                     .handle_auth(
                         context,
-                        self.jwt_verifier.clone(),
+                        self.token_verification.clone(),
                         self.repository_authorizer.clone(),
                     )
                     .await

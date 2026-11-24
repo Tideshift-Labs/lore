@@ -2401,6 +2401,12 @@ fn internal_delete_request<T>(body: T) -> Request<T> {
         "lore-authn-bearer",
         "Bearer distinct-authn-jwt".parse().unwrap(),
     );
+    // A verified caller: the domain admission gate refuses carriage from anyone else.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "verified-lore-jwt".to_string(),
+        ));
     request
         .extensions_mut()
         .insert(lore_server::auth::jwt::AuthorizationToken {
@@ -2484,6 +2490,12 @@ impl lore_server::grpc::forwarded_requests::ForwardedRequests for DeleteForwardM
     >{
         panic!("governed delete must not forward")
     }
+    fn forwarded_lock_service(
+        &self,
+    ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+    {
+        panic!("governed delete must not forward")
+    }
 }
 
 #[tokio::test]
@@ -2496,6 +2508,7 @@ async fn branch_delete_handlers_refuse_internal_admission_and_carried_forwarding
             Arc::new(context(true).with_operation_verifier(Some(Arc::new(DeleteMustNotVerify))));
         let notifications = Arc::new(crate::notification::testing::MockNotificationSender::new());
         let hooks = lore_server::hooks::HookDispatcher::empty();
+        let authorizer = crate::util::test_support::allow_all_authorizer();
         let forward: Option<Arc<dyn lore_server::grpc::forwarded_requests::ForwardedRequests>> =
             Some(Arc::new(DeleteForwardMustNotConnect(
                 lore_server::grpc::forwarded_requests::RpcFlags {
@@ -2515,6 +2528,7 @@ async fn branch_delete_handlers_refuse_internal_admission_and_carried_forwarding
                     );
                     lore_server::grpc::handlers::branch_delete::handler(
                         request,
+                        &authorizer,
                         immutable,
                         mutable,
                         notifications,
@@ -2539,6 +2553,7 @@ async fn branch_delete_handlers_refuse_internal_admission_and_carried_forwarding
                     );
                     lore_server::grpc::revision::v1::branch_delete::handler(
                         request,
+                        &authorizer,
                         immutable,
                         mutable,
                         notifications,
@@ -2725,9 +2740,10 @@ async fn run_non_creator_delete(
             let authorizer: Arc<
                 dyn lore_server::authnz::repository_authorizer::RepositoryAuthorizer,
             > = Arc::new(
-                lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer::new(Some(
-                    "groups".to_string(),
-                )),
+                lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer::new(
+                    Some("groups".to_string()),
+                    Vec::new(),
+                ),
             );
             let registry =
                 lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered;

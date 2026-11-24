@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use lore_revision::fragment;
 use lore_revision::lore::RepositoryId;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::grpc::caller_capabilities::CallerCapabilityPolicy;
 use lore_server::protocol::storage::put::Put;
@@ -98,7 +99,7 @@ fn start_public_quic(
         immutable.clone(),
         immutable,
         mutable,
-        None,
+        TokenVerification::Ignore,
         false,
         Arc::new(AllowAllRepositoryAuthorizer),
         AdmissionLimits {

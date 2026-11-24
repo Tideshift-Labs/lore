@@ -10,6 +10,7 @@ use lore_credential::verify_jwt_usage_for_remote;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::UserService;
+use lore_transport::auth::exchange::is_expired;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -370,15 +371,25 @@ pub struct LoreAuthUserTokenEventData {
     pub id: LoreString,
     /// Display name for the user
     pub name: LoreString,
-    /// The token string
+    /// The token string, or empty when the caller did not ask for it
     pub token: LoreString,
     /// Preferred username from the token
     pub preferred_username: LoreString,
     /// Non-zero if the identity is a service account
     #[serde(with = "u8_as_bool")]
     pub flag_service_account: u8,
-    /// Expiry time in milliseconds since UNIX epoch, or 0 if unavailable
+    /// Expiry time of `token` in milliseconds since UNIX epoch, or 0 if unavailable
     pub expires: u64,
+    /// When the stored refresh token stops working, in milliseconds since the UNIX epoch. 0
+    /// if there is no refresh token, or if the provider did not give a deadline.
+    pub refresh_expires: u64,
+    /// Non-zero if a refresh token is stored for the identity
+    #[serde(with = "u8_as_bool")]
+    pub refreshable: u8,
+    /// Non-zero if `token` has not expired, or if it has but the stored refresh token can still
+    /// renew it
+    #[serde(with = "u8_as_bool")]
+    pub session_valid: u8,
 }
 
 /// Result of resolving a user identity from locally cached JWT tokens.
@@ -394,6 +405,35 @@ pub struct ResolvedIdentity {
     /// [`auth::verify_jwt_usage_for_remote`]. Use this field only for local
     /// display purposes (names, expiry, service account flag).
     pub local_user_info: Option<lore_credential::UserInfo>,
+    /// The deadline of the refresh token stored beside the token in `local_user_info`, in
+    /// milliseconds since the UNIX epoch, or `Some(0)` when the provider named none. `None`
+    /// without one, and when the token was supplied rather than read from the store, as a
+    /// supplied token is never refreshed.
+    pub refresh_expires: Option<u64>,
+}
+
+impl ResolvedIdentity {
+    /// Whether the token in `local_user_info` is still valid, or a stored refresh token can
+    /// still renew it.
+    pub fn session_valid(&self) -> bool {
+        self.local_user_info
+            .as_ref()
+            .is_some_and(|info| session_valid(info.expires, self.refresh_expires))
+    }
+}
+
+/// Whether a login is still usable: its token, expiring at `expires`, has not expired, or a
+/// refresh token can still renew it. `refresh_expires` is `None` without a refresh token, and
+/// `Some(0)` for one with no deadline.
+pub fn session_valid(expires: u64, refresh_expires: Option<u64>) -> bool {
+    if !is_expired(expires) {
+        return true;
+    }
+    match refresh_expires {
+        Some(0) => true,
+        Some(refresh_expires) => !is_expired(refresh_expires),
+        None => false,
+    }
 }
 
 fn display_name(info: &lore_credential::UserInfo) -> String {
@@ -446,16 +486,23 @@ pub(crate) async fn resolve_local_user_info(
         .await
         {
             let name = display_name(&info);
+            let refresh_expires = if identity_token.is_empty() {
+                lore_credential::token_store::load_refresh_expires(auth_url, user_id).await
+            } else {
+                None
+            };
             results.push(ResolvedIdentity {
                 id: info.id.clone(),
                 name,
                 local_user_info: Some(info),
+                refresh_expires,
             });
         } else {
             results.push(ResolvedIdentity {
                 id: user_id.clone(),
                 name: user_id.clone(),
                 local_user_info: None,
+                refresh_expires: None,
             });
         }
     }

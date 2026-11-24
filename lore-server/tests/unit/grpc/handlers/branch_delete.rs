@@ -16,6 +16,8 @@ use lore_revision::state;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_delete::*;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::hooks::HookDispatcher;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -82,6 +84,7 @@ async fn enforcing_cell_rejects_before_legacy_branch_delete_body() {
 
     let error = handler(
         request,
+        &crate::util::test_support::allow_all_authorizer(),
         immutable_store,
         mutable_store,
         notification_sender,
@@ -124,11 +127,12 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         repository_context.clone(),
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push head revision")
@@ -189,6 +193,7 @@ async fn sends_delete_notification_for_deleted_branch() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             request,
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -225,6 +230,7 @@ async fn no_delete_notification_for_branch_not_exists() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             request,
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -274,6 +280,7 @@ async fn no_delete_notification_for_branch_delete_errors() {
         let hook_dispatcher = HookDispatcher::empty();
         let response = handler(
             request,
+            &crate::util::test_support::allow_all_authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),

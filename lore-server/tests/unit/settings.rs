@@ -782,6 +782,42 @@ fn fork_tier_2_carve_out_keeps_every_other_rule() {
         validate_auth_config(&keyword_issuer).expect_err("an OIDC table needs a URL issuer");
     assert!(error.to_string().contains("jwt_issuer"), "{error}");
 }
+
+#[test]
+fn trust_unsigned_identity_beside_server_auth_fails_validation() {
+    let mut settings = settings_with_auth_keys(
+        r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+
+            [environment.endpoint]
+            auth_url = "ucs-auth://auth.example.com"
+        "#,
+    )
+    .expect("a complete [server.auth] must parse");
+    settings.server.trust_unsigned_identity = true;
+    validate_auth_config(&settings)
+        .expect_err("trust_unsigned_identity with [server.auth] must fail validation");
+}
+
+#[test]
+fn trust_unsigned_identity_without_server_auth_passes_validation() {
+    let config = r#"
+        [server]
+        runtime_shutdown_timeout_seconds = 0
+        trust_unsigned_identity = true
+
+        [immutable_store]
+        mode = "local"
+
+        [mutable_store]
+        mode = "local"
+    "#;
+    let settings: Settings = toml::from_str(config).expect("must parse");
+    assert!(settings.server.trust_unsigned_identity);
+    validate_auth_config(&settings).expect("trust_unsigned_identity alone must validate");
+}
+
 /// The loader reads `user_url` from `[environment.endpoint]` for the catalog
 /// selection, so `repository_catalog = "user_service"` loads with it and is
 /// refused without it.
@@ -2418,4 +2454,116 @@ fn http_health_only_is_opt_in() {
     assert!(!http_settings("").health_only);
     assert!(!http_settings("health_only = false").health_only);
     assert!(http_settings("health_only = true").health_only);
+}
+
+mod deserialize_quic_internal {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+
+    use super::*;
+
+    const ENDPOINT_KEYS: &str = "host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10";
+
+    fn parse(extra_keys: &str) -> ServerSettings {
+        toml::from_str(&format!(
+            "[quic]\n{ENDPOINT_KEYS}\n[quic_internal]\n{ENDPOINT_KEYS}\n{extra_keys}"
+        ))
+        .expect("[server] should deserialize")
+    }
+
+    #[test]
+    fn internal_endpoint_defaults_to_the_peer_window() {
+        let quic_internal = parse("")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        assert_eq!(
+            quic_internal.initial_cwnd_bytes,
+            Some(DEFAULT_PEER_INITIAL_CWND_BYTES)
+        );
+    }
+
+    #[test]
+    fn internal_endpoint_keeps_a_configured_window() {
+        let quic_internal = parse("initial_cwnd_bytes = 65536")
+            .quic_internal
+            .expect("[server.quic_internal] present");
+
+        let initial_cwnd = quic_internal
+            .initial_cwnd_bytes
+            .expect("initial_cwnd_bytes set");
+        assert_eq!(initial_cwnd.get(), 65_536);
+    }
+
+    #[test]
+    fn absent_internal_endpoint_stays_absent() {
+        let server: ServerSettings =
+            toml::from_str("").expect("[server] with no tables should deserialize");
+
+        assert!(server.quic_internal.is_none());
+    }
+}
+
+mod replicated_store_settings_initial_cwnd_bytes {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+    use lore_server::quic::initial_cwnd::InitialCwndBytes;
+
+    use super::*;
+
+    const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(initial_cwnd: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{initial_cwnd}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_initial_cwnd_is_the_peer_default() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes, DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+
+    #[test]
+    fn configured_initial_cwnd_is_kept() {
+        let settings = parse("initial_cwnd_bytes = 65536").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes.get(), 65_536);
+    }
+
+    #[test]
+    fn initial_cwnd_below_minimum_is_rejected() {
+        let error = parse(&format!(
+            "initial_cwnd_bytes = {}",
+            InitialCwndBytes::MIN - 1
+        ))
+        .expect_err("below the minimum");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "initial_cwnd_bytes must be at least {}",
+                InitialCwndBytes::MIN
+            )),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod quic_settings_initial_cwnd_bytes {
+    use super::*;
+
+    #[test]
+    fn omitted_initial_cwnd_is_left_to_the_controller() {
+        let quic: QuicSettings =
+            toml::from_str("host = \"0.0.0.0\"\nport = 41337\nnum_listeners = 10")
+                .expect("[server.quic] should deserialize");
+
+        assert_eq!(quic.initial_cwnd_bytes, None);
+    }
 }

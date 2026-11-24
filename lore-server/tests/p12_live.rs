@@ -692,11 +692,18 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 repo.clone(),
                 main,
                 state_hash,
-                true,
+                lore_server::grpc::handlers::branch_push::PushAccess {
+                    write: true,
+                    push_protected: true,
+                },
                 true,
                 false,
                 branch::DEFAULT_HISTORY_STEP_SIZE,
                 lore_server::grpc::server::RevisionListAcceleration::default(),
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await
             .expect("push main head")

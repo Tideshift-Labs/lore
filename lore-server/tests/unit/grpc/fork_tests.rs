@@ -10,14 +10,17 @@ use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::grpc::*;
 use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
 
-/// Fork extensions carrying one verified token with `resources`.
+/// Fork extensions carrying one verified token with `resources`. The interceptor inserts
+/// `RawToken` beside the claims of a verified token; fork claim readers read only such claims.
 fn fork_extensions_with(subject: &str, resources: Vec<(&str, &[&str])>) -> Extensions {
     let mut extensions = Extensions::new();
+    extensions.insert(RawToken("verified".to_string()));
     extensions.insert(AuthorizationToken {
         user_id: subject.to_string(),
         issuer: "issuer".to_string(),
@@ -43,7 +46,8 @@ fn fork_repo() -> RepositoryId {
 
 /// FORK-LOCAL: the branch-creator rule keeps the pre-v0.10.0 reader. Only
 /// the FIRST exact `urc-<repo>` entry counts. `urc-*` and later exact
-/// entries do not, although upstream's `is_owner_or_admin` now honours both.
+/// entries do not. (Upstream v0.13 removed `is_owner_or_admin`, which honoured both;
+/// its owner/admin checks now go through the authorizer's `Action`.)
 #[test]
 fn branch_creator_rule_reads_only_the_first_exact_entry() {
     let exact = format!("urc-{FORK_REPO}");
@@ -51,12 +55,10 @@ fn branch_creator_rule_reads_only_the_first_exact_entry() {
 
     let wildcard_owner = fork_extensions_with("s", vec![("urc-*", &["owner"])]);
     assert!(!can_set_branch_creator(&wildcard_owner, fork_repo()));
-    assert!(is_owner_or_admin(&wildcard_owner, fork_repo()));
 
     let later_exact_admin =
         fork_extensions_with("s", vec![(&exact, &["read"]), (&exact, &["admin"])]);
     assert!(!can_set_branch_creator(&later_exact_admin, fork_repo()));
-    assert!(is_owner_or_admin(&later_exact_admin, fork_repo()));
 
     let exact_owner_after_others = fork_extensions_with(
         "s",
@@ -305,6 +307,9 @@ mod is_self_force_unlock_tests {
                     .collect(),
             }]);
         }
+        // The interceptor inserts `RawToken` beside the claims of a verified token; fork claim
+        // readers read only such claims.
+        extensions.insert(RawToken("verified".to_string()));
         extensions.insert(token);
         extensions
     }

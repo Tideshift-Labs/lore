@@ -4,6 +4,8 @@
 target-*/
 *.dSYM
 
+/.bin/
+
 # mkdocs build output
 /site/
 

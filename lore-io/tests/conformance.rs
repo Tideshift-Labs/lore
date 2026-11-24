@@ -9,6 +9,8 @@ use lore_base::test_util::TempDir;
 use lore_io::BackendKind;
 use lore_io::IoDriver;
 use lore_io::OpenOptions;
+use lore_io::Stat;
+use lore_io::StatKind;
 
 /// Every backend this build has, skipping one the machine cannot run. A kernel without
 /// `io_uring`, or a container that blocks `io_uring_setup`, must not fail the suite — but the
@@ -260,6 +262,18 @@ async fn read_file_bytes_roundtrip() {
     }
 }
 
+/// A directory is not a file, whatever size the filesystem reports for it: zero on some, so a
+/// read sized by it would otherwise answer with an empty file.
+#[tokio::test]
+async fn read_file_bytes_refuses_a_directory() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-read-directory-");
+        let path = dir.child("directory");
+        std::fs::create_dir(&path).expect("create directory");
+        assert!(driver.read_file_bytes(&path).await.is_err());
+    }
+}
+
 /// The whole-file operations hold a pool thread and the whole file for their duration, so they
 /// are for small files and say so. A caller that reaches for the wrong one finds out at the
 /// call rather than by occupying one of at most 32 threads for a multi-gigabyte transfer.
@@ -357,6 +371,109 @@ async fn remove_dir_all_takes_the_tree_and_reports_a_missing_one() {
     }
 }
 
+/// Recursive removal around a boundary keeps the directory holding one, deep in the tree, with
+/// all it holds and every directory leading to it, and removes the rest. A reserved entry deep in
+/// the tree stays with every directory leading to it, and its siblings go. A tree holding no
+/// boundary goes whole, a link is removed rather than followed, and a missing path is `Ok`.
+#[tokio::test]
+async fn remove_dir_all_keeping_keeps_each_boundary_and_its_ancestors() {
+    fn reserved(name: &str) -> bool {
+        name.eq_ignore_ascii_case(".lore") || name.eq_ignore_ascii_case(".urc")
+    }
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-removetree-keeping-");
+        let root = dir.child("tree");
+        let kept = root.join("a/b/repository");
+        driver.create_dir_all(kept.join(".lore")).await.unwrap();
+        driver
+            .create_dir_all(root.join("a/gone/deeper"))
+            .await
+            .unwrap();
+        driver.create_dir_all(root.join("c")).await.unwrap();
+        driver
+            .create_dir_all(root.join("a/legacy/.urc"))
+            .await
+            .unwrap();
+        for file in [
+            "top.txt",
+            "a/one.txt",
+            "a/b/two.txt",
+            "a/b/repository/work.txt",
+            "a/b/repository/.lore/id",
+            "a/gone/deeper/three.txt",
+            "c/four.txt",
+            "a/legacy/.urc/state",
+            "a/legacy/beside.txt",
+        ] {
+            driver
+                .write_file_bytes(root.join(file), Bytes::from_static(b"leaf"), false)
+                .await
+                .unwrap();
+        }
+        let outside = dir.child("outside");
+        driver.create_dir_all(&outside).await.unwrap();
+        driver
+            .write_file_bytes(outside.join("held.txt"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        #[cfg(target_family = "unix")]
+        std::os::unix::fs::symlink(&outside, root.join("a/link")).unwrap();
+
+        driver
+            .remove_dir_all_keeping(&root, ".lore", reserved)
+            .await
+            .unwrap();
+
+        for held in [
+            "a/b/repository/work.txt",
+            "a/b/repository/.lore/id",
+            "a/legacy/.urc/state",
+        ] {
+            assert!(root.join(held).is_file(), "{held} must stay");
+        }
+        for gone in [
+            "top.txt",
+            "a/one.txt",
+            "a/b/two.txt",
+            "a/gone",
+            "a/link",
+            "a/legacy/beside.txt",
+            "c",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(root.join(gone)).is_err(),
+                "{gone} must be gone"
+            );
+        }
+        assert!(
+            outside.join("held.txt").is_file(),
+            "a link must not be followed"
+        );
+
+        driver
+            .remove_dir_all_keeping(root.join("a/b/repository"), ".lore", reserved)
+            .await
+            .unwrap();
+        assert!(
+            kept.join("work.txt").is_file(),
+            "a boundary at the root must stay"
+        );
+
+        driver
+            .remove_dir_all_keeping(&outside, ".lore", reserved)
+            .await
+            .unwrap();
+        assert!(
+            driver.metadata(&outside).await.is_err(),
+            "a tree without a boundary must be gone"
+        );
+        driver
+            .remove_dir_all_keeping(&outside, ".lore", reserved)
+            .await
+            .expect("removing a missing tree is Ok");
+    }
+}
+
 /// A listing yields every child with the metadata the walk resolved for it, and ends. The
 /// entries arrive in whatever order the walk finds them, so the test compares them as a set.
 #[tokio::test]
@@ -377,8 +494,8 @@ async fn read_dir_yields_every_child_with_metadata() {
             let metadata = entry.metadata.expect("an entry must resolve its metadata");
             found.push((
                 entry.file_name.to_string_lossy().to_string(),
-                metadata.is_dir(),
-                metadata.len(),
+                metadata.kind == StatKind::Directory,
+                metadata.len,
             ));
         }
         found.sort();
@@ -548,6 +665,407 @@ async fn holds_name_exactly_declines_a_path_beyond_max_path() {
     }
 }
 
+/// What `stat` answers for `path`, held against what `metadata` answers for it.
+async fn stat_and_metadata(driver: &IoDriver, path: &std::path::Path) -> (Stat, Stat) {
+    let stat = driver.stat(path).await.expect("stat");
+    let metadata = driver.metadata(path).await.expect("metadata");
+    (stat, Stat::from(&metadata))
+}
+
+/// A file and a directory stat as `metadata` describes them: the kind, the length, the
+/// modification time and the permission bits.
+#[tokio::test]
+async fn stat_answers_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-stat-");
+        driver
+            .write_file_bytes(dir.child("file"), Bytes::from(pattern(5000, 1)), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+
+        let (file, expected) = stat_and_metadata(&driver, &dir.child("file")).await;
+        assert_eq!(file, expected, "{}", driver.backend_name());
+        assert_eq!(file.kind, StatKind::File);
+        assert_eq!(file.len, 5000);
+
+        let (directory, expected) = stat_and_metadata(&driver, &dir.child("directory")).await;
+        assert_eq!(directory, expected, "{}", driver.backend_name());
+        assert_eq!(directory.kind, StatKind::Directory);
+    }
+}
+
+/// A path holding nothing fails as `NotFound` with the OS code `metadata` reports, whether its
+/// own name or a directory above it is what is missing.
+#[tokio::test]
+async fn stat_reports_a_missing_path_as_not_found() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statmissing-");
+        for path in [dir.child("absent"), dir.child("absent").join("child")] {
+            let error = driver.stat(&path).await.expect_err("nothing is there");
+            let expected = driver.metadata(&path).await.expect_err("nothing is there");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "{} through {}",
+                path.display(),
+                driver.backend_name()
+            );
+            assert_eq!(
+                error.raw_os_error(),
+                expected.raw_os_error(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// A file last written before the Unix epoch stats with the time `metadata` gives it. A
+/// filesystem that refuses to hold such a time skips the case.
+#[tokio::test]
+async fn stat_answers_a_time_before_the_unix_epoch_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statpreepoch-");
+        let path = dir.child("old");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"old"), false)
+            .await
+            .unwrap();
+        let before_epoch =
+            std::time::SystemTime::UNIX_EPOCH - std::time::Duration::from_secs(400 * 86_400);
+        let stamped = std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(before_epoch));
+        if let Err(error) = stamped {
+            eprintln!("skipping: the filesystem holds no time before 1970: {error}");
+            return;
+        }
+
+        let (stat, expected) = stat_and_metadata(&driver, &path).await;
+        assert_eq!(stat, expected, "{}", driver.backend_name());
+    }
+}
+
+/// A path holding a null names nothing a filesystem holds, and fails as `metadata` fails it.
+#[tokio::test]
+async fn stat_refuses_a_path_holding_a_null_as_metadata_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statnull-");
+        let path = dir.child("before\0after");
+        let stat = driver.stat(&path).await.expect_err("a null names nothing");
+        let metadata = driver
+            .metadata(&path)
+            .await
+            .expect_err("a null names nothing");
+        assert_eq!(stat.kind(), metadata.kind(), "{}", driver.backend_name());
+    }
+}
+
+/// Creates a link at `link` to the file at `target`, answering whether the platform let it:
+/// Windows creates one only with the privilege or developer mode to.
+fn file_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(target_family = "unix")]
+    let created = std::os::unix::fs::symlink(target, link);
+    #[cfg(target_family = "windows")]
+    let created = std::os::windows::fs::symlink_file(target, link);
+    created.is_ok()
+}
+
+/// A link stats as the file it names, and a link naming nothing fails as `NotFound`, as the
+/// name does when nothing is there.
+#[tokio::test]
+async fn stat_follows_a_link() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statlink-");
+        driver
+            .write_file_bytes(dir.child("target"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        if !file_link(&dir.child("target"), &dir.child("link"))
+            || !file_link(&dir.child("gone"), &dir.child("dangling"))
+        {
+            eprintln!("skipping: this machine creates no links");
+            return;
+        }
+
+        let (link, expected) = stat_and_metadata(&driver, &dir.child("link")).await;
+        assert_eq!(link, expected, "{}", driver.backend_name());
+        assert_eq!(link.kind, StatKind::File);
+        assert_eq!(link.len, 4);
+
+        let error = driver
+            .stat(dir.child("dangling"))
+            .await
+            .expect_err("a dangling link names nothing");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+/// A file and a directory are described by `symlink_stat` as `symlink_metadata` describes them,
+/// and as `stat` describes them.
+#[tokio::test]
+async fn symlink_stat_answers_a_file_and_a_directory_as_stat_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstat-");
+        driver
+            .write_file_bytes(dir.child("file"), Bytes::from(pattern(5000, 1)), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+
+        for name in ["file", "directory"] {
+            let path = dir.child(name);
+            let described = driver.symlink_stat(&path).await.expect("symlink_stat");
+            let expected = Stat::from(&std::fs::symlink_metadata(&path).expect("symlink_metadata"));
+            assert_eq!(
+                expected,
+                described,
+                "{name} through {}",
+                driver.backend_name()
+            );
+            assert_eq!(
+                driver.stat(&path).await.expect("stat"),
+                described,
+                "{name} through {}",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
+/// A path holding nothing fails `symlink_stat` as `NotFound`, with the OS code
+/// `symlink_metadata` reports.
+#[tokio::test]
+async fn symlink_stat_reports_a_missing_path_as_not_found() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatmissing-");
+        let path = dir.child("absent");
+        let error = driver
+            .symlink_stat(&path)
+            .await
+            .expect_err("nothing is there");
+        let expected = std::fs::symlink_metadata(&path).expect_err("nothing is there");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            error.raw_os_error(),
+            expected.raw_os_error(),
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// A symbolic link is described as the name it is, not as what it names, and one naming nothing
+/// is described too. On Unix a symbolic link is `Other`; on Windows one made to a directory is a
+/// `Directory` and one made to a file a `File`, as their attributes give.
+#[tokio::test]
+async fn symlink_stat_describes_a_symbolic_link_itself() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatlink-");
+        driver
+            .write_file_bytes(dir.child("target"), Bytes::from_static(b"held"), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+        if !file_link(&dir.child("target"), &dir.child("file-link"))
+            || !directory_link(&dir.child("directory"), &dir.child("directory-link"))
+            || !file_link(&dir.child("gone"), &dir.child("dangling"))
+        {
+            eprintln!("skipping: this machine creates no links");
+            return;
+        }
+
+        let expected = if cfg!(target_family = "windows") {
+            [
+                ("file-link", StatKind::File),
+                ("directory-link", StatKind::Directory),
+                ("dangling", StatKind::File),
+            ]
+        } else {
+            [
+                ("file-link", StatKind::Other),
+                ("directory-link", StatKind::Other),
+                ("dangling", StatKind::Other),
+            ]
+        };
+        for (name, kind) in expected {
+            let described = driver
+                .symlink_stat(dir.child(name))
+                .await
+                .expect("the symbolic link is there");
+            assert_eq!(
+                kind,
+                described.kind,
+                "{name} through {}",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
+/// A junction, which Windows creates without a privilege, is described as the directory its
+/// attributes say it is made as.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn symlink_stat_describes_a_junction_as_a_directory() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-symlinkstatjunction-");
+        driver.create_dir_all(dir.child("directory")).await.unwrap();
+        junction(&dir.child("junction"), &dir.child("directory"));
+
+        let described = driver
+            .symlink_stat(dir.child("junction"))
+            .await
+            .expect("the junction is there");
+        assert_eq!(
+            StatKind::Directory,
+            described.kind,
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// A directory is made writable by its owner, its group and other bits left as they are, and a
+/// symbolic link to a directory is refused, the directory it stands for left as it is.
+#[tokio::test]
+#[cfg(target_family = "unix")]
+async fn make_owner_writable_adds_the_owners_write_and_refuses_a_symbolic_link() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-ownerwritable-");
+        let directory = dir.child("directory");
+        let target = dir.child("target");
+        let link = dir.child("link");
+        driver.create_dir_all(&directory).await.unwrap();
+        driver.create_dir_all(&target).await.unwrap();
+        std::os::unix::fs::symlink(&target, &link).expect("create the link");
+        for path in [&directory, &target] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555))
+                .expect("set the directory's mode");
+        }
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path)
+                .expect("stat the directory")
+                .permissions()
+                .mode()
+                & 0o777
+        };
+
+        driver
+            .make_owner_writable(&directory)
+            .await
+            .expect("make the directory writable by its owner");
+        driver
+            .make_owner_writable(&link)
+            .await
+            .expect_err("a symbolic link is refused");
+
+        assert_eq!(0o755, mode(&directory), "{}", driver.backend_name());
+        assert_eq!(0o555, mode(&target), "{}", driver.backend_name());
+    }
+}
+
+/// Making a junction writable clears the junction's own read-only attribute and leaves the
+/// read-only directory it stands for as it is.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn make_owner_writable_clears_a_junctions_own_attribute_and_leaves_its_target() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-clearreadonly-");
+        let target = dir.child("directory");
+        let link = dir.child("junction");
+        driver.create_dir_all(&target).await.unwrap();
+        junction(&link, &target);
+        mark_read_only_itself(&link);
+        let mut permissions = std::fs::metadata(&target)
+            .expect("stat the directory")
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&target, permissions).expect("make the directory read-only");
+        let readonly_itself = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .expect("read the name itself")
+                .permissions()
+                .readonly()
+        };
+        assert!(readonly_itself(&link), "the junction is read-only itself");
+
+        driver
+            .make_owner_writable(&link)
+            .await
+            .expect("clear the junction's attribute");
+
+        assert!(
+            !readonly_itself(&link),
+            "the junction's own attribute is clear through {}",
+            driver.backend_name()
+        );
+        assert!(
+            std::fs::metadata(&target)
+                .expect("stat the directory")
+                .permissions()
+                .readonly(),
+            "the directory stays read-only through {}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// Creates a junction at `link` to the directory `target`, which Windows does without a privilege.
+#[cfg(target_family = "windows")]
+fn junction(link: &std::path::Path, target: &std::path::Path) {
+    let created = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .output()
+        .expect("run mklink");
+    assert!(created.status.success(), "mklink /J failed: {created:?}");
+}
+
+/// Sets the read-only attribute of the name `path` itself, a junction's on the junction.
+#[cfg(target_family = "windows")]
+fn mark_read_only_itself(path: &std::path::Path) {
+    let marked = std::process::Command::new("cmd")
+        .args(["/C", "attrib", "+r"])
+        .arg(path)
+        .arg("/L")
+        .output()
+        .expect("run attrib");
+    assert!(marked.status.success(), "attrib +r /L failed: {marked:?}");
+}
+
+/// Past `MAX_PATH` a path answers whether or not it carries the verbatim prefix: a plain one is
+/// left to `metadata`, which prefixes it, and a verbatim one is queried as it stands.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn stat_answers_for_a_path_beyond_max_path() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-statlong-");
+        let mut deep = dir.path().to_path_buf();
+        while deep.as_os_str().len() < 260 {
+            deep = deep.join("directory-with-a-name-long-enough-to-get-there");
+        }
+        driver.create_dir_all(&deep).await.unwrap();
+        let path = deep.join("Rock.mesh");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", path.display()));
+
+        for path in [path, verbatim] {
+            let (stat, expected) = stat_and_metadata(&driver, &path).await;
+            assert_eq!(stat, expected, "{}", path.display());
+            assert_eq!(stat.kind, StatKind::File);
+        }
+    }
+}
+
 /// Permissions round-trip through the driver: what `metadata` reports is what `set_permissions`
 /// accepts back, which is the whole shape callers use since none of them build a mode by hand.
 #[tokio::test]
@@ -647,6 +1165,212 @@ async fn read_dir_reports_a_missing_directory() {
             .err()
             .expect("listing a missing directory must fail");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+/// Listing a file fails with the OS error `std` reports for it.
+#[tokio::test]
+async fn read_dir_of_a_file_fails_as_std_fails() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-readdir-file-");
+        let file = dir.child("file");
+        std::fs::write(&file, b"held").expect("write the file");
+
+        let error = driver
+            .read_dir(&file)
+            .await
+            .err()
+            .expect("listing a file must fail");
+        let expected = std::fs::read_dir(&file).expect_err("listing a file must fail");
+        assert_eq!(
+            expected.raw_os_error(),
+            error.raw_os_error(),
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// Every name that is no symbolic link carries what `std`'s own listing describes it with.
+#[tokio::test]
+async fn read_dir_describes_each_entry_as_std_lists_it() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-readdir-std-");
+        let root = dir.child("tree");
+        std::fs::create_dir_all(root.join("child_dir")).expect("create the directory");
+        std::fs::write(root.join("child_file"), b"four").expect("write the file");
+        std::fs::write(root.join("empty"), b"").expect("write the empty file");
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.join("child_file"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("mark the file executable");
+        }
+
+        let mut expected = std::fs::read_dir(&root)
+            .expect("std lists the directory")
+            .map(|entry| {
+                let entry = entry.expect("std reads the entry");
+                let metadata = entry.metadata().expect("std describes the entry");
+                (entry.file_name(), Some(Stat::from(&metadata)), false)
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut listing = driver.read_dir(&root).await.unwrap();
+        let mut found = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let entry = entry.expect("an entry must be readable");
+            found.push((entry.file_name, entry.metadata, entry.is_symlink));
+        }
+        found.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(expected, found, "{}", driver.backend_name());
+    }
+}
+
+/// Creates a symbolic link at `link` to the directory at `target`, answering whether the platform
+/// let it.
+fn directory_link(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(target_family = "unix")]
+    let created = std::os::unix::fs::symlink(target, link);
+    #[cfg(target_family = "windows")]
+    let created = std::os::windows::fs::symlink_dir(target, link);
+    created.is_ok()
+}
+
+/// A symbolic link is listed as one, described by what it names, and a symbolic link naming
+/// nothing carries no metadata.
+#[tokio::test]
+async fn read_dir_follows_a_symbolic_link_and_marks_it() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-readdir-link-");
+        let root = dir.child("tree");
+        std::fs::create_dir_all(root.join("directory")).expect("create the directory");
+        std::fs::write(root.join("file"), b"held").expect("write the file");
+        if !file_link(&root.join("file"), &root.join("file-link"))
+            || !directory_link(&root.join("directory"), &root.join("directory-link"))
+            || !file_link(&root.join("gone"), &root.join("dangling"))
+        {
+            eprintln!("skipping: this machine creates no links");
+            return;
+        }
+
+        let mut listing = driver.read_dir(&root).await.unwrap();
+        let mut links = Vec::new();
+        while let Some(entry) = listing.next().await {
+            let entry = entry.expect("an entry must be readable");
+            if entry.is_symlink {
+                links.push((
+                    entry.file_name.to_string_lossy().to_string(),
+                    entry.metadata,
+                ));
+            }
+        }
+        links.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let file = driver.stat(root.join("file")).await.unwrap();
+        let directory = driver.stat(root.join("directory")).await.unwrap();
+        assert_eq!(
+            vec![
+                ("dangling".to_string(), None),
+                ("directory-link".to_string(), Some(directory)),
+                ("file-link".to_string(), Some(file)),
+            ],
+            links,
+            "{}",
+            driver.backend_name()
+        );
+    }
+}
+
+/// A junction, which Windows creates without a privilege, is marked as a symbolic link as `std`
+/// marks it, and is described by the directory it stands for, as `IoDriver::stat` describes it.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn read_dir_follows_a_junction_and_marks_it_as_std_does() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-readdir-junction-");
+        let root = dir.child("tree");
+        std::fs::create_dir_all(root.join("directory")).expect("create the directory");
+        std::fs::write(root.join("directory").join("file"), b"held").expect("write the file");
+        let created = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("junction"))
+            .arg(root.join("directory"))
+            .output()
+            .expect("run mklink");
+        assert!(created.status.success(), "mklink /J failed: {created:?}");
+
+        let mut expected = std::fs::read_dir(&root)
+            .expect("std lists the directory")
+            .map(|entry| {
+                let entry = entry.expect("std reads the entry");
+                let file_type = entry.file_type().expect("std types the entry");
+                (entry.file_name(), file_type.is_symlink())
+            })
+            .collect::<Vec<_>>();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut listing = driver.read_dir(&root).await.unwrap();
+        let mut marks = Vec::new();
+        let mut junction = None;
+        while let Some(entry) = listing.next().await {
+            let entry = entry.expect("an entry must be readable");
+            if entry.file_name == "junction" {
+                junction = Some(entry.metadata);
+            }
+            marks.push((entry.file_name, entry.is_symlink));
+        }
+        marks.sort_by(|left, right| left.0.cmp(&right.0));
+
+        assert_eq!(
+            vec![
+                (std::ffi::OsString::from("directory"), false),
+                (std::ffi::OsString::from("junction"), true),
+            ],
+            expected,
+            "std marks the junction as a symbolic link"
+        );
+        assert_eq!(expected, marks, "{}", driver.backend_name());
+        let stat = driver.stat(root.join("junction")).await.unwrap();
+        assert_eq!(StatKind::Directory, stat.kind);
+        assert_eq!(Some(Some(stat)), junction, "{}", driver.backend_name());
+    }
+}
+
+/// Past `MAX_PATH` a directory lists whether or not its path carries the verbatim prefix.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn read_dir_lists_a_directory_beyond_max_path() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-readdirlong-");
+        let mut deep = dir.path().to_path_buf();
+        while deep.as_os_str().len() < 260 {
+            deep = deep.join("directory-with-a-name-long-enough-to-get-there");
+        }
+        driver.create_dir_all(&deep).await.unwrap();
+        std::fs::write(deep.join("Rock.mesh"), b"data").expect("write the file");
+        let verbatim = std::path::PathBuf::from(format!(r"\\?\{}", deep.display()));
+
+        for path in [deep, verbatim] {
+            let mut listing = driver.read_dir(&path).await.unwrap();
+            let mut found = Vec::new();
+            while let Some(entry) = listing.next().await {
+                let entry = entry.expect("an entry must be readable");
+                let metadata = entry.metadata.expect("an entry must resolve its metadata");
+                found.push((entry.file_name, metadata.kind, metadata.len));
+            }
+            assert_eq!(
+                vec![(std::ffi::OsString::from("Rock.mesh"), StatKind::File, 4)],
+                found,
+                "{}",
+                path.display()
+            );
+        }
     }
 }
 

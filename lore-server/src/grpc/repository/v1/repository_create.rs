@@ -39,11 +39,13 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_authorization_optional;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::repository_create::governed_repository_create;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
+use crate::grpc::requested_repository_id;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -81,6 +83,7 @@ pub async fn handler(
     let request_metadata = request.metadata().clone();
     let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
+    let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
@@ -145,6 +148,7 @@ pub async fn handler(
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository
         user_id,
+        is_service_account,
         correlation_id,
         authorization,
     };
@@ -209,7 +213,7 @@ pub async fn repository_create_implementation(
     let correlation_id = caller_context.correlation_id;
     let authorization = caller_context.authorization;
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
     let name = req.name;
     let description = req.description;
     let default_branch_id: Context = req.default_branch_id.into();
@@ -240,6 +244,7 @@ pub async fn repository_create_implementation(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let (created_metadata, metadata_hash) = match &governed {

@@ -360,9 +360,10 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// ID. For remote resolution with proper authorization, use
 /// `lore_auth_user_info` which queries the remote authentication service.
 ///
-/// When `with_identity_token` is set, identities with a locally stored token
-/// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-/// token instead of `AUTH_USER_INFO`.
+/// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+/// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+/// `token` holds the cached identity token when `with_identity_token` is set,
+/// and is empty otherwise.
 ///
 /// When `with_access_token` is set, the call requires a repository and
 /// additionally emits one `AUTH_IDENTITY` event carrying the
@@ -390,7 +391,7 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 /// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_local_user_info(
@@ -415,6 +416,10 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 
 /// Authenticate interactively via a browser-based login flow.
 ///
+/// With `reuse_session` set, a stored login whose session is still valid, as
+/// `session_valid` in `lore_auth_user_token_event_data_t` reports it, is
+/// returned without starting a new login.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -436,7 +441,7 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive(
     globals: &LoreGlobalArgs,
@@ -469,7 +474,7 @@ pub extern "C" fn lore_auth_login_interactive(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive_async(
     globals: &LoreGlobalArgs,
@@ -8170,6 +8175,56 @@ pub extern "C" fn lore_repository_instance_prune(
 pub extern "C" fn lore_repository_instance_prune_async(
     globals: &LoreGlobalArgs,
     args: &LoreRepositoryInstancePruneArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceDeleteArgs = crate::repository::LoreRepositoryInstanceDeleteArgs;
+
+/// Delete the current repository instance: unmount (if SWFS and in service),
+/// deregister from the mutable store, and delete associated directories.
+/// With `dry_run` set in `globals`, emits events describing what would be deleted
+/// without performing any changes.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_delete`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceMoveArgs = crate::repository::LoreRepositoryInstanceMoveArgs;
+
+/// Move the current repository instance to a new path: update registry metadata
+/// and remap mount (for SWFS in service context) or move directory (for regular
+/// instances).
+/// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_move`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, dispatch_command);

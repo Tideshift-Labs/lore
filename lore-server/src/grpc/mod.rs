@@ -2,12 +2,15 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use futures::FutureExt;
+
+use crate::authnz::repository_authorizer::Action;
 pub mod admin_service;
 pub mod caller_capabilities;
 pub mod domain;
 pub mod domain_operation_metadata;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_lock_service;
 pub mod forwarded_repository;
 pub mod forwarded_requests;
 pub mod forwarded_revision;
@@ -74,16 +77,18 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourceMatcher;
+use crate::auth::jwt::ResourcePermission;
+use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::util::get_user_id_from_token_ref;
-use crate::util::resources_from_token;
 
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
@@ -381,8 +386,34 @@ pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
 /// principal" from "verified principal X" and decide for themselves — the
 /// CR-029 domain admission gate, which refuses carriage from an unauthenticated
 /// caller but leaves an ordinary auth-off request alone.
+///
+/// FORK-LOCAL (Tideshift): verified claims only. Under upstream's
+/// `trust_unsigned_identity` (c10042cd) the interceptor inserts the claims of
+/// an unsigned token without a [`RawToken`]; those name a caller but are not a
+/// verified principal, so they answer `None` here.
 pub fn get_authorization_optional(extensions: &Extensions) -> Option<AuthorizationToken> {
-    extensions.get::<AuthorizationToken>().cloned()
+    verified_claims(extensions).cloned()
+}
+
+/// FORK-LOCAL (Tideshift): the claims of the interceptor-verified token, or
+/// `None` when there is none. Unsigned-identity claims (no [`RawToken`]) are
+/// not verified and answer `None`. Every fork claim reader goes through this.
+fn verified_claims(extensions: &Extensions) -> Option<&AuthorizationToken> {
+    extensions.get::<RawToken>()?;
+    extensions.get::<AuthorizationToken>()
+}
+
+/// Decodes a repository id carried in a request body.
+///
+/// The all-zero id is refused because it identifies the namespace-root
+/// partition, which holds the deployment's repository name table rather than
+/// a repository.
+pub fn requested_repository_id(id: &[u8]) -> Result<RepositoryId, Status> {
+    let id = Context::from(id);
+    if id.is_zero() {
+        return Err(Status::invalid_argument("Repository id must not be zero"));
+    }
+    Ok(id.into())
 }
 
 pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, Status> {
@@ -421,7 +452,7 @@ pub fn link_read_authorizer(
     Arc::new(move |repository_id| {
         let token = token.as_ref().map(VerifiedTokenOwned::as_token);
         authorizer
-            .check_repository_access_sync(token.as_ref(), repository_id, None)
+            .check_repository_access_sync(token.as_ref(), repository_id, Action::Read)
             .is_some_and(|verdict| verdict.is_ok())
     })
 }
@@ -429,6 +460,15 @@ pub fn link_read_authorizer(
 pub fn get_user_id(extensions: &Extensions) -> String {
     let auth = extensions.get::<AuthorizationToken>();
     get_user_id_from_token_ref(auth)
+}
+
+/// Whether the caller's verified token marks it as a service account. False
+/// without a token.
+pub fn get_is_service_account(extensions: &Extensions) -> bool {
+    extensions
+        .get::<AuthorizationToken>()
+        .and_then(|token| token.is_service_account)
+        .unwrap_or(false)
 }
 
 /// Marker that opts the gRPC server crate into [`RepositoryWriteToken::server`].
@@ -502,41 +542,151 @@ pub(crate) fn log_server_error(status: &Status) {
     }
 }
 
-/// Whether `user_id` may delete `repository`, recorded as created by
-/// `creator`. The creator may while the authorizer still lets them reach the
-/// repository, and so may a caller holding `owner` or `admin` on it. Without
-/// a verifier the authorizer allows every action, so only the creator may.
-pub async fn may_delete_repository(
+/// What the caller's grants allow for administering a repository, before
+/// the recorded creator is known.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositoryAdministration {
+    /// `owner` or `admin`; also `write` without a verified token, where there
+    /// is no identity to compare with the creator: every caller is
+    /// `<unknown>` while the recorded creator is whatever identity the client
+    /// sent at create.
+    Permitted,
+    /// `write`: permitted only to the recorded creator.
+    CreatorOnly,
+    Denied,
+}
+
+impl RepositoryAdministration {
+    pub fn permits(self, creator: &str, user_id: &str) -> bool {
+        match self {
+            Self::Permitted => true,
+            Self::CreatorOnly => creator == user_id,
+            Self::Denied => false,
+        }
+    }
+}
+
+/// Answered from the grants the partition-access layer enumerated for
+/// `repository` when the request carries them, else from one enumeration,
+/// else per action.
+pub async fn repository_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: RepositoryId,
+) -> RepositoryAdministration {
+    let token = get_verified_token(extensions);
+    let enumerated;
+    let grants = if let Some(grants) = extensions
+        .get::<PartitionGrants>()
+        .filter(|grants| grants.repository_id == repository)
+    {
+        Some(&grants.grants)
+    } else {
+        let Ok(grants) = authorizer.granted_actions(token.as_ref(), repository).await else {
+            return RepositoryAdministration::Denied;
+        };
+        enumerated = grants;
+        enumerated.as_ref()
+    };
+    let permits = async |action| {
+        permits_with(&**authorizer, grants, token.as_ref(), repository, action).await
+    };
+    if permits(Action::Owner).await || permits(Action::Admin).await {
+        RepositoryAdministration::Permitted
+    } else if !permits(Action::Write).await {
+        RepositoryAdministration::Denied
+    } else if token.is_none() {
+        RepositoryAdministration::Permitted
+    } else {
+        RepositoryAdministration::CreatorOnly
+    }
+}
+
+/// Whether `user_id` may administer `repository`, recorded as created by
+/// `creator`, per [`RepositoryAdministration`].
+pub async fn may_administer_repository(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     extensions: &Extensions,
     repository: RepositoryId,
     creator: &str,
     user_id: &str,
 ) -> bool {
-    let token = get_verified_token(extensions);
-    if creator == user_id {
-        return authorizer
-            .check_repository_access(token.as_ref(), repository, None)
-            .await
-            .is_ok();
-    }
-    let Some(token) = token else {
-        return false;
-    };
-    match authorizer.granted_actions(Some(&token), repository).await {
-        Ok(Some(grants)) => grants.permits("owner") || grants.permits("admin"),
-        Ok(None) => {
-            authorizer.permits(extensions, repository, "owner").await
-                || authorizer.permits(extensions, repository, "admin").await
+    repository_administration(authorizer, extensions, repository)
+        .await
+        .permits(creator, user_id)
+}
+
+/// The creator recorded in `repository`'s metadata. Reads only, so it does
+/// not repair the name mapping and may run before the caller is authorized.
+pub async fn repository_creator(
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+) -> Result<String, Status> {
+    let to_status = |err: &lore_revision::repository::RepositoryError| {
+        if err.is_not_found() || err.is_repository_not_found() || err.is_address_not_found() {
+            Status::not_found("Repository does not exist")
+        } else {
+            Status::internal(format!("Failed to read repository metadata: {err}"))
         }
-        Err(_) => false,
+    };
+    let metadata_hash = lore_revision::repository::metadata_hash(repository.clone())
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    let metadata = lore_revision::repository::metadata(repository, metadata_hash)
+        .await
+        .filter_slow_down()?
+        .warn_map_err(to_status)?;
+    Ok(metadata.creator)
+}
+
+/// Refuses with `permission_denied` unless the caller may administer
+/// `repository`. The recorded creator is read only when the decision rests
+/// on it.
+pub async fn require_repository_administration(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    extensions: &Extensions,
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    user_id: &str,
+) -> Result<(), Status> {
+    let permitted = match repository_administration(authorizer, extensions, repository.id).await {
+        RepositoryAdministration::Permitted => true,
+        RepositoryAdministration::CreatorOnly => repository_creator(repository).await? == user_id,
+        RepositoryAdministration::Denied => false,
+    };
+    if permitted {
+        Ok(())
+    } else {
+        info!(user_id, "Repository administration refused");
+        Err(Status::permission_denied("Not repository owner"))
     }
 }
 
-pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
+/// Whether the caller may perform `action` on the partition the request's
+/// metadata names, answered from the partition-access layer's grants when
+/// present. Denial is the uniform [`no_repository_access_status`].
+pub async fn require_action<T>(
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
+    request: &tonic::Request<T>,
+    action: Action,
+) -> Result<(), Status> {
+    let repository = get_repository(request.metadata())?;
+    if authorizer
+        .permits(request.extensions(), repository, action)
+        .await
+    {
+        Ok(())
+    } else {
+        Err(no_repository_access_status())
+    }
+}
+
+/// FORK-LOCAL (Tideshift): the `resources` claim of the verified token, or
+/// nothing. Replaces upstream's removed `util::resources_from_token` for the
+/// fork claim readers below.
+fn verified_resources(extensions: &Extensions) -> Vec<ResourcePermission> {
+    verified_claims(extensions)
+        .and_then(|token| token.resources.clone())
+        .unwrap_or_default()
 }
 
 /// FORK-LOCAL (Tideshift): the permission list of the FIRST token resource
@@ -551,7 +701,7 @@ pub fn first_exact_repository_permissions(
     extensions: &Extensions,
     repository: RepositoryId,
 ) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
+    let user_resources = verified_resources(extensions);
     for resource in user_resources {
         let resource_repository = resource
             .resource_id
@@ -575,7 +725,8 @@ pub fn first_exact_repository_permissions(
 /// Requires `owner` or `admin` on the FIRST exact `urc-<repository>` entry
 /// (see [`first_exact_repository_permissions`]). A `urc-*` grant does not
 /// qualify. This keeps the fork's pre-v0.10.0 creator-attribution rule; it does
-/// not follow upstream's wildcard-honouring [`is_owner_or_admin`].
+/// not follow upstream's wildcard-honouring `Action::Owner`/`Action::Admin`
+/// grants.
 pub fn can_set_branch_creator(extensions: &Extensions, repository: RepositoryId) -> bool {
     let permissions = first_exact_repository_permissions(extensions, repository);
     permissions
@@ -583,16 +734,8 @@ pub fn can_set_branch_creator(extensions: &Extensions, repository: RepositoryId)
         .any(|permission| permission == "owner" || permission == "admin")
 }
 
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
-}
-
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"migrate".to_string())
-}
-
 /// The `ForceUnlock` bar: the `owner` permission, and deliberately not
-/// [`can_admin_lock`]'s `migrate`.
+/// `AdminLock`'s `migrate` ([`Action::Migrate`]).
 ///
 /// **The platform table no longer says the same thing, and that is deliberate.**
 /// Owner ruling D8 (2026-09-15) lowered `lock.force_release` in the platform's
@@ -614,22 +757,17 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
 /// carries both today, so the two agreed in effect and would have diverged the
 /// moment a role carried one but not the other. The ruling names the platform
 /// table as the contract, so `ForceUnlock` gets its own gate and `AdminLock`
-/// keeps [`can_admin_lock`].
+/// keeps `migrate` (since v0.13.0 asked as [`Action::Migrate`]).
 ///
-/// `owner` is a first-class scope in the JWT vocabulary this server reads, not a
-/// new name introduced here: [`is_owner_or_admin`] already matches the same
-/// string, and Lorehub's mint emits it for the `owner` role alongside `migrate`.
+/// `owner` is a first-class scope in the JWT vocabulary this server reads
+/// ([`Action::Owner`]), and Lorehub's mint emits it for the `owner` role
+/// alongside `migrate`.
 ///
 /// It reads the string through [`has_required_permission`], which merges ALL
-/// resources matching the repository and honours the `urc-*` wildcard. That
-/// was its semantics before v0.10.0 and it is unchanged. Since upstream
-/// 657e05e9 (merged at v0.10.0) [`is_owner_or_admin`], [`can_admin_lock`] and
-/// [`can_obliterate`] resolve the same way through [`user_permissions`]. The
+/// verified resources matching the repository and honours the `urc-*`
+/// wildcard. That was its semantics before v0.10.0 and it is unchanged. The
 /// fork's branch-creator rule does NOT: it keeps the pre-v0.10.0 first-exact,
-/// no-wildcard reader ([`can_set_branch_creator`]). This gate still behaves
-/// exactly like [`can_admin_lock`], the sibling it was split away from, so the
-/// two administrative RPCs differ in which scope they demand and in nothing
-/// else.
+/// no-wildcard reader ([`can_set_branch_creator`]).
 pub fn can_force_unlock(extensions: &Extensions, repository: RepositoryId) -> bool {
     has_required_permission(extensions, repository, "owner")
 }
@@ -695,8 +833,10 @@ pub fn is_self_force_unlock(
     if !has_required_permission(extensions, repository, "read") {
         return false;
     }
-    let Some(token) = extensions.get::<AuthorizationToken>() else {
-        return false; // auth OFF, or an unauthenticated call: never self-authorize
+    let Some(token) = verified_claims(extensions) else {
+        // auth OFF, an unauthenticated call, or an unsigned identity
+        // (upstream `trust_unsigned_identity`): never self-authorize
+        return false;
     };
     if token.user_id.is_empty() {
         return false;
@@ -745,8 +885,11 @@ pub fn require_permission(
     permission: &str,
     enforce: bool,
 ) -> Result<(), Status> {
-    if get_authorization(extensions).is_err() {
-        return Ok(()); // auth OFF (no token) ⇒ no enforcement
+    // auth OFF (no verified token) ⇒ no enforcement. Unsigned-identity claims
+    // (upstream `trust_unsigned_identity`, auth-off servers only) count as no
+    // token: the authorizer, not this gate, decides what such a caller holds.
+    if verified_claims(extensions).is_none() {
+        return Ok(());
     }
     if enforce && !has_required_permission(extensions, repository, permission) {
         return Err(Status::permission_denied("Permission denied"));
@@ -754,8 +897,12 @@ pub fn require_permission(
     Ok(())
 }
 
+/// FORK-LOCAL (Tideshift): the permissions the verified token's `resources`
+/// claim grants on `repository`, merged across every matching entry with the
+/// `urc-*` wildcard honoured. Upstream v0.13.0 removed its claim reader of
+/// this name; the fork gates above still read the claim (merge decision D2).
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
+    let user_resources = verified_resources(extensions);
     ResourceMatcher::default().merged_permissions(&user_resources, repository)
 }
 
@@ -858,8 +1005,9 @@ where
 
 /// Converts a [`HookError`] into a [`tonic::Status`].
 ///
-/// Maps [`StatusCode`] variants to their corresponding gRPC status codes.
-/// Non-rejection errors (timeout, panic, execution failure) map to `INTERNAL`.
+/// Maps [`StatusCode`] variants to their corresponding gRPC status codes. A
+/// timeout maps to `UNAVAILABLE`, so the client may retry. Other non-rejection
+/// errors (panic, execution failure) map to `INTERNAL`.
 pub fn hook_error_to_status(error: HookError) -> Status {
     match &error {
         HookError::Rejected {
@@ -871,7 +1019,9 @@ pub fn hook_error_to_status(error: HookError) -> Status {
             StatusCode::InvalidArgument => Status::invalid_argument(message),
             StatusCode::Aborted => Status::aborted(message),
             StatusCode::Internal => Status::internal(message),
+            StatusCode::Unavailable => Status::unavailable(message),
         },
+        HookError::Timeout { .. } => Status::unavailable(error.to_string()),
         _ => Status::internal(error.to_string()),
     }
 }

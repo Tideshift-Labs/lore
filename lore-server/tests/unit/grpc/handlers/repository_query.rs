@@ -9,6 +9,7 @@ use lore_proto::RepositoryQueryRequest;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -29,7 +30,7 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         Err(Status::permission_denied("denied"))
     }
@@ -115,7 +116,7 @@ impl RepositoryAuthorizer for TimedOutRepositoryAuthorizer {
         &self,
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
-        _action: Option<&str>,
+        _action: Action,
     ) -> Result<(), Status> {
         Err(lore_server::authnz::auth::auth_unavailable_status(
             "lore auth service did not answer check_user_permission within 8s".to_string(),

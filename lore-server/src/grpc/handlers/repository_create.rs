@@ -51,6 +51,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
+use crate::grpc::requested_repository_id;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -121,7 +122,7 @@ pub async fn handler(
         None => None,
     };
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
@@ -143,6 +144,7 @@ pub async fn handler(
 
             hook_dispatcher
                 .dispatch_pre(HookPoint::RepositoryCreate, &hook_ctx)
+                .await
                 .map_err(hook_error_to_status)?;
 
             let default_branch_id = req.default_branch_id.into();

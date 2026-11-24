@@ -30,6 +30,7 @@ use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
 use lore_server::auth::jwt::JwtVerifier;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::grpc::caller_capabilities::ADMISSION_HEADER;
 use lore_server::grpc::caller_capabilities::CAPABILITIES_HEADER;
@@ -496,8 +497,8 @@ impl JWKService for UnusedJwkService {
     }
 }
 
-fn verifier_present() -> Arc<Option<JwtVerifier>> {
-    Arc::new(Some(JwtVerifier {
+fn verifier_present() -> Arc<TokenVerification> {
+    Arc::new(TokenVerification::Verify(JwtVerifier {
         jwk_service: Arc::new(UnusedJwkService),
         jwt_issuer: None,
         jwt_audience: None,
@@ -531,7 +532,7 @@ fn service(
     let verifier = if auth {
         verifier_present()
     } else {
-        Arc::new(None)
+        Arc::new(TokenVerification::Ignore)
     };
     match protocol {
         Protocol::V4 => {
@@ -824,7 +825,7 @@ async fn services_built_without_a_policy_stay_compatible() {
     let stores = Stores::new().await;
     let repository = random::<RepositoryId>();
     let v4 = StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         stores.immutable.clone(),
         stores.local.clone(),
@@ -856,7 +857,7 @@ async fn services_built_without_a_policy_stay_compatible() {
     .expect("a default-built v4 service admits Put");
 
     let legacy = StorageService::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         stores.immutable.clone(),
         stores.local.clone(),
@@ -910,7 +911,7 @@ fn declared_v4_service(
     let verifier = if auth {
         verifier_present()
     } else {
-        Arc::new(None)
+        Arc::new(TokenVerification::Ignore)
     };
     let service = StorageServiceV4::new(
         verifier,
@@ -1075,7 +1076,7 @@ async fn the_authorize_start_declaration_decides_the_sessions_writes() {
     let stores = Stores::new().await;
     let repository = random::<RepositoryId>();
     let service = StorageServiceV4::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         stores.immutable.clone(),
         stores.local.clone(),

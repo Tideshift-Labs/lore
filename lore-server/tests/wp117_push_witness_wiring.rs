@@ -99,7 +99,8 @@ fn a_fenced_cell_checks_every_push_and_never_falls_back_to_the_legacy_guard() {
     for (generation, handler) in [("v0", V0_HANDLER), ("v1", V1_HANDLER)] {
         let request_path = between(
             handler,
-            "let fenced_coordinator = domain_context",
+            // The merged handlers wrap this binding across two lines (rustfmt).
+            "let fenced_coordinator =\n                domain_context.and_then(|domain| domain.lock_coordinator().cloned());",
             "let PushResult {",
         );
         assert!(

@@ -198,7 +198,10 @@ async fn verify_push(
             parent,
             None,
             state,
-            &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+            &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                Default::default(),
+            ),
         )
         .await
     }))
@@ -571,7 +574,10 @@ mod push_verification {
                 parent,
                 None,
                 state,
-                &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+                &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+                    lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+                    Default::default(),
+                ),
             )
             .await
         }))

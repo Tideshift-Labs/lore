@@ -5,10 +5,10 @@
 //! The backend surface is the set of operations [`DriverInner`]'s match arms call: `open`,
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
-//! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
-//! `holds_name_exactly`, `set_len`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir`
-//! and `remove_dir_all`. A backend implements all twenty-three as inherent methods on its own
-//! type.
+//! `write_file_segments`, `sync`, `metadata`, `stat`, `symlink_stat`, `file_metadata`,
+//! `holds_name_exactly`, `rename`, `copy`, `remove_file`, `read_dir`, `create_dir_all`,
+//! `set_permissions`, `make_owner_writable`, `remove_dir` and `remove_dir_all`. A backend
+//! implements all twenty-six as inherent methods on its own type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -395,6 +395,62 @@ impl IoDriver {
         }
     }
 
+    /// The kind, size, modification time and permission bits of what `path` names, with
+    /// links followed: what [`metadata`](Self::metadata) answers of them, for a caller that
+    /// needs no more.
+    ///
+    /// On Windows, `metadata` opens the path, queries the handle and closes it, and every
+    /// filter driver on the volume sees the open and the close. This queries an absolute path
+    /// with one `GetFileAttributesExW`, which opens no handle, and answers from it where the
+    /// path names nothing, or names no reparse point and carries a time `SystemTime` can hold.
+    /// The file system answers that query without an open, unless a filter driver declines it
+    /// and the system opens, queries and closes the file instead. Every other path answers as
+    /// `metadata` does.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it over rather
+    /// than having it copied.
+    pub async fn stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.stat(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.stat(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.stat(path).await,
+        }
+    }
+
+    /// The kind, size, modification time and permission bits of what `path` names itself, a
+    /// symbolic link described rather than followed: what `std::fs::symlink_metadata` answers of
+    /// them, but for the kind on Windows.
+    ///
+    /// The kind is the one the name gives: on Unix a symbolic link is [`StatKind::Other`], as
+    /// `std` has it. On Windows the kind is taken from the name's file attributes, so a symbolic
+    /// link or junction made to a directory is a [`StatKind::Directory`] and one made to a file a
+    /// [`StatKind::File`], as Windows removes and renames them, where `std` types each as a
+    /// symbolic link.
+    ///
+    /// On Windows this is one `GetFileAttributesExW`, which opens no handle and follows no
+    /// reparse point, for an absolute path the call can take and whose time `SystemTime` can
+    /// hold. Every other path answers as `std::fs::symlink_metadata` does.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it over rather
+    /// than having it copied.
+    ///
+    /// [`StatKind::Other`]: crate::StatKind::Other
+    /// [`StatKind::Directory`]: crate::StatKind::Directory
+    /// [`StatKind::File`]: crate::StatKind::File
+    pub async fn symlink_stat(&self, path: impl Into<PathBuf>) -> std::io::Result<crate::Stat> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.symlink_stat(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.symlink_stat(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.symlink_stat(path).await,
+        }
+    }
+
     /// Whether the filesystem holds `path` spelled exactly the way it is given.
     ///
     /// A case-insensitive filesystem keeps one spelling of a name and answers a
@@ -458,8 +514,11 @@ impl IoDriver {
     /// walk.
     ///
     /// This is a driver operation rather than an inline `read_dir` because a listing is not one
-    /// syscall: it is `getdents` plus a stat per child, and a caller wanting the children's
-    /// metadata otherwise pays all of them on whatever thread polls it.
+    /// syscall: it is a read of the directory plus, on Unix, a stat per child, and a caller
+    /// wanting the children's metadata otherwise pays all of them on whatever thread polls it. On
+    /// Windows the children are described by the records of a directory search that queries
+    /// with a larger buffer, and only a symbolic link, or a name whose last-write time
+    /// `SystemTime` can't hold, is stat'd.
     pub async fn read_dir(&self, path: impl AsRef<Path>) -> std::io::Result<crate::DirStream> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
@@ -507,6 +566,27 @@ impl IoDriver {
         }
     }
 
+    /// Makes what `path` names itself writable by its owner, for a removal its permissions
+    /// refused: on Unix it adds the owner's write permission to a directory, which removing the
+    /// entries the directory holds needs, and on Windows it clears the read-only attribute, which
+    /// keeps a directory from being removed.
+    ///
+    /// The name is opened without following a symbolic link and changed through the handle, so
+    /// nothing a link stands for is changed, where [`set_permissions`](Self::set_permissions)
+    /// follows the link: on Unix a name that is not a directory itself fails, and on Windows a
+    /// symbolic link or junction has its own attribute cleared. A name already writable is left
+    /// as it is.
+    pub async fn make_owner_writable(&self, path: impl Into<PathBuf>) -> std::io::Result<()> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.make_owner_writable(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.make_owner_writable(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.make_owner_writable(path).await,
+        }
+    }
+
     pub async fn remove_dir(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
@@ -539,6 +619,29 @@ impl IoDriver {
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.remove_dir_all(path).await,
         }
+    }
+
+    /// Removes the tree at `path` as [`Self::remove_dir_all`] does, but keeps each directory that
+    /// holds a directory named `boundary`, with all it holds and the directories leading to it, and
+    /// each entry whose name `reserved` answers for, with the directories leading to it. A link is
+    /// removed, not followed, and a path that does not exist is `Ok`.
+    ///
+    /// The walk runs as one job, with as many listings and removals as [`Self::remove_dir_all`],
+    /// and reads both rules from each listing, with no stat of its own. Each directory is listed in
+    /// full before anything in it is removed, so the job holds the entry names of each directory
+    /// on its current path.
+    ///
+    /// Every backend runs this on the syscall pool, so it goes there directly, as
+    /// [`Self::write_file_segments_atomic`] does.
+    pub async fn remove_dir_all_keeping(
+        &self,
+        path: impl AsRef<Path>,
+        boundary: &'static str,
+        reserved: impl Fn(&str) -> bool + Send + 'static,
+    ) -> std::io::Result<()> {
+        PsyncDriver
+            .remove_dir_all_keeping(path.as_ref().to_path_buf(), boundary, reserved)
+            .await
     }
 
     pub(crate) async fn file_metadata_raw(

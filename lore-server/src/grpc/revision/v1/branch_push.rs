@@ -4,12 +4,10 @@
 use std::sync::Arc;
 
 use lore_base::lore_spawn;
-use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::lore::revision::v1::BranchPushRequest;
 use lore_proto::lore::revision::v1::BranchPushResponse;
 use lore_revision::branch;
-use lore_revision::branch::BranchError;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
@@ -30,23 +28,31 @@ use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
-use crate::grpc::FilterSlowDownExt;
-use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::branch_push::PushAccess;
+use crate::grpc::handlers::branch_push::PushHandler;
+use crate::grpc::handlers::branch_push::PushPhase;
+use crate::grpc::handlers::branch_push::PushReport;
 use crate::grpc::handlers::branch_push::PushResult;
+use crate::grpc::handlers::branch_push::carried_push_preparation_error;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
+use crate::grpc::handlers::branch_push::enforce_fenced_locks;
 use crate::grpc::handlers::branch_push::extract_client_ip;
+use crate::grpc::handlers::branch_push::load_branch_and_head;
+use crate::grpc::handlers::branch_push::load_response_repository_metadata;
 use crate::grpc::handlers::branch_push::prepare_governed_push;
-use crate::grpc::handlers::branch_push::push_with_governance;
+use crate::grpc::handlers::branch_push::push_loaded;
 use crate::grpc::handlers::branch_push::settle_governed_push;
 use crate::grpc::handlers::push_lock_guard;
 use crate::grpc::hook_error_to_status;
-use crate::grpc::none_or_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
+use crate::hooks::context::METADATA_BRANCH_NAME;
+use crate::hooks::context::METADATA_IS_SERVICE_ACCOUNT;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchPush` handler.
@@ -58,7 +64,8 @@ use crate::util::setup_execution;
 /// id whose metadata is missing returns `NotFound`. Pushing to a
 /// deleted branch reinstates the name → id mapping if the name is
 /// still free, or returns `AlreadyExists` if claimed by a different
-/// live branch.
+/// live branch. The pre-handlers run between reading the branch and
+/// reinstating its mapping, so a rejected push writes nothing.
 ///
 /// A fragment of the pushed revision the server does not hold is the
 /// other `FailedPrecondition`, and the only one carrying an address in
@@ -76,105 +83,117 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instrument_provider: &impl InstrumentProvider,
-    lock_enforcement: Option<&crate::grpc::handlers::push_lock_guard::PushLockEnforcement>,
+    lock_enforcement: Option<&push_lock_guard::PushLockEnforcement>,
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchPushResponse>, Status> {
-    let request_metadata = request.metadata().clone();
-    let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
+    let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
-
-    // The `push-protected` action waives branch protection, which is how mirroring pushes.
-    let bypass_protection = authorizer
-        .permits(request.extensions(), repository_id, "push-protected")
-        .await;
-
-    let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
-    let req = request.into_inner();
-
-    let admitted = admit_at_entry(
-        domain_context,
-        &request_metadata,
-        request_authorization.as_ref(),
-        GovernedScope::TargetRepository {
-            repository_id: repository_id.data(),
-        },
-    )?;
-    let branch_id = BranchId::from(req.id);
-    let revision = Hash::from(req.revision_signature);
-    let force = req.force;
-    let fast_forward_merge = req.fast_forward_merge;
-
-    // Request validation precedes witness capture: a zero-revision request is
-    // malformed, not a CR-019 bypass, and must not pay for a database read
-    // before it is rejected (INV-EE P2-10).
-    if revision.is_zero() {
-        info!("Invalid branch push request, revision_signature is zero");
-        return Err(
-            crate::grpc::handlers::branch_push::carried_push_preparation_error(
-                admitted.as_ref(),
-                Status::invalid_argument("revision_signature must be non-zero"),
-            ),
-        );
-    }
-
-    let fenced_coordinator = domain_context.and_then(|domain| domain.lock_coordinator().cloned());
-    let governed_push = prepare_governed_push(
-        domain_context,
-        admitted,
-        repository_id,
-        branch_id,
-        revision,
-        force,
-        fast_forward_merge,
-    )
-    .await?;
-
-    debug!(
-        {REVISION} = %revision,
-        bypass_protection,
-        {BRANCH_ID} = %branch_id,
-        force,
-        fast_forward_merge,
-        "Handling branch push request",
-    );
-
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
-    let repository_id: RepositoryId = repository.id;
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
-    LORE_CONTEXT
-        .scope(execution, async move {
-            let mut ctx_builder = HookContext::builder()
-                .correlation_id(correlation_id.clone())
-                .hook_point(HookPoint::BranchPush)
-                .repository(repository_id)
-                .user(user_id.clone())
-                .branch(branch_id)
-                .revision(revision);
+    PushReport::new(PushHandler::V1, repository_id)
+        .run(execution, async move |report| {
+            let request_metadata = request.metadata().clone();
+            let request_authorization =
+                crate::grpc::get_authorization_optional(request.extensions());
+            let access = PushAccess::of(&authorizer, request.extensions(), repository_id).await?;
 
-            if let Some(ip) = client_ip {
-                ctx_builder = ctx_builder.metadata("client_ip", ip);
+            let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
+            let req = request.into_inner();
+
+            // FORK-LOCAL (Tideshift, CR-029): the one shared reader of the
+            // domain-operation headers.
+            let admitted = admit_at_entry(
+                domain_context,
+                &request_metadata,
+                request_authorization.as_ref(),
+                GovernedScope::TargetRepository {
+                    repository_id: repository_id.data(),
+                },
+            )?;
+            let branch_id = BranchId::from(req.id);
+            let revision = Hash::from(req.revision_signature);
+            let force = req.force;
+            let fast_forward_merge = req.fast_forward_merge;
+            report.set_target(branch_id, revision);
+
+            // Request validation precedes witness capture: a zero-revision request is
+            // malformed, not a CR-019 bypass, and must not pay for a database read
+            // before it is rejected (INV-EE P2-10).
+            if revision.is_zero() {
+                info!("Invalid branch push request, revision_signature is zero");
+                return Err(carried_push_preparation_error(
+                    admitted.as_ref(),
+                    Status::invalid_argument("revision_signature must be non-zero"),
+                ));
             }
 
-            let mut hook_ctx = ctx_builder.build();
+            let fenced_coordinator =
+                domain_context.and_then(|domain| domain.lock_coordinator().cloned());
+            let governed_push = prepare_governed_push(
+                domain_context,
+                admitted,
+                repository_id,
+                branch_id,
+                revision,
+                force,
+                fast_forward_merge,
+            )
+            .await?;
 
-            let push_result = async {
+            debug!(
+                {REVISION} = %revision,
+                ?access,
+                {BRANCH_ID} = %branch_id,
+                force,
+                fast_forward_merge,
+                "Handling branch push request",
+            );
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+            ));
+            let repository_id: RepositoryId = repository.id;
+
+            // FORK-LOCAL (Tideshift, CR-019/CR-029/CR-030): everything from the
+            // branch read to the publication is one result, so a governed push's
+            // refusal is settled against its publication receipt before it is
+            // answered. See the shared v0 handler.
+            let admitted_push = async {
+                let (branch_metadata, loaded) =
+                    load_branch_and_head(repository.clone(), branch_id, revision).await;
+                let branch_metadata = branch_metadata?;
+
+                let mut ctx_builder = HookContext::builder()
+                    .correlation_id(correlation_id.clone())
+                    .hook_point(HookPoint::BranchPush)
+                    .repository(repository_id)
+                    .user(user_id.clone())
+                    .branch(branch_id)
+                    .revision(revision)
+                    .metadata(
+                        METADATA_BRANCH_NAME,
+                        branch::name(&branch_metadata).unwrap_or_default(),
+                    )
+                    .metadata(METADATA_IS_SERVICE_ACCOUNT, is_service_account.to_string());
+
+                if let Some(ip) = client_ip {
+                    ctx_builder = ctx_builder.metadata("client_ip", ip);
+                }
+
+                let hook_ctx = ctx_builder.build();
+
                 hook_dispatcher
                     .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+                    .await
                     .map_err(hook_error_to_status)?;
-
-                ensure_branch_pushable(repository.clone(), branch_id).await?;
 
                 // On a fenced cell the coordinator checks every push, governed or
                 // not, because it is the only authority holding a lock's verified
                 // owner pair; off a fenced cell CR-019's opt-in guard applies.
-                // See the shared v0 handler.
                 if let Some(coordinator) = fenced_coordinator.as_ref() {
                     let pusher = match governed_push.as_ref() {
                         Some(governed) => governed.owner.clone(),
@@ -182,7 +201,7 @@ pub async fn handler(
                             push_lock_guard::verified_push_owner(request_authorization.as_ref())?
                         }
                     };
-                    crate::grpc::handlers::branch_push::enforce_fenced_locks(
+                    enforce_fenced_locks(
                         coordinator,
                         repository.clone(),
                         branch_id,
@@ -202,29 +221,53 @@ pub async fn handler(
                     )
                     .await?;
                 }
-
-                push_with_governance(
-                    repository.clone(),
-                    branch_id,
-                    revision,
-                    bypass_protection,
-                    force,
-                    fast_forward_merge,
-                    history_step_size,
-                    acceleration,
-                    governed_push.as_ref(),
-                )
-                .await
+                Ok::<_, Status>((branch_metadata, loaded, hook_ctx))
             }
             .await;
+
+            let (pushed, hook_ctx, repository_metadata) = match admitted_push {
+                Ok((branch_metadata, loaded, hook_ctx)) => {
+                    let (pushed, repository_metadata) = tokio::join!(
+                        async {
+                            let pushed = push_loaded(
+                                repository.clone(),
+                                branch_id,
+                                revision,
+                                access,
+                                force,
+                                fast_forward_merge,
+                                history_step_size,
+                                acceleration,
+                                branch_metadata,
+                                loaded,
+                                governed_push.as_ref(),
+                                &mut *report,
+                            )
+                            .await;
+                            report.enter(PushPhase::Respond);
+                            pushed
+                        },
+                        load_response_repository_metadata(hook_dispatcher, repository.clone()),
+                    );
+                    (pushed, Some(hook_ctx), repository_metadata)
+                }
+                Err(status) => {
+                    report.enter(PushPhase::Respond);
+                    (Err(status), None, None)
+                }
+            };
             let PushResult {
                 success,
                 advanced,
                 fast_forward_merged,
                 revision: resulting_revision,
                 revision_number,
-            } = settle_governed_push(governed_push.as_ref(), push_result).await?;
+                branch_name,
+            } = settle_governed_push(governed_push.as_ref(), pushed).await?;
 
+            // A successful no-op push (the current head again) is answered but
+            // emits no push side effect: Lorehub reads a hook as a real branch
+            // transition.
             if advanced {
                 instrument_provider
                     .counter("num_branches_pushed")
@@ -248,7 +291,7 @@ pub async fn handler(
                 return Err(Status::failed_precondition(detail));
             }
 
-            if advanced {
+            if advanced && let Some(mut hook_ctx) = hook_ctx {
                 lore_spawn!({
                     let user_id = user_id.clone();
                     async move {
@@ -276,10 +319,10 @@ pub async fn handler(
                 &user_id,
                 repository_id,
                 branch_id,
+                &branch_name,
                 resulting_revision,
-                repository.clone(),
-            )
-            .await;
+                repository_metadata.as_ref(),
+            );
 
             debug!(
                 {BRANCH_ID} = %branch_id,
@@ -297,104 +340,4 @@ pub async fn handler(
             }))
         })
         .await
-}
-
-/// Returns `NotFound` for branch ids without metadata, and reinstates
-/// the name → id mapping for deleted branches whose name is still
-/// free. If the name has been claimed by a different live branch,
-/// returns `AlreadyExists`.
-async fn ensure_branch_pushable(
-    repository: Arc<RepositoryContext>,
-    branch_id: BranchId,
-) -> Result<(), Status> {
-    let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
-        .await
-        .filter_slow_down()?
-        .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
-    let metadata = branch::load_metadata(repository.clone(), metadata_hash)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| Status::internal(err.to_string()))?;
-
-    let Ok(name) = branch::name(&metadata) else {
-        return Ok(());
-    };
-    if name.is_empty() {
-        return Ok(());
-    }
-
-    // The `None` arm reinstates the mapping, so an unreadable name key must
-    // not reach it: that would rebind the name away from whichever branch
-    // currently owns it.
-    match none_or_status(
-        branch::load_name_to_id_local(repository.clone(), name).await,
-        BranchError::is_branch_not_found,
-    )? {
-        Some(mapped) if BranchId::from(mapped) == branch_id => Ok(()),
-        Some(other) => {
-            let other_id = BranchId::from(other);
-            if other_branch_still_claims_name(&repository, other_id, name).await? {
-                info!(
-                    {BRANCH_ID} = %branch_id,
-                    %name,
-                    claimed_by = %other_id,
-                    "Cannot reinstate deleted branch: name claimed by another branch",
-                );
-                Err(Status::already_exists(format!(
-                    "Branch name '{name}' is in use by a different branch"
-                )))
-            } else {
-                debug!(
-                    {BRANCH_ID} = %branch_id,
-                    %name,
-                    stale = %other_id,
-                    "Stale name → id mapping, reinstating to current branch",
-                );
-                branch::store_name_to_id(repository, branch_id, name)
-                    .await
-                    .filter_slow_down()?
-                    .warn_map_err(|err| {
-                        Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
-                    })
-            }
-        }
-        None => {
-            // No mapping (deleted — the underlying store treats zero
-            // values as missing — or never written). Reinstate the
-            // mapping so the subsequent push sees a live branch.
-            debug!({BRANCH_ID} = %branch_id, %name, "Reinstating name → id mapping for push");
-            branch::store_name_to_id(repository, branch_id, name)
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to reinstate name → id mapping: {err}"))
-                })
-        }
-    }
-}
-
-/// True iff `other_id` exists and its metadata still names it `name`. A
-/// mismatch (dead branch, missing metadata, or a rename that left an
-/// orphan name pointer) is treated as a stale mapping the caller can
-/// safely overwrite. A store that cannot answer is reported rather than
-/// read as a mismatch, so an unreadable branch never has its name
-/// reassigned.
-async fn other_branch_still_claims_name(
-    repository: &Arc<RepositoryContext>,
-    other_id: BranchId,
-    name: &str,
-) -> Result<bool, Status> {
-    let Ok(metadata_hash) = branch::metadata_hash(repository.clone(), other_id)
-        .await
-        .filter_slow_down()?
-    else {
-        return Ok(false);
-    };
-    let Ok(metadata) = branch::load_metadata(repository.clone(), metadata_hash)
-        .await
-        .filter_slow_down()?
-    else {
-        return Ok(false);
-    };
-    Ok(branch::name(&metadata).unwrap_or("") == name)
 }

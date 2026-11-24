@@ -21,6 +21,8 @@ use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::handlers::revision_tree::*;
 use lore_storage::hash::hash_string;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -87,11 +89,12 @@ async fn tree_on_file_returns_invalid_argument() {
                 repository.clone(),
                 main,
                 revision_hash,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 lore_server::grpc::server::RevisionListAcceleration::default(),
+                &mut PushReport::new(PushHandler::Legacy, Default::default()),
             )
             .await
             .expect("Failed to push revision");
@@ -166,11 +169,12 @@ async fn tree_on_missing_path_returns_not_found() {
                 repository.clone(),
                 main,
                 revision_hash,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 lore_server::grpc::server::RevisionListAcceleration::default(),
+                &mut PushReport::new(PushHandler::Legacy, Default::default()),
             )
             .await
             .expect("Failed to push revision");
@@ -262,11 +266,12 @@ async fn tree_emits_link_node_with_target_repository_context() {
                 repository.clone(),
                 main,
                 revision_hash,
-                true,
+                crate::util::test_support::PUSH_ANY,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 lore_server::grpc::server::RevisionListAcceleration::default(),
+                &mut PushReport::new(PushHandler::Legacy, Default::default()),
             )
             .await
             .expect("Failed to push revision");
@@ -383,11 +388,12 @@ async fn link_tree_path(
         repository.clone(),
         main,
         revision_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push revision");

@@ -20,6 +20,8 @@ use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_diff::*;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
 use tonic::Request;
@@ -83,11 +85,12 @@ async fn push_revision_on_branch(
         repository_context.clone(),
         branch,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push head revision")

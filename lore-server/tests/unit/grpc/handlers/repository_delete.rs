@@ -13,6 +13,7 @@ use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_registry::RepositoryRegistry;
@@ -119,7 +120,10 @@ fn delete_request(id: RepositoryId, token: AuthorizationToken) -> Request<Reposi
 
 /// A verifier configured with global grants read from `groups`.
 fn global_grants() -> Arc<dyn RepositoryAuthorizer> {
-    Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())))
+    Arc::new(GlobalGrantsAuthorizer::new(
+        Some("groups".to_string()),
+        vec![Action::Read, Action::Write],
+    ))
 }
 
 /// A Tier 2 verifier reading per-repository grants from `resources`.
@@ -145,7 +149,7 @@ fn creator_request(
             identity: Some("alice".to_string()),
             resources: Some(vec![ResourcePermission {
                 resource_id: format!("urc-{granted}"),
-                permission: vec!["read".to_string()],
+                permission: vec!["write".to_string()],
             }]),
             ..Default::default()
         },
@@ -215,9 +219,9 @@ async fn owner_not_service_account_lets_a_non_creator_delete() {
     .await;
 }
 
-/// The creator may delete only while the authorizer lets them reach the
-/// repository: on Tier 2 a creator whose token grants another repository
-/// only is refused, and `read` on this one restores the creator's right.
+/// The creator may delete only while they hold `write` on the repository:
+/// on Tier 2 a creator whose token grants another repository only is
+/// refused, and `write` on this one restores the creator's right.
 #[tokio::test]
 async fn the_creator_must_reach_the_repository_to_delete() {
     let (immutable_store, mutable_store, execution) =
@@ -253,4 +257,52 @@ async fn the_creator_must_reach_the_repository_to_delete() {
         .expect("a creator who reaches the repository may delete");
     }))
     .await;
+}
+
+mod zero_repository_id {
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+
+    use super::*;
+
+    /// The all-zero id names the namespace-root partition: the delete is
+    /// refused and whatever is stored there stays in place.
+    #[tokio::test]
+    async fn is_refused_and_deletes_nothing() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let namespace_root = RepositoryId::default();
+            seed_repository(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                namespace_root,
+                "alice",
+            )
+            .await;
+
+            let status = handler(
+                delete_request(namespace_root, AuthorizationToken::default()),
+                &RepositoryRegistry::Unregistered,
+                &(Arc::new(AllowAllRepositoryAuthorizer) as Arc<dyn RepositoryAuthorizer>),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                &TestInstrumentProvider,
+                None,
+            )
+            .await
+            .expect_err("the zero id must be refused");
+            assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                namespace_root,
+            ));
+            repository::metadata_hash(repository)
+                .await
+                .expect("the stored metadata must survive");
+        }))
+        .await;
+    }
 }

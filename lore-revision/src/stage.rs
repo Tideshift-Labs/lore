@@ -23,6 +23,7 @@ use crate::branch;
 use crate::change;
 use crate::errors::*;
 use crate::event;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::DirectoryEntry;
@@ -408,7 +409,7 @@ async fn is_committed(
 /// Whether `node`, which the staged tree holds at `id`, and its subtree can leave the staged tree
 /// instead of being staged for delete: none of it is committed, a link or a merge entry, which
 /// carry a registry entry and flags only a staged delete settles.
-async fn drops_cleanly(
+pub(crate) async fn drops_cleanly(
     committed: &State,
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -476,19 +477,18 @@ async fn is_on_disk(operation: &InstanceOperationImpl, path: &RelativePath) -> b
 /// [drops cleanly](drops_cleanly). `None` where `node` itself is committed or on disk, or where
 /// none drops cleanly, which leaves a delete to stage.
 ///
-/// `path` is taken from the root of the state `node` indexes, so it crosses no link.
+/// `path` is taken from the root of the state `node` indexes, so it crosses no link. `leaf` is
+/// the node `node` names.
+#[allow(clippy::too_many_arguments)]
 async fn uncommitted_absent_root(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     committed: &State,
     node: NodeID,
+    leaf: Node,
     path: &RelativePath,
 ) -> Result<Option<NodeID>, StageError> {
-    let leaf = state
-        .node(repository.clone(), node)
-        .await
-        .forward::<StageError>("Failed to resolve the staged node")?;
     if is_committed(committed, repository, node, &leaf).await? || is_on_disk(operation, path).await
     {
         return Ok(None);
@@ -552,6 +552,9 @@ async fn is_uncommitted_child(
 /// is the only part checked for case consistency. A mounted state starts at its own root and spells
 /// its nodes from there, so the base is named by its node while the walk carries the path the file
 /// system, the filter and the reported changes all answer for.
+///
+/// The filter is asked about the path as what the working tree holds there, else as the node the
+/// tree holds, a link as a directory, and as a directory where neither holds anything.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
@@ -595,13 +598,8 @@ pub(crate) async fn stage_filesystem_path(
         RelativePath::new_from_clean_parts(base.path.as_str(), remainder_path.as_str())
     };
 
-    let force = execution_context().globals().force();
-    if crate::repository_fence::is_workflow_path(full_relative_path.as_str())
-        || !force
-            && repository
-                .filter
-                .emit_excludes(&full_relative_path, true, FilterMode::Full)
-    {
+    // FORK-LOCAL: workflow credentials and intent are never staged, even under `force`.
+    if crate::repository_fence::is_workflow_path(full_relative_path.as_str()) {
         lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
         return Ok(NodeLink::invalid());
     }
@@ -616,7 +614,69 @@ pub(crate) async fn stage_filesystem_path(
             .filter(|info| info.exists())
     };
 
+    let force = execution_context().globals().force();
     if let Some(info) = staged_info {
+        // The tree is searched only for a path the filter would drop, since a path the tree tracks
+        // as the kind the working tree holds is past the ignore slot.
+        let excluded = !force
+            && repository.filter.excludes_tree(
+                &full_relative_path,
+                info.is_dir(),
+                FilterMode::Full,
+            )
+            && {
+                let tracked = state
+                    .relative_path_tracked_as(
+                        repository.clone(),
+                        base.node,
+                        remainder_path.as_str(),
+                    )
+                    .await
+                    .forward::<StageError>("Failed to read the revision the tree was built on")?
+                    == Some(info.is_dir());
+                repository.filter.emit_excludes(
+                    &full_relative_path,
+                    info.is_dir(),
+                    FilterMode::TRACKED.at(tracked),
+                )
+            };
+        if excluded {
+            lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
+            let (replaced_states, replaced_excluded) = repository.filter.child_excludes_tree(
+                repository
+                    .filter
+                    .parent_exclusion_states(&full_relative_path),
+                &full_relative_path,
+                !info.is_dir(),
+                FilterMode::Full,
+            );
+            if !replaced_excluded {
+                Box::pin(async {
+                    let Ok((node_link, None)) = state
+                        .find_relative(repository.clone(), base.node, remainder_path.as_str())
+                        .await
+                    else {
+                        return Ok(());
+                    };
+                    stage_replaced_node(
+                        repository.clone(),
+                        state.clone(),
+                        full_relative_path.clone(),
+                        KnownChild::Resolved(Some(node_link.node)),
+                        base.node,
+                        !info.is_dir(),
+                        replaced_states,
+                        options.node_flags,
+                        stats.clone(),
+                        link_tracker.clone(),
+                    )
+                    .await
+                })
+                .await?;
+            }
+            return Ok(NodeLink::invalid());
+        }
+
         if info.is_dir() {
             lore_trace!("Stage directory: {}", full_relative_path.as_str());
         } else if info.is_file() {
@@ -665,7 +725,22 @@ pub(crate) async fn stage_filesystem_path(
             )
             .await;
             stats.task_count.fetch_sub(1, Ordering::Release);
-            result?;
+            if !result?
+                && descent.unkept != INVALID_NODE
+                && descent.repository.id == repository.id
+                && let Some(queue) = discards.as_deref()
+            {
+                discard_unkept(
+                    &descent.repository,
+                    &descent.state,
+                    descent.node,
+                    descent.unkept,
+                    queue,
+                    &stats,
+                )
+                .await?;
+                return Ok(NodeLink::default());
+            }
         }
 
         return Ok(NodeLink {
@@ -683,10 +758,51 @@ pub(crate) async fn stage_filesystem_path(
         repository.path_for_display(),
         full_relative_path.as_str(),
     );
-    if let Ok(node_link) = state
-        .find_relative_node_link(repository.clone(), base.node, remainder_path.as_str())
+    // The tree is searched before the filter is asked, since a path the tree tracks is past the
+    // ignore slot.
+    let filter = &repository.filter;
+    let mode = absence_mode(force, FilterMode::Full);
+    let parent_states = filter.parent_exclusion_states(&full_relative_path);
+
+    let Ok((node_link, linked)) = state
+        .find_relative(repository.clone(), base.node, remainder_path.as_str())
         .await
-    {
+    else {
+        if filter
+            .child_emit_excludes(parent_states, &full_relative_path, true, mode)
+            .1
+        {
+            lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
+            return Ok(NodeLink::invalid());
+        }
+        lore_debug!("Path {} does not exist in repository", full_relative_path);
+        if !force {
+            return Err(StageError::internal(format!(
+                "Invalid path {full_relative_path}"
+            )));
+        }
+        lore_debug!("Non-existing path ignored by force flag");
+        return Ok(NodeLink::default());
+    };
+    let (current_repository, node_state) =
+        linked.unwrap_or_else(|| (repository.clone(), state.clone()));
+    // A block of its own, so the future holds the node only until the discard check.
+    let (held, states) = {
+        let Some((node, states)) = absent_named_node(
+            filter,
+            &current_repository,
+            &node_state,
+            node_link.node,
+            &full_relative_path,
+            parent_states,
+            force,
+        )
+        .await?
+        else {
+            lore_trace!("Path excluded by filter: {}", full_relative_path.as_str());
+            return Ok(NodeLink::invalid());
+        };
+
         if node_link.repository == repository.id
             && let Some(queue) = discards.as_deref()
             && let Some(root) = uncommitted_absent_root(
@@ -695,6 +811,7 @@ pub(crate) async fn stage_filesystem_path(
                 &state,
                 &queue.committed,
                 node_link.node,
+                node,
                 &full_relative_path,
             )
             .await?
@@ -703,71 +820,116 @@ pub(crate) async fn stage_filesystem_path(
             queue.push(root);
             return Ok(NodeLink::default());
         }
+        (NodeFlags::from_bits_retain(node.flags), states)
+    };
 
-        // Without its children a missing directory is only located: deleting it would delete
-        // everything below it, where the caller stages only some of that.
-        if options.no_children {
-            return Ok(if node_link.repository == repository.id {
-                node_link
-            } else {
-                NodeLink::default()
-            });
-        }
-
-        let mut current_repository = repository.clone();
-        let node_state = if node_link.repository != repository.id {
-            current_repository = repository.to_link_context(node_link.repository).await;
-            State::deserialize(current_repository.clone(), node_link.revision)
-                .await
-                .forward::<StageError>("Failed to deserialize revision state")?
+    // Without its children a missing directory is only located: deleting it would delete
+    // everything below it, where the caller stages only some of that.
+    if options.no_children {
+        return Ok(if node_link.repository == repository.id {
+            node_link
         } else {
-            state.clone()
-        };
-
-        if let Some(ref tracker) = link_tracker
-            && node_link.repository != repository.id
-        {
-            // Record a tracker context for every link crossed to reach the
-            // deleted path, so a delete nested two or more levels deep folds
-            // its pin up through all intermediate links (not just one level).
-            let chain = crate::link::resolve_link_chain(
-                base.clone(),
-                state.clone(),
-                remainder_path.clone(),
-                BranchId::default(),
-            )
-            .await
-            .forward::<StageError>("Failed to resolve link chain")?;
-
-            chain.record_tracker_contexts(tracker, &node_state);
-        }
-
-        lore_debug!(
-            "Path {} exist in repository, stage deletion",
-            full_relative_path
-        );
-        stage_absent_delete(
-            current_repository.clone(),
-            node_state,
-            full_relative_path.clone(),
-            node_link.node,
-            options.node_flags,
-            stats.clone(),
-            link_tracker.clone(),
-        )
-        .await?;
-    } else {
-        lore_debug!("Path {} does not exist in repository", full_relative_path);
-        if !force {
-            return Err(StageError::internal(format!(
-                "Invalid path {full_relative_path}"
-            )));
-        } else {
-            lore_debug!("Non-existing path ignored by force flag");
-        }
+            NodeLink::default()
+        });
     }
 
+    if let Some(ref tracker) = link_tracker
+        && node_link.repository != repository.id
+    {
+        // Record a tracker context for every link crossed to reach the
+        // deleted path, so a delete nested two or more levels deep folds
+        // its pin up through all intermediate links (not just one level).
+        let chain = crate::link::resolve_link_chain(
+            base.clone(),
+            state.clone(),
+            remainder_path.clone(),
+            BranchId::default(),
+        )
+        .await
+        .forward::<StageError>("Failed to resolve link chain")?;
+
+        chain.record_tracker_contexts(tracker, &node_state);
+    }
+
+    lore_debug!(
+        "Path {} exist in repository, stage deletion",
+        full_relative_path
+    );
+    stage_absent_delete(
+        current_repository,
+        node_state,
+        full_relative_path,
+        node_link.node,
+        held,
+        options.node_flags,
+        stats,
+        link_tracker,
+        states,
+        force,
+    )
+    .await?;
+
     Ok(NodeLink::default())
+}
+
+/// The node `state` holds at `id`, which the working tree lacks at the named `path`, with the
+/// filter verdict at it from `parent`, or `None` where `filter` leaves it out. The node is asked
+/// about as what it is, and the ignore rules leave it out where the tree only marks it, unless
+/// `force` puts the stage past them.
+///
+/// A function of its own, so the node sits in the caller's future only across the discard check
+/// that follows, rather than beside the tree's answer too.
+async fn absent_named_node(
+    filter: &Filter,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    id: NodeID,
+    path: &RelativePath,
+    parent: FilterStates,
+    force: bool,
+) -> Result<Option<(Node, FilterStates)>, StageError> {
+    let node = state
+        .node(repository.clone(), id)
+        .await
+        .forward::<StageError>("Failed to resolve the staged node")?;
+    let is_directory = Node::asked_as_directory(Some(&node));
+    let flags = NodeFlags::from_bits_retain(node.flags);
+    let mode = filter
+        .tracked_mode(
+            parent,
+            path,
+            is_directory,
+            absence_mode(force, FilterMode::TRACKED),
+            async || state.tracks(repository, id, flags).await,
+        )
+        .await
+        .forward::<StageError>("Failed to read the revision the tree was built on")?;
+    let (states, excluded) = filter.child_emit_excludes(parent, path, is_directory, mode);
+    Ok((!excluded).then_some((node, states)))
+}
+
+/// Discards `unkept`, the first of the directories a descent added from it down to `node` that
+/// hold nothing kept, and takes back the adds the descent recorded for them.
+async fn discard_unkept(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    mut node: NodeID,
+    unkept: NodeID,
+    queue: &DiscardQueue,
+    stats: &StageStats,
+) -> Result<(), StageError> {
+    let mut adds = 1;
+    while node != unkept && node != ROOT_NODE {
+        node = state
+            .node(repository.clone(), node)
+            .await
+            .forward::<StageError>("Failed to resolve an added directory")?
+            .parent;
+        adds += 1;
+    }
+    stats.directory_add_count.fetch_sub(adds, Ordering::Relaxed);
+    queue.push(unkept);
+    Ok(())
 }
 
 /// The node a staged path's descent has reached, in the repository and state holding it past
@@ -779,6 +941,9 @@ struct StageDescent {
     relative_path: RelativePathBuf,
     absolute_path: PathBuf,
     states: FilterStates,
+    /// The first of the directories ending the descent that an unforced stage added and the filter
+    /// excludes, which stand only for what is kept below them, or [`INVALID_NODE`].
+    unkept: NodeID,
 }
 
 impl StageDescent {
@@ -797,10 +962,13 @@ impl StageDescent {
             absolute_path: if base.path.is_empty() {
                 repository_root.to_path_buf()
             } else {
-                base.path.to_absolute_path(repository_root)
+                base.path
+                    .to_absolute_path(repository_root)
+                    .forward::<StageError>("placing the staged path below the root")?
             },
             states: base.repository.filter.exclusion_states(&relative_path),
             relative_path,
+            unkept: INVALID_NODE,
         })
     }
 
@@ -861,7 +1029,11 @@ impl StageDescent {
                 }
             }
 
-            let staged = stage_node_from_metadata(
+            let StagedChild {
+                link: node_link,
+                states,
+                added,
+            } = stage_node_from_metadata(
                 operation,
                 NodeMapping {
                     repository: self.repository.clone(),
@@ -878,7 +1050,17 @@ impl StageDescent {
                 self.states,
             )
             .await?;
-            let node_link = staged.link;
+            if added {
+                stats.record_action(LoreFileAction::Add, true);
+            }
+            if added && states.excluded(FilterMode::Full) && !execution_context().globals().force()
+            {
+                if self.unkept == INVALID_NODE {
+                    self.unkept = node_link.node;
+                }
+            } else {
+                self.unkept = INVALID_NODE;
+            }
 
             if !node_link.is_valid() {
                 return Ok(Some(node_link));
@@ -896,7 +1078,7 @@ impl StageDescent {
                 self.relative_path.push(&final_name);
             }
 
-            self.states = staged.states;
+            self.states = states;
 
             let node = self
                 .state
@@ -982,7 +1164,7 @@ pub(crate) async fn stage_single_node(
         || !force
             && repository
                 .filter
-                .emit_excludes(&relative_path, true, filter_mode)
+                .emit_excludes(&relative_path, !node.is_file(), filter_mode)
     {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
         return Ok(NodeLink::invalid());
@@ -1031,13 +1213,13 @@ pub(crate) async fn stage_single_node(
             );
 
             if node_flags.node_type() == existing_node.node_type() {
-                // Update the existing node
                 let block_dirtied = {
                     let mut block_writer = block.write();
                     let existing_node = block_writer.node(node_index);
                     existing_node.address = node.address;
                     existing_node.mode = node.mode;
                     existing_node.size = node.size;
+                    existing_node.take_mount_source(&node);
                     block_writer.mark_dirty()
                 };
                 if block_dirtied {
@@ -1350,6 +1532,38 @@ async fn stage_delete_node(
     Ok(Some(node))
 }
 
+/// Stages the delete of the node at `node_id` that a node of another kind replaces, dropping its
+/// registry entry where it links the repository `link`. Apart from the scan, so the scan's future
+/// holds no room for the registry edit.
+#[allow(clippy::too_many_arguments)]
+async fn stage_delete_replaced(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    relative_path: RelativePath,
+    node_id: NodeID,
+    link: Option<RepositoryId>,
+    node_flags: NodeFlags,
+    stats: Arc<StageStats>,
+    link_tracker: Option<Arc<crate::link::LinkTracker>>,
+) -> Result<(), StageError> {
+    if let Some(link) = link {
+        state
+            .link_remove_if_present(repository.clone(), link, node_id)
+            .await
+            .forward::<StageError>("Failed to remove link")?;
+    }
+    stage_delete(
+        repository,
+        state,
+        relative_path,
+        node_id,
+        node_flags,
+        stats,
+        link_tracker,
+    )
+    .await
+}
+
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -1426,35 +1640,131 @@ fn stage_delete_recurse(
     ))
 }
 
+/// The filter slots asked about a deletion that a path missing from the working tree drives: the
+/// view alone where the stage is forced, since a forced stage passes the ignore file and the
+/// working tree lacks what the view excludes without its having been deleted, and `unforced`
+/// otherwise.
+fn absence_mode(force: bool, unforced: FilterMode) -> FilterMode {
+    if force { FilterMode::View } else { unforced }
+}
+
+/// The filter verdict a staging walk carries from `parent` to `path`, and whether it leaves `path`
+/// out, asking the slots in `unforced`. A forced stage leaves out nothing, and still steps the view
+/// for the deletions below that ask it.
+fn stage_step(
+    filter: &Filter,
+    force: bool,
+    parent: FilterStates,
+    path: &RelativePath,
+    is_directory: bool,
+    unforced: FilterMode,
+) -> (FilterStates, bool) {
+    if force {
+        let (states, _) = filter.child_excludes_tree(parent, path, is_directory, FilterMode::View);
+        (states, false)
+    } else {
+        filter.child_emit_excludes(parent, path, is_directory, unforced)
+    }
+}
+
+/// Stages the deletion of the node the tree holds at `path` where it is of the kind the working
+/// tree does not hold there, `replaced_directory` saying whether that kind is a directory. The
+/// filter leaves out what the working tree holds and keeps a node of the other kind, whose
+/// verdict is `states`, so the node is asked about as what it is, as a node no listing entry
+/// claims is. `known_child` is the node as the caller established it, and `base_node` the
+/// directory a node it left unresolved is looked up in. Nothing is staged where the tree holds
+/// no node there or one of the kind the working tree holds.
+///
+/// A cold path, which its caller boxes: a stage meets it only where the filter tells a file from a
+/// directory at a path, as a directory-only rule does.
+#[allow(clippy::too_many_arguments)]
+async fn stage_replaced_node(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    path: RelativePath,
+    known_child: KnownChild,
+    base_node: NodeID,
+    replaced_directory: bool,
+    states: FilterStates,
+    node_flags: NodeFlags,
+    stats: Arc<StageStats>,
+    link_tracker: Option<Arc<crate::link::LinkTracker>>,
+) -> Result<(), StageError> {
+    let node_id = match known_child {
+        KnownChild::Resolved(Some(node_id)) => node_id,
+        KnownChild::Resolved(None) => return Ok(()),
+        KnownChild::Unresolved => match state
+            .find_subnode(
+                repository.clone(),
+                base_node,
+                hash::hash_string(path.name()),
+            )
+            .await
+        {
+            Ok(node_id) => node_id,
+            Err(err) if err.is_node_not_found() => return Ok(()),
+            Err(err) => return Err(err).forward::<StageError>("Failed to resolve the child node"),
+        },
+    };
+    let node = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<StageError>("Failed to resolve the replaced node")?;
+    if node.is_file() == replaced_directory {
+        return Ok(());
+    }
+    stage_absent_delete(
+        repository,
+        state,
+        path,
+        node_id,
+        NodeFlags::from_bits_retain(node.flags),
+        node_flags,
+        stats,
+        link_tracker,
+        states,
+        false,
+    )
+    .await
+    .map(|_| ())
+}
+
 /// Stage the deletion of `node_id`, which the file system does not hold, and report whether
-/// a link kept part of it.
+/// part of it was kept.
 ///
 /// A mount stays absent while the linked repository cannot be read, so the link and every
-/// directory on its path stay. A node already staged for deletion keeps nothing.
+/// directory on its path stay. A node the view excludes stays too, with every directory on its
+/// path, as a view leaves the files it excludes out of the working tree. So does a directory the
+/// view excludes that holds no children, which nothing materializes. The ignore file has no say
+/// over a node the tree tracks, so a deletion of one is staged as any other; it leaves out only an
+/// add marked dirty, which was never staged. A node already staged for deletion keeps nothing.
+///
+/// `held` is what the tree holds `node_id` as: its type and what is staged on it. `states` is the
+/// filter verdict at `relative_path`, which each child steps from, and `force` whether the stage
+/// is forced past the ignore file. A child is asked about in the tracked mode.
+#[allow(clippy::too_many_arguments)]
 async fn stage_absent_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     relative_path: RelativePath,
     node_id: NodeID,
+    held: NodeFlags,
     node_flags: NodeFlags,
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    states: FilterStates,
+    force: bool,
 ) -> Result<bool, StageError> {
-    let node = state
-        .node(repository.clone(), node_id)
-        .await
-        .forward::<StageError>("Failed deserializing state node block")?;
-
-    if node.is_staged_delete() {
+    if held.contains(NodeFlags::StagedDelete) {
         return Ok(false);
     }
 
-    if node.is_link() {
+    if held.contains(NodeFlags::Link) {
         lore_debug!("Link mount {relative_path} is absent from the file system, keeping the link");
         return Ok(true);
     }
 
-    if !node.is_directory() {
+    if !held.is_directory() {
         stage_delete_node(
             &repository,
             &state,
@@ -1473,26 +1783,66 @@ async fn stage_absent_delete(
             .await
             .forward::<StageError>("Failed to list directory node children")?;
 
-    let mut kept_link = false;
-    while let Some((child_node_id, _child_node, child_name)) = children
+    let mut kept = false;
+    let mut had_child = false;
+    while let Some((child_node_id, child_held, child_name)) = children
         .next()
         .await
         .forward::<StageError>("Failed to list directory node children")?
+        .map(|(id, node, name)| (id, NodeFlags::from_bits_retain(node.flags), name))
     {
+        had_child = true;
         let child_path = relative_path.join(child_name);
-        kept_link |= stage_absent_delete_recurse(
+        let is_directory = !child_held.contains(NodeFlags::File);
+        let mode = repository
+            .filter
+            .tracked_mode(
+                states,
+                &child_path,
+                is_directory,
+                absence_mode(force, FilterMode::TRACKED),
+                async || state.tracks(&repository, child_node_id, child_held).await,
+            )
+            .await
+            .forward::<StageError>("Failed to read the revision the staged tree was built on")?;
+        let (child_states, excluded) =
+            repository
+                .filter
+                .child_excludes_tree(states, &child_path, is_directory, mode);
+        if excluded {
+            kept = true;
+            continue;
+        }
+        kept |= stage_absent_delete_recurse(
             repository.clone(),
             state.clone(),
             child_path,
             child_node_id,
+            child_held,
             node_flags,
             stats.clone(),
             link_tracker.clone(),
+            child_states,
+            force,
         )
         .await?;
     }
 
-    if kept_link {
+    if kept {
+        return Ok(true);
+    }
+    // An empty directory the view excludes stays, as nothing materializes it, and so does one
+    // the ignore rules exclude that the tree only marks. One the tree tracks is deleted past them.
+    if !had_child
+        && states.excluded(FilterMode::Full)
+        && (states.excluded(FilterMode::View)
+            || !state
+                .tracks(&repository, node_id, held)
+                .await
+                .forward::<StageError>(
+                    "Failed to read the revision the staged tree was built on",
+                )?)
+    {
         return Ok(true);
     }
 
@@ -1509,23 +1859,30 @@ async fn stage_absent_delete(
     Ok(false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_absent_delete_recurse(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     relative_path: RelativePath,
     node_id: NodeID,
+    held: NodeFlags,
     node_flags: NodeFlags,
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
+    states: FilterStates,
+    force: bool,
 ) -> Pin<Box<dyn Future<Output = Result<bool, StageError>> + Send>> {
     Box::pin(stage_absent_delete(
         repository,
         state,
         relative_path,
         node_id,
+        held,
         node_flags,
         stats,
         link_tracker,
+        states,
+        force,
     ))
 }
 
@@ -1785,8 +2142,74 @@ fn directory_task_semaphore() -> &'static Arc<Semaphore> {
         .get_or_init(|| Arc::new(Semaphore::new(max_concurrent_stage_directory_tasks())))
 }
 
+/// What [`stage_directory`]'s pass over the children no listing entry claims does with `child`,
+/// which the working tree lacks below `relative_path`, whose verdict is `states`: `None` where the
+/// filter leaves it out, or where it was never committed and is queued to leave the staged tree,
+/// and otherwise its path, the verdict its children step from and what the tree holds it as, for
+/// the delete to stage. The ignore rules leave out a child the tree only marks.
+///
+/// A function of its own, so the node and its path sit in the directory's future only while this
+/// runs, rather than in every state that awaits beside it.
+async fn unclaimed_child(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    relative_path: &RelativePathBuf,
+    states: FilterStates,
+    child: NodeID,
+    force: bool,
+    discards: Option<&DiscardQueue>,
+) -> Result<Option<(RelativePath, FilterStates, NodeFlags)>, StageError> {
+    let Some((node, node_name)) = state
+        .node_and_name_or_skip(repository.clone(), child)
+        .await
+        .forward::<StageError>("Failed to resolve the child node")?
+    else {
+        return Ok(None);
+    };
+    let mut filter_path = relative_path.clone();
+    filter_path.push(node_name);
+    let filter_path = filter_path.freeze();
+    let held = NodeFlags::from_bits_retain(node.flags);
+    let mode = repository
+        .filter
+        .tracked_mode(
+            states,
+            &filter_path,
+            !node.is_file(),
+            absence_mode(force, FilterMode::TRACKED),
+            async || state.tracks(repository, child, held).await,
+        )
+        .await
+        .forward::<StageError>("Failed to read the revision the staged tree was built on")?;
+    let (child_states, excluded) =
+        repository
+            .filter
+            .child_emit_excludes(states, &filter_path, !node.is_file(), mode);
+    // A staged add the filter excludes was forced, so it stays
+    if excluded && node.is_staged() {
+        lore_trace!("Node excluded by filter: {}", filter_path.as_str());
+        return Ok(None);
+    }
+
+    if let Some(queue) = discards
+        && drops_cleanly(&queue.committed, repository, state, child, &node).await?
+    {
+        lore_trace!("Node was never committed, dropping it: {filter_path}");
+        queue.push(child);
+        return Ok(None);
+    }
+
+    if excluded {
+        lore_trace!("Node excluded by filter: {}", filter_path.as_str());
+        return Ok(None);
+    }
+    Ok(Some((filter_path, child_states, held)))
+}
+
 /// `states` is the filter verdict for `relative_path`, which each child steps
 /// from rather than folding its whole path.
+///
+/// Answers whether the tree keeps anything below the directory.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_directory(
     operation: Arc<InstanceOperationImpl>,
@@ -1802,7 +2225,7 @@ pub(crate) async fn stage_directory(
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
     states: FilterStates,
-) -> Result<(), StageError> {
+) -> Result<bool, StageError> {
     let mut children = DirectoryChildren::new(
         state
             .node_children_with_name_hash(repository.clone(), directory_node)
@@ -1846,7 +2269,7 @@ pub(crate) async fn stage_directory(
     .await?;
 
     let mut directory_tasks = JoinSet::new();
-    let mut failure = None;
+    let mut outcome = Ok(false);
     // Reusable buffer for layer mount path checks: one allocation per directory
     // instead of per child. Sized for the parent path plus a typical name; grows
     // if a child name is longer.
@@ -1900,7 +2323,7 @@ pub(crate) async fn stage_directory(
             {
                 Ok(claimed) => claimed,
                 Err(err) => {
-                    failure = failure.or(Some(err));
+                    fold_child(Err(err), &mut outcome);
                     break;
                 }
             };
@@ -1908,7 +2331,7 @@ pub(crate) async fn stage_directory(
             let uncommitted = match is_uncommitted_child(&repository, &state, claimed).await {
                 Ok(uncommitted) => uncommitted,
                 Err(err) => {
-                    failure = failure.or(Some(err));
+                    fold_child(Err(err), &mut outcome);
                     break;
                 }
             };
@@ -1954,12 +2377,13 @@ pub(crate) async fn stage_directory(
             {
                 Ok(staged) => staged,
                 Err(err) => {
-                    failure = failure.or(Some(err));
+                    fold_child(Err(err), &mut outcome);
                     break;
                 }
             };
             let node_link = staged.link;
             let child_states = staged.states;
+            let added = staged.added;
 
             // Inline fallback rather than a blocking acquire: a parent awaiting
             // its children must never block on a permit a descendant needs, or
@@ -1984,6 +2408,7 @@ pub(crate) async fn stage_directory(
                             absolute_path,
                             relative_path,
                             node_link,
+                            added,
                             depth,
                             options,
                             stats,
@@ -2003,6 +2428,7 @@ pub(crate) async fn stage_directory(
                     absolute_path.to_path_buf(),
                     relative_path.clone(),
                     node_link,
+                    added,
                     depth,
                     options,
                     stats.clone(),
@@ -2012,14 +2438,16 @@ pub(crate) async fn stage_directory(
                     child_states,
                 )
                 .await;
-                failure = failure.or(result.err());
+                fold_child(result, &mut outcome);
             }
 
             while let Some(result) = directory_tasks.try_join_next() {
-                failure = failure.or(result
-                    .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
-                    .flatten()
-                    .err());
+                fold_child(
+                    result
+                        .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+                        .flatten(),
+                    &mut outcome,
+                );
             }
         } else if item.info.is_file() {
             let file = item;
@@ -2042,7 +2470,7 @@ pub(crate) async fn stage_directory(
             {
                 Ok(claimed) => claimed,
                 Err(err) => {
-                    failure = failure.or(Some(err));
+                    fold_child(Err(err), &mut outcome);
                     break;
                 }
             };
@@ -2064,106 +2492,102 @@ pub(crate) async fn stage_directory(
                 states,
             )
             .await;
-            failure = failure.or(result.err());
+            fold_child(result.map(|staged| staged.link.is_valid()), &mut outcome);
         }
 
         while let Some(result) = directory_tasks.try_join_next() {
-            failure = failure.or(result
-                .internal("Recursion task failed")
-                .map_err(StageError::from)
-                .flatten()
-                .err());
+            fold_child(
+                result
+                    .internal("Recursion task failed")
+                    .map_err(StageError::from)
+                    .flatten(),
+                &mut outcome,
+            );
         }
 
-        if failure.is_some() {
+        if outcome.is_err() {
             break;
         }
     }
 
+    let force = execution_context().globals().force();
     for child in children.unclaimed() {
-        if failure.is_some() {
+        if outcome.is_err() {
             break;
         }
-        let node_name = match state
-            .node_name_ref_or_skip(repository.clone(), child)
-            .await
-            .forward::<StageError>("Failed to resolve node name")
+        let (filter_path, child_states, held) = match unclaimed_child(
+            &repository,
+            &state,
+            &relative_path,
+            states,
+            child,
+            force,
+            discards.as_deref(),
+        )
+        .await
         {
-            Ok(Some(node_name)) => node_name,
+            Ok(Some(unclaimed)) => unclaimed,
             Ok(None) => continue,
             Err(err) => {
-                failure = Some(err);
+                fold_child(Err(err), &mut outcome);
                 break;
             }
         };
-        let mut filter_path = relative_path.clone();
-        filter_path.push(node_name);
-        let (_, excluded) = repository.filter.child_emit_excludes(
-            states,
-            &filter_path.clone().freeze(),
-            true,
-            FilterMode::Full,
-        );
-        if excluded {
-            lore_trace!("Node excluded by filter: {}", filter_path.as_str());
-            continue;
-        }
-
-        if let Some(queue) = discards.as_deref() {
-            let dropped = match state
-                .node(repository.clone(), child)
-                .await
-                .forward::<StageError>("Failed to resolve the child node")
-            {
-                Ok(node) => {
-                    drops_cleanly(&queue.committed, &repository, &state, child, &node).await
-                }
-                Err(err) => Err(err),
-            };
-            match dropped {
-                Ok(true) => {
-                    lore_trace!("Node was never committed, dropping it: {filter_path}");
-                    queue.push(child);
-                    continue;
-                }
-                Ok(false) => {}
-                Err(err) => {
-                    failure = Some(err);
-                    break;
-                }
-            }
-        }
 
         let result = stage_absent_delete(
             repository.clone(),
             state.clone(),
-            filter_path.clone().freeze(),
+            filter_path,
             child,
+            held,
             options.node_flags,
             stats.clone(),
             link_tracker.clone(),
+            child_states,
+            force,
         )
         .await;
-        failure = failure.or(result.err());
+        fold_child(result.map(|_| true), &mut outcome);
     }
 
     while let Some(result) = directory_tasks.join_next().await {
-        failure = failure.or(result
-            .internal("Recursion task failed")
-            .map_err(StageError::from)
-            .flatten()
-            .err());
+        fold_child(
+            result
+                .internal("Recursion task failed")
+                .map_err(StageError::from)
+                .flatten(),
+            &mut outcome,
+        );
     }
-    if let Some(err) = failure {
-        return Err(err);
-    }
-
-    Ok(())
+    outcome
 }
 
-/// Descend into one child directory of `stage_directory`. Split out from the
-/// child loop so the bounded fan-out there can either spawn this or await it
+/// Folds what the tree keeps of one child into `outcome`, which holds on to the first failure.
+fn fold_child(result: Result<bool, StageError>, outcome: &mut Result<bool, StageError>) {
+    match result {
+        Ok(kept) => {
+            if let Ok(holds) = outcome {
+                *holds |= kept;
+            }
+        }
+        Err(err) => {
+            if outcome.is_ok() {
+                *outcome = Err(err);
+            }
+        }
+    }
+}
+
+/// Descend into one child directory of `stage_directory`, and answer whether the tree keeps it.
+/// Split out from the child loop so the bounded fan-out there can either spawn this or await it
 /// inline without duplicating the body.
+///
+/// A directory the filter excludes stands on disk only for content below it. Where this stage
+/// adds such a directory, one no commit holds, and the descent keeps nothing below it, the
+/// directory is discarded rather than staged, and its add is recorded only where it is kept. An
+/// add staged before stays, as what it holds can be staged past the filter, and a forced stage
+/// keeps every directory, as it leaves nothing out. `added` is whether staging the directory added
+/// it.
 ///
 /// `states` is the child's own filter verdict, which staging it already reached.
 #[allow(clippy::too_many_arguments)]
@@ -2174,6 +2598,7 @@ async fn stage_child_directory(
     mut absolute_path: PathBuf,
     mut relative_path: RelativePathBuf,
     node_link: NodeLink,
+    added: bool,
     depth: usize,
     options: StageOptions,
     stats: Arc<StageStats>,
@@ -2181,9 +2606,9 @@ async fn stage_child_directory(
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
     states: FilterStates,
-) -> Result<(), StageError> {
+) -> Result<bool, StageError> {
     if !node_link.is_valid() {
-        return Ok(());
+        return Ok(false);
     }
 
     let from_node = state
@@ -2251,7 +2676,7 @@ async fn stage_child_directory(
 
         stats.task_count.fetch_sub(1, Ordering::Release);
 
-        result
+        result.map(|_| true)
     } else {
         // If the directory node was renamed as part of the stage case variation unification,
         // use the updated unified name to recurse into the correct subdirectory on disk
@@ -2282,7 +2707,19 @@ async fn stage_child_directory(
         )
         .await;
         stats.task_count.fetch_sub(1, Ordering::Release);
-        result
+        if !result?
+            && added
+            && states.excluded(FilterMode::Full)
+            && !execution_context().globals().force()
+            && let Some(queue) = discards.as_deref()
+        {
+            queue.push(node_link.node);
+            return Ok(false);
+        }
+        if added {
+            stats.record_action(LoreFileAction::Add, true);
+        }
+        Ok(true)
     }
 }
 
@@ -2301,7 +2738,7 @@ fn stage_directory_recurse(
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
     states: FilterStates,
-) -> Pin<Box<dyn Future<Output = Result<(), StageError>> + Send + '_>> {
+) -> Pin<Box<dyn Future<Output = Result<bool, StageError>> + Send + '_>> {
     Box::pin(stage_directory(
         operation,
         repository,
@@ -2339,6 +2776,9 @@ fn stage_directory_recurse(
 pub(crate) struct StagedChild {
     pub link: NodeLink,
     pub states: FilterStates,
+    /// A directory no commit holds whose add this call staged, which the caller records once it
+    /// keeps it.
+    pub added: bool,
 }
 
 impl StagedChild {
@@ -2347,6 +2787,7 @@ impl StagedChild {
         Self {
             link: NodeLink::invalid(),
             states: FilterStates::ROOT,
+            added: false,
         }
     }
 }
@@ -2414,6 +2855,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states: parent_states,
+            added: false,
         });
     }
 
@@ -2434,29 +2876,15 @@ pub(crate) async fn stage_node_from_metadata(
         return Ok(StagedChild::invalid());
     }
 
-    let force = execution_context().globals().force();
-    let filter_path = base_relative_path.join(name.as_str());
-    // Workflow credentials and intent are never staged, even under `force`, which
+    // FORK-LOCAL: workflow credentials and intent are never staged, even under `force`, which
     // otherwise walks past the filter.
-    if crate::repository_fence::is_workflow_path(filter_path.as_str()) {
-        lore_trace!("Ignore workflow path {}", filter_path.as_str());
-        return Ok(StagedChild::invalid());
+    {
+        let workflow_path = base_relative_path.join(name.as_str());
+        if crate::repository_fence::is_workflow_path(workflow_path.as_str()) {
+            lore_trace!("Ignore workflow path {}", workflow_path.as_str());
+            return Ok(StagedChild::invalid());
+        }
     }
-    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
-        force,
-        parent_states,
-        &filter_path,
-        true,
-        FilterMode::Full,
-    );
-    if excluded {
-        lore_trace!("Node excluded by filter: {}", filter_path.as_str());
-        return Ok(StagedChild::invalid());
-    }
-
-    lore_trace!("Stage node {}", base_relative_path.join(name.as_str()));
-
-    let relative_path = base_relative_path;
 
     let name_hash = hash::hash_string(name.as_str());
 
@@ -2472,6 +2900,81 @@ pub(crate) async fn stage_node_from_metadata(
         },
     };
 
+    // Asked once the tree has been searched: a node it tracks as the kind the working tree holds is
+    // past the ignore slot. The node is read only where the ignore rules would drop the path.
+    let force = execution_context().globals().force();
+    let filter_path = base_relative_path.join(name.as_str());
+    let tracked = match found_child {
+        Ok(Some(node_id))
+            if !force
+                && repository
+                    .filter
+                    .child_excludes_tree(
+                        parent_states,
+                        &filter_path,
+                        info.is_dir(),
+                        FilterMode::Full,
+                    )
+                    .1 =>
+        {
+            // The flags alone, so the node is not held across the tree's answer.
+            let flags = state
+                .node(repository.clone(), node_id)
+                .await
+                .map(|node| NodeFlags::from_bits_retain(node.flags));
+            match flags {
+                Ok(flags) => state
+                    .tracks_as(&repository, node_id, flags, info.is_dir())
+                    .await
+                    .forward::<StageError>(
+                        "Failed to read the revision the staged tree was built on",
+                    )?,
+                Err(_) => false,
+            }
+        }
+        Ok(Some(_)) => true,
+        _ => false,
+    };
+    let (states, excluded) = stage_step(
+        &repository.filter,
+        force,
+        parent_states,
+        &filter_path,
+        info.is_dir(),
+        FilterMode::TRACKED.at(tracked),
+    );
+    if excluded {
+        lore_trace!("Node excluded by filter: {}", filter_path.as_str());
+        if !matches!(known_child, KnownChild::Resolved(None)) {
+            let (replaced_states, replaced_excluded) = repository.filter.child_excludes_tree(
+                parent_states,
+                &filter_path,
+                !info.is_dir(),
+                FilterMode::Full,
+            );
+            if !replaced_excluded {
+                Box::pin(stage_replaced_node(
+                    repository,
+                    state,
+                    filter_path,
+                    known_child,
+                    base_node,
+                    !info.is_dir(),
+                    replaced_states,
+                    options.node_flags,
+                    stats,
+                    link_tracker,
+                ))
+                .await?;
+            }
+        }
+        return Ok(StagedChild::invalid());
+    }
+
+    lore_trace!("Stage node {}", base_relative_path.join(name.as_str()));
+
+    let relative_path = base_relative_path;
+
     let node_link = match found_child {
         Ok(Some(found_node_id)) => {
             // Verify that the found node matches the type in the filesystem
@@ -2486,20 +2989,24 @@ pub(crate) async fn stage_node_from_metadata(
 
             lore_trace!("Found node {} with flags 0x{:x}", found_node_id, node.flags);
 
-            if (node.is_link() && !info.is_dir())
-                || (node.is_directory() && !info.is_dir())
-                || (node.is_file() && info.is_dir())
-            {
-                // Type mismatch, stage the current node for delete and add a new new node
+            // A link mounts as a directory: a file replaces it, and so does a directory once the
+            // link is staged for delete.
+            let retype = if node.is_link() {
+                node.is_staged_delete() || !info.is_dir()
+            } else {
+                node.is_file() == info.is_dir()
+            };
+            if retype {
                 lore_debug!(
-                    "Directory/file different, stage delete of node {} and recreate new node",
+                    "Node kind differs, stage delete of node {} and recreate new node",
                     found_node_id
                 );
-                stage_delete(
+                stage_delete_replaced(
                     repository.clone(),
                     state.clone(),
-                    relative_path.clone(),
+                    relative_path.join(name.as_str()),
                     found_node_id,
+                    node.is_link().then(|| node.address.context.into()),
                     options.node_flags,
                     stats.clone(),
                     link_tracker.clone(),
@@ -2595,7 +3102,6 @@ pub(crate) async fn stage_node_from_metadata(
             stats
                 .directory_checked_count
                 .fetch_add(1, Ordering::Relaxed);
-            stats.directory_add_count.fetch_add(1, Ordering::Relaxed);
         } else {
             stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
             stats.file_add_count.fetch_add(1, Ordering::Relaxed);
@@ -2614,6 +3120,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states,
+            added: info.is_dir(),
         });
     }
 
@@ -2904,7 +3411,9 @@ pub(crate) async fn stage_node_from_metadata(
         stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    if let Some(action) = event_action {
+    let added =
+        node.is_directory() && node.is_dirty_add() && event_action == Some(LoreFileAction::Add);
+    if let Some(action) = event_action.filter(|_| !added) {
         stats.record_action(action, node.is_directory());
         if !node.is_directory() {
             event::LoreEvent::FileStageFile(LoreFileStageFileEventData {
@@ -2919,6 +3428,7 @@ pub(crate) async fn stage_node_from_metadata(
     Ok(StagedChild {
         link: node_link,
         states,
+        added,
     })
 }
 
@@ -3229,7 +3739,7 @@ async fn stage_from_parent_revision_in_operation(
     #[cfg(not(feature = "test-util"))]
     let permits = MAX_CONCURRENT_TREE_TASKS;
     #[cfg(feature = "test-util")]
-    let permits = resolve_tasks::budget();
+    let permits = RESOLVE_TASKS.budget();
     let budget = Arc::new(Semaphore::new(permits));
     let mut tasks = JoinSet::new();
     let dispatch_result: Result<(), StageError> = async {
@@ -3513,7 +4023,7 @@ async fn stage_from_parent_revision_in_operation(
                     StageError::internal_with_context(err, "The task budget is closed")
                 })?;
                 #[cfg(feature = "test-util")]
-                let live = resolve_tasks::Live::enter();
+                let live = RESOLVE_TASKS.enter();
                 lore_spawn!(tasks, {
                     let operation = operation.clone();
                     let repository = repository.clone();
@@ -4122,7 +4632,7 @@ pub(crate) async fn stage_from_parent_state(
             let operation = operation.clone();
             let stage_change = async move {
                 #[cfg(feature = "test-util")]
-                resolve_tasks::wait_if_held().await;
+                RESOLVE_TASKS.wait_if_held().await;
                 let info = operation
                     .file_info(&file_path)
                     .await
@@ -4145,17 +4655,21 @@ pub(crate) async fn stage_from_parent_state(
                     file_name,
                     info,
                     options,
-                    stats,
+                    stats.clone(),
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     KnownChild::Unresolved,
                     parent_states,
                 )
                 .await
-                .map(|_| ())
+                .map(|staged| {
+                    if staged.added {
+                        stats.record_action(LoreFileAction::Add, true);
+                    }
+                })
             };
             if let Ok(permit) = budget.clone().try_acquire_owned() {
                 #[cfg(feature = "test-util")]
-                let live = resolve_tasks::Live::enter();
+                let live = RESOLVE_TASKS.enter();
                 lore_spawn!(tasks, async move {
                     let _permit = permit;
                     #[cfg(feature = "test-util")]
@@ -4190,98 +4704,6 @@ pub(crate) async fn stage_from_parent_state(
     final_result
 }
 
-/// Counts the tasks one-side resolutions have live, for a test to read the peak, and holds
-/// every change they stage until released, so a test can see the tasks pile up. Per process,
-/// so a test using this runs alone in its binary.
+/// Counts and holds the tasks one-side resolutions spawn, and sizes their budget, for a test.
 #[cfg(feature = "test-util")]
-pub mod resolve_tasks {
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use tokio::sync::Notify;
-
-    static LIVE: AtomicUsize = AtomicUsize::new(0);
-    static PEAK: AtomicUsize = AtomicUsize::new(0);
-    static SPAWNED: AtomicUsize = AtomicUsize::new(0);
-    static HELD: AtomicBool = AtomicBool::new(false);
-    static RELEASED: Notify = Notify::const_new();
-    static BUDGET: AtomicUsize = AtomicUsize::new(crate::MAX_CONCURRENT_TREE_TASKS);
-
-    /// Zeroes the counts and restores the budget.
-    pub fn reset() {
-        LIVE.store(0, Ordering::Relaxed);
-        PEAK.store(0, Ordering::Relaxed);
-        SPAWNED.store(0, Ordering::Relaxed);
-        BUDGET.store(crate::MAX_CONCURRENT_TREE_TASKS, Ordering::Relaxed);
-    }
-
-    /// Sizes the budget the next resolution runs under, so a test can exceed it with a small
-    /// tree. [`crate::MAX_CONCURRENT_TREE_TASKS`] until set.
-    pub fn set_budget(permits: usize) {
-        BUDGET.store(permits, Ordering::Relaxed);
-    }
-
-    /// The permits a resolution's budget holds.
-    pub(crate) fn budget() -> usize {
-        BUDGET.load(Ordering::Relaxed)
-    }
-
-    /// Stops every change about to be staged until [`release`] is called.
-    pub fn hold() {
-        HELD.store(true, Ordering::Release);
-    }
-
-    /// Lets the changes [`hold`] stopped go on.
-    pub fn release() {
-        HELD.store(false, Ordering::Release);
-        RELEASED.notify_waiters();
-    }
-
-    /// Waits while a hold is on. The wakeup is registered before the flag is read, so a
-    /// release between the two is not missed.
-    pub(crate) async fn wait_if_held() {
-        loop {
-            let released = RELEASED.notified();
-            tokio::pin!(released);
-            released.as_mut().enable();
-            if !HELD.load(Ordering::Acquire) {
-                return;
-            }
-            released.await;
-        }
-    }
-
-    /// The tasks live now.
-    pub fn live() -> usize {
-        LIVE.load(Ordering::Relaxed)
-    }
-
-    /// The most tasks live at once since the last reset.
-    pub fn peak() -> usize {
-        PEAK.load(Ordering::Relaxed)
-    }
-
-    /// The tasks spawned since the last reset.
-    pub fn spawned() -> usize {
-        SPAWNED.load(Ordering::Relaxed)
-    }
-
-    /// A task counted as live from its spawn until this is dropped.
-    pub(crate) struct Live;
-
-    impl Live {
-        pub(crate) fn enter() -> Self {
-            SPAWNED.fetch_add(1, Ordering::Relaxed);
-            let live = LIVE.fetch_add(1, Ordering::AcqRel) + 1;
-            PEAK.fetch_max(live, Ordering::AcqRel);
-            Live
-        }
-    }
-
-    impl Drop for Live {
-        fn drop(&mut self) {
-            LIVE.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-}
+pub static RESOLVE_TASKS: crate::test_util::TaskProbe = crate::test_util::TaskProbe::new();

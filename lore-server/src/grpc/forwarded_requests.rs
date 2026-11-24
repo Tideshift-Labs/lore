@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+pub mod lock_service;
 pub mod repository_service;
 pub mod revision_service;
 
@@ -22,10 +23,13 @@ use tonic::Status;
 use tonic::transport::Channel;
 
 use crate::grpc::extract_correlation_id;
+use crate::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient;
+use crate::grpc::forwarded_requests::lock_service::GrpcForwardedLockServiceClient;
 use crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient;
 use crate::grpc::forwarded_requests::repository_service::GrpcForwardedRepositoryServiceClient;
 use crate::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
 use crate::grpc::forwarded_requests::revision_service::GrpcForwardedRevisionServiceClient;
+use crate::grpc::get_is_service_account;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::settings::GrpcInternalClientSettings;
@@ -36,6 +40,7 @@ pub type ForwardedRequestResult<T> = Result<Result<Response<T>, Status>, Interna
 
 const ON_BEHALF_OF_USER_ID_FIELD: &str = "on-behalf-of-user-id";
 const ON_BEHALF_OF_AUTHORIZATION_FIELD: &str = "on-behalf-of-authorization";
+const ON_BEHALF_OF_SERVICE_ACCOUNT_FIELD: &str = "on-behalf-of-service-account";
 
 /// Classify what a forwarded call returned.
 ///
@@ -70,6 +75,7 @@ pub(crate) fn classify_forwarded_result<T>(
 pub struct CallerContext {
     pub repository_id: RepositoryId,
     pub user_id: String,
+    pub is_service_account: bool,
     pub correlation_id: String,
     pub authorization: Option<String>,
 }
@@ -81,6 +87,7 @@ impl CallerContext {
         Ok(Self {
             repository_id: get_repository(request.metadata())?,
             user_id: get_user_id(request.extensions()),
+            is_service_account: get_is_service_account(request.extensions()),
             correlation_id: extract_correlation_id(request).unwrap_or_default(),
             authorization: request
                 .metadata()
@@ -109,6 +116,12 @@ impl CallerContext {
                 .parse()
                 .map_err(|_err| Status::internal("invalid user_id for forwarding"))?,
         );
+        if self.is_service_account {
+            request.metadata_mut().insert(
+                ON_BEHALF_OF_SERVICE_ACCOUNT_FIELD,
+                tonic::metadata::MetadataValue::from_static("true"),
+            );
+        }
         if !self.correlation_id.is_empty()
             && let Ok(value) = self.correlation_id.parse()
         {
@@ -134,9 +147,17 @@ impl CallerContext {
             .map(|v| v.to_string())
             .ok_or_else(|| Status::internal("missing/invalid `on-behalf-of-user-id` field"))?;
 
+        // Absent from a peer that predates the field: such a peer forwarded
+        // every caller as a user.
+        let is_service_account = request
+            .metadata()
+            .get(ON_BEHALF_OF_SERVICE_ACCOUNT_FIELD)
+            .is_some_and(|v| v == "true");
+
         Ok(Self {
             repository_id: get_repository(request.metadata())?,
             user_id,
+            is_service_account,
             correlation_id: extract_correlation_id(request).unwrap_or_default(),
             authorization: request
                 .metadata()
@@ -173,12 +194,16 @@ pub struct RpcFlags {
     pub repository_create: bool,
     #[serde(default)]
     pub repository_get: bool,
+
+    #[serde(default)]
+    pub lock_query: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {
     fn rpc_flags(&self) -> &RpcFlags;
     fn forwarded_revision_service(&self) -> Box<dyn ForwardedRevisionServiceClient>;
     fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient>;
+    fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient>;
 }
 
 async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, UnhandledError> {
@@ -246,6 +271,11 @@ impl ForwardedRequests for GrpcForwardedRequests {
 
     fn forwarded_repository_service(&self) -> Box<dyn ForwardedRepositoryServiceClient> {
         let client = GrpcForwardedRepositoryServiceClient::new(self.channel.clone());
+        Box::new(client)
+    }
+
+    fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient> {
+        let client = GrpcForwardedLockServiceClient::new(self.channel.clone());
         Box::new(client)
     }
 }

@@ -27,6 +27,8 @@ use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::server::RevisionListAcceleration;
 use lore_server::grpc::thinclient::v1::revision_tree::*;
 use lore_storage::hash::hash_string;
@@ -130,11 +132,12 @@ async fn push_branch_with_revisions(
             repository.clone(),
             branch_id,
             serialized,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push")
@@ -218,11 +221,12 @@ async fn push_branch_with_subdir(repository: &Arc<RepositoryContext>) -> (Branch
         repository.clone(),
         branch_id,
         serialized,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("push")
@@ -321,11 +325,12 @@ async fn push_branch_with_link(
         repository.clone(),
         branch_id,
         serialized,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("push")
@@ -401,11 +406,15 @@ async fn push_branch_with_sized_files(
         repository.clone(),
         branch_id,
         serialized,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut lore_server::grpc::handlers::branch_push::PushReport::new(
+            lore_server::grpc::handlers::branch_push::PushHandler::Legacy,
+            Default::default(),
+        ),
     )
     .await
     .expect("push")
@@ -1421,11 +1430,12 @@ async fn distinct_links_to_same_repository_both_walked() {
             a_context.clone(),
             branch_id,
             serialized,
-            true,
+            crate::util::test_support::PUSH_ANY,
             true,
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push")

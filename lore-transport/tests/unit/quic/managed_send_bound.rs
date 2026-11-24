@@ -64,7 +64,11 @@ async fn connect(peer: &Peer) -> Arc<StorageClient> {
         &peer.url(),
         "127.0.0.1".to_string(),
         &lore_transport::auth::AuthEndpoint::none(),
-        "managed-send-bound",
+        // No identity: with one, upstream v0.13 sends an unsigned identity token on every command
+        // to a server without authentication. That adds bytes to every stream, shifting the
+        // fixture's exact credit accounting, and it would also give the client an authorization
+        // to bind a namespace to, which these cases deliberately lack.
+        "",
         partition(),
         &Arc::new(SuppliedCredentials::default()),
         None,
@@ -995,11 +999,11 @@ impl Authentication for GrantingAuthentication {
         })
     }
 
-    async fn exchange_for_custom_resource(
+    async fn exchange_for_custom_resources(
         &self,
         _: &str,
         _: &str,
-        _: &str,
+        _: &[&str],
         _: &str,
     ) -> Result<AuthorizationToken, ProtocolError> {
         Err(ProtocolError::internal("repository exchanges only"))

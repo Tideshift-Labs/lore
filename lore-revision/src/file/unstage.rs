@@ -198,6 +198,9 @@ pub struct UnstageStats {
 pub struct UnstageOptions {
     /// Single node, no recursion
     pub single_node: bool,
+    /// Discard the work a staged link add or removal would delete or overwrite at its mount,
+    /// which unstaging otherwise refuses to.
+    pub discard_local: bool,
 }
 
 pub async fn unstage(
@@ -605,19 +608,7 @@ async fn unstage_path(
         resolved.unwrap_or(relative_path)
     };
 
-    let force = execution_context().globals().force();
     let parent_states = repository.filter.parent_exclusion_states(&relative_path);
-    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
-        force,
-        parent_states,
-        &relative_path,
-        true,
-        FilterMode::Full,
-    );
-    if excluded {
-        lore_trace!("Path excluded by filter: {}", relative_path.as_str());
-        return Ok(());
-    }
 
     // Path is repository root, unstage as directory
     if relative_path.is_empty() {
@@ -640,7 +631,7 @@ async fn unstage_path(
             options,
             stats.clone(),
             link_tracker.clone(),
-            states,
+            parent_states,
         )
         .await;
     }
@@ -658,22 +649,86 @@ async fn unstage_path(
         return Ok(());
     };
 
-    Box::pin(unstage_node(
-        operation,
-        NodeMapping {
-            repository: target.repository,
-            state: target.state_staged,
-            path: relative_path,
-            node: target.node_id,
-        },
-        target.state_current,
-        discard,
-        options,
-        stats,
-        link_tracker,
-        parent_states,
-    ))
-    .await
+    let replaced = staged_type_change(&target.repository, &target.state_staged, target.node_id)
+        .await?
+        .map(|(_, replaced)| replaced);
+    for node_id in std::iter::once(target.node_id).chain(replaced) {
+        Box::pin(unstage_node(
+            operation.clone(),
+            NodeMapping {
+                repository: target.repository.clone(),
+                state: target.state_staged.clone(),
+                path: relative_path.clone(),
+                node: node_id,
+            },
+            target.state_current.clone(),
+            discard.clone(),
+            options,
+            stats.clone(),
+            link_tracker.clone(),
+            parent_states,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// The node a staged type change adds at `newest`, the newest node of its name, and the node of
+/// another kind it replaces, which is staged for delete. Nodes are prepended, so the replaced one
+/// follows the added one.
+async fn staged_type_change(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    newest: NodeID,
+) -> Result<Option<(NodeID, NodeID)>, UnstageError> {
+    let added = state
+        .node(repository.clone(), newest)
+        .await
+        .forward::<UnstageError>("Failed deserializing state node block")?;
+    if !added.is_staged_add() && !added.is_dirty_add() {
+        return Ok(None);
+    }
+    let mut cycle = SiblingCycleGuard::new(added.parent);
+    let mut next = added.sibling();
+    while let Some(id) = next {
+        let node = state
+            .node(repository.clone(), id)
+            .await
+            .forward::<UnstageError>("Failed deserializing state node block")?;
+        node.walk_step(id, added.parent, &mut cycle)
+            .forward::<UnstageError>("Invalid node hierarchy")?;
+        if node.name_hash == added.name_hash {
+            return Ok(
+                (node.is_staged_delete() && node.node_type() != added.node_type())
+                    .then_some((newest, id)),
+            );
+        }
+        next = node.sibling();
+    }
+    Ok(None)
+}
+
+/// Whether the current revision's registry holds the link `link_id` at `node_id`.
+async fn link_committed(
+    repository: &Arc<RepositoryContext>,
+    state_current: &State,
+    link_id: RepositoryId,
+    node_id: NodeID,
+) -> Result<bool, UnstageError> {
+    match state_current
+        .link_find(repository.clone(), link_id, node_id)
+        .await
+    {
+        Ok(_) => Ok(true),
+        Err(err) if err.is_link_not_found() => Ok(false),
+        Err(err) => Err(err).forward::<UnstageError>("Failed to find link registry entry"),
+    }
+}
+
+/// Whether unstaging discards the local changes a staged link change would otherwise refuse to
+/// overwrite.
+fn overwrite_local(options: UnstageOptions) -> bool {
+    options.discard_local || execution_context().globals().force()
 }
 
 /// The node a path names, and the trees it lives in.
@@ -926,12 +981,47 @@ async fn unstage_node(
         return Ok(());
     }
 
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+
+    let block = state_staged
+        .block_with_nametable(repository.clone(), block_index)
+        .await
+        .forward::<UnstageError>("Failed deserializing state node block")?;
+    let mut node = block.node(node_index);
+
+    // Past the ignore rules where the staged tree tracks a change at or below the node, which it
+    // is asked only where the rules would leave the node out.
+    let force = execution_context().globals().force();
+    let mode = if force {
+        FilterMode::TRACKED
+    } else {
+        repository
+            .filter
+            .tracked_mode(
+                states,
+                &node_path,
+                !node.is_file(),
+                FilterMode::TRACKED,
+                async || {
+                    state_staged
+                        .holds_tracked_change(
+                            &repository,
+                            node_id,
+                            NodeFlags::from_bits_retain(node.flags),
+                        )
+                        .await
+                },
+            )
+            .await
+            .forward::<UnstageError>("Failed to read the revision the staged tree was built on")?
+    };
     let (child_states, excluded) = repository.filter.child_emit_excludes_unless_forced(
-        execution_context().globals().force(),
+        force,
         states,
         &node_path,
-        true,
-        FilterMode::Full,
+        !node.is_file(),
+        mode,
     );
     if excluded {
         lore_debug!("Node excluded by filter: {}", node_path.as_str());
@@ -943,15 +1033,6 @@ async fn unstage_node(
         node_path.as_str(),
         repository.id
     );
-
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-
-    let block = state_staged
-        .block_with_nametable(repository.clone(), block_index)
-        .await
-        .forward::<UnstageError>("Failed deserializing state node block")?;
-    let mut node = block.node(node_index);
 
     lore_debug!("Found node {node_id}");
 
@@ -972,6 +1053,7 @@ async fn unstage_node(
             lore_debug!("Discarding staged-add link {node_id}");
 
             link::reset::reset_staged_add_link(
+                &operation,
                 NodeMapping {
                     repository: repository.clone(),
                     state: state_staged.clone(),
@@ -980,6 +1062,7 @@ async fn unstage_node(
                 },
                 state_current.clone(),
                 node,
+                overwrite_local(options),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-add link")?;
@@ -999,10 +1082,7 @@ async fn unstage_node(
                 }
             }
 
-            // The `or_default` guard dies at the `;`, so the shard lock is
-            // not held across the await below.
-            #[allow(clippy::disallowed_methods)]
-            discard.entry(repository.id).or_default().push(node_id);
+            queue_discard(&discard, repository.id, node_id);
 
             unstage_parent_chain(
                 repository.clone(),
@@ -1048,6 +1128,7 @@ async fn unstage_node(
     // Default values for the non-keep paths below; only read for link
     // nodes, which always go through the `!keep_as_dirty_add` branch.
     let mut was_staged_delete = false;
+    let mut replacing = None;
     let mut current_node = node;
     if !keep_as_dirty_add {
         let current_block = state_current
@@ -1058,9 +1139,19 @@ async fn unstage_node(
         current_node = current_block.node(node_index);
 
         was_staged_delete = node.is_staged_delete();
+        if node.is_link() && was_staged_delete {
+            let newest = state_staged
+                .find_subnode(repository.clone(), node.parent, node.name_hash)
+                .await
+                .forward::<UnstageError>("Failed to find subnode")?;
+            replacing = staged_type_change(&repository, &state_staged, newest)
+                .await?
+                .filter(|&(_, replaced)| replaced == node_id)
+                .map(|(added, _)| added);
+        }
 
         let is_staged_update_link =
-            link::is_staged_pin_change(&node, &current_node, repository.clone())
+            link::is_staged_link_update(&node, &current_node, repository.clone())
                 .await
                 .forward::<UnstageError>("Failed to check link staged pin change")?;
 
@@ -1082,6 +1173,7 @@ async fn unstage_node(
                 state_current.clone(),
                 node,
                 current_node,
+                overwrite_local(options),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-update link")?;
@@ -1089,6 +1181,9 @@ async fn unstage_node(
             node.flags |= NodeFlags::Link;
             node.address.hash = current_node.address.hash;
             node.child = current_node.child;
+            stats
+                .directory_unstaged_count
+                .fetch_add(1, Ordering::Relaxed);
             true
         } else {
             false
@@ -1227,9 +1322,18 @@ async fn unstage_node(
 
         link_tracker.add_link(link_context);
 
-        // If we're unstaging a link removal, restore the link registry
-        // entry and re-materialize the linked content on disk.
-        if was_staged_delete {
+        if was_staged_delete
+            && !link_committed(
+                &repository,
+                &state_current,
+                link_metadata.repository,
+                node_id,
+            )
+            .await?
+        {
+            // A link added and replaced before it was committed has nothing to restore.
+            queue_discard(&discard, repository.id, node_id);
+        } else if was_staged_delete {
             link::reset::reset_staged_remove_link(
                 &operation,
                 NodeMapping {
@@ -1240,9 +1344,15 @@ async fn unstage_node(
                 },
                 state_current.clone(),
                 current_node,
+                overwrite_local(options),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-remove link")?;
+
+            // The link takes its path back, so the node that replaced it goes.
+            if let Some(added) = replacing {
+                queue_discard(&discard, repository.id, added);
+            }
 
             node.clear_dirty_flags();
             let dirtied = {
@@ -1450,6 +1560,16 @@ fn demote_subnodes_to_dirty<'a>(
 
         Ok(())
     })
+}
+
+fn queue_discard(
+    discard: &DashMap<RepositoryId, Vec<u32>>,
+    repository_id: RepositoryId,
+    node_id: NodeID,
+) {
+    // The `or_default` guard dies at the `;`, so the shard lock is not held across an await.
+    #[allow(clippy::disallowed_methods)]
+    discard.entry(repository_id).or_default().push(node_id);
 }
 
 // TODO(vri): UCS-12299 - Unify codepaths to discard nodes

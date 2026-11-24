@@ -9,7 +9,7 @@ use std::path::Path;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
 use lore_base::test_util::TempFile;
-use lore_revision::fs::swfs::mount_manager::MountManager;
+use lore_revision::fs::mount_manager::MountManager;
 use lore_revision::global::external_dir::external_dir_for_instance;
 use lore_revision::instance::InstanceId;
 use lore_revision::instance::register_instance;
@@ -163,6 +163,27 @@ async fn an_instance_whose_config_cannot_be_read_is_skipped() {
                 opened(next_store.path()),
                 "the walk opens the store after the skipped instance"
             );
+        })
+        .await;
+}
+
+/// The service closes its mounts as it exits whether or not it made any, so closing a manager with
+/// none succeeds and leaves it with none.
+#[tokio::test]
+async fn closing_a_manager_with_no_mounts_succeeds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let manager = MountManager::initialize()
+                .await
+                .expect("a manager with no stores registered initializes");
+            assert_eq!(manager.mount_count(), 0);
+
+            manager
+                .close_all()
+                .await
+                .expect("closing a manager with no mounts succeeds");
+
+            assert_eq!(manager.mount_count(), 0);
         })
         .await;
 }

@@ -13,6 +13,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::grpc::forwarded_requests::ForwardedRequests;
@@ -224,6 +225,13 @@ mod forwarded_request {
                 response: Arc::clone(&self.response),
             })
         }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in repository_get tests")
+        }
     }
 
     fn make_request(name: &str) -> Request<RepositoryGetRequest> {
@@ -413,7 +421,7 @@ mod forwarded_request {
                 &self,
                 _token: Option<&VerifiedToken<'_>>,
                 _repository_id: lore_base::types::RepositoryId,
-                _action: Option<&str>,
+                _action: Action,
             ) -> Result<(), Status> {
                 Err(Status::permission_denied("denied"))
             }
@@ -652,7 +660,7 @@ mod refresh_generation {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             _repository_id: lore_base::types::RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             Err(Status::permission_denied("denied"))
         }
@@ -839,7 +847,7 @@ mod refresh_generation {
             &self,
             _token: Option<&VerifiedToken<'_>>,
             repository_id: lore_base::types::RepositoryId,
-            _action: Option<&str>,
+            _action: Action,
         ) -> Result<(), Status> {
             if repository_id == self.0 {
                 Ok(())

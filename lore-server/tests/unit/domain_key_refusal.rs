@@ -31,6 +31,7 @@ use lore_proto::lore::storage::v1::storage_service_server::StorageService as Sto
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::grpc::storage_service::LoreStorageService;
 use lore_server::legacy::rpc::storage_service_server::StorageService as StorageServiceV0;
@@ -400,6 +401,12 @@ fn with_write_token<T>(inner: T, repository: RepositoryId, permissions: &[&str])
         REPOSITORY_ID_KEY,
         tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
     );
+    // Fork claim readers read only a verified token: claims travel with their raw token.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request.extensions_mut().insert(AuthorizationToken {
         user_id: "test-user".into(),
         resources: Some(vec![ResourcePermission {
@@ -647,7 +654,7 @@ struct QuicV02;
 impl QuicV02 {
     async fn run(f: &Fixture, request: ParsedStorageRequest) -> Result<(), Refusal> {
         let service = QuicStorageServiceV02::new(
-            Arc::new(None),
+            Arc::new(TokenVerification::Ignore),
             Arc::new(AllowAllRepositoryAuthorizer),
             f.immutable.clone(),
             f.immutable.clone(),
@@ -717,7 +724,7 @@ struct QuicV04;
 impl QuicV04 {
     async fn run(f: &Fixture, opcode: Command, payload: Bytes) -> Result<(), Refusal> {
         let service = StorageServiceV4::new(
-            Arc::new(None),
+            Arc::new(TokenVerification::Ignore),
             Arc::new(AllowAllRepositoryAuthorizer),
             f.immutable.clone(),
             f.immutable.clone(),

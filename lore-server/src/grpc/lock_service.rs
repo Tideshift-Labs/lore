@@ -44,14 +44,20 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use super::ServerResultExt;
 use super::extract_correlation_id;
 use super::get_authorization;
 use super::get_repository;
 use super::get_user_id;
 use super::timeout_grpc;
+use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::can_force_unlock;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::is_self_force_unlock;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::require_action;
 use crate::grpc::require_permission;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -93,6 +99,59 @@ fn lock_query_from_request(
     }
 }
 
+/// Answers a lock query from this server's own lock store.
+pub async fn query_implementation(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    lock_store: &dyn LockStore,
+) -> Result<Response<QueryResponse>, Status> {
+    let query = lock_query_from_request(caller_context.repository_id, &request)
+        .map_err(handle_lock_error)?;
+
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
+
+    LORE_CONTEXT
+        .scope(execution, async move {
+            lock_store
+                .query_locks(query)
+                .await
+                .map(|result| {
+                    Response::new(QueryResponse {
+                        result: result.into_iter().map(Into::into).collect(),
+                        // FORK-LOCAL (Tideshift, WP-120): the legacy store has
+                        // no namespace generation.
+                        namespace_generation: None,
+                    })
+                })
+                .map_err(handle_lock_error)
+        })
+        .await
+}
+
+/// Has the peer named by `forwarded_requests` answer the query, and relays its
+/// answer to the client.
+async fn forward_query(
+    request: QueryRequest,
+    caller_context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<QueryResponse>, Status> {
+    let mut client = forwarded_requests.forwarded_lock_service();
+    let request = caller_context.to_forwarded_request(request)?;
+
+    let query_result = client
+        .query(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = query_result?;
+    Ok(response)
+}
+
 fn handle_lock_error(error: LockError) -> Status {
     match error {
         LockError::LockNotFound(_) => Status::not_found(error.to_string()),
@@ -115,6 +174,7 @@ pub struct LoreLockService {
     /// wasn't handed a dispatcher (CR-015).
     hook_dispatcher: Arc<HookDispatcher>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     enforce_write_permission: bool,
     fenced_coordinator: Option<Arc<PostgresLockCoordinator>>,
@@ -137,6 +197,7 @@ impl LoreLockService {
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
         enforce_write_permission: bool,
     ) -> Self {
@@ -147,6 +208,7 @@ impl LoreLockService {
             notification,
             hook_dispatcher,
             authorizer,
+            forwarded_requests,
             rpc_timeout,
             enforce_write_permission,
             fenced_coordinator: None,
@@ -828,11 +890,11 @@ impl LoreLockService {
     /// `owner` or `admin` on `repository` waives the lock-ownership check.
     async fn is_elevated(&self, extensions: &tonic::Extensions, repository: RepositoryId) -> bool {
         self.authorizer
-            .permits(extensions, repository, "owner")
+            .permits(extensions, repository, Action::Owner)
             .await
             || self
                 .authorizer
-                .permits(extensions, repository, "admin")
+                .permits(extensions, repository, Action::Admin)
                 .await
     }
 }
@@ -866,6 +928,7 @@ impl LoreLockService {
         &self,
         request: Request<LockRequest>,
     ) -> Result<Response<LockResponse>, Status> {
+        require_action(&self.authorizer, &request, Action::Write).await?;
         let repository = get_repository(request.metadata())?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -915,16 +978,19 @@ impl LoreLockService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let user_id = get_user_id(request.extensions());
-        let repository = get_repository(request.metadata())?;
-        let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-        let query_request = request.get_ref();
+        let caller_context = CallerContext::from_original_request(&request)?;
 
-        let query =
-            lock_query_from_request(repository, query_request).map_err(handle_lock_error)?;
-
+        // FORK-LOCAL (Tideshift, WP-117/WP-120): in fenced mode the Postgres
+        // lock coordinator is the lock store of record, so it answers the query
+        // (with the namespace generation) ahead of upstream's forwarding and
+        // legacy-store paths.
         if let Some(coordinator) = &self.fenced_coordinator {
+            let repository = caller_context.repository_id;
             let authorization = get_authorization(request.extensions())?;
+            let query_request = request.into_inner();
+            // Refuse an unsupported query combination exactly as the legacy
+            // path does.
+            lock_query_from_request(repository, &query_request).map_err(handle_lock_error)?;
             let owner = query_request
                 .owner
                 .as_ref()
@@ -963,23 +1029,14 @@ impl LoreLockService {
             }));
         }
 
-        let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                self.lock_store
-                    .query_locks(query)
-                    .await
-                    .map(|result| {
-                        Response::new(QueryResponse {
-                            result: result.into_iter().map(Into::into).collect(),
-                            // The legacy store has no namespace generation.
-                            namespace_generation: None,
-                        })
-                    })
-                    .map_err(handle_lock_error)
-            })
-            .await
+        let query_request = request.into_inner();
+        if let Some(forwarded_requests) = &self.forwarded_requests
+            && forwarded_requests.rpc_flags().lock_query
+        {
+            forward_query(query_request, caller_context, forwarded_requests).await
+        } else {
+            query_implementation(query_request, caller_context, self.lock_store.as_ref()).await
+        }
     }
 
     async fn handle_status(
@@ -1067,7 +1124,16 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !self.is_elevated(request.extensions(), repository).await;
+        let elevated = self.is_elevated(request.extensions(), repository).await;
+        if !elevated
+            && !self
+                .authorizer
+                .permits(request.extensions(), repository, Action::Write)
+                .await
+        {
+            return Err(no_repository_access_status());
+        }
+        let validate_user = !elevated;
         let fenced = self.fenced_call(request.metadata(), request.extensions())?;
         let unlock_request = request.into_inner();
 
@@ -1147,7 +1213,14 @@ impl LoreLockService {
     ) -> Result<Response<AdminLockResponse>, Status> {
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let extensions = request.extensions().clone();
+        if !self
+            .authorizer
+            .permits(request.extensions(), repository, Action::Migrate)
+            .await
+        {
+            warn!("Attempt to apply admin locks, but user does not have the correct permissions");
+            return Err(Status::permission_denied("Permission denied"));
+        }
         let fenced = self.fenced_call(request.metadata(), request.extensions())?;
 
         let user_id = get_user_id(request.extensions());
@@ -1171,11 +1244,6 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                if !self.authorizer.permits(&extensions, repository, "migrate").await {
-                    warn!("Attempt to apply admin locks, but user does not have the correct permissions");
-                    return Err(Status::permission_denied("Permission denied"));
-                }
-
                 if let Some(call) = fenced {
                     let locks = self
                         .fenced_acquire(

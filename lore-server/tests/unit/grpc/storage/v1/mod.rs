@@ -9,6 +9,7 @@ mod put_resolved;
 mod query;
 mod service;
 mod test_utils;
+mod verify;
 
 use lore_server::grpc::storage::v1::STREAM_PROCESS_LIMIT;
 use lore_server::grpc::storage::v1::parse_put_concurrency;

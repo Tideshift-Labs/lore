@@ -31,6 +31,7 @@ use lore_server::authnz::auth::answered_labels;
 use lore_server::authnz::auth::is_auth_unavailable;
 use lore_server::authnz::auth::timed_out_labels;
 use lore_server::authnz::auth::within_deadline;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -223,7 +224,7 @@ async fn check(authorizer: &AuthClientAuthorizer) -> Result<(), tonic::Status> {
         claims: &claims,
     };
     authorizer
-        .check_repository_access(Some(&token), repository(), None)
+        .check_repository_access(Some(&token), repository(), Action::Read)
         .await
 }
 

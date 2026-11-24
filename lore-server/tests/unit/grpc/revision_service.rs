@@ -48,6 +48,12 @@ fn insert_token<T>(request: &mut Request<T>, repository: RepositoryId, perms: &[
         REPOSITORY_ID_KEY,
         tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
     );
+    // Fork claim readers read only a verified token: claims travel with their raw token.
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
     request.extensions_mut().insert(AuthorizationToken {
         user_id: "test-user".into(),
         resources: Some(vec![ResourcePermission {
