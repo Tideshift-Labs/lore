@@ -8,10 +8,19 @@
 
 mod clone;
 mod driver;
+mod file;
 #[cfg(target_family = "windows")]
 mod find;
+#[cfg(any(
+    target_os = "linux",
+    target_vendor = "apple",
+    target_family = "windows"
+))]
+mod holes;
 #[cfg(target_family = "windows")]
 mod iocp;
+#[cfg(target_family = "windows")]
+mod junction;
 mod pool;
 #[cfg(any(target_os = "macos", target_os = "linux", target_family = "windows"))]
 mod priority;

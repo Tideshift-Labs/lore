@@ -228,7 +228,8 @@ pub struct RevisionSyncArgs {
     #[clap(long, action, conflicts_with = "forward_changes")]
     reset: bool,
 
-    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies). A root file inside a link is skipped
+    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies, and
+    /// the whole folder that replaces a link they lie in). A root file inside a link is skipped. Don't commit after merging, reverting or cherry-picking in such an instance: the commit can delete a directory the instance never had on disk, with everything in it
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 
@@ -643,7 +644,7 @@ pub fn handle_revision_history(globals: LoreGlobalArgs, args: &RevisionHistoryAr
                 )
                 .unwrap_or_default()
             } else {
-                message.lines().next().map(String::from).unwrap_or_default()
+                message.lines().next().map_or_default(String::from)
             };
 
             println!("{revision_number} {message}");
@@ -1476,12 +1477,15 @@ fn revision_info_display(revision: &LoreRevisionSyncRevisionEventData) -> String
     )
 }
 
-fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
+fn print_sync_remote_warning(
+    remote_available: u8,
+    remote_authorized: u8,
+    remote_unauthenticated: u8,
+) {
     if remote_available != 0 && remote_authorized == 0 {
-        println!(
-            "{}Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only{}",
-            LogStyles::WARNING,
-            anstyle::Reset,
+        util::print_remote_unread(
+            remote_unauthenticated != 0,
+            ", synchronizing against local history only",
         );
     }
 }
@@ -1489,7 +1493,11 @@ fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
 pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: bool) {
     match event {
         LoreEvent::RevisionSyncTarget(data) if data.source_revision == data.target_revision => {
-            print_sync_remote_warning(data.remote_available, data.remote_authorized);
+            print_sync_remote_warning(
+                data.remote_available,
+                data.remote_authorized,
+                data.remote_unauthenticated,
+            );
             if data.is_latest != 0 {
                 println!(
                     "Already on branch {} latest revision {} -> {}",
@@ -1503,7 +1511,11 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
             }
         }
         LoreEvent::RevisionSyncTarget(data) => {
-            print_sync_remote_warning(data.remote_available, data.remote_authorized);
+            print_sync_remote_warning(
+                data.remote_available,
+                data.remote_authorized,
+                data.remote_unauthenticated,
+            );
             if !data.remote.is_empty() {
                 println!("Sync from remote {}", data.remote);
             }

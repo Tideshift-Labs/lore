@@ -12,6 +12,7 @@ use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_get::*;
 use lore_server::grpc::get_write_token;
@@ -51,6 +52,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
 
     let latest = branch_push::push(
         repository_context.clone(),
+        None,
         main,
         state_hash,
         crate::util::test_support::PUSH_ANY,
@@ -144,6 +146,7 @@ mod base_branch_get_handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -179,6 +182,7 @@ mod base_branch_get_handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 
@@ -238,6 +242,7 @@ mod refresh_generation {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 

@@ -4323,8 +4323,7 @@ fn ledger_state_fingerprint(ledger: &ProviderAttemptLedger) -> (u64, u64, u64, u
         ledger.ambiguous_count(),
         ledger
             .poisoned()
-            .map(|error| format!("{error:?}"))
-            .unwrap_or_default(),
+            .map_or_default(|error| format!("{error:?}")),
     )
 }
 

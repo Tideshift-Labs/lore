@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+#[cfg(target_os = "linux")]
+use lore_base::types::FragmentFlags;
 use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
@@ -12,6 +14,8 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::realize::*;
+use lore_revision::lore::RepositoryId;
+use lore_revision::node::INVALID_NODE;
 use lore_revision::node::Node;
 #[cfg(target_family = "unix")]
 use lore_revision::node::NodeFileMode;
@@ -20,13 +24,14 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::sync::SyncError;
+use lore_revision::revision::sync::SyncOptions;
 use lore_revision::revision::sync::SyncRealizeStats;
-#[cfg(target_family = "unix")]
 use lore_revision::revision::sync::SyncVerifyArgs;
 use lore_revision::state;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+#[cfg(target_family = "unix")]
 use lore_revision::util;
 use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
@@ -36,9 +41,12 @@ use zerocopy::FromZeros;
 use crate::fs::filesystem_provider::TestFilesystemProvider;
 use crate::fs::filesystem_provider::test_repository_over;
 use crate::fs::filesystem_provider::test_store_create;
+use crate::helper::in_memory;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::file;
 use crate::repository::test_helpers::file_node;
+#[cfg(target_os = "linux")]
+use crate::repository::test_helpers::store_fragment;
 use crate::repository::test_helpers::stored_as_list;
 use crate::repository::test_helpers::working_tree_repository;
 use crate::repository::test_helpers::working_tree_repository_filtered;
@@ -202,7 +210,7 @@ async fn verify_action(
         false,
         Arc::default(),
         FilterMode::Full,
-        &IncomingMoves::new(Arc::default()),
+        &IncomingChanges::new(Arc::default()),
     ))
     .await?;
 
@@ -219,26 +227,15 @@ async fn verify_as_a_sync(
     source: &Staged,
     current: &Staged,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .expect("filesystem operation");
     let change = NodeChange {
         action: FileAction::Keep,
         flags: change::Flags::None,
         from: side(repository, base, path.clone()),
         to: side(repository, source, path.clone()),
     };
-    Box::pin(verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
-        changes: Arc::new(vec![change]),
-        repository_current: repository.clone(),
-        operation,
-        current: NodeMapping::root(repository.clone(), current.state.clone()),
-        options: Arc::default(),
-        carries_modes: true,
-    })))
-    .await
+    Box::pin(verify_set(repository, &current.state, vec![change]))
+        .await
+        .map(|verified| verified.changes)
 }
 
 /// Record that the working file holds the current revision's content, which is what a
@@ -266,14 +263,31 @@ async fn add_clean(
         .expect("the node adds")
 }
 
-/// A state holding `dir/keep.txt`, `dir/a.txt` and `other/`, clean, and `dir`'s id.
-async fn dir_and_other(repository: &Arc<RepositoryContext>) -> (Arc<State>, NodeID) {
+/// A directory named `name` that a commit gave an address.
+fn committed_directory(name: &str) -> Node {
+    Node {
+        address: file(name).address,
+        ..directory(name)
+    }
+}
+
+/// A state holding `dir/keep.txt`, `dir/a.txt` and `other/`, clean, and `dir`'s id, `dir` as
+/// `make` makes it.
+async fn dir_and_other_as(
+    repository: &Arc<RepositoryContext>,
+    make: fn(&str) -> Node,
+) -> (Arc<State>, NodeID) {
     let state = State::new();
-    let dir = add_clean(repository, &state, ROOT_NODE, (directory, "dir")).await;
+    let dir = add_clean(repository, &state, ROOT_NODE, (make, "dir")).await;
     add_clean(repository, &state, dir, (file, "keep.txt")).await;
     add_clean(repository, &state, dir, (file, "a.txt")).await;
     add_clean(repository, &state, ROOT_NODE, (directory, "other")).await;
     (state, dir)
+}
+
+/// [`dir_and_other_as`] with `dir` committed.
+async fn dir_and_other(repository: &Arc<RepositoryContext>) -> (Arc<State>, NodeID) {
+    dir_and_other_as(repository, committed_directory).await
 }
 
 /// The realized move of `dir/a.txt` to `other/a.txt` in `state`.
@@ -313,6 +327,46 @@ async fn a_realized_move_out_of_a_directory_stages_the_one_it_left() {
     .await;
 }
 
+/// A realized move of a file out of a directory no commit gave an address, or out of one marked
+/// dirty for a change of its own, leaves it unstaged, as a staged move by another route does: the
+/// commit drops the one, and stages the other for its rehash once its change is left out.
+#[tokio::test]
+async fn a_realized_move_leaves_unstaged_a_directory_no_staged_move_stages() {
+    for own_change in [false, true] {
+        Box::pin(with_execution(async move {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let make = if own_change {
+                committed_directory
+            } else {
+                directory
+            };
+            let (state, from) = dir_and_other_as(&repository, make).await;
+            if own_change {
+                let moved = Mark::dirty(
+                    NodeFlags::DirtyMove,
+                    state::Ext::Set(lore_revision::node::NodeExtFlags::NoFlags),
+                    true,
+                );
+                state
+                    .node_mark(&repository, from, moved)
+                    .await
+                    .expect("dir marked dirty as moved");
+            }
+
+            realize_move_of_a(&repository, &state).await;
+
+            let left = state.node(repository.clone(), from).await.expect("dir");
+            assert!(
+                !left.is_staged(),
+                "own change {own_change}: flags {:#x}",
+                left.flags
+            );
+        }))
+        .await;
+    }
+}
+
 /// A realized move of a file out of a directory staged as moved keeps that directory's move: the
 /// mark of the directory it left sets the base bit alone, where it is not set.
 #[tokio::test]
@@ -330,36 +384,6 @@ async fn a_realized_move_out_of_a_moved_directory_keeps_its_move() {
 
         let left = state.node(repository.clone(), from).await.expect("dir");
         assert!(left.is_staged_move(), "flags {:#x}", left.flags);
-    }))
-    .await;
-}
-
-/// A scratch write reaches the filesystem directly, so a path in the tracked tree has to
-/// be refused: the provider may be virtualizing what is under the root, and a direct
-/// write would go behind it.
-///
-/// The node is empty so that it is written without reading the store, which leaves the
-/// refusal as the only thing that can fail the call.
-#[tokio::test]
-async fn a_scratch_path_inside_the_repository_is_refused() {
-    Box::pin(with_execution(async {
-        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
-        let repository = working_tree_repository(dir.path()).await;
-
-        let inside = dir.path().join("inside.bin");
-        assert!(
-            realize_scratch_file(repository.clone(), &inside, file_node(&[]), Arc::default())
-                .await
-                .is_err(),
-            "A path under the repository root has to go through an operation"
-        );
-        assert!(!inside.exists(), "The refused path must not be written");
-
-        let outside = util::fs::generate_temppath("outside");
-        assert!(
-            !is_inside_repository(&repository, &outside),
-            "A generated scratch path is outside the tree the repository tracks"
-        );
     }))
     .await;
 }
@@ -920,7 +944,7 @@ async fn verify_relocation(
         false,
         Arc::default(),
         FilterMode::Full,
-        &IncomingMoves::new(Arc::default()),
+        &IncomingChanges::new(Arc::default()),
     ))
     .await
 }
@@ -1056,6 +1080,8 @@ async fn an_untracked_file_at_the_source_of_the_current_branch_s_move_holds_no_l
 const PLUGIN: &str = "Plugin";
 const SOURCE: &str = "Plugin/Source";
 const TRACKED: &str = "Plugin/Source/Plugin.Build.cs";
+/// The name [`TRACKED`] ends in.
+const TRACKED_NAME: &str = "Plugin.Build.cs";
 const VARIANT: &str = "Plugin/Source/Plugin.build.cs";
 
 fn relative(path: &str) -> RelativePath {
@@ -1191,7 +1217,7 @@ async fn verify_change(
         false,
         Arc::default(),
         FilterMode::View,
-        &IncomingMoves::new(Arc::new(incoming.to_vec())),
+        &IncomingChanges::new(Arc::new(incoming.to_vec())),
     ))
     .await?;
     Ok((verdict == Verdict::Realize).then_some(change))
@@ -1229,9 +1255,12 @@ async fn realize_verified(
         repository.clone(),
         operation,
         Arc::new(realized),
+        &[],
+        None, /* No subtrees */
         None,
         false,
-        false,
+        None,
+        None,
         Arc::default(),
     )
     .await
@@ -1593,6 +1622,29 @@ async fn a_deleted_directory_keeps_entries_of_another_type_under_a_case_variant_
     .await;
 }
 
+/// The delete of the link mounted at `mount`.
+fn deleted_link(repository: &Arc<RepositoryContext>, mount: &str) -> NodeChange {
+    let mount = relative(mount);
+    let from = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: State::new(),
+            path: mount.clone(),
+            node: NodeID::new_zeroed(),
+        },
+        observed: None,
+        flags: NodeFlags::Link,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Delete,
+        flags: change::Flags::None,
+        to: from.invalid(mount),
+        from,
+    }
+}
+
 /// The delete of a link takes the mount it names, not a directory spelled as a case variant of it.
 #[cfg(target_os = "linux")]
 #[tokio::test]
@@ -1602,35 +1654,641 @@ async fn a_deleted_link_keeps_a_directory_under_a_case_variant_of_its_mount() {
         let repository = working_tree_repository(dir.path()).await;
         let work = "libs/shared/mywork.txt";
         write_working_files(&repository, &[(work, b"untracked work")]).await;
-        let mount = relative("libs/Shared");
-        let from = NodeChangeState {
-            mapping: NodeMapping {
-                repository: repository.clone(),
-                state: State::new(),
-                path: mount.clone(),
-                node: NodeID::new_zeroed(),
-            },
-            observed: None,
-            flags: NodeFlags::Link,
-            address: Default::default(),
-            mode: 0,
-        };
-        let deleted = NodeChange {
-            action: FileAction::Delete,
-            flags: change::Flags::None,
-            to: from.invalid(mount),
-            from,
-        };
 
         Box::pin(realize_verified(
             &repository,
             &State::new(),
-            vec![deleted],
+            vec![deleted_link(&repository, "libs/Shared")],
             false,
         ))
         .await
         .expect("the delete realizes");
         assert_eq!(working_file(&repository, work).await, b"untracked work");
+    }))
+    .await;
+}
+
+/// A tree holding, at `mount`, a link mounting the root of a repository of its own, which holds
+/// `files` by their paths below it, with the delete of that link.
+async fn linked_plugin_tree(
+    repository: &Arc<RepositoryContext>,
+    mount: &str,
+    files: &[(&str, &[u8])],
+) -> (Arc<State>, NodeChange) {
+    let linked_id: RepositoryId = lore_base::types::Context::from(uuid::Uuid::now_v7()).into();
+    let linked = repository.to_link_context(linked_id).await;
+    let linked_state = State::new();
+    let mut directories: std::collections::HashMap<&str, NodeID> = Default::default();
+    for (path, content) in files {
+        let mut parent = ROOT_NODE;
+        let mut start = 0;
+        for (end, _) in path.match_indices('/') {
+            let component = &path[start..end];
+            parent = if let Some(&node) = directories.get(&path[..end]) {
+                node
+            } else {
+                let node = in_memory::add(
+                    &linked_state,
+                    linked.clone(),
+                    parent,
+                    directory(component),
+                    component,
+                )
+                .await;
+                directories.insert(&path[..end], node);
+                node
+            };
+            start = end + 1;
+        }
+        let name = &path[start..];
+        let mut linked_file = file_node(content);
+        linked_file.name_hash = hash::hash_string(name);
+        in_memory::add(&linked_state, linked.clone(), parent, linked_file, name).await;
+    }
+    let revision = in_memory::commit(
+        &linked,
+        &linked_state,
+        lore_base::types::Hash::default(),
+        in_memory::branch_id(),
+    )
+    .await;
+
+    let state = State::new();
+    state.set_revision(lore_base::types::Hash::from([1; 32]));
+    let (parent, name) = mount.rsplit_once('/').unwrap();
+    let parent = in_memory::add(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        directory(parent),
+        parent,
+    )
+    .await;
+    let mut link = Node::new_zeroed();
+    link.flags = NodeFlags::Link.bits();
+    link.mode = 0o755;
+    link.name_hash = hash::hash_string(name);
+    link.child = ROOT_NODE;
+    link.address = lore_base::types::Address {
+        hash: revision,
+        context: linked_id.into(),
+    };
+    in_memory::add(&state, repository.clone(), parent, link, name).await;
+    let delete = delete_change(repository, &state, mount).await;
+    (state, delete)
+}
+
+/// The add of a file holding `incoming` at [`TRACKED`], starting at `current` with no node of its
+/// own, as an add below a link that a folder replaces does.
+async fn add_over_tracked(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    incoming: &[u8],
+) -> NodeChange {
+    let target = plugin_tree(repository, &[(TRACKED, incoming)]).await;
+    let added = Staged {
+        state: current.clone(),
+        node: INVALID_NODE,
+        address: lore_base::types::Address::default(),
+        mode: 0,
+    };
+    let incoming_node = file_node(incoming);
+    let source = Staged {
+        node: target
+            .find_node_link(repository.clone(), TRACKED)
+            .await
+            .unwrap()
+            .node,
+        state: target,
+        address: incoming_node.address,
+        mode: incoming_node.mode,
+    };
+    NodeChange {
+        action: FileAction::Add,
+        flags: change::Flags::None,
+        from: side(repository, &added, relative(TRACKED)),
+        to: side(repository, &source, relative(TRACKED)),
+    }
+}
+
+/// Verifies `changes` against the working tree standing on `state` as a sync does.
+async fn verify_set(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    changes: Vec<NodeChange>,
+) -> Result<VerifiedChanges, SyncError> {
+    Box::pin(verify_set_forwarding(repository, state, changes, false)).await
+}
+
+/// [`verify_set`], forwarding local changes past the sync where `forward_changes` says so.
+async fn verify_set_forwarding(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    changes: Vec<NodeChange>,
+    forward_changes: bool,
+) -> Result<VerifiedChanges, SyncError> {
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    Box::pin(verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
+        changes: Arc::new(changes),
+        repository_current: repository.clone(),
+        operation,
+        current: NodeMapping::root(repository.clone(), state.clone()),
+        options: Arc::new(SyncOptions {
+            forward_changes,
+            ..Default::default()
+        }),
+        carries_modes: true,
+    })))
+    .await
+}
+
+/// An add below a deleted link whose file already holds the incoming content is left to the
+/// delete to keep, however the delete spells the mount, as the delete matches it ignoring case.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_over_the_incoming_content_is_kept() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        write_working_files(&repository, &[(TRACKED, &incoming)]).await;
+        let current = plugin_tree(&repository, &[(TRACKED, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let VerifiedChanges { changes, kept } = verify_set(
+                &repository,
+                &current,
+                vec![deleted_link(&repository, &mount), add.clone()],
+            )
+            .await
+            .expect("a file holding the incoming content is not a local change");
+            assert_eq!(
+                changes
+                    .iter()
+                    .map(|change| change.path().as_str())
+                    .collect::<Vec<_>>(),
+                [mount.as_str()],
+                "The file holds what the add writes"
+            );
+            assert_eq!(
+                kept,
+                [relative(TRACKED)],
+                "The delete of the link at {mount} keeps the file"
+            );
+        }
+    }))
+    .await;
+}
+
+/// An add below a deleted link is measured against the file the current revision holds through
+/// the link's mount, however the delete spells the mount, so a file holding that content is
+/// realized rather than refused.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_is_measured_against_the_linked_file() {
+    Box::pin(with_execution(async {
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            let linked = pseudo_random_bytes(20 * 1024, 0);
+            let incoming = pseudo_random_bytes(20 * 1024, 1);
+            write_working_files(&repository, &[(TRACKED, &linked)]).await;
+            let (current, delete) =
+                linked_plugin_tree(&repository, &mount, &[(TRACKED_NAME, &linked)]).await;
+            let add = add_over_tracked(&repository, &current, &incoming).await;
+
+            assert!(
+                Box::pin(verify_change(&repository, &current, add, &[delete]))
+                    .await
+                    .expect("a file holding the linked content is not a local change")
+                    .is_some(),
+                "The file holds what the link at {mount} held, so the add is realized over it"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A file the view kept out of a link's mount is the user's own, whatever it holds, so an add
+/// below the deleted link that would overwrite it is refused.
+#[tokio::test]
+async fn an_add_below_a_deleted_link_refuses_a_file_the_view_excluded() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion(&format!("/{TRACKED}")).unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        write_working_files(&repository, &[(TRACKED, &linked)]).await;
+        let (current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        let result = Box::pin(verify_change(&repository, &current, add, &[delete])).await;
+        assert!(
+            is_local_modifications(&result),
+            "The add would overwrite the user's file: {result:?}"
+        );
+        assert_eq!(working_file(&repository, TRACKED).await, linked);
+    }))
+    .await;
+}
+
+/// The check of a directory deleted as a whole looks through the mount of a link below it: a file
+/// the link tracks that holds what the link holds passes, and one holding other content refuses
+/// the sync.
+#[tokio::test]
+async fn a_deleted_directory_refuses_a_modified_file_in_the_mount_of_a_link_below_it() {
+    Box::pin(with_execution(async {
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let modified = pseudo_random_bytes(20 * 1024, 1);
+        for (content, refused) in [(&linked, false), (&modified, true)] {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+            write_working_files(&repository, &[(TRACKED, content)]).await;
+            let (current, _) =
+                linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+            let parent = SOURCE.rsplit_once('/').unwrap().0;
+            let mut whole = delete_change(&repository, &current, parent).await;
+            whole.flags = change::Flags::Subtree;
+
+            let result = verify_set(&repository, &current, vec![whole]).await;
+            if refused {
+                assert!(
+                    result
+                        .as_ref()
+                        .is_err_and(SyncError::is_local_modifications),
+                    "A modified file the link tracks refuses the sync: {:?}",
+                    result.map(|verified| verified.changes)
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "A file holding what the link holds is no local work: {:?}",
+                    result.map(|verified| verified.changes)
+                );
+            }
+            assert_eq!(working_file(&repository, TRACKED).await, content.as_slice());
+        }
+    }))
+    .await;
+}
+
+/// The delete of a link keeps a file below its mount that already holds what replaces it, without
+/// writing it again, and removes what the link alone held there.
+#[tokio::test]
+async fn a_deleted_link_keeps_a_file_already_holding_what_replaces_it() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024, 0);
+        let linked_only = "Plugin/Source/linked.txt";
+        write_working_files(
+            &repository,
+            &[(TRACKED, &content), (linked_only, b"linked")],
+        )
+        .await;
+        let (current, delete) = linked_plugin_tree(
+            &repository,
+            SOURCE,
+            &[(TRACKED_NAME, &content), ("linked.txt", b"linked")],
+        )
+        .await;
+        let add = add_over_tracked(&repository, &current, &content).await;
+        let VerifiedChanges { changes, kept } =
+            verify_set(&repository, &current, vec![delete, add])
+                .await
+                .expect("a file holding the incoming content is not a local change");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path().as_str())
+                .collect::<Vec<_>>(),
+            [SOURCE],
+            "Only the link delete is left to realize"
+        );
+        assert_eq!(kept, [relative(TRACKED)]);
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            changes,
+            &kept,
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+        assert_eq!(working_file(&repository, TRACKED).await, content);
+        assert!(
+            !working_path_exists(&repository, linked_only).await,
+            "What the link alone held goes with it"
+        );
+    }))
+    .await;
+}
+
+/// The delete of a link removes every file the link tracks in a wide mount but the files it keeps,
+/// and every directory but those holding them.
+#[tokio::test]
+async fn a_deleted_link_removes_a_wide_mount_around_the_files_it_keeps() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let nested = "Plugin/Source/Nested/kept.txt";
+        let siblings: Vec<String> = (0..1500)
+            .map(|index| format!("Plugin/Source/sibling-{index}.txt"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = siblings
+            .iter()
+            .map(|path| (path.as_str(), b"linked".as_slice()))
+            .collect();
+        files.extend([
+            (TRACKED, b"kept".as_slice()),
+            (nested, b"kept".as_slice()),
+            ("Plugin/Source/Nested/linked.txt", b"linked".as_slice()),
+            ("Plugin/Source/Gone/linked.txt", b"linked".as_slice()),
+        ]);
+        write_working_files(&repository, &files).await;
+        let (_current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &below_mount(&files)).await;
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![delete]),
+            &[relative(TRACKED), relative(nested)],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+
+        let mut left: Vec<String> = files_below(dir.path().join(SOURCE));
+        left.sort();
+        assert_eq!(left, ["Nested/kept.txt", TRACKED_NAME]);
+    }))
+    .await;
+}
+
+/// The delete of a link removes the files the link tracks beside a kept file at every level of a
+/// deep path to it.
+#[tokio::test]
+async fn a_deleted_link_removes_a_deep_mount_around_the_file_it_keeps() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let levels: Vec<String> = (0..30)
+            .scan(String::from(SOURCE), |path, level| {
+                path.push_str(&format!("/d{level}"));
+                Some(path.clone())
+            })
+            .collect();
+        let kept = format!("{}/kept.txt", levels.last().unwrap());
+        let siblings: Vec<String> = levels
+            .iter()
+            .map(|level| format!("{level}/sibling.txt"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = siblings
+            .iter()
+            .map(|path| (path.as_str(), b"linked".as_slice()))
+            .collect();
+        files.push((kept.as_str(), b"kept".as_slice()));
+        write_working_files(&repository, &files).await;
+        let (_current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &below_mount(&files)).await;
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![delete]),
+            &[relative(&kept)],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+
+        assert_eq!(
+            files_below(dir.path().join(SOURCE)),
+            [kept.strip_prefix(&format!("{SOURCE}/")).unwrap()]
+        );
+    }))
+    .await;
+}
+
+/// `files`, below [`SOURCE`], by their paths below it, as the link mounted there tracks them.
+fn below_mount<'a>(files: &[(&'a str, &'a [u8])]) -> Vec<(&'a str, &'a [u8])> {
+    files
+        .iter()
+        .map(|(path, content)| (&path[SOURCE.len() + 1..], *content))
+        .collect()
+}
+
+/// The files below `root`, as paths relative to it.
+fn files_below(root: std::path::PathBuf) -> Vec<String> {
+    let mut files = Vec::new();
+    let mut pending = vec![root.clone()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(&root).unwrap();
+                files.push(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    files
+}
+
+/// The delete of a link keeps a local edit below its mount that a sync forwards past it.
+#[tokio::test]
+async fn a_deleted_link_keeps_a_forwarded_local_edit() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let linked = pseudo_random_bytes(20 * 1024, 0);
+        let incoming = pseudo_random_bytes(20 * 1024, 1);
+        let edited = pseudo_random_bytes(20 * 1024, 2);
+        write_working_files(&repository, &[(TRACKED, &edited)]).await;
+        let (current, delete) =
+            linked_plugin_tree(&repository, SOURCE, &[(TRACKED_NAME, &linked)]).await;
+        let add = add_over_tracked(&repository, &current, &incoming).await;
+
+        let VerifiedChanges { changes, kept } = Box::pin(verify_set_forwarding(
+            &repository,
+            &current,
+            vec![delete, add],
+            true,
+        ))
+        .await
+        .expect("a forwarded edit is not refused");
+        assert_eq!(kept, [relative(TRACKED)]);
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            changes,
+            &kept,
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the link delete realizes");
+        assert_eq!(working_file(&repository, TRACKED).await, edited);
+    }))
+    .await;
+}
+
+/// The add of `node` at `path`.
+fn add_of(repository: &Arc<RepositoryContext>, path: &str, node: NodeID) -> NodeChange {
+    let to = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: State::new(),
+            path: relative(path),
+            node,
+        },
+        observed: None,
+        flags: NodeFlags::File,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Add,
+        flags: change::Flags::None,
+        from: to.invalid(relative(path)),
+        to,
+    }
+}
+
+/// The action and path of each change the dependency set `inclusion_set` keeps of `changes`.
+fn kept_in_dependency_set(changes: Vec<NodeChange>, inclusion_set: &[NodeID]) -> Vec<String> {
+    let included = |change: &NodeChange| {
+        let node = match change.action {
+            FileAction::Delete => change.from.mapping.node,
+            _ => change.to.mapping.node,
+        };
+        inclusion_set.contains(&node)
+    };
+    changes_in_dependency_set(changes, included)
+        .iter()
+        .map(|change| format!("{} {}", change.action.as_string_short(), change.path()))
+        .collect()
+}
+
+/// A dependency set holding a file below the mount of a deleted link keeps the link delete and
+/// every change below the mount, in their order, however the delete spells the mount.
+#[tokio::test]
+async fn a_dependency_set_below_a_deleted_link_lands_what_replaces_it_whole() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        for mount in [SOURCE.to_string(), SOURCE.to_lowercase()] {
+            let changes = vec![
+                deleted_link(&repository, &mount),
+                add_of(&repository, SOURCE, 11),
+                add_of(&repository, TRACKED, 12),
+                add_of(&repository, VARIANT, 13),
+                add_of(&repository, "Plugin/outside.txt", 14),
+            ];
+            assert_eq!(
+                kept_in_dependency_set(changes, &[12]),
+                [
+                    format!("D {mount}"),
+                    format!("A {SOURCE}"),
+                    format!("A {TRACKED}"),
+                    format!("A {VARIANT}"),
+                ],
+                "The link at {mount} goes, and the folder lands whole"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A dependency set holding a file below nested deleted links keeps everything below the
+/// outermost mount.
+#[tokio::test]
+async fn a_dependency_set_below_nested_deleted_links_lands_the_outermost_whole() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, PLUGIN),
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, TRACKED, 12),
+            add_of(&repository, "Plugin/outside.txt", 14),
+            add_of(&repository, "elsewhere.txt", 15),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[12]),
+            [
+                format!("D {PLUGIN}"),
+                format!("D {SOURCE}"),
+                format!("A {TRACKED}"),
+                "A Plugin/outside.txt".to_string(),
+            ],
+        );
+    }))
+    .await;
+}
+
+/// A dependency set holding what replaces a link at its own mount keeps the link delete.
+#[tokio::test]
+async fn a_dependency_set_holding_what_replaces_a_link_at_its_mount_keeps_the_link_delete() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, SOURCE, 11),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[11]),
+            [format!("D {SOURCE}"), format!("A {SOURCE}")],
+        );
+    }))
+    .await;
+}
+
+/// A dependency set holding nothing below the mount of a deleted link keeps the link in place.
+#[tokio::test]
+async fn a_dependency_set_outside_a_deleted_link_keeps_only_what_it_holds() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let changes = vec![
+            deleted_link(&repository, SOURCE),
+            add_of(&repository, TRACKED, 12),
+            add_of(&repository, "Plugin/outside.txt", 14),
+        ];
+        assert_eq!(
+            kept_in_dependency_set(changes, &[14]),
+            ["A Plugin/outside.txt"],
+        );
     }))
     .await;
 }
@@ -1674,6 +2332,289 @@ async fn a_delete_leaves_a_second_tracked_spelling_alone() {
             .await
             .expect("the delete realizes");
         assert!(working_path_exists(&repository, VARIANT).await);
+    }))
+    .await;
+}
+
+/// A move whose destination the working tree holds already, an untracked file here, leaves the
+/// entry the working tree holds its source in under another spelling where it stands, and writes
+/// the destination over what stood there.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_move_onto_an_occupied_destination_leaves_the_other_spelling_of_its_source() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        store_fragment(
+            &repository,
+            &content,
+            FragmentFlags::empty(),
+            content.len() as u64,
+        )
+        .await;
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        let destination = "Plugin/Moved.cs";
+        write_working_files(
+            &repository,
+            &[(VARIANT, &content), (destination, b"untracked")],
+        )
+        .await;
+        let from = Staged {
+            state: state.clone(),
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        Box::pin(realize_verified(&repository, &state, vec![moved], false))
+            .await
+            .expect("the move realizes");
+        assert_eq!(working_file(&repository, VARIANT).await, content);
+        assert_eq!(working_file(&repository, destination).await, content);
+    }))
+    .await;
+}
+
+/// A merge's move starts from the base revision, while the working tree stands on the revision
+/// the merge applies to. The entry the working tree holds the source in under another spelling
+/// is paired with the node that revision holds, and moved where it holds that node's content,
+/// edited since the base, with the merged content written over it.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_merge_moves_the_other_spelling_of_a_source_edited_since_the_base() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let base_content = pseudo_random_bytes(1174, 0);
+        let current_content = pseudo_random_bytes(1174, 1);
+        let merged = pseudo_random_bytes(1174, 2);
+        store_fragment(
+            &repository,
+            &merged,
+            FragmentFlags::empty(),
+            merged.len() as u64,
+        )
+        .await;
+        let base = plugin_tree(&repository, &[(TRACKED, &base_content)]).await;
+        let current = plugin_tree(&repository, &[(TRACKED, &current_content)]).await;
+        current.set_revision(lore_base::types::Hash::from([3; 32]));
+        write_working_files(&repository, &[(VARIANT, &current_content)]).await;
+        let from = Staged {
+            state: base.clone(),
+            node: base
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            address: file_node(&base_content).address,
+            mode: 0,
+        };
+        let destination = "Plugin/Moved.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&merged), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![moved]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            Some(MergeCurrent::new(current)),
+            None,
+            Arc::default(),
+        )
+        .await
+        .expect("the merge realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert_eq!(working_file(&repository, destination).await, merged);
+    }))
+    .await;
+}
+
+/// A move into a directory the sync adds carries the file there, though no view line names the
+/// directory and the realize of its add creates nothing: the rename creates the directory it
+/// lands in.
+#[tokio::test]
+async fn a_move_into_an_added_directory_creates_it() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(TRACKED, &content)]).await;
+        let from = Staged {
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            state,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let destination = "Moved/Plugin.Build.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let mut added = add_of(
+            &repository,
+            "Moved",
+            to.state
+                .find_node_link(repository.clone(), "Moved")
+                .await
+                .unwrap()
+                .node,
+        );
+        added.to.mapping.state = to.state.clone();
+        added.to.flags = NodeFlags::empty();
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![added, moved]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the move realizes");
+        assert!(!working_path_exists(&repository, TRACKED).await);
+        assert_eq!(working_file(&repository, destination).await, content);
+    }))
+    .await;
+}
+
+/// A move into a directory the sync adds carries the entry the working tree holds its source in
+/// under another spelling there, creating the directory it lands in.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_move_into_an_added_directory_carries_the_other_spelling_of_its_source() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(1174, 0);
+        let state = plugin_tree(&repository, &[(TRACKED, &content)]).await;
+        write_working_files(&repository, &[(VARIANT, &content)]).await;
+        let from = Staged {
+            node: state
+                .find_node_link(repository.clone(), TRACKED)
+                .await
+                .unwrap()
+                .node,
+            state,
+            address: file_node(&content).address,
+            mode: 0,
+        };
+        let destination = "Moved/Plugin.Build.cs";
+        let to = state_holding(&repository, &relative(destination), file_node(&content), 2).await;
+        let moved = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side(&repository, &from, relative(TRACKED)),
+            to: side(&repository, &to, relative(destination)),
+        };
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        Box::pin(realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![moved]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await
+        .expect("the move realizes");
+        assert!(!working_path_exists(&repository, VARIANT).await);
+        assert_eq!(working_file(&repository, destination).await, content);
+    }))
+    .await;
+}
+
+/// A move into a directory the realize adds whose renames are refused is realized by writing the
+/// node at its destination, in the directory the write creates: the rename removes the directory it
+/// created for the refused second rename, and nothing else.
+#[tokio::test]
+async fn a_refused_move_into_an_added_directory_writes_its_destination() {
+    Box::pin(with_execution(async {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Making test stores");
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        std::fs::create_dir(dir.path().join("Dir")).expect("the source on disk");
+        let filesystem = Arc::new(TestFilesystemProvider::reading(dir.path()));
+        let repository = test_repository_over(immutable_store, mutable_store, filesystem.clone());
+        let state = State::new();
+        let node = add_clean(&repository, &state, ROOT_NODE, (directory, "Dir")).await;
+        let side = |path: &str| NodeChangeState {
+            mapping: NodeMapping {
+                repository: repository.clone(),
+                state: state.clone(),
+                path: relative(path),
+                node,
+            },
+            observed: None,
+            flags: NodeFlags::NoFlags,
+            address: Default::default(),
+            mode: 0,
+        };
+        let change = NodeChange {
+            action: FileAction::Move,
+            flags: change::Flags::None,
+            from: side("Dir"),
+            to: side("New/Dir"),
+        };
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        realize_changes(
+            repository.clone(),
+            operation,
+            Arc::new(vec![change]),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None,
+            None,
+            Arc::default(),
+        )
+        .await
+        .expect("a refused rename is realized by writing the node");
+
+        assert_eq!(filesystem.removed.lock().as_slice(), ["New/Dir"]);
+        assert!(dir.path().join("New/Dir").is_dir());
+        assert!(dir.path().join("Dir").is_dir());
     }))
     .await;
 }
@@ -1792,7 +2733,7 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 false,
                 Arc::default(),
                 FilterMode::Full,
-                &IncomingMoves::new(Arc::default()),
+                &IncomingChanges::new(Arc::default()),
             ))
             .await
             .is_err();
@@ -1804,9 +2745,12 @@ async fn a_merge_deleting_a_directory_keeps_an_edited_case_variant_of_an_ignored
                 repository.clone(),
                 operation,
                 Arc::new(changes),
+                &[],
+                None, /* No subtrees */
                 None,
                 false,
-                true,
+                Some(MergeCurrent::new(state.clone())),
+                None,
                 Arc::default(),
             )
             .await
@@ -1902,10 +2846,13 @@ async fn sync_continues_after_a_materialization_error() {
         let result = realize_changes(
             repository.clone(),
             operation.clone(),
-            Arc::new(changes),
+            Arc::new(changes.clone()),
+            &[],
+            None, /* No subtrees */
             None,
             false,
-            false,
+            None,
+            None,
             Arc::default(),
         )
         .await;
@@ -1919,6 +2866,294 @@ async fn sync_continues_after_a_materialization_error() {
             assert!(info.exists(), "available file {name} was not materialized");
             assert_eq!(info.size(), 0);
         }
+    }))
+    .await;
+}
+
+/// A directory deleted as a whole, handed over without the subtrees that expand it or beside a state
+/// to stage it in, fails before anything is removed rather than deleting nothing below it.
+#[tokio::test]
+async fn a_subtree_change_without_its_subtrees_is_refused() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-subtree-without-subtrees-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let inner = RelativePath::new_from_initial_path("gone/inner.txt").unwrap();
+        std::fs::create_dir(temp.path().join("gone")).expect("create the directory");
+        write_working_file(&repository, &inner, b"inner").await;
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let changes = vec![NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::Subtree,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        }];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        let result = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes.clone()),
+            &[],
+            None, /* No subtrees */
+            None,
+            false,
+            None, /* Not a merge */
+            None, /* No view change */
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            result.is_err_and(|err| err.is_internal()),
+            "A subtree change needs its subtrees"
+        );
+        let (_, subtrees) = state::diff_collect_subtrees(
+            repository.clone(),
+            current.state.clone(),
+            repository.clone(),
+            current.state.clone(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the subtrees of an empty diff");
+        let staged = realize_changes(
+            repository.clone(),
+            operation.clone(),
+            Arc::new(changes.clone()),
+            &[],
+            Some(subtrees),
+            Some(State::new()),
+            false,
+            None, /* Not a merge */
+            None, /* No view change */
+            Arc::default(),
+        )
+        .await;
+        assert!(
+            staged.is_err_and(|err| err.is_internal()),
+            "A subtree change is never staged"
+        );
+        assert!(
+            operation.file_info(&inner).await.unwrap().exists(),
+            "Nothing below the directory may be removed"
+        );
+    }))
+    .await;
+}
+
+/// The check of a deleted directory's working tree stops once another change has refused the
+/// sync, rather than going on through a directory that holds no local work.
+#[tokio::test]
+async fn a_deleted_directory_check_stops_once_the_sync_is_refused() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-refused-stops-check-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let clean = RelativePath::new_from_initial_path("gone/clean.txt").unwrap();
+        std::fs::create_dir(temp.path().join("gone")).expect("create the directory");
+        write_working_file(&repository, &clean, b"clean").await;
+        // An untracked file is a difference the check walks to, and keeps rather than refuses.
+        let untracked = RelativePath::new_from_initial_path("gone/untracked.txt").unwrap();
+        write_working_file(&repository, &untracked, b"untracked").await;
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            current.state.clone(),
+            clean.clone(),
+            file_node(b"clean"),
+            Arc::default(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("stage the file");
+        let root = NodeMapping::root(repository.clone(), current.state.clone());
+        let directory = root.node_at(&path).await;
+        let check = async |refused: bool| {
+            let mut change = NodeChange {
+                action: FileAction::Delete,
+                flags: change::Flags::None,
+                from: NodeChangeState {
+                    mapping: NodeMapping {
+                        repository: repository.clone(),
+                        state: current.state.clone(),
+                        path: path.clone(),
+                        node: directory.node,
+                    },
+                    observed: None,
+                    flags: NodeFlags::NoFlags,
+                    address: Default::default(),
+                    mode: 0,
+                },
+                to: side(&repository, &current, path.clone()),
+            };
+            let stats = Arc::new(lore_revision::revision::sync::SyncVerifyStats::default());
+            stats
+                .refused
+                .store(refused, std::sync::atomic::Ordering::Relaxed);
+            let operation = repository.file_system().begin_operation().await.unwrap();
+            Box::pin(verify_filesystem(
+                &mut change,
+                repository.clone(),
+                operation,
+                root.clone(),
+                false,
+                false,
+                false,
+                stats,
+                FilterMode::Full,
+                &IncomingChanges::new(Arc::default()),
+            ))
+            .await
+        };
+
+        assert_eq!(
+            check(false)
+                .await
+                .expect("A clean directory may be deleted"),
+            Verdict::Realize,
+            "The directory holds no local work"
+        );
+        assert!(
+            check(true)
+                .await
+                .is_err_and(|err| err.is_local_modifications()),
+            "A refused sync stops the check"
+        );
+    }))
+    .await;
+}
+
+/// A directory log reads back every path pushed to it, last first, across chunk boundaries and
+/// where consecutive paths share a prefix that ends inside a character.
+#[test]
+fn a_directory_log_reads_back_every_path_last_first() {
+    let mut log = DirectoryLog::default();
+    let mut pushed = Vec::new();
+    for index in 0..(2 * 4096 + 17) {
+        // `é` and `è` share their first byte, so each path keeps part of a character of the last.
+        let accent = if index % 2 == 0 { "é" } else { "è" };
+        let path = RelativePath::new_from_initial_path(format!("top/{accent}{index}/below"))
+            .expect("a valid path");
+        log.push(&path, index as NodeID);
+        pushed.push((path.as_str().to_string(), index as NodeID));
+    }
+
+    let mut reader = log.into_rev_reader();
+    let mut read = Vec::new();
+    while let Some((path, node)) = reader.next() {
+        read.push((path.as_str().to_string(), node));
+    }
+    pushed.reverse();
+    assert_eq!(read, pushed);
+}
+
+/// A verification refused for local modifications marks the sync refused, which stops the check
+/// of a deleted directory still running, and any other failure doesn't; the first failure is the
+/// one answered either way.
+#[test]
+fn only_a_refusal_for_local_modifications_marks_the_verification_refused() {
+    use std::sync::atomic::Ordering;
+
+    use lore_base::error::LocalModifications;
+    use lore_revision::revision::sync::SyncVerifyStats;
+
+    let stats = SyncVerifyStats::default();
+    let mut failure = None;
+    record_verify_failure(&stats, &mut failure, SyncError::internal("unreadable node"));
+    assert!(
+        !stats.refused.load(Ordering::Relaxed),
+        "An internal failure refuses nothing"
+    );
+    record_verify_failure(&stats, &mut failure, LocalModifications.into());
+    assert!(
+        stats.refused.load(Ordering::Relaxed),
+        "Local modifications refuse the sync"
+    );
+    assert!(
+        failure.is_some_and(|err| err.is_internal()),
+        "The first failure is the one answered"
+    );
+}
+
+/// The delete of a directory deleted as a whole is boxed, so the delete of listed changes, which
+/// every realize awaits, doesn't hold its walk.
+#[tokio::test]
+async fn the_deletes_of_a_realize_hold_no_whole_directory_delete() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-subtree-delete-size-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("gone").unwrap();
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let (_, subtrees) = state::diff_collect_subtrees(
+            repository.clone(),
+            current.state.clone(),
+            repository.clone(),
+            current.state.clone(),
+            FilterMode::Full,
+        )
+        .await
+        .expect("the subtrees of an empty diff");
+        let change = NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::Subtree,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        };
+        let context = Arc::new(DeleteContext {
+            repository: repository.clone(),
+            operation: repository.file_system().begin_operation().await.unwrap(),
+            state_stage: None,
+            dry_run: true,
+            merge_current: None,
+            view_change: None,
+            stats: Arc::default(),
+        });
+        let changes = [change];
+        let listed = realize_changes_delete(&context, &changes, &[], Some(&subtrees));
+        let whole = realize_subtree_delete(&context, &changes[0], &subtrees, &[], &[]);
+        assert!(
+            size_of_val(&listed) < size_of_val(&whole),
+            "the deletes hold {} bytes beside the {} of a whole-directory delete",
+            size_of_val(&listed),
+            size_of_val(&whole)
+        );
+    }))
+    .await;
+}
+
+/// The task deleting a file below a directory deleted as a whole holds its change once, beside the
+/// removal it awaits.
+#[tokio::test]
+async fn a_file_delete_task_holds_its_change_once() {
+    Box::pin(with_execution(async {
+        let temp = lore_base::test_util::TempDir::new("lore-delete-below-size-");
+        let repository = working_tree_repository(temp.path()).await;
+        let path = RelativePath::new_from_initial_path("file.txt").unwrap();
+        let current = state_holding(&repository, &path, Node::new_zeroed(), 1).await;
+        let change = NodeChange {
+            action: FileAction::Delete,
+            flags: change::Flags::None,
+            from: side(&repository, &current, path.clone()),
+            to: side(&repository, &current, path.clone()),
+        };
+        let context = Arc::new(DeleteContext {
+            repository: repository.clone(),
+            operation: repository.file_system().begin_operation().await.unwrap(),
+            state_stage: None,
+            dry_run: true,
+            merge_current: None,
+            view_change: None,
+            stats: Arc::default(),
+        });
+        let removal = size_of_val(&remove_file(&context, &change, &[]));
+        let task = delete_below(context.clone(), change.clone());
+        assert!(
+            size_of_val(&task) < removal + 2 * size_of::<NodeChange>(),
+            "the task holds {} bytes beside a removal of {} and a change of {}",
+            size_of_val(&task),
+            removal,
+            size_of::<NodeChange>()
+        );
     }))
     .await;
 }
@@ -1941,7 +3176,9 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
             (TestIdentity::Fails, "other", &[][..]),
         ];
         for (identity, to, removed) in cases {
-            let filesystem = Arc::new(TestFilesystemProvider::new().with_identity(identity));
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let filesystem =
+                Arc::new(TestFilesystemProvider::reading(dir.path()).with_identity(identity));
             let repository = test_repository_over(
                 immutable_store.clone(),
                 mutable_store.clone(),
@@ -1973,9 +3210,12 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 repository.clone(),
                 operation,
                 Arc::new(vec![change]),
+                &[],
+                None, /* No subtrees */
                 None,
                 false,
-                false,
+                None,
+                None,
                 stats.clone(),
             )
             .await
@@ -1988,9 +3228,9 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 .then(|| ("Dir".to_string(), to.to_string()));
             assert_eq!(
                 (
-                    stats.kept_moves.count.load(Ordering::Relaxed),
+                    stats.kept_renames.count.load(Ordering::Relaxed),
                     stats
-                        .kept_moves
+                        .kept_renames
                         .first
                         .get()
                         .map(|kept| (kept.from.to_string(), kept.to.to_string())),
@@ -1999,6 +3239,292 @@ async fn a_refused_move_removes_its_destination_unless_it_is_the_source() {
                 "{context}"
             );
         }
+    }))
+    .await;
+}
+
+/// A state holding `files` and the empty `directories`, with every directory on their paths staged
+/// before them, unfiltered as a revision is.
+async fn tree_holding(
+    repository: &Arc<RepositoryContext>,
+    files: &[&str],
+    directories: &[&str],
+) -> Arc<State> {
+    let state = State::new();
+    state.set_revision(lore_base::types::Hash::from([2; 32]));
+    let mut staged = std::collections::BTreeSet::new();
+    for path in files.iter().chain(directories) {
+        for (end, _) in path.match_indices('/') {
+            staged.insert((path[..end].to_owned(), true));
+        }
+        staged.insert((path.to_string(), directories.contains(path)));
+    }
+    for (path, is_directory) in staged {
+        let node = if is_directory {
+            Node::new_zeroed()
+        } else {
+            file_node(path.as_bytes())
+        };
+        lore_revision::stage::stage_single_node(
+            repository.clone(),
+            state.clone(),
+            relative(&path),
+            node,
+            Arc::default(),
+            None,
+            FilterMode::empty(),
+        )
+        .await
+        .expect("stage the node");
+    }
+    state
+}
+
+/// The delete of the file at `path`, which is all [`remove_emptied_directories`] reads of it.
+fn file_delete_at(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    path: &str,
+) -> NodeChange {
+    let from = NodeChangeState {
+        mapping: NodeMapping {
+            repository: repository.clone(),
+            state: state.clone(),
+            path: relative(path),
+            node: INVALID_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::File,
+        address: Default::default(),
+        mode: 0,
+    };
+    NodeChange {
+        action: FileAction::Delete,
+        flags: change::Flags::None,
+        to: from.invalid(relative(path)),
+        from,
+    }
+}
+
+/// The directories below `root`, sorted.
+fn directories_below(root: &std::path::Path) -> Vec<String> {
+    let mut directories = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() && !path.ends_with(".lore") {
+                let relative = path.strip_prefix(root).unwrap();
+                directories.push(relative.to_string_lossy().replace('\\', "/"));
+                pending.push(path);
+            }
+        }
+    }
+    directories.sort();
+    directories
+}
+
+/// One case of [`remove_emptied_directories`]: the view the working tree is under, the tree the
+/// target revision holds, the files deleted, what the working tree holds once they are, and the
+/// directories it holds after the removal.
+struct Removal {
+    view: &'static [&'static str],
+    target_files: &'static [&'static str],
+    target_empty: &'static [&'static str],
+    deleted: &'static [&'static str],
+    on_disk: &'static [&'static str],
+    local_files: &'static [&'static str],
+    /// The realize carries the tree to `view` from another, as `lore sync --view` does.
+    view_changes: bool,
+    left: &'static [&'static str],
+}
+
+/// The directories the working tree of `case` holds after [`remove_emptied_directories`] at the
+/// root.
+async fn directories_left(case: &Removal) -> Vec<String> {
+    let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+    let mut filter = Filter::default();
+    for rule in case.view {
+        match rule.strip_prefix('!') {
+            Some(included) => filter.view.add_inclusion(included).unwrap(),
+            None => filter.view.add_exclusion(rule).unwrap(),
+        }
+    }
+    let repository = working_tree_repository_filtered(dir.path(), filter).await;
+    let target = NodeMapping::root(
+        repository.clone(),
+        tree_holding(&repository, case.target_files, case.target_empty).await,
+    );
+    for directory in case.on_disk {
+        std::fs::create_dir_all(dir.path().join(directory)).unwrap();
+    }
+    for file in case.local_files {
+        write_working_files(&repository, &[(file, b"local")]).await;
+    }
+    let changes: Vec<NodeChange> = case
+        .deleted
+        .iter()
+        .map(|path| file_delete_at(&repository, &target.state, path))
+        .collect();
+    let operation = repository.file_system().begin_operation().await.unwrap();
+    remove_emptied_directories(
+        &operation,
+        &repository,
+        &changes,
+        &RelativePath::new(),
+        case.view_changes.then_some(&target),
+        &Arc::default(),
+    )
+    .await;
+    directories_below(dir.path())
+}
+
+/// A change of view removes each directory its deletes leave empty that the new view leaves off
+/// the disk, and keeps one holding a local file, one the target revision holds empty, one a line
+/// names, and one whose subtree the view covers. Without a change of view, as in a merge, a
+/// directory the view includes stays.
+#[tokio::test]
+async fn a_view_change_removes_the_directories_the_new_view_does_not_create() {
+    let cases = [
+        Removal {
+            view: &["*.txt"],
+            target_files: &["a/b/x.txt", "a/c/y.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt", "a/c/y.txt"],
+            on_disk: &["a/b", "a/c"],
+            local_files: &["a/c/local.dat"],
+            view_changes: true,
+            left: &["a", "a/c"],
+        },
+        Removal {
+            view: &["*.txt"],
+            target_files: &["a/x.txt"],
+            target_empty: &["a/e"],
+            deleted: &["a/e/z.txt", "a/x.txt"],
+            on_disk: &["a/e"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/e"],
+        },
+        Removal {
+            view: &["**", "!/a/b/", "/a/b/*"],
+            target_files: &["a/b/x.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/b"],
+        },
+        Removal {
+            view: &["/z/*.txt"],
+            target_files: &["a/b/x.txt"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &["a", "a/b"],
+        },
+        Removal {
+            view: &["*.bat"],
+            target_files: &["a/b/y.bat"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: true,
+            left: &[],
+        },
+        Removal {
+            view: &["*.bat"],
+            target_files: &["a/b/y.bat"],
+            target_empty: &[],
+            deleted: &["a/b/x.txt"],
+            on_disk: &["a/b"],
+            local_files: &[],
+            view_changes: false,
+            left: &["a", "a/b"],
+        },
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let left = Box::pin(with_execution(directories_left(case))).await;
+        assert_eq!(left, case.left, "case {index}");
+    }
+}
+
+/// Below a link's mount, a change of view finds each directory in the linked tree and removes the
+/// ones the new view leaves off the disk, but not the mount, which stands for the link.
+#[tokio::test]
+async fn a_view_change_removes_directories_below_a_link_mount_but_not_the_mount() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("*.txt").unwrap();
+        filter.view.add_exclusion("*.bat").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let (state, _) =
+            linked_plugin_tree(&repository, SOURCE, &[("b/x.txt", b"x"), ("s.bat", b"s")]).await;
+        std::fs::create_dir_all(dir.path().join(SOURCE).join("b")).unwrap();
+        let target = NodeMapping::root(repository.clone(), state.clone());
+        let changes = [file_delete_at(
+            &repository,
+            &state,
+            &format!("{SOURCE}/b/x.txt"),
+        )];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+
+        remove_emptied_directories(
+            &operation,
+            &repository,
+            &changes,
+            &RelativePath::new(),
+            Some(&target),
+            &Arc::default(),
+        )
+        .await;
+
+        assert_eq!(directories_below(dir.path()), [PLUGIN, SOURCE]);
+    }))
+    .await;
+}
+
+/// Below a layer's mount, a change of view looks each directory up below the layer's source
+/// path, the mount standing for the layer.
+#[tokio::test]
+async fn a_view_change_removes_directories_below_a_layer_mount_from_its_source_path() {
+    Box::pin(with_execution(async {
+        let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+        let mut filter = Filter::default();
+        filter.view.add_exclusion("*.txt").unwrap();
+        let repository = working_tree_repository_filtered(dir.path(), filter).await;
+        let layered = tree_holding(&repository, &["src/b/x.txt", "src/c/y.txt"], &[]).await;
+        let source = layered
+            .find_node_link(repository.clone(), "src")
+            .await
+            .unwrap()
+            .node;
+        let target = NodeMapping {
+            repository: repository.clone(),
+            state: layered.clone(),
+            path: relative("layer"),
+            node: source,
+        };
+        std::fs::create_dir_all(dir.path().join("layer/b")).unwrap();
+        let changes = [file_delete_at(&repository, &layered, "layer/b/x.txt")];
+        let operation = repository.file_system().begin_operation().await.unwrap();
+
+        remove_emptied_directories(
+            &operation,
+            &repository,
+            &changes,
+            &relative("layer"),
+            Some(&target),
+            &Arc::default(),
+        )
+        .await;
+
+        assert_eq!(directories_below(dir.path()), ["layer"]);
     }))
     .await;
 }

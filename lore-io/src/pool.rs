@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use parking_lot::Condvar;
 use parking_lot::Mutex;
+use parking_lot::MutexGuard;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(10);
 
@@ -104,8 +105,29 @@ pub fn set_max_threads(count: usize) -> bool {
     BUDGETED_MAX_THREADS.set(count.max(1)).is_ok()
 }
 
+/// Functions a pool thread runs around its waits for work, without the pool's lock held, so either
+/// may wait.
+#[derive(Clone, Copy)]
+pub struct IdleHooks {
+    /// Runs as the thread finds no work and begins waiting for it.
+    pub begin: fn(),
+    /// Runs once the thread has work after a wait, before it runs the work. A thread taking work
+    /// queued as it ends a job runs neither, and a thread can end after `begin` without `end`.
+    pub end: fn(),
+}
+
+static IDLE_HOOKS: OnceLock<IdleHooks> = OnceLock::new();
+
+/// Sets the functions the pool threads run around their waits for work. Applies to the threads
+/// started after the call, so like [`set_max_threads`] it must run before the first file operation.
+/// Returns false if hooks were already set.
+pub fn set_idle_hooks(hooks: IdleHooks) -> bool {
+    IDLE_HOOKS.set(hooks).is_ok()
+}
+
 /// The cap the process-wide pool is built with: its budgeted share when one has been set, else
 /// what the crate asks for on its own.
+#[lore_macro::test_pub]
 fn configured_max_threads() -> usize {
     BUDGETED_MAX_THREADS
         .get()
@@ -138,6 +160,17 @@ enum TaskState<T, F> {
     Taken,
 }
 
+/// The jobs every pool of the process has run, on its threads or on the threads that submitted
+/// them, which only a test build counts.
+#[cfg(feature = "test-util")]
+static JOBS_RUN: AtomicUsize = AtomicUsize::new(0);
+
+/// The jobs every pool of the process has run so far.
+#[cfg(feature = "test-util")]
+pub fn jobs_run() -> usize {
+    JOBS_RUN.load(Ordering::Relaxed)
+}
+
 /// The runnable view of a [`Task`], which is what the queue holds.
 #[lore_macro::test_pub]
 trait Job: Send + Sync {
@@ -164,6 +197,8 @@ where
         let Some(work) = work else {
             return;
         };
+        #[cfg(feature = "test-util")]
+        JOBS_RUN.fetch_add(1, Ordering::Relaxed);
 
         // Deliberately not under the lock: the work is a blocking syscall, and the awaiter polls
         // while it runs.
@@ -273,24 +308,66 @@ struct PoolInner {
     max_threads: usize,
 }
 
-/// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
+thread_local! {
+    /// Whether this thread runs the work it submits itself
+    /// ([`run_file_operations_on_this_thread`]).
+    static RUNS_OWN_WORK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread is inside [`run_file_operations_on_this_thread`].
 #[lore_macro::test_pub]
-pub(crate) struct Lent<'a> {
+pub(crate) fn runs_file_operations_on_this_thread() -> bool {
+    RUNS_OWN_WORK.get()
+}
+
+/// Runs `call` with every job this thread submits to a syscall pool within it run on this thread,
+/// inside the submission, rather than on a pool thread, which saves the two thread hand-offs of
+/// each job.
+///
+/// Only for a thread that meets all of these:
+///
+/// - It isn't an async runtime worker, which a job would block.
+/// - It blocks until the operations it starts within `call` finish, as a thread inside `block_on`
+///   does, so that running them delays nothing else.
+/// - The work awaits its file operations one at a time. Joined ones run one after another, and a
+///   timeout around one can't fire while it runs.
+///
+/// It applies to every pool and to all code `call` reaches on this thread, and to no other
+/// thread. Work given a thread of its own still gets one
+/// ([`crate::IoDriver::remove_dir_all_in_background`]), and the positional reads and writes of
+/// the completion backends, which submit no job, are issued as they are without it.
+pub fn run_file_operations_on_this_thread<T>(call: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RUNS_OWN_WORK.set(self.0);
+        }
+    }
+    let _restore = Restore(RUNS_OWN_WORK.replace(true));
+    call()
+}
+
+/// Lends up to `wanted` threads of the cap of the process's syscall pool, the one every file
+/// operation runs on, to work that runs them itself, as [`SyscallPool::lend`] does.
+pub fn lend_threads(wanted: usize) -> Lent<'static> {
+    SyscallPool::global().lend(wanted)
+}
+
+/// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
+pub struct Lent<'a> {
     pool: &'a SyscallPool,
     count: usize,
 }
 
 impl Lent<'_> {
     /// How many threads were lent.
-    #[lore_macro::test_pub]
-    pub(crate) fn count(&self) -> usize {
+    pub fn count(&self) -> usize {
         self.count
     }
 
     /// Takes over the threads `other` holds, which the same pool lent, so they are given back with
     /// these.
-    #[lore_macro::test_pub]
-    pub(crate) fn absorb(&mut self, mut other: Lent<'_>) {
+    pub fn absorb(&mut self, mut other: Lent<'_>) {
         debug_assert!(std::ptr::eq(self.pool, other.pool), "lent by another pool");
         self.count += std::mem::take(&mut other.count);
     }
@@ -299,8 +376,7 @@ impl Lent<'_> {
     /// could not start them, and starts a thread in each slot given back for a job that queued
     /// while they were lent and that no idle thread will take, so the queue drains at the full
     /// cap again rather than waiting for a later submission to start one.
-    #[lore_macro::test_pub]
-    pub(crate) fn give_back(&mut self, count: usize) {
+    pub fn give_back(&mut self, count: usize) {
         let count = count.min(self.count);
         if count == 0 {
             return;
@@ -388,6 +464,9 @@ impl SyscallPool {
         Lent { pool: self, count }
     }
 
+    /// Queues `work` for a pool thread, or runs it before returning on a thread inside
+    /// [`run_file_operations_on_this_thread`]. Either way the task answers with its result, and
+    /// resumes a panic of the work on its awaiter.
     #[lore_macro::test_pub]
     pub(crate) fn submit<T, F>(&self, work: F) -> SyscallTask<T>
     where
@@ -395,6 +474,10 @@ impl SyscallPool {
         F: FnOnce() -> T + Send + 'static,
     {
         let (job, task) = new_task(work);
+        if runs_file_operations_on_this_thread() {
+            job.run();
+            return task;
+        }
         self.enqueue(job);
         task
     }
@@ -529,7 +612,10 @@ fn spawn_worker_thread(inner: Arc<PoolInner>) -> std::io::Result<()> {
 }
 
 fn worker_loop(inner: &PoolInner) {
+    let idle_hooks = IDLE_HOOKS.get();
     loop {
+        // Whether the thread ran the begin hook since its last job.
+        let mut waited = false;
         let job = {
             let mut state = inner.state.lock();
             loop {
@@ -541,6 +627,16 @@ fn worker_loop(inner: &PoolInner) {
                 }
                 if let Some(job) = state.queue.pop_front() {
                     break Some(job);
+                }
+                if let Some(hooks) = idle_hooks.filter(|_| !waited) {
+                    // Outside the lock every submitter takes. Counted idle meanwhile, so work queued
+                    // now wakes a waiting thread rather than starting one, and the loop checks the
+                    // queue again.
+                    waited = true;
+                    state.idle += 1;
+                    MutexGuard::unlocked(&mut state, hooks.begin);
+                    state.idle -= 1;
+                    continue;
                 }
                 state.idle += 1;
                 let timed_out = inner
@@ -555,7 +651,12 @@ fn worker_loop(inner: &PoolInner) {
             }
         };
         match job {
-            Some(job) => job.run(),
+            Some(job) => {
+                if let Some(hooks) = idle_hooks.filter(|_| waited) {
+                    (hooks.end)();
+                }
+                job.run();
+            }
             None => return,
         }
     }
@@ -564,12 +665,12 @@ fn worker_loop(inner: &PoolInner) {
 /// Completion future for work submitted to the syscall pool.
 ///
 /// Wakes through a plain waker and therefore runs under any executor. A
-/// panic on the pool thread resumes on the awaiting task.
+/// panic of the work resumes on the awaiting task.
 ///
 /// Dropping this cancels nothing: the work owns its buffer and runs to completion, publishing a
-/// result nobody reads, and the allocation — with that buffer in it — is freed when the pool
-/// thread releases its own handle. That is what makes an early free of kernel-visible memory
-/// unrepresentable rather than merely avoided.
+/// result nobody reads, and the allocation — with that buffer in it — is freed once the thread
+/// running the work has released its own handle. That is what makes an early free of
+/// kernel-visible memory unrepresentable rather than merely avoided.
 ///
 /// Work that is discarded rather than run leaves this pending forever. Only a pool dropped with a
 /// non-empty queue can do that, which the process-wide pool never is. Detecting it here is not

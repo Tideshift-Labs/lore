@@ -78,6 +78,7 @@ mod shared_store_tests {
                 remote_url: REMOTE_URL.into(),
                 path: LoreString::from(path.display().to_string().as_str()),
                 make_default: 0,
+                ..Default::default()
             },
             None,
         )
@@ -198,7 +199,10 @@ mod shared_store_tests {
     async fn close(handle: lore::storage::handle::LoreStore) {
         let status = lore::storage::close::close(
             globals(),
-            lore::storage::close::LoreStorageCloseArgs { handle },
+            lore::storage::close::LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             None,
         )
         .await;
@@ -403,6 +407,7 @@ mod shared_store_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (sink, callback) = capture_sink();

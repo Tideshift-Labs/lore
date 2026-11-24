@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::auth::LoreAuthUserInfoArgs;
@@ -172,7 +171,7 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
                 );
             }
             LoreEvent::LockFileStatus(data) => {
-                let timestamp = parse_timestamp(data.locked_at);
+                let timestamp = util::rfc2822_display(data.locked_at).unwrap_or_default();
 
                 status_data_clone.lock().push(LockEventData {
                     branch: String::default(),
@@ -226,7 +225,7 @@ fn handle_lock_query(globals: LoreGlobalArgs, args: &FileLockQueryArgs) -> u8 {
                 println!("{}Locks found:{}", CommonStyles::HEADERS, anstyle::Reset);
             }
             LoreEvent::LockFileQuery(data) => {
-                let timestamp = parse_timestamp(data.locked_at);
+                let timestamp = util::rfc2822_display(data.locked_at).unwrap_or_default();
 
                 query_data_clone.lock().push(LockEventData {
                     branch: data.branch.to_string(),
@@ -331,12 +330,6 @@ pub fn handle_lock_file_commands(globals: LoreGlobalArgs, cmd: &LockFileCommands
         LockFileCommands::Query(args) => handle_lock_query(globals, args),
         LockFileCommands::Release(args) => handle_lock_release(globals, args),
     }
-}
-
-fn parse_timestamp(timestamp: u64) -> String {
-    DateTime::from_timestamp_millis(timestamp as i64)
-        .map(|time| time.to_rfc2822())
-        .unwrap_or_default()
 }
 
 fn resolve_user_ids(

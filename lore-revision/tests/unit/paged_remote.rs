@@ -4,6 +4,7 @@
 //! counts the reads reaching it.
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -19,8 +20,10 @@ use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_revision::metadata::Metadata;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::KeyType;
@@ -31,7 +34,11 @@ use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
+use lore_storage::test_util::Answered;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::StoreCall;
 use lore_transport::BranchListResponse;
+use lore_transport::BranchPushError;
 use lore_transport::BranchPushResponse;
 use lore_transport::BranchQueryResponse;
 use lore_transport::BranchRecord;
@@ -46,12 +53,9 @@ use tokio::sync::Notify;
 use zerocopy::IntoBytes;
 
 use crate::helper::in_memory;
-use crate::hooked_store::Answered;
-use crate::hooked_store::HookedStore;
-use crate::hooked_store::StoreCall;
 
 /// What a page answers: a revision number on the remote's branch, or a revision signature.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Anchor {
     Number(u64),
     Signature(Hash),
@@ -68,12 +72,14 @@ struct Page {
 /// anchor and counts the revision lists it is asked for. An anchor with no page is not found, a
 /// list for an anchor registered as failing fails, and a list for an anchor registered as stalling
 /// is never answered. A page item carries the state of a revision the remote holds, and no state
-/// otherwise. A remote with a `refusal` answers every branch query with it. It records each name a
-/// branch query asks for.
+/// otherwise. A remote with a `refusal` answers every branch query with it, and one built
+/// `deleted` answers that its branch is deleted. It records each name a branch query asks for, and
+/// each anchor a revision list asks for.
 pub(crate) struct PagedRemote {
     branch: BranchId,
     latest: Hash,
     metadata: Hash,
+    deleted: bool,
     pages: Vec<Page>,
     failures: Vec<(Anchor, ProtocolError)>,
     stalls: Vec<Anchor>,
@@ -81,20 +87,25 @@ pub(crate) struct PagedRemote {
     stalled: Notify,
     /// Signalled when a list left unanswered is dropped, which is the only way it ends.
     abandoned: Notify,
+    /// How many lists left unanswered are not yet dropped.
+    unanswered: AtomicUsize,
     held: Vec<RemoteRevision>,
     /// The metadata hash a page item carries for a revision, by signature; zero for any other.
     listed_metadata: Vec<(Hash, Hash)>,
     lists: AtomicUsize,
     refusal: Option<ProtocolError>,
     queried_names: std::sync::Mutex<Vec<String>>,
+    listed_anchors: std::sync::Mutex<Vec<Anchor>>,
 }
 
-/// Signals a [`PagedRemote`]'s `abandoned` when the list left unanswered that holds it is dropped.
-struct Abandoned<'a>(&'a Notify);
+/// A list left unanswered by a [`PagedRemote`]. When dropped, counts the list as ended and signals
+/// `abandoned`.
+struct Abandoned<'a>(&'a PagedRemote);
 
 impl Drop for Abandoned<'_> {
     fn drop(&mut self) {
-        self.0.notify_one();
+        self.0.unanswered.fetch_sub(1, Ordering::SeqCst);
+        self.0.abandoned.notify_one();
     }
 }
 
@@ -129,6 +140,81 @@ pub(crate) async fn remote_revision(number: u64, parent: Hash, metadata: Hash) -
     RemoteRevision { signature, state }
 }
 
+/// The hash of metadata naming `branch` as the branch of a revision, written to the local store of
+/// `stores`.
+pub(crate) async fn branch_metadata(stores: &ClientStores, branch: BranchId) -> Hash {
+    let mut metadata = Metadata::new();
+    metadata
+        .set_branch(branch)
+        .expect("the metadata holds the branch");
+    metadata
+        .serialize_local(stores.writer.clone())
+        .await
+        .expect("writing the metadata")
+}
+
+/// Revisions numbered 1 to `count` that only the remote holds, oldest first, each with `metadata`
+/// as its metadata hash.
+pub(crate) async fn remote_line(count: u64, metadata: Hash) -> Vec<RemoteRevision> {
+    let mut line: Vec<RemoteRevision> = Vec::new();
+    for number in 1..=count {
+        let parent = line.last().map_or(Hash::default(), |below| below.signature);
+        line.push(remote_revision(number, parent, metadata).await);
+    }
+    line
+}
+
+/// The page items of `line` from the revision numbered `newest` down to the one numbered `oldest`.
+pub(crate) fn span(line: &[RemoteRevision], newest: u64, oldest: u64) -> Vec<(u64, Hash)> {
+    (oldest..=newest)
+        .rev()
+        .map(|number| (number, line[number as usize - 1].signature))
+        .collect()
+}
+
+/// The hash signature anchor of the revision numbered `number` of `line`.
+pub(crate) fn signature_of(line: &[RemoteRevision], number: u64) -> Anchor {
+    Anchor::Signature(line[number as usize - 1].signature)
+}
+
+/// A remote holding `line`, whose latest is the line's newest revision, that lists the pages of a
+/// hundred revisions a walk down the line reads: the first two by hash signature, and those below
+/// them by revision number on `branch`.
+pub(crate) fn paging_remote(branch: BranchId, line: &[RemoteRevision]) -> PagedRemote {
+    let newest = line.len() as u64;
+    let mut remote = PagedRemote::new(branch, line[line.len() - 1].signature).holding(line);
+    for top in (1..=newest).rev().step_by(100) {
+        let oldest = top.saturating_sub(99).max(1);
+        let anchor = if top + 200 > newest {
+            signature_of(line, top)
+        } else {
+            Anchor::Number(top)
+        };
+        remote = remote.page(anchor, span(line, top, oldest), Hash::default());
+    }
+    remote
+}
+
+/// The anchors `remote` was asked to list by hash signature, in order, and by number, newest
+/// first.
+pub(crate) fn anchors(remote: &PagedRemote) -> (Vec<Anchor>, Vec<u64>) {
+    let listed = remote.listed_anchors();
+    let signatures = listed
+        .iter()
+        .filter(|anchor| matches!(anchor, Anchor::Signature(_)))
+        .copied()
+        .collect();
+    let mut numbers: Vec<u64> = listed
+        .iter()
+        .filter_map(|anchor| match anchor {
+            Anchor::Number(number) => Some(*number),
+            Anchor::Signature(_) => None,
+        })
+        .collect();
+    numbers.sort_unstable_by(|a, b| b.cmp(a));
+    (signatures, numbers)
+}
+
 /// `revision` in each way a page can list it without its own state: with no state, with its state
 /// cut short, and with `other`'s state. Each comes with its name, and with what a remote holding
 /// it carries for it, if anything.
@@ -151,6 +237,30 @@ pub(crate) fn without_its_own_state(
                 signature: revision.signature,
                 state: other.state.clone(),
             }),
+        ),
+    ]
+}
+
+/// A page that a test names, as its name, its items and its cursor.
+pub(crate) type NamedPage = (&'static str, Vec<(u64, Hash)>, Hash);
+
+/// The pages for `asked` that do not continue its line, each with its name and its cursor: one
+/// listing `stray` where the line holds `parent`, the first parent of `asked`, one whose cursor
+/// names `stray`, and one without `asked`. `stray` is numbered as `parent` is, so only the parent
+/// link tells it from the line.
+pub(crate) fn off_the_line(asked: (u64, Hash), parent: Hash, stray: Hash) -> [NamedPage; 3] {
+    let below = asked.0 - 1;
+    [
+        (
+            "a revision off the line",
+            vec![asked, (below, stray)],
+            Hash::default(),
+        ),
+        ("a cursor off the line", vec![asked], stray),
+        (
+            "a page without the revision asked for",
+            vec![(below, parent)],
+            Hash::default(),
         ),
     ]
 }
@@ -221,22 +331,31 @@ impl PagedRemote {
             branch,
             latest,
             metadata: Hash::default(),
+            deleted: false,
             pages: Vec::new(),
             failures: Vec::new(),
             stalls: Vec::new(),
             stalled: Notify::new(),
             abandoned: Notify::new(),
+            unanswered: AtomicUsize::new(0),
             held: Vec::new(),
             listed_metadata: Vec::new(),
             lists: AtomicUsize::new(0),
             refusal: None,
             queried_names: std::sync::Mutex::default(),
+            listed_anchors: std::sync::Mutex::default(),
         }
     }
 
     /// Hold the branch's metadata at `metadata`.
     pub(crate) fn metadata(mut self, metadata: Hash) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Answer that the branch is deleted, as an archived branch is.
+    pub(crate) fn deleted(mut self) -> Self {
+        self.deleted = true;
         self
     }
 
@@ -296,6 +415,14 @@ impl PagedRemote {
             .clone()
     }
 
+    /// The anchors the revision lists asked for, in order.
+    pub(crate) fn listed_anchors(&self) -> Vec<Anchor> {
+        self.listed_anchors
+            .lock()
+            .expect("the listed anchors' lock")
+            .clone()
+    }
+
     /// Wait until a list left unanswered starts.
     pub(crate) async fn stalled(&self) {
         self.stalled.notified().await;
@@ -304,6 +431,25 @@ impl PagedRemote {
     /// Wait until a list left unanswered is dropped.
     pub(crate) async fn abandoned(&self) {
         self.abandoned.notified().await;
+    }
+
+    /// Wait until `count` lists are left unanswered at once.
+    pub(crate) async fn unanswered(&self, count: usize) {
+        while self.unanswered.load(Ordering::SeqCst) < count {
+            self.stalled.notified().await;
+        }
+    }
+
+    /// How many lists are left unanswered now.
+    pub(crate) fn lists_unanswered(&self) -> usize {
+        self.unanswered.load(Ordering::SeqCst)
+    }
+
+    /// Wait until every list left unanswered is dropped.
+    pub(crate) async fn all_abandoned(&self) {
+        while self.unanswered.load(Ordering::SeqCst) > 0 {
+            self.abandoned.notified().await;
+        }
     }
 }
 
@@ -322,8 +468,8 @@ pub(crate) async fn stored_locally(
 
 /// The in-memory stores of a client.
 pub(crate) struct ClientStores {
-    immutable: Arc<dyn ImmutableStore>,
-    mutable: Arc<dyn MutableStore>,
+    pub immutable: Arc<dyn ImmutableStore>,
+    pub mutable: Arc<dyn MutableStore>,
     /// A context over the stores that can write the revisions the client holds locally.
     pub writer: Arc<RepositoryContext>,
 }
@@ -345,6 +491,8 @@ pub(crate) async fn counted_client_stores() -> (ClientStores, Arc<CountingStore>
         payloads: AtomicUsize::new(0),
         queries: AtomicUsize::new(0),
         failing: AtomicBool::new(false),
+        failing_hashes: Mutex::new(Vec::new()),
+        durable_only: AtomicBool::new(false),
     });
     (stores_over(counting.clone(), mutable), counting)
 }
@@ -375,8 +523,12 @@ impl ClientStores {
     /// a miss ([`RepositoryContext::strict_local_reads`]).
     pub(crate) fn strict_reader(&self) -> Arc<RepositoryContext> {
         Arc::new(
-            RepositoryContext::new_null_context(self.immutable.clone(), self.mutable.clone())
-                .strict_local_reads(),
+            RepositoryContext::new_null_context(
+                self.immutable.clone(),
+                self.mutable.clone(),
+                allow_all_repositories(),
+            )
+            .strict_local_reads(),
         )
     }
 }
@@ -385,6 +537,7 @@ fn stores_over(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore
     let writer = Arc::new(RepositoryContext::new_null_context(
         immutable.clone(),
         mutable.clone(),
+        allow_all_repositories(),
     ));
     ClientStores {
         immutable,
@@ -402,12 +555,15 @@ pub(crate) struct Reads {
 }
 
 /// An immutable store that counts the reads reaching the store it wraps, and fails each payload
-/// read after [`Self::fail_reads`] is called.
+/// read after [`Self::fail_reads`] is called, and each of the hashes [`Self::fail_reads_of`]
+/// names. After [`Self::report_durable_only`] it answers each query as a server's store does.
 pub(crate) struct CountingStore {
     inner: Arc<dyn ImmutableStore>,
     payloads: AtomicUsize,
     queries: AtomicUsize,
     failing: AtomicBool,
+    failing_hashes: Mutex<Vec<Hash>>,
+    durable_only: AtomicBool,
 }
 
 impl CountingStore {
@@ -422,6 +578,29 @@ impl CountingStore {
     /// Answer each payload read from now on with `Disconnected`, which no local read retries.
     pub(crate) fn fail_reads(&self) {
         self.failing.store(true, Ordering::Relaxed);
+    }
+
+    /// Answer each payload read of one of `hashes` from now on with `Disconnected`.
+    pub(crate) fn fail_reads_of(&self, hashes: impl IntoIterator<Item = Hash>) {
+        self.failing_hashes
+            .lock()
+            .expect("the failing hashes are never poisoned")
+            .extend(hashes);
+    }
+
+    /// Answer each query from now on with what it holds as durable and none of it as held
+    /// locally, as a server's store reports what it holds.
+    pub(crate) fn report_durable_only(&self) {
+        self.durable_only.store(true, Ordering::Relaxed);
+    }
+
+    fn fails(&self, hash: &Hash) -> bool {
+        self.failing.load(Ordering::Relaxed)
+            || self
+                .failing_hashes
+                .lock()
+                .expect("the failing hashes are never poisoned")
+                .contains(hash)
     }
 }
 
@@ -454,7 +633,7 @@ impl ImmutableStore for CountingStore {
         partition: Partition,
         address: Address,
     ) -> Result<StoreGetData, StoreError> {
-        if self.failing.load(Ordering::Relaxed) {
+        if self.fails(&address.hash) {
             return Err(StoreError::from(Disconnected));
         }
         self.payloads.fetch_add(1, Ordering::Relaxed);
@@ -479,7 +658,14 @@ impl ImmutableStore for CountingStore {
         self.inner
             .clone()
             .query(partition, addresses, results)
-            .await
+            .await?;
+        if self.durable_only.load(Ordering::Relaxed) {
+            for result in results.iter_mut() {
+                result.stored_durable |= result.stored_local;
+                result.stored_local = false;
+            }
+        }
+        Ok(())
     }
 
     async fn put(
@@ -755,6 +941,7 @@ impl Revision for PagedRemote {
             id: self.branch,
             latest: self.latest,
             metadata: self.metadata,
+            deleted: self.deleted,
             ..Default::default()
         })
     }
@@ -765,7 +952,7 @@ impl Revision for PagedRemote {
         _: Hash,
         _: bool,
         _: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         unreachable!("no test of a paged remote pushes a branch")
     }
 
@@ -792,11 +979,16 @@ impl Revision for PagedRemote {
             }
             RevisionListStart::Signature(signature) => Anchor::Signature(signature),
         };
+        self.listed_anchors
+            .lock()
+            .expect("the listed anchors' lock")
+            .push(anchor);
         if let Some((_, failure)) = self.failures.iter().find(|(failing, _)| *failing == anchor) {
             return Err(failure.clone());
         }
         if self.stalls.contains(&anchor) {
-            let _abandoned = Abandoned(&self.abandoned);
+            self.unanswered.fetch_add(1, Ordering::SeqCst);
+            let _abandoned = Abandoned(self);
             self.stalled.notify_one();
             std::future::pending::<()>().await;
         }
@@ -814,14 +1006,12 @@ impl Revision for PagedRemote {
                         .listed_metadata
                         .iter()
                         .find(|(revision, _)| *revision == signature)
-                        .map(|&(_, metadata)| metadata)
-                        .unwrap_or_default(),
+                        .map_or_default(|&(_, metadata)| metadata),
                     state: self
                         .held
                         .iter()
                         .find(|revision| revision.signature == signature)
-                        .map(|revision| revision.state.clone())
-                        .unwrap_or_default(),
+                        .map_or_default(|revision| revision.state.clone()),
                 })
                 .collect(),
             next_revision: page.older,

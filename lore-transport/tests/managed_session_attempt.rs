@@ -195,6 +195,7 @@ async fn a_sibling_closed_under_a_managed_write_rebinds_once_and_resends_once() 
         "",
         "",
         lore_transport::auth::AuthMode::Auto,
+        None,
     )
     .await
     .expect("connect builds its storage connection to the scripted peer");
@@ -372,6 +373,7 @@ async fn connect_to(peer: &Peer) -> Arc<lore_transport::Connection> {
         "",
         "",
         lore_transport::auth::AuthMode::Auto,
+        None,
     )
     .await
     .expect("connect builds its storage connection to the scripted peer")

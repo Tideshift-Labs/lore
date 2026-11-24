@@ -102,8 +102,7 @@ pub fn to_stored(version: &AggregateVersion) -> Result<StoredAggregateVersion, V
     let identity = version
         .identity
         .as_ref()
-        .map(|identity| identity.as_bytes().to_vec())
-        .unwrap_or_default();
+        .map_or_default(|identity| identity.as_bytes().to_vec());
     StoredAggregateVersion::new(version.ordinal, identity)
         .map_err(|_err| VersionDecodeError::IdentityTooWide)
 }

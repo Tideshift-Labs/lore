@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::str::FromStr;
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
@@ -17,9 +18,12 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::diff3_collect;
+use lore_revision::state::LinkPin;
+use lore_revision::state::LinkReference;
 use lore_revision::state::Mark;
 use lore_revision::state::NodeMapping;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_revision::util::path::RelativePath;
 use lore_storage::hash::hash_string;
 
@@ -50,7 +54,11 @@ async fn only_a_node_change_in_a_linked_repository_marks_links() {
         .scope(setup_test_execution(), async {
             let (immutable_store, mutable_store, _execution) =
                 test_store_create().await.expect("making test stores");
-            let top_level = RepositoryContext::new_null_context(immutable_store, mutable_store);
+            let top_level = RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            );
             let linked = top_level.to_link_context(RepositoryId::from([1; 16])).await;
 
             let tracker = LinkTracker::new();
@@ -99,6 +107,36 @@ async fn link_work_past_the_limit_runs_the_limit_at_a_time() {
 
     assert_eq!(results, (0..count).collect::<Vec<_>>());
     assert_eq!(peak.load(Ordering::SeqCst), MAX_CONCURRENT_LINK_TASKS);
+}
+
+/// The first error starts no more link work and is returned once the work in flight finishes.
+#[tokio::test]
+async fn link_work_failing_finishes_the_work_in_flight_and_starts_no_more() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    let (started, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let work = (0..MAX_CONCURRENT_LINK_TASKS * 2)
+        .map(|index| {
+            let (started, finished) = (&started, &finished);
+            async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                if index == 0 {
+                    return Err(index);
+                }
+                tokio::task::yield_now().await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(index)
+            }
+        })
+        .collect();
+
+    assert_eq!(try_join_links(work).await, Err(0));
+    assert_eq!(started.load(Ordering::SeqCst), MAX_CONCURRENT_LINK_TASKS);
+    assert_eq!(
+        finished.load(Ordering::SeqCst),
+        MAX_CONCURRENT_LINK_TASKS - 1
+    );
 }
 
 /// The repository the merged link points at.
@@ -278,6 +316,148 @@ async fn a_merged_link_the_merge_removes_or_replaces_stands_nowhere() {
                     "a merged link on {branch:?} must stand nowhere in {staged:?}"
                 );
             }
+        })
+        .await;
+}
+
+/// A merge brings in each following link of the merged side at a path where neither the side it
+/// merges into nor the base links the same repository, grouped by repository.
+#[tokio::test]
+async fn a_merge_brings_in_the_following_links_only_the_merged_side_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let other = RepositoryId::from([2; 16]);
+            let (target, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/replaced", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let (base, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let (source, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", merged(), tracking(), false),
+                    ("libs/replaced", other, tracking(), false),
+                    ("libs/pinned", merged(), branch_id(), false),
+                    ("libs/new", merged(), tracking(), false),
+                    ("vendor/new", merged(), tracking(), false),
+                ],
+            )
+            .await;
+            let libs = node_at(&repository, &source, "libs").await;
+            let vendored = add(
+                &source,
+                repository.clone(),
+                libs,
+                link_node("vendored", merged(), Hash::from_u64(0x11)),
+                "vendored",
+            )
+            .await;
+            source
+                .link_add(
+                    repository.clone(),
+                    merged(),
+                    tracking(),
+                    Hash::from_u64(0x11),
+                    vendored,
+                    LinkFlags::DisableAutoFollow,
+                )
+                .await
+                .expect("registering the link");
+
+            let mut incoming: Vec<(RepositoryId, Vec<String>)> =
+                incoming_following_links(&repository, &target, &base, &source)
+                    .await
+                    .expect("finding the incoming links")
+                    .into_iter()
+                    .map(|(link_id, mounts)| {
+                        let mut paths: Vec<String> =
+                            mounts.into_iter().map(|mount| mount.link_path).collect();
+                        paths.sort();
+                        (link_id, paths)
+                    })
+                    .collect();
+            incoming.sort();
+
+            let mut expected = vec![
+                (
+                    merged(),
+                    vec!["libs/new".to_string(), "vendor/new".to_string()],
+                ),
+                (other, vec!["libs/replaced".to_string()]),
+            ];
+            expected.sort();
+            assert_eq!(incoming, expected);
+        })
+        .await;
+}
+
+/// A merge keeps each repository the side it merges into links, at the pin it holds there, but at a
+/// path where the base links it and the merged side removed it.
+#[tokio::test]
+async fn a_merge_keeps_the_repositories_linked_but_where_the_merged_side_removes_them() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let (removed, added) = (RepositoryId::from([2; 16]), RepositoryId::from([3; 16]));
+            let (target, nodes) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", removed, tracking(), false),
+                    ("libs/added", added, tracking(), false),
+                ],
+            )
+            .await;
+            target
+                .link_update(
+                    repository.clone(),
+                    merged(),
+                    tracking(),
+                    Hash::from_u64(0x22),
+                    nodes[0],
+                )
+                .await
+                .expect("repinning the kept link");
+            let (base, _) = state_linking(
+                &repository,
+                &[
+                    ("libs/kept", merged(), tracking(), false),
+                    ("libs/removed", removed, tracking(), false),
+                ],
+            )
+            .await;
+            let (source, _) =
+                state_linking(&repository, &[("libs/kept", merged(), tracking(), false)]).await;
+
+            let kept = repositories_the_merge_keeps(&repository, &target, &base, &source)
+                .await
+                .expect("finding the repositories the merge keeps");
+
+            assert_eq!(
+                kept,
+                [
+                    (merged(), Hash::from_u64(0x22)),
+                    (added, Hash::from_u64(0x11))
+                ]
+                .into()
+            );
         })
         .await;
 }
@@ -465,6 +645,260 @@ async fn a_link_the_merged_branch_moves_keeps_or_never_held_is_not_deleted_by_th
         .await;
 }
 
+/// How a side of a merge changes the link at `libs/old` of a base linking it.
+#[derive(Debug, Clone, Copy)]
+enum LinkEdit {
+    /// Adds a file at the root and leaves the link.
+    Keep,
+    Remove,
+    /// Deletes `libs`, the directory holding the link.
+    RemoveDirectory,
+    /// Removes the link and links its repository at `libs/new`.
+    MoveElsewhere,
+    /// Pins the link to another revision of its repository.
+    Repin,
+    /// Has the link's row name another branch, at the same pin.
+    ChangeBranch,
+    /// Has the link's row stop following its parent's branch.
+    ChangeFlags,
+}
+
+/// Commits `edit` on a revision of `base`, where `link` and `libs` are the link and the directory
+/// holding it.
+async fn commit_link_edit(
+    repository: &Arc<RepositoryContext>,
+    base: Hash,
+    (link, libs): (NodeID, NodeID),
+    (merged, pin): (RepositoryId, Hash),
+    edit: LinkEdit,
+) -> Hash {
+    let state = in_memory::revision_state(repository, base).await;
+    let remove = async |node| {
+        state
+            .node_delete(repository.clone(), node)
+            .await
+            .expect("deleting the node");
+        state
+            .link_remove(repository.clone(), merged, link)
+            .await
+            .expect("removing the link's row");
+    };
+    match edit {
+        LinkEdit::Keep => {
+            add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                in_memory::file("beside.txt"),
+                "beside.txt",
+            )
+            .await;
+        }
+        LinkEdit::Remove => remove(link).await,
+        LinkEdit::RemoveDirectory => remove(libs).await,
+        LinkEdit::MoveElsewhere => {
+            remove(link).await;
+            let moved = add(
+                &state,
+                repository.clone(),
+                libs,
+                link_node("new", merged, pin),
+                "new",
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    merged,
+                    tracking(),
+                    pin,
+                    moved,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the moved link");
+        }
+        LinkEdit::Repin => {
+            let linked = repository.to_link_context(merged).await;
+            let linked_state = in_memory::revision_state(&linked, pin).await;
+            add(
+                &linked_state,
+                linked.clone(),
+                ROOT_NODE,
+                in_memory::file("m.txt"),
+                "m.txt",
+            )
+            .await;
+            let repin = in_memory::commit(&linked, &linked_state, pin, branch_id()).await;
+            state
+                .node_set_link_target(
+                    repository,
+                    link,
+                    LinkPin::Whole {
+                        address: Address {
+                            hash: repin,
+                            context: Context::from(merged),
+                        },
+                        child: ROOT_NODE,
+                    },
+                )
+                .await
+                .expect("repinning the link");
+            state
+                .link_update(repository.clone(), merged, tracking(), repin, link)
+                .await
+                .expect("repinning the link's row");
+        }
+        LinkEdit::ChangeBranch => {
+            state
+                .link_update(repository.clone(), merged, branch_id(), pin, link)
+                .await
+                .expect("naming another branch in the link's row");
+        }
+        LinkEdit::ChangeFlags => {
+            let row = state
+                .link_find(repository.clone(), merged, link)
+                .await
+                .expect("the link's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("fixing the link's row");
+        }
+    }
+    in_memory::commit(repository, &state, base, branch_id()).await
+}
+
+/// The diff, at `path` or of the whole trees, of a merge whose merged branch makes `source` and
+/// whose current branch makes `target` on a base linking a repository at `libs/old`. Answers the
+/// diff and the linked repository.
+async fn diff_of_link_edits(
+    source: LinkEdit,
+    target: LinkEdit,
+    path: Option<&str>,
+) -> (lore_revision::revision::DiffResult, RepositoryId) {
+    let (immutable, mutable, _execution) = test_store_create().await.expect("making test stores");
+    let repository = in_memory::repository(immutable, mutable);
+    let merged = RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = linked_revision(&repository, merged).await;
+    let base_state = State::new();
+    let libs = add(
+        &base_state,
+        repository.clone(),
+        ROOT_NODE,
+        directory("libs"),
+        "libs",
+    )
+    .await;
+    let link = add(
+        &base_state,
+        repository.clone(),
+        libs,
+        link_node("old", merged, pin),
+        "old",
+    )
+    .await;
+    add(
+        &base_state,
+        repository.clone(),
+        libs,
+        in_memory::file("beside.txt"),
+        "beside.txt",
+    )
+    .await;
+    base_state
+        .link_add(
+            repository.clone(),
+            merged,
+            tracking(),
+            pin,
+            link,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("registering the link");
+    let base = in_memory::commit(&repository, &base_state, Hash::default(), branch_id()).await;
+    let nodes = (link, libs);
+    let source = commit_link_edit(&repository, base, nodes, (merged, pin), source).await;
+    let target = commit_link_edit(&repository, base, nodes, (merged, pin), target).await;
+
+    let path = path.map(|path| RelativePath::from_str(path).expect("a valid path"));
+    let diff = diff3_collect(repository.clone(), base, source, target, path, true)
+        .await
+        .expect("diffing the revisions");
+    (diff, merged)
+}
+
+/// A link one side removes, also with the directory holding it, conflicts at its mount where the
+/// other side repinned it or changed its row, whichever side removes it, within the path the diff
+/// covers. Otherwise it is removed, and moved where the removing side links its repository
+/// elsewhere. Removing the directory still deletes what it holds beside the conflict.
+#[tokio::test]
+async fn a_link_removed_on_one_side_conflicts_where_the_other_side_changed_it() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            use FileAction::Add;
+            use FileAction::Delete;
+            use LinkEdit::*;
+            for (source, target, path, conflicted, changed) in [
+                (Remove, Repin, None, &["libs/old"][..], &[][..]),
+                (Repin, Remove, None, &["libs/old"], &[]),
+                (Remove, ChangeBranch, None, &["libs/old"], &[]),
+                (Remove, ChangeFlags, None, &["libs/old"], &[]),
+                (
+                    RemoveDirectory,
+                    ChangeBranch,
+                    None,
+                    &["libs/old"],
+                    &[(Delete, "libs/beside.txt")],
+                ),
+                (Remove, Repin, Some("libs"), &["libs/old"], &[]),
+                (Remove, Repin, Some("other"), &[], &[]),
+                (
+                    MoveElsewhere,
+                    Repin,
+                    None,
+                    &[],
+                    &[(Add, "libs/new"), (Delete, "libs/old")],
+                ),
+                (Remove, Remove, None, &[], &[(Delete, "libs/old")]),
+                (Remove, Keep, None, &[], &[(Delete, "libs/old")]),
+            ] {
+                let (diff, merged) = diff_of_link_edits(source, target, path).await;
+                let case = format!("{source:?} against {target:?} at {path:?}");
+                let paths: Vec<_> = diff
+                    .conflicts
+                    .iter()
+                    .map(|(source, _)| source.path().as_str())
+                    .collect();
+                assert_eq!(paths, conflicted, "{case}");
+                let mut changes = diff.changes;
+                lore_revision::change::sort_by_path(&mut changes);
+                let under_libs: Vec<_> = changes
+                    .iter()
+                    .filter(|change| change.path().as_str().starts_with("libs"))
+                    .map(|change| (change.action, change.path().as_str()))
+                    .collect();
+                assert_eq!(under_libs, changed, "{case}");
+                if !conflicted.is_empty() {
+                    continue;
+                }
+                assert_eq!(
+                    merge_deletes_link(&changes, "libs/old", merged),
+                    !changed.is_empty(),
+                    "{case}"
+                );
+            }
+        })
+        .await;
+}
+
 /// A change taking `action` at `path` from a node of `from` to one of `to`, each addressed in
 /// [`merged`], in states holding nothing.
 fn change_of(
@@ -495,6 +929,35 @@ fn change_of(
         from: side(from),
         to: side(to),
     }
+}
+
+/// Reversing a conflicted delete the staged state holds adds back the node the from side holds,
+/// and adds nothing where the merge staged a node the from side never held, added and deleted at
+/// once.
+#[tokio::test]
+async fn reversing_a_conflicted_delete_adds_back_only_a_node_the_from_side_holds() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            for (held, reversed) in [(true, FileAction::Add), (false, FileAction::Delete)] {
+                let mut change = change_of(
+                    &repository,
+                    FileAction::Delete,
+                    "a.txt",
+                    NodeFlags::File,
+                    NodeFlags::File | NodeFlags::StagedDelete | NodeFlags::StagedMergeConflict,
+                );
+                change.flags = lore_revision::change::Flags::Conflict;
+                if !held {
+                    change.from = change.from.invalid(change.from.mapping.path.clone());
+                }
+                change.reverse();
+                assert_eq!(change.action, reversed, "held by the from side: {held}");
+            }
+        })
+        .await;
 }
 
 /// A change replacing a link, or a directory above it, with a file takes the link with it, and
@@ -675,6 +1138,530 @@ async fn a_link_has_no_child_in_the_state_holding_it() {
                 ),
             ] {
                 assert!(!held.expect("reading the link"), "a {read} child");
+            }
+        })
+        .await;
+}
+
+/// A link at `path` of [`merged`] pinned at `signature` with `flags`.
+fn link_at(path: &str, signature: u64, flags: LinkFlags) -> LinkAtPath {
+    LinkAtPath {
+        path: path.to_string(),
+        reference: LinkReference {
+            repository: merged(),
+            signature: Hash::from_u64(signature),
+            local_node: 2,
+            flags: flags.bits(),
+            ..Default::default()
+        },
+        mount_source: None,
+    }
+}
+
+/// A link whose row changed only its flags is touched.
+#[test]
+fn a_link_with_other_flags_is_touched() {
+    let from = [link_at("libs/a", 1, LinkFlags::NoFlags)];
+    let to = [link_at("libs/a", 1, LinkFlags::DisableAutoFollow)];
+    assert_eq!(
+        touched_link_repositories(&from, &to).collect::<Vec<_>>(),
+        [merged(), merged()]
+    );
+}
+
+/// The same links in another order touch nothing, as a link removed and added back moves its row
+/// to the end of the registry.
+#[test]
+fn the_same_links_in_another_order_touch_nothing() {
+    let from = [
+        link_at("libs/a", 1, LinkFlags::NoFlags),
+        link_at("libs/b", 2, LinkFlags::DisableAutoFollow),
+    ];
+    let to = [
+        link_at("libs/b", 2, LinkFlags::DisableAutoFollow),
+        link_at("libs/a", 1, LinkFlags::NoFlags),
+    ];
+    assert_eq!(touched_link_repositories(&from, &to).count(), 0);
+}
+
+/// A revision of `holder` linking each of `links`, as (mount, repository, pin), at its root.
+async fn revision_linking(
+    root: &Arc<RepositoryContext>,
+    holder: RepositoryId,
+    links: &[(&str, RepositoryId, Hash)],
+) -> Hash {
+    let context = root.to_link_context(holder).await;
+    let state = State::new();
+    for &(name, repository, pin) in links {
+        let node = add(
+            &state,
+            context.clone(),
+            ROOT_NODE,
+            link_node(name, repository, pin),
+            name,
+        )
+        .await;
+        state
+            .link_add(
+                context.clone(),
+                repository,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the link");
+    }
+    in_memory::commit(&context, &state, Hash::default(), branch_id()).await
+}
+
+fn first_reach(repository: RepositoryId, pin: Hash, mount_path: &str) -> LinkReach {
+    LinkReach {
+        repository,
+        pin,
+        branch: branch_id(),
+        mount_path: mount_path.to_string(),
+        depth: 1,
+        leads: true,
+    }
+}
+
+/// A walk reaches a repository through a cycle once, reads each distinct pin of it, and never lists
+/// the root, even where a linked revision links it back.
+#[tokio::test]
+async fn a_link_walk_reads_each_pin_once_and_skips_the_root() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("making test stores");
+            let root = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            ));
+            let (a, b) = (RepositoryId::from([1; 16]), RepositoryId::from([2; 16]));
+            let a_unlinked = revision_linking(&root, a, &[]).await;
+            let b_pin = revision_linking(&root, b, &[("a", a, a_unlinked)]).await;
+            let a_pin = revision_linking(
+                &root,
+                a,
+                &[("b", b, b_pin), ("up", root.id, Hash::from_u64(7))],
+            )
+            .await;
+
+            let reached = collect_with_context(&root, vec![first_reach(a, a_pin, "a")])
+                .await
+                .expect("walking the links");
+
+            let listed: Vec<_> = reached.iter().map(|linked| linked.repository).collect();
+            assert_eq!(listed, [a, b]);
+            let a_paths: Vec<_> = reached[0]
+                .reaches
+                .iter()
+                .map(|r| r.mount_path.as_str())
+                .collect();
+            assert_eq!(a_paths, ["a", "a/b/a"]);
+            let a_pins: Vec<_> = reached[0].pins.iter().map(|walked| walked.pin).collect();
+            assert_eq!(a_pins, [a_pin, a_unlinked]);
+            assert_eq!(reached[0].pins[0].linked, [b]);
+            assert_eq!(reached[1].reaches[0].depth, 2);
+        })
+        .await;
+}
+
+/// A walk reads the revision a link at the depth limit pins, and goes no deeper.
+#[tokio::test]
+async fn a_link_walk_stops_at_the_depth_limit() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable_store, mutable_store, _execution) =
+                test_store_create().await.expect("making test stores");
+            let root = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            ));
+            let chain: Vec<RepositoryId> = (1..=lore_revision::state::MAX_LINK_DEPTH as u8 + 1)
+                .map(|byte| RepositoryId::from([byte; 16]))
+                .collect();
+            let mut pin = revision_linking(&root, chain[chain.len() - 1], &[]).await;
+            for pair in chain.windows(2).rev() {
+                pin = revision_linking(&root, pair[0], &[("next", pair[1], pin)]).await;
+            }
+
+            let reached = collect_with_context(&root, vec![first_reach(chain[0], pin, "first")])
+                .await
+                .expect("walking the links");
+
+            let listed: Vec<_> = reached.iter().map(|linked| linked.repository).collect();
+            assert_eq!(listed, chain[..lore_revision::state::MAX_LINK_DEPTH]);
+            let deepest = reached.last().expect("the deepest repository");
+            assert_eq!(deepest.pins.len(), 1, "the deepest pin must be read");
+            assert!(deepest.pins[0].linked.is_empty());
+        })
+        .await;
+}
+
+/// A revision of `linked` holding a directory for each of `names`, added in that order.
+async fn revision_with_directories(linked: &Arc<RepositoryContext>, names: &[&str]) -> Hash {
+    let state = State::new();
+    for &name in names {
+        add(&state, linked.clone(), ROOT_NODE, directory(name), name).await;
+    }
+    in_memory::commit(linked, &state, Hash::default(), branch_id()).await
+}
+
+/// A State linking `linked` at `a`, exposing `foo`, and at `b`, exposing `bar`, both of the
+/// revision `pin`, with the nodes of the two mounts.
+async fn mounting_foo_and_bar(
+    repository: &Arc<RepositoryContext>,
+    linked: &Arc<RepositoryContext>,
+    pin: Hash,
+) -> (Arc<State>, NodeID, NodeID) {
+    let pinned = in_memory::revision_state(linked, pin).await;
+    let state = State::new();
+    let mut mounts = Vec::new();
+    for (name, source) in [("a", "foo"), ("b", "bar")] {
+        let child = node_at(linked, &pinned, source).await;
+        let node = add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            lore_revision::node::Node {
+                child,
+                ..link_node(name, linked.id, pin)
+            },
+            name,
+        )
+        .await;
+        state
+            .link_add(
+                repository.clone(),
+                linked.id,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the mount");
+        mounts.push(node);
+    }
+    (state, mounts[0], mounts[1])
+}
+
+/// Repinning a repository rewrites the row and the node of every mount: a mount whose folder keeps
+/// its node in the new revision keeps it, and one whose node the new revision gives another folder
+/// exposes its folder again.
+#[tokio::test]
+async fn repinning_a_repository_moves_every_mount_to_the_folder_it_exposed() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["other", "bar", "foo"]).await;
+            let (old_state, new_state) = (
+                in_memory::revision_state(&linked, old).await,
+                in_memory::revision_state(&linked, new).await,
+            );
+            let old_foo = node_at(&linked, &old_state, "foo").await;
+            let (new_foo, new_bar) = (
+                node_at(&linked, &new_state, "foo").await,
+                node_at(&linked, &new_state, "bar").await,
+            );
+            assert_eq!(node_at(&linked, &new_state, "other").await, old_foo);
+            assert_eq!(node_at(&linked, &old_state, "bar").await, new_bar);
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, old).await;
+
+            let moved = repin_repository(&state, repository.clone(), linked.id, new, branch_id())
+                .await
+                .expect("repinning the repository");
+
+            assert_eq!(
+                moved
+                    .iter()
+                    .map(|mount| (mount.link_node, mount.child))
+                    .collect::<Vec<_>>(),
+                [(a, new_foo), (b, new_bar)]
+            );
+            for (mount, child) in [(a, new_foo), (b, new_bar)] {
+                let node = state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount");
+                assert_eq!((node.address.hash, node.child), (new, child));
+            }
+            let rows = state
+                .link_list(repository.clone())
+                .await
+                .expect("reading the registry");
+            assert!(rows.iter().all(|row| row.signature() == new));
+        })
+        .await;
+}
+
+/// Repinning a repository at a revision lacking the folder a mount exposes fails as an invalid
+/// path.
+#[tokio::test]
+async fn repinning_a_repository_refuses_a_revision_lacking_a_mounted_folder() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["foo"]).await;
+            let (state, _, _) = mounting_foo_and_bar(&repository, &linked, old).await;
+
+            let refused = repin_repository(&state, repository, linked.id, new, branch_id())
+                .await
+                .err()
+                .expect("bar is gone from the new revision");
+
+            assert!(refused.is_invalid_path(), "{refused:?}");
+        })
+        .await;
+}
+
+/// Repinning a repository whose mounts carry different flags fails before any mount moves.
+#[tokio::test]
+async fn repinning_a_repository_refuses_mounts_with_different_flags() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let old = revision_with_directories(&linked, &["foo", "bar"]).await;
+            let new = revision_with_directories(&linked, &["foo", "bar", "baz"]).await;
+            let (state, a, b) = mounting_foo_and_bar(&repository, &linked, old).await;
+            let row = state
+                .link_find(repository.clone(), linked.id, b)
+                .await
+                .expect("finding the mount's row");
+            state
+                .link_replace(
+                    repository.clone(),
+                    LinkReference {
+                        flags: LinkFlags::DisableAutoFollow.bits(),
+                        ..row
+                    },
+                )
+                .await
+                .expect("changing one mount's flags");
+
+            let refused = repin_repository(&state, repository.clone(), linked.id, new, branch_id())
+                .await
+                .err()
+                .expect("the mounts carry different flags");
+
+            assert!(refused.is_link_pins_diverge(), "{refused:?}");
+            for mount in [a, b] {
+                let node = state
+                    .node(repository.clone(), mount)
+                    .await
+                    .expect("reading the mount");
+                assert_eq!(node.address.hash, old);
+            }
+        })
+        .await;
+}
+
+/// A State of `repository` mounting `linked` at `a`, exposing `foo`, staged at a revision lacking
+/// `bar`, and at `b`, exposing `bar`, pinned at the revision before, as mounts that disagree from
+/// before every mount shared one pin can hold.
+async fn mounting_a_revision_lacking_a_mounted_folder(
+    repository: &Arc<RepositoryContext>,
+    linked: &Arc<RepositoryContext>,
+) -> Arc<State> {
+    let old = revision_with_directories(linked, &["foo", "bar"]).await;
+    let new = revision_with_directories(linked, &["foo"]).await;
+    let state = State::new();
+    for (name, source, pin, staged) in [("a", "foo", new, true), ("b", "bar", old, false)] {
+        let pinned = in_memory::revision_state(linked, pin).await;
+        let node = lore_revision::node::Node {
+            child: node_at(linked, &pinned, source).await,
+            ..link_node(name, linked.id, pin)
+        };
+        let node = if staged {
+            add(&state, repository.clone(), ROOT_NODE, node, name).await
+        } else {
+            state
+                .node_add(repository.clone(), ROOT_NODE, node, name)
+                .await
+                .expect("adding the mount")
+        };
+        state
+            .link_add(
+                repository.clone(),
+                linked.id,
+                BranchId::default(),
+                pin,
+                node,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("registering the mount");
+    }
+    state
+}
+
+/// A commit through a mount staged at a revision lacking the folder another mount exposes is
+/// refused before anything is committed, whether the parent mounts the repository or a repository
+/// the parent links does.
+#[tokio::test]
+async fn a_commit_refuses_a_staged_revision_lacking_a_folder_another_mount_exposes() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let linked = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let top_level =
+                mounting_a_revision_lacking_a_mounted_folder(&repository, &linked).await;
+
+            let holder = repository
+                .to_link_context(RepositoryId::from(uuid::Uuid::now_v7()))
+                .await;
+            let holder_state = mounting_a_revision_lacking_a_mounted_folder(&holder, &linked).await;
+            let staged = holder_state
+                .serialize(holder.clone(), &in_memory::token())
+                .await
+                .expect("storing the holder's staged state");
+            let nested = State::new();
+            let node = add(
+                &nested,
+                repository.clone(),
+                ROOT_NODE,
+                link_node("holder", holder.id, staged),
+                "holder",
+            )
+            .await;
+            nested
+                .link_add(
+                    repository.clone(),
+                    holder.id,
+                    BranchId::default(),
+                    staged,
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the holder");
+
+            for state in [top_level, nested] {
+                let refused =
+                    lore_revision::commit::reject_unmovable_link_mounts(&repository, &state)
+                        .await
+                        .expect_err("bar is gone from the staged revision");
+                assert!(refused.is_invalid_arguments(), "{refused:?}");
+            }
+        })
+        .await;
+}
+
+/// Mounts a link to `link_id` at `<directory_name>/lib` in `state` and registers it.
+async fn mount_registered_link(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    directory_name: &str,
+    link_id: RepositoryId,
+) -> NodeID {
+    let parent = add(
+        state,
+        repository.clone(),
+        ROOT_NODE,
+        directory(directory_name),
+        directory_name,
+    )
+    .await;
+    let node = add(
+        state,
+        repository.clone(),
+        parent,
+        link_node("lib", link_id, Hash::from_u64(0x11)),
+        "lib",
+    )
+    .await;
+    state
+        .link_add(
+            repository.clone(),
+            link_id,
+            tracking(),
+            Hash::from_u64(0x11),
+            node,
+            LinkFlags::NoFlags,
+        )
+        .await
+        .expect("registering the link");
+    node
+}
+
+/// A link staged for add and one staged for delete both count as mounts a path overlaps, the
+/// latter staged as `lore link remove` stages it: its node staged for delete and its row gone
+/// from the staged registry, so only the current registry still lists it.
+#[tokio::test]
+async fn overlapping_link_mount_reports_staged_links() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let (immutable, mutable, _execution) =
+                test_store_create().await.expect("making test stores");
+            let repository = in_memory::repository(immutable, mutable);
+            let removed_id = RepositoryId::from([2; 16]);
+
+            // Both states build `gone` alike, so its link node has one ID in each.
+            let state_current = State::new();
+            mount_registered_link(&state_current, &repository, "gone", removed_id).await;
+            let state_staged = State::new();
+            let removed =
+                mount_registered_link(&state_staged, &repository, "gone", removed_id).await;
+            state_staged
+                .node_mark(
+                    &repository,
+                    removed,
+                    Mark::staged(NodeFlags::StagedDelete, true),
+                )
+                .await
+                .expect("staging the delete of the link node");
+            state_staged
+                .link_remove(repository.clone(), removed_id, removed)
+                .await
+                .expect("removing the link from the staged registry");
+            mount_registered_link(&state_staged, &repository, "vendor", merged()).await;
+
+            for (path, expected) in [
+                ("vendor", Some("vendor/lib")),
+                ("gone/lib/x", Some("gone/lib")),
+                ("gone", Some("gone/lib")),
+                ("other", None),
+            ] {
+                let path = RelativePath::new_from_initial_path(path).expect("the path");
+                let found = overlapping_link_mount(
+                    &state_current,
+                    &state_staged,
+                    repository.clone(),
+                    &path,
+                )
+                .await
+                .expect("listing the link mounts");
+                assert_eq!(
+                    found.as_ref().map(RelativePath::as_str),
+                    expected,
+                    "the link mount overlapping {path}"
+                );
             }
         })
         .await;

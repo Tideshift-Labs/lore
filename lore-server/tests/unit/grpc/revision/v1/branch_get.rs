@@ -14,6 +14,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -53,6 +54,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
 
     let latest = branch_push::push(
         repository_context.clone(),
+        None,
         main,
         state_hash,
         crate::util::test_support::PUSH_ANY,
@@ -124,6 +126,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -165,6 +168,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let latest = create_test_branch(repository_context, branch_id).await;
 
@@ -201,6 +205,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -236,6 +241,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context.clone(), branch_id).await;
             branch::delete(repository_context, branch_id)
@@ -563,6 +569,7 @@ mod forwarded_request {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 
@@ -599,6 +606,7 @@ async fn get_by_id_fresh_branch_reports_protected_false() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         create_test_branch(repository_context, branch_id).await;
 
@@ -633,6 +641,7 @@ async fn get_by_id_protected_branch_reports_protected_true() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         create_test_branch(repository_context.clone(), branch_id).await;
         branch::protect(repository_context, branch_id)
@@ -670,6 +679,7 @@ async fn get_by_id_branch_after_protect_then_unprotect_reports_protected_false()
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         create_test_branch(repository_context.clone(), branch_id).await;
         branch::protect(repository_context.clone(), branch_id)
@@ -731,6 +741,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             for request in [
@@ -759,6 +770,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             for request in [
@@ -789,6 +801,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             let response = get(
@@ -816,6 +829,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             for request in [
@@ -844,6 +858,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             let response = get(
@@ -873,6 +888,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             let response = get(
@@ -925,6 +941,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             let recording = RecordingMutableStore::wrap(mutable.clone(), log.clone());
@@ -972,6 +989,7 @@ mod refresh_generation {
                 immutable.clone(),
                 mutable.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(context, branch_id).await;
             for (label, request) in [
@@ -1007,6 +1025,7 @@ mod refresh_generation {
             immutable.clone(),
             mutable.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         let hook_context = context.clone();
         let hook: ReadHook = Arc::new(move || {
@@ -1201,6 +1220,7 @@ mod store_read_failures {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_test_branch(repository_context, branch_id).await;
 
@@ -1293,6 +1313,7 @@ mod store_read_failures {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                lore_revision::state::allow_all_repositories(),
             ));
             create_unpushed_branch(repository_context, branch_id).await;
 

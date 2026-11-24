@@ -7,6 +7,7 @@ use lore_macro::LoreArgs;
 use lore_revision::global::GlobalConfig;
 use lore_revision::instance::list_instances;
 use lore_revision::repository::RepositoryError;
+use lore_revision::repository::StoreConfig;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
 use lore_revision::shared_store::LoreSharedStoreListEventData;
 use lore_revision::shared_store::LoreSharedStoreListItem;
@@ -36,7 +37,18 @@ pub struct LoreSharedStoreCreateArgs {
 
     /// Set this as the default shared store in the global config
     pub make_default: u8,
+
+    /// Bytes the store holds before compaction reclaims space; 0 uses the default of 10 GiB
+    pub max_size: u64,
+
+    /// Fragments the store holds before eviction removes some; 0 uses the default of 2000000. The
+    /// periodic eviction pass treats a value below 1048576 as 1048576
+    pub max_capacity: u64,
 }
+
+// Locks the C ABI layout, as `LoreStorageOpenArgs` does: remote_url and path (16 bytes each),
+// make_default with 7 bytes of padding, max_size and max_capacity.
+const _: () = assert!(std::mem::size_of::<LoreSharedStoreCreateArgs>() == 56);
 
 /// Creates a new shared store at the specified path
 ///
@@ -58,12 +70,12 @@ pub struct LoreSharedStoreCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::GlobalStoreCreate`](crate::interface::LoreEvent::GlobalStoreCreate) | Emitted on success with the path of the newly created store |
-pub async fn create(
+pub fn create(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, create_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, create_local)
 }
 
 fn create_local(
@@ -84,8 +96,21 @@ fn create_local(
             .unwrap_or(raw_remote_url)
             .to_owned();
 
-        lore_revision::shared_store::create_shared_store(path, remote_url, args.make_default != 0)
-            .await
+        let mut store_config = StoreConfig::client_default();
+        if args.max_size != 0 {
+            store_config.max_size = Some(args.max_size as usize);
+        }
+        if args.max_capacity != 0 {
+            store_config.max_capacity = Some(args.max_capacity as usize);
+        }
+
+        lore_revision::shared_store::create_shared_store(
+            path,
+            remote_url,
+            args.make_default != 0,
+            store_config,
+        )
+        .await
     })
 }
 
@@ -115,12 +140,12 @@ pub struct LoreSharedStoreInfoArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::SharedStoreInfo`](crate::interface::LoreEvent::SharedStoreInfo) | Emitted on success with the path of the configured default shared store |
-pub async fn info(
+pub fn info(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, info_local)
 }
 
 async fn info_local(
@@ -191,12 +216,12 @@ pub struct LoreSharedStoreListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::SharedStoreList`](crate::interface::LoreEvent::SharedStoreList) | Emitted on success with every registered shared store, and the instances using each when `include_instances` is set |
-pub async fn list(
+pub fn list(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_local)
 }
 
 async fn list_local(
@@ -263,12 +288,12 @@ pub struct LoreSharedStoreSetUseAutomaticallyArgs {
 /// | [`UrcEvent::Log`](crate::interface::UrcEvent::Log) | Diagnostic messages throughout execution |
 /// | [`UrcEvent::Complete`](crate::interface::UrcEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`UrcEvent::End`](crate::interface::UrcEvent::End) | Always emitted after `Complete` to signal callback termination |
-pub async fn set_use_automatically(
+pub fn set_use_automatically(
     globals: LoreGlobalArgs,
     args: LoreSharedStoreSetUseAutomaticallyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, set_use_automatically_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, set_use_automatically_local)
 }
 
 async fn set_use_automatically_local(

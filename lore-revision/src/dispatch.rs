@@ -27,6 +27,28 @@ use lore_transport::outcome::GrpcRpc;
 use lore_transport::outcome::with_dispatch_attempt;
 
 use crate::lore::RepositoryId;
+
+/// The error of a dispatch an attempt journals: any call's [`ProtocolError`], or a branch push's
+/// [`BranchPushError`](lore_transport::BranchPushError), which keeps the remote's
+/// `BranchAdvanced` refusal. Only an unknown outcome leaves the attempt unresolved; every other
+/// error resolves it not applied.
+pub(crate) trait AttemptError: From<ProtocolError> {
+    /// Whether the dispatch's answer was lost, so its effect is not known.
+    fn outcome_unknown(&self) -> bool;
+}
+
+impl AttemptError for ProtocolError {
+    fn outcome_unknown(&self) -> bool {
+        self.is_outcome_unknown()
+    }
+}
+
+impl AttemptError for lore_transport::BranchPushError {
+    fn outcome_unknown(&self) -> bool {
+        self.is_outcome_unknown()
+    }
+}
+
 /// Dispatch one irreversible submutation under an attempt identity of its own (WP-120).
 ///
 /// **One id per dispatch, never one per operation.** A single push reaches several
@@ -64,14 +86,15 @@ use crate::lore::RepositoryId;
 /// appears, not before: an attempt record no reconciler ever reads is a durable write that stays
 /// unresolved forever.
 #[lore_macro::test_pub]
-pub(crate) async fn under_own_attempt<T, Fut>(
+pub(crate) async fn under_own_attempt<T, E, Fut>(
     attempts: Option<&Arc<dyn AttemptStore>>,
     repository: RepositoryId,
     rpc: GrpcRpc,
     dispatch: Fut,
-) -> Result<T, ProtocolError>
+) -> Result<T, E>
 where
-    Fut: Future<Output = Result<T, ProtocolError>>,
+    E: AttemptError,
+    Fut: Future<Output = Result<T, E>>,
 {
     if lore_transport::current_caller_operation().is_some() {
         return under_named_attempt(attempts, AttemptId::new(), repository, rpc, dispatch).await;
@@ -103,21 +126,22 @@ where
 /// reintroduces the defect [`under_own_attempt`] documents: the server files several receipts
 /// under one id and `attempt_receipt_get` answers `NotFound` for all of them.
 #[lore_macro::test_pub]
-pub(crate) async fn under_named_attempt<T, Fut>(
+pub(crate) async fn under_named_attempt<T, E, Fut>(
     attempts: Option<&Arc<dyn AttemptStore>>,
     attempt: AttemptId,
     repository: RepositoryId,
     rpc: GrpcRpc,
     dispatch: Fut,
-) -> Result<T, ProtocolError>
+) -> Result<T, E>
 where
-    Fut: Future<Output = Result<T, ProtocolError>>,
+    E: AttemptError,
+    Fut: Future<Output = Result<T, E>>,
 {
     if let Some(context) = lore_transport::current_caller_operation() {
         if context.repository() != repository {
-            return Err(ProtocolError::internal(
+            return Err(E::from(ProtocolError::internal(
                 "managed operation repository mismatch",
-            ));
+            )));
         }
         // The transport request producer owns canonical intent, journaling and settlement.
         return with_dispatch_attempt(attempt, dispatch).await;
@@ -134,7 +158,8 @@ where
                 recorded_at_unix_millis: unix_millis_now(),
                 receipt: None,
             })
-            .await?;
+            .await
+            .map_err(E::from)?;
     }
 
     let result = with_dispatch_attempt(attempt, dispatch).await;
@@ -142,11 +167,11 @@ where
     if let Some(store) = attempts {
         let resolution = match &result {
             Ok(_) => Some(AttemptResolution::Applied),
-            Err(ProtocolError::OutcomeUnknown(_)) => None,
+            Err(err) if err.outcome_unknown() => None,
             Err(_) => Some(AttemptResolution::NotApplied),
         };
         if let Some(resolution) = resolution {
-            store.resolve(&attempt, resolution).await?;
+            store.resolve(&attempt, resolution).await.map_err(E::from)?;
         }
     }
     result

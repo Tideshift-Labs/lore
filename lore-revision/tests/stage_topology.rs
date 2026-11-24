@@ -578,7 +578,7 @@ mod tests {
             fixture.write_file("nested/conflict.txt", b"mine\n");
             fixture.stage_and_commit_all("mine").await;
 
-            let unresolved_revision = branch::merge::merge_start(
+            let unresolved_revision = Box::pin(branch::merge::merge_start(
                 fixture.repository.clone(),
                 &fixture.write_token,
                 source_branch,
@@ -589,7 +589,7 @@ mod tests {
                     scope: branch::merge::MergeScope::MainOnly,
                     inherit_metadata: lore_revision::metadata::MetadataInherit::default(),
                 },
-            )
+            ))
             .await
             .expect("start conflicting merge");
             let unresolved = state_at(&fixture, unresolved_revision).await;

@@ -745,9 +745,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     let (runtime_raw, runtime_connection) = tokio_postgres::connect(
         &format!(
             "postgresql://object_dispatch_retention_runtime@{}?sslmode=disable",
-            url.split_once('@')
-                .map(|(_, rest)| rest)
-                .unwrap_or_default()
+            url.split_once('@').map_or_default(|(_, rest)| rest)
         ),
         tokio_postgres::NoTls,
     )

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
-use lore::interface::LoreEventCallback;
 use lore_base::error::RepositoryNotFound;
 use lore_revision::event::EventError;
 use lore_revision::repository::RepositoryError;
@@ -16,8 +15,11 @@ use lore::call::*;
 use lore_base::error::NotFound;
 use lore_error_set::Location;
 use lore_error_set::prelude::*;
-use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreGlobalArgs;
+use test_support::completes;
+use test_support::has_error_event;
+use test_support::recording_callback;
+use test_support::take_recorded;
 
 // FORK-LOCAL (Tideshift, WP-120): the caller-supplied attempt identity tests, moved from
 // `src/call.rs` with the upstream unit-test relocation.
@@ -109,58 +111,27 @@ enum SampleError {
 
 impl EventError for SampleError {}
 
-// The full event a callback receives, kept verbatim so a test can read the
-// `Complete` detail (code, message, trace) a real consumer would see.
-#[derive(Clone)]
-enum CapturedEvent {
-    Error,
-    Complete(lore_revision::event::LoreCompleteEventData),
-    Other,
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Error(_) => Self::Error,
-            LoreEvent::Complete(data) => Self::Complete(data.clone()),
-            _ => Self::Other,
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
 #[tokio::test]
 async fn failing_op_completes_with_error_code_and_no_error_event() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "failing_op",
         |()| async move { Err::<(), SampleError>(NotFound.into()) },
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
 
     assert!(
-        !events.iter().any(|e| matches!(e, CapturedEvent::Error)),
+        !has_error_event(&events),
         "no Error event must be emitted on terminal failure"
     );
 
     // Exactly one `Complete` event.
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     // The status holds the error code (79 for `NotFound`) and the detail is
@@ -179,10 +150,10 @@ async fn failing_op_completes_with_error_code_and_no_error_event() {
 
 #[tokio::test]
 async fn succeeding_op_completes_with_status_zero_and_empty_detail() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "succeeding_op",
         |()| async move { Ok::<(), SampleError>(()) },
@@ -191,14 +162,8 @@ async fn succeeding_op_completes_with_status_zero_and_empty_detail() {
 
     assert_eq!(status, 0);
 
-    let events = sink.lock().unwrap().clone();
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let events = take_recorded(&sink);
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     let data = &completes[0];
@@ -225,24 +190,18 @@ async fn missing_repository_completes_with_real_ffi_code() {
         ..LoreGlobalArgs::default()
     };
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = repository_call_read(
         globals,
-        make_callback(sink.clone()),
+        callback,
         (),
         "missing_repo",
         |_repo, ()| async move { Ok::<(), SampleError>(()) },
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
-    let completes: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
-        .collect();
+    let events = take_recorded(&sink);
+    let completes = completes(&events);
     assert_eq!(completes.len(), 1, "exactly one Complete event");
 
     let expected_code = RepositoryError::from(RepositoryNotFound {
@@ -265,10 +224,10 @@ async fn missing_repository_completes_with_real_ffi_code() {
 
 #[tokio::test]
 async fn failing_op_lets_consumer_read_trace_locations() {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let _status = no_repository_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         (),
         "trace_op",
         |()| async move {
@@ -286,13 +245,10 @@ async fn failing_op_lets_consumer_read_trace_locations() {
     )
     .await;
 
-    let events = sink.lock().unwrap().clone();
-    let data = events
-        .iter()
-        .find_map(|e| match e {
-            CapturedEvent::Complete(data) => Some(data.clone()),
-            _ => None,
-        })
+    let events = take_recorded(&sink);
+    let data = completes(&events)
+        .into_iter()
+        .next()
         .expect("a Complete event must be emitted");
 
     // The pushed location is reconstructable from the trace; with
@@ -577,4 +533,72 @@ async fn an_exclusive_call_plans_for_an_instance_missing_its_instance_file() {
     let planned = planned.lock().unwrap().expect("the plan runs");
     assert!(!planned.is_zero(), "the plan sees the recovered ID");
     assert!(root.join(".lore").join("instance").is_file());
+}
+
+/// A repository call at a path inside a FUSE mount whose external directory can't be examined
+/// fails before any command runs, delivering one `Complete` that carries the error, for a read
+/// call and a write call alike. The instance's external directory, in the binary's sandbox, has
+/// mode `0o000`, so its lookup fails with a permission error and touches no other test's.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_call_inside_a_mount_with_an_unknown_external_directory_completes_with_its_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    use lore_revision::fs::fuse::discover::test_util::fuse_lore_entry;
+    use lore_revision::fs::fuse::discover::test_util::plant_table;
+    use lore_revision::instance::InstanceId;
+
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let instance_id = InstanceId::generate();
+    let external = lore_revision::global::get_global_data_dir()
+        .expect("the sandbox's global data directory")
+        .join("external")
+        .join(instance_id.text_encoding());
+    std::fs::create_dir_all(&external).expect("make the external directory");
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o000))
+        .expect("make it unreadable");
+    let mount = lore_base::test_util::TempDir::new("lore-call-unknown-external-");
+    let _planted = plant_table(mount.path(), fuse_lore_entry(mount.path(), instance_id));
+    let globals = || LoreGlobalArgs {
+        repository_path: mount.path().join("sub").display().to_string().into(),
+        ..LoreGlobalArgs::default()
+    };
+
+    let (read_sink, read_callback) = recording_callback();
+    let read = repository_call_read(
+        globals(),
+        read_callback,
+        (),
+        "unknown_read",
+        |_, ()| async { Ok::<(), SampleError>(()) },
+    )
+    .await;
+    let (write_sink, write_callback) = recording_callback();
+    let write = repository_call_write(
+        globals(),
+        write_callback,
+        (),
+        "unknown_write",
+        |_, _, ()| async { Ok::<(), SampleError>(()) },
+    )
+    .await;
+
+    std::fs::set_permissions(&external, std::fs::Permissions::from_mode(0o700))
+        .expect("make it readable again");
+    std::fs::remove_dir(&external).expect("remove the external directory");
+    for (status, sink) in [(read, read_sink), (write, write_sink)] {
+        let events = take_recorded(&sink);
+        let completes = completes(&events);
+        assert_eq!(completes.len(), 1, "exactly one Complete event");
+        assert_eq!(
+            status, -1,
+            "the lookup's internal error, not a missing repository"
+        );
+        assert_eq!(completes[0].status, status);
+        assert_eq!(completes[0].error.error_code, status);
+        assert!(!has_error_event(&events));
+    }
 }

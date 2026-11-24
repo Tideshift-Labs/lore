@@ -9,6 +9,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::RepositoryMetadataSetRequest;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
@@ -233,6 +234,7 @@ async fn seed_metadata_blob(
         immutable,
         mutable,
         Context::from(REPOSITORY_ID).into(),
+        allow_all_repositories(),
     ));
     lore_revision::repository::metadata_store(
         repo_ctx,
@@ -402,6 +404,7 @@ mod admin_required {
                 immutable.clone(),
                 mutable.clone(),
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             )),
             RepositoryMetadata {
                 name: "acme".to_string(),
@@ -448,6 +451,7 @@ mod admin_required {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         )))
         .await
         .expect("metadata must still be readable");
@@ -556,6 +560,7 @@ mod admin_required {
                 immutable.clone(),
                 mutable.clone(),
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             )),
             RepositoryMetadata {
                 name: "acme".to_string(),
@@ -602,6 +607,7 @@ mod admin_required {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         )))
         .await
         .expect("metadata must still be readable");

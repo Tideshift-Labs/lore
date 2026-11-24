@@ -9,6 +9,7 @@ use lore_proto::RepositoryQueryRequest;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -19,6 +20,7 @@ use tonic::Code;
 use tonic::Request;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::RefusingAuthorizer;
 use crate::store::test_support::test_store_create;
 
 /// Denies every request.
@@ -48,6 +50,7 @@ async fn seed_repository(
         immutable_store,
         mutable_store,
         id,
+        allow_all_repositories(),
     ));
     let metadata_hash = repository::metadata_store(
         repository.clone(),
@@ -124,11 +127,13 @@ impl RepositoryAuthorizer for TimedOutRepositoryAuthorizer {
     }
 }
 
-/// FORK-LOCAL (Tideshift): non-disclosure. An auth timeout answers exactly
-/// like a deny (`NotFound`, same message), by id and by name: a caller
-/// without access must not tell a timeout from a deny.
+/// FORK-LOCAL (Tideshift): the fork's auth timeout is a failed check under
+/// upstream f2013946, not a denial. It answers `INTERNAL`, by id and by name,
+/// where a deny answers `NOT_FOUND`. Before f2013946 the fork answered it as
+/// `NOT_FOUND` (non-disclosure); upstream's ruling that a failed check reaches
+/// the client as a failure replaces that.
 #[tokio::test]
-async fn an_auth_timeout_answers_the_same_not_found_as_a_deny() {
+async fn an_auth_timeout_answers_internal_not_the_deny_not_found() {
     let id = random::<RepositoryId>();
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
@@ -154,13 +159,67 @@ async fn an_auth_timeout_answers_the_same_not_found_as_a_deny() {
                 )
                 .await
                 .expect_err("a timed-out check must fail");
-                assert_eq!(timed_out.code(), Code::NotFound, "{timed_out:?}");
-                assert_eq!(timed_out.code(), denied.code());
-                assert_eq!(timed_out.message(), denied.message());
-                assert!(
-                    !lore_server::authnz::auth::is_auth_unavailable(&timed_out),
-                    "{timed_out:?}"
-                );
+                assert_eq!(denied.code(), Code::NotFound, "{denied:?}");
+                assert_eq!(timed_out.code(), Code::Internal, "{timed_out:?}");
+            }
+        })
+        .await;
+}
+
+/// A check that could not be made answers its failure, by ID and by name,
+/// rather than `NOT_FOUND`.
+#[tokio::test]
+async fn failed_authorization_check_answers_its_failure() {
+    let id = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
+            for (failure, code) in [
+                (
+                    Status::resource_exhausted("rate limited"),
+                    Code::ResourceExhausted,
+                ),
+                (Status::internal("failed"), Code::Internal),
+            ] {
+                for request in [query_by_id(id), query_by_name("repo")] {
+                    let err = handler(
+                        request,
+                        Arc::new(RefusingAuthorizer(failure.clone())),
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .await
+                    .expect_err("a failed check must fail the query");
+                    assert_eq!(err.code(), code, "{err:?}");
+                }
+            }
+        })
+        .await;
+}
+
+/// A permitted lookup of a repository that does not exist still answers
+/// `NOT_FOUND`, by ID and by name.
+#[tokio::test]
+async fn a_missing_repository_answers_not_found() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            for request in [
+                query_by_id(random::<RepositoryId>()),
+                query_by_name("missing"),
+            ] {
+                let err = handler(
+                    request,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("a missing repository must not resolve");
+                assert_eq!(err.code(), Code::NotFound, "{err:?}");
             }
         })
         .await;
@@ -401,6 +460,7 @@ pub(crate) mod authz_test_support {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let hash = repository::metadata_store(
             repository.clone(),
@@ -535,6 +595,7 @@ mod fork_tests {
             immutable,
             faulty_mutable,
             repository_id,
+            allow_all_repositories(),
         ));
 
         let data = repository_query_id(repository, repository_id, None, None)

@@ -26,6 +26,7 @@ use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -206,6 +207,7 @@ async fn push_linked_revision(
         .expect("serialize state");
     branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -299,6 +301,7 @@ async fn identical_revisions_return_header_only() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev = push_revision(
@@ -356,6 +359,7 @@ async fn same_branch_two_way_diff_streams_changes_no_base() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev1 = push_revision(
@@ -436,6 +440,7 @@ async fn branch_point_of_other_is_two_way() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let main_rev = push_revision(
@@ -521,6 +526,7 @@ async fn three_way_diff_populates_base_and_emits_conflict() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let main_rev = push_revision(
@@ -625,6 +631,7 @@ async fn unknown_signature_returns_not_found() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(&repository_context, main, Hash::default(), 1, &[]).await
@@ -666,6 +673,7 @@ async fn zero_from_signature_diffs_as_two_way_showing_all_adds() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(
@@ -739,6 +747,7 @@ async fn zero_to_signature_diffs_as_two_way_showing_all_adds() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_branch(&repository_context, "main", vec![]).await;
             push_revision(
@@ -844,6 +853,7 @@ async fn identifier_query_resolves_through_diff() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_branch(&repository_context, "main", vec![]).await;
         let rev1 = push_revision(
@@ -917,6 +927,7 @@ async fn three_way_clean_merge_has_base_but_no_conflicts() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // Common ancestor on main; two sibling branches change
         // disjoint files (no overlap → no conflict).
@@ -1085,6 +1096,7 @@ async fn diff_over_merge_history(
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (b_rev, merge_rev) = push_branch_merged_into_main(&repository_context).await;
 
@@ -1436,6 +1448,7 @@ async fn touched_link_is_announced_to_every_caller() {
             immutable_store.clone(),
             mutable_store.clone(),
             linked_id,
+            allow_all_repositories(),
         ));
         let (pin, sub) = write_linked_revision(&linked, 1, b"v1").await;
         let (same_content, _) = write_linked_revision(&linked, 2, b"v1").await;
@@ -1490,6 +1503,7 @@ async fn touched_link_is_announced_to_every_caller() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let revisions = push_link_pins(&repository_context, linked_id, pins).await;
             for &(from, to) in diffs {

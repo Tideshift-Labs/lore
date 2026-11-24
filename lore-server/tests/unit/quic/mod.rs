@@ -3,6 +3,7 @@
 
 mod faults;
 mod initial_cwnd;
+mod quinn;
 mod replication_store_service;
 mod storage_service;
 mod storage_service_v4;

@@ -42,6 +42,7 @@ fn service_with(
 ) -> LoreRevisionV1Service {
     LoreRevisionV1Service::new(
         immutable_store,
+        None,
         mutable_store,
         Arc::new(MockNotificationSender::new()),
         Arc::new(HookDispatcher::empty()),

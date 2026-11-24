@@ -4,7 +4,7 @@ import os
 
 import pytest
 from error_types import LOCAL_MODIFICATIONS, LocalChanges
-from link_helpers import build_nested_link_repos_at, link_pin
+from link_helpers import build_nested_link_repos_at, fail_unless_holds, link_pin
 from lore_parsers import parse_status_json
 from test_utils import to_posix, unstaged_entries, working_tree_files
 
@@ -525,6 +525,39 @@ def test_nested_link_commit_scoped(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_nested_link_commit_keeps_the_intermediate_links_directories(new_lore_repo):
+    """`commit --link <nested-path>` commits the intermediate link's staged deletion alone.
+
+    The intermediate link's commit walks its tree from its root rather than from its mount,
+    so it must not read its directories as gone from the working tree.
+    """
+    repo_a, _repo_b, _repo_c, b_mount, nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "vendor/c"
+    )
+    removed = f"{b_mount}/b-data/removed.txt"
+    kept = f"{b_mount}/b-data/kept.txt"
+    repo_a.write_files({removed: "removed\n", kept: "kept\n"})
+    repo_a.stage(scan=True)
+    repo_a.commit("Add B's data")
+    repo_a.push()
+
+    repo_a.remove_file(removed)
+    repo_a.stage([removed])
+    inner_file = f"{nested_mount}/c-data/inner.txt"
+    repo_a.write_files({inner_file: "nested change\n"})
+    repo_a.stage([inner_file])
+    output = repo_a.commit("Scoped nested commit", link=nested_mount)
+    assert "Commit succeeded" in output, output
+    repo_a.commit("Record the scoped nested commit on the parent")
+    repo_a.push()
+
+    fresh = repo_a.clone()
+    assert fresh.file_exists(kept), "the rest of B's directory survives a fresh clone"
+    assert not fresh.file_exists(removed), "B's staged deletion reaches a fresh clone"
+    assert fresh.compare_file(repo_a, inner_file), "C's change reaches a fresh clone"
+
+
+@pytest.mark.smoke
 def test_nested_link_stage_delete_deep(new_lore_repo):
     """Staging a DELETE of a file two levels deep works.
 
@@ -626,12 +659,12 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
         new_lore_repo, "vendor/b", "vendor/c"
     )
 
-    nested_before = sorted(repo_c.branch_list().remote_branches)
+    nested_before = sorted(repo_c.branch_list(remote=True).remote_branches)
 
     repo_a.branch_create("feature")
     repo_a.push()
-    assert repo_b.branch_list().has_remote_branch("feature"), (
-        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list()}"
+    assert repo_b.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list(remote=True)}"
     )
 
     repo_a.branch_switch("main")
@@ -640,9 +673,32 @@ def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
     assert repo_c.get_id() in output, (
         f"Expected the cascade to reach nested link {repo_c.get_id()}, got: {output}"
     )
-    assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
-        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
+    assert sorted(repo_c.branch_list(remote=True).remote_branches) == nested_before, (
+        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list(remote=True)}"
     )
+
+
+@pytest.mark.smoke
+def test_merge_lands_an_edit_inside_a_nested_link(new_lore_repo):
+    """A branch editing a file inside a nested link and one inside its outer
+    link merges both edits."""
+    repo_a, _repo_b, _repo_c, b_mount, nested = build_nested_link_repos_at(
+        new_lore_repo, "vendor/b", "deps/c"
+    )
+    repo_a.branch_create("feature")
+    outer_path, outer_edit = f"{b_mount}/b-root.txt", "b on feature\n"
+    nested_path, nested_edit = f"{nested}/c-data/inner.txt", "c on feature\n"
+    repo_a.write_commit_push(
+        "Edit both links", {outer_path: outer_edit, nested_path: nested_edit}
+    )
+
+    repo_a.branch_switch("main")
+    repo_a.branch_merge_start("feature", message="Merge feature")
+    repo_a.push()
+
+    fail_unless_holds(repo_a, outer_path, outer_edit)
+    with repo_a.open_file(nested_path) as f:
+        assert f.read() == nested_edit, "the merge must land the nested edit"
 
 
 @pytest.mark.smoke

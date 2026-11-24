@@ -282,6 +282,7 @@ mod quic_strict_admission_tests {
                             inflight_limit: 800,
                             handler_timeout: None,
                             permit_timeout: None,
+                            slow_send_threshold: None,
                         },
                     )) as Box<dyn StreamDataHandler>
                 }),
@@ -363,7 +364,7 @@ mod quic_strict_admission_tests {
                 GrpcServerBuilder::new()
                     .with_environment(environment)
                     .with_feature(FeatureSettings::default())
-                    .with_immutable_store(immutable.clone(), immutable)
+                    .with_immutable_store(immutable.clone(), immutable, None)
                     .with_mutable_store(mutable)
                     .with_lock_store(None)
                     .with_domain_context(None)
@@ -448,6 +449,7 @@ mod quic_strict_admission_tests {
             "",
             &token(partition),
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await?;
         connection.session(partition, "wp120-strict-quic").await

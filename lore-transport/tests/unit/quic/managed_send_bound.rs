@@ -72,6 +72,7 @@ async fn connect(peer: &Peer) -> Arc<StorageClient> {
         partition(),
         &Arc::new(SuppliedCredentials::default()),
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect to the scripted peer")
@@ -1023,6 +1024,7 @@ async fn authenticated_client(peer: &Peer) -> Arc<StorageClient> {
         partition(),
         &Arc::new(SuppliedCredentials::new(&unsigned_jwt(HEAL_IDENTITY), "")),
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect with a stub authentication")

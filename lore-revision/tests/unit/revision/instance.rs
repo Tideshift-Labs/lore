@@ -26,6 +26,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataInherit;
+use lore_revision::node::Node;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
@@ -108,6 +109,11 @@ pub(super) fn write(instance: &Instance, path: &str, content: &str) {
     test_file_write(&absolute, content.as_bytes());
 }
 
+/// `path` in the working tree, as a command names it.
+pub(super) fn named(instance: &Instance, path: &str) -> LoreArray<LoreString> {
+    LoreArray::from_vec(vec![LoreString::from(instance.path.join(path).as_path())])
+}
+
 /// Every file under `root` by its path, spelled as the file system holds it, with its content.
 pub(super) fn working_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut files = BTreeMap::new();
@@ -151,6 +157,44 @@ pub(super) fn renamed(
         .collect()
 }
 
+/// `files` with `renames` made one after another, as [`renamed`] makes each.
+pub(crate) fn renamed_all(
+    files: &BTreeMap<String, Vec<u8>>,
+    renames: &[(&str, &str)],
+) -> BTreeMap<String, Vec<u8>> {
+    renames
+        .iter()
+        .fold(files.clone(), |files, (from, to)| renamed(&files, from, to))
+}
+
+/// The edits of a branch renaming a directory only in case together with a move or a case-only
+/// rename below it, or a move into it, and the renames that carry the tree it starts from to what
+/// the branch holds.
+pub(crate) type RenamingBelow = ([Edit; 2], [(&'static str, &'static str); 2]);
+
+/// The [`RenamingBelow`]s of a tree holding `Dir/Sub/c.txt` and `Top.txt`, which the merge, sync
+/// and FUSE merge tests start from.
+pub(crate) const RENAMES_BELOW: [RenamingBelow; 3] = [
+    (
+        [
+            Edit::Move("Dir", "dir"),
+            Edit::Move("dir/Sub/c.txt", "dir/Sub/d.txt"),
+        ],
+        [("Dir", "dir"), ("dir/Sub/c.txt", "dir/Sub/d.txt")],
+    ),
+    (
+        [
+            Edit::Move("Dir/Sub", "Dir/sub"),
+            Edit::Move("Top.txt", "Dir/sub/Top.txt"),
+        ],
+        [("Dir/Sub", "Dir/sub"), ("Top.txt", "Dir/sub/Top.txt")],
+    ),
+    (
+        [Edit::Move("Dir", "dir"), Edit::Move("dir/Sub", "dir/sub")],
+        [("Dir", "dir"), ("dir/Sub", "dir/sub")],
+    ),
+];
+
 /// Stages `path` and everything below it, taking a name that differs from the tree's only in case
 /// as a rename.
 pub(super) async fn stage(instance: &Instance, path: &Path) {
@@ -188,7 +232,7 @@ pub(super) async fn stage_and_commit(instance: &Instance, path: &Path, message: 
 
 /// An edit to the working tree.
 #[derive(Clone, Copy, Debug)]
-pub(super) enum Edit {
+pub(crate) enum Edit {
     /// Renames the first path to the second.
     Move(&'static str, &'static str),
     /// Writes the content to the file at the path.
@@ -280,6 +324,20 @@ pub(super) async fn revision_state(instance: &Instance, revision: Hash) -> Arc<S
     State::deserialize(instance.repository.clone(), revision)
         .await
         .expect("Failed to read the revision")
+}
+
+/// The node `revision` holds at `path`.
+pub(super) async fn node_at(instance: &Instance, revision: Hash, path: &str) -> Node {
+    let state = revision_state(instance, revision).await;
+    let node = state
+        .find_node_link(instance.repository.clone(), path)
+        .await
+        .expect("Failed to find the path")
+        .node;
+    state
+        .node(instance.repository.clone(), node)
+        .await
+        .expect("Failed to read the node")
 }
 
 /// Merges branch `name` into the current one, answering whether the merge committed.

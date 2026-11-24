@@ -270,7 +270,8 @@ async fn checks_succeed_after_the_auth_service_restarts() {
     // While it is down every check fails, as before, and nothing is cached
     // that would keep failing once it is back.
     let down = check(&authorizer).await.unwrap_err();
-    assert_eq!(down.code(), tonic::Code::Internal, "{down:?}");
+    // f2013946: an unreachable auth service is a failed check that can clear.
+    assert_eq!(down.code(), tonic::Code::ResourceExhausted, "{down:?}");
 
     server.serve();
     for _ in 0..5 {
@@ -290,8 +291,13 @@ async fn a_service_never_reached_is_retried_on_the_next_check() {
     server.stop().await;
     let authorizer = AuthClientAuthorizer::new(server.url());
     let refused = check(&authorizer).await.unwrap_err();
-    assert_eq!(refused.code(), tonic::Code::Internal);
-    assert_eq!(refused.message(), "Failed to connect to lore auth service");
+    // f2013946: a dial that fails is a failed check that can clear; the auth
+    // service's own message is not passed on.
+    assert_eq!(refused.code(), tonic::Code::ResourceExhausted);
+    assert_eq!(
+        refused.message(),
+        "The auth service could not answer the permission check"
+    );
 
     server.serve();
     check(&authorizer).await.unwrap();
@@ -299,7 +305,7 @@ async fn a_service_never_reached_is_retried_on_the_next_check() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn error_mapping_is_unchanged() {
+async fn error_mapping_follows_f2013946() {
     let server = FakeServer::start();
     let authorizer = AuthClientAuthorizer::new(server.url());
     let cases = [
@@ -309,8 +315,18 @@ async fn error_mapping_is_unchanged() {
             tonic::Code::Unauthenticated,
             "Query resource failed - unauthenticated",
         ),
-        (UNAVAILABLE, tonic::Code::Internal, ""),
-        (DEADLINE_EXCEEDED, tonic::Code::Internal, ""),
+        // f2013946: a failure that can clear is RESOURCE_EXHAUSTED, without the
+        // auth service's own message.
+        (
+            UNAVAILABLE,
+            tonic::Code::ResourceExhausted,
+            "The auth service could not answer the permission check",
+        ),
+        (
+            DEADLINE_EXCEEDED,
+            tonic::Code::ResourceExhausted,
+            "The auth service could not answer the permission check",
+        ),
     ];
     for (mode, code, message) in cases {
         server.set_mode(mode);

@@ -75,6 +75,9 @@ impl InstrumentProvider for RevisionServiceInstrumentProvider {
 #[derive(Clone)]
 pub struct LoreRevisionV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    /// The store that reads through `immutable_store` fill with what they read. `None` where they
+    /// fill none.
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -97,6 +100,7 @@ impl LoreRevisionV1Service {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         notification: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -133,6 +137,7 @@ impl LoreRevisionV1Service {
         };
         Self {
             immutable_store,
+            local_tier,
             mutable_store,
             notification,
             hook_dispatcher,
@@ -279,6 +284,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
+                self.local_tier.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
                 &self.hook_dispatcher,

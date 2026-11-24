@@ -35,12 +35,12 @@ use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
 use lore_storage::StoreError;
 use lore_storage::hash::hash_string;
+use lore_storage::test_util::StoreCall;
 use zerocopy::FromZeros;
 
 use crate::branch::null_repository;
 use crate::fs::filesystem_provider::setup_test_execution;
 use crate::fs::filesystem_provider::test_execution_with;
-use crate::hooked_store::StoreCall;
 use crate::repository::test_helpers::caused_by;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
@@ -66,12 +66,12 @@ fn on_disk(temp: &TempDir, path: &RelativePath) -> std::path::PathBuf {
 }
 
 #[tokio::test]
-async fn ensure_parent_dir_creates_missing_ancestors() {
+async fn ensure_directory_creates_missing_ancestors() {
     let (temp, operation) = create_operation().await;
     let file = relative_path("nested/deeper/file.txt");
     let stats = CloneStats::default();
 
-    ensure_parent_dir(&file, &operation, &stats)
+    ensure_directory(&file.parent_path(), &operation, &stats, false)
         .await
         .expect("missing parent should be created");
 
@@ -81,27 +81,27 @@ async fn ensure_parent_dir_creates_missing_ancestors() {
 /// The clone root already exists and is not ours to create: files at the top of the tree
 /// take it as their parent, so this must not fail the clone.
 #[tokio::test]
-async fn ensure_parent_dir_accepts_existing_parent() {
+async fn ensure_directory_accepts_existing_parent() {
     let (_temp, operation) = create_operation().await;
     let file = relative_path("file.txt");
     let stats = CloneStats::default();
 
-    ensure_parent_dir(&file, &operation, &stats)
+    ensure_directory(&file.parent_path(), &operation, &stats, false)
         .await
         .expect("existing parent should not fail");
 }
 
 #[tokio::test]
-async fn ensure_parent_dir_caches_parent_once_per_path() {
+async fn ensure_directory_caches_parent_once_per_path() {
     let (_temp, operation) = create_operation().await;
     let stats = CloneStats::default();
     let first = relative_path("dir/a.txt");
     let second = relative_path("dir/b.txt");
 
-    ensure_parent_dir(&first, &operation, &stats)
+    ensure_directory(&first.parent_path(), &operation, &stats, false)
         .await
         .expect("first file should create the parent");
-    ensure_parent_dir(&second, &operation, &stats)
+    ensure_directory(&second.parent_path(), &operation, &stats, false)
         .await
         .expect("sibling should hit the cache");
 
@@ -111,7 +111,7 @@ async fn ensure_parent_dir_caches_parent_once_per_path() {
 /// Tolerating an existing parent must not extend to tolerating a real failure: a file
 /// sitting where the parent directory belongs still has to abort the clone.
 #[tokio::test]
-async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
+async fn ensure_directory_rejects_parent_that_is_a_file() {
     let (temp, operation) = create_operation().await;
     let blocker = relative_path("blocker");
     tokio::fs::File::create(on_disk(&temp, &blocker))
@@ -119,7 +119,7 @@ async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
         .expect("create blocker file");
     let stats = CloneStats::default();
 
-    let err = ensure_parent_dir(&blocker.join("file.txt"), &operation, &stats)
+    let err = ensure_directory(&blocker, &operation, &stats, false)
         .await
         .expect_err("a file where the parent belongs must fail");
 
@@ -127,12 +127,17 @@ async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
     assert!(stats.created_parents.is_empty());
 }
 
-/// A parent that genuinely cannot be created still has to abort the clone.
+/// A parent that genuinely cannot be created still has to abort the clone. Root can write the
+/// read-only directory that stands in for one, so the test returns early as root.
 #[cfg(unix)]
 #[tokio::test]
-async fn ensure_parent_dir_rejects_uncreatable_parent() {
+async fn ensure_directory_rejects_uncreatable_parent() {
     use std::os::unix::fs::PermissionsExt;
 
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
     let (temp, operation) = create_operation().await;
     let locked = relative_path("locked");
     tokio::fs::create_dir(on_disk(&temp, &locked))
@@ -146,7 +151,7 @@ async fn ensure_parent_dir_rejects_uncreatable_parent() {
     .expect("drop write permission");
     let stats = CloneStats::default();
 
-    let result = ensure_parent_dir(&locked.join("child/file.txt"), &operation, &stats).await;
+    let result = ensure_directory(&locked.join("child"), &operation, &stats, false).await;
 
     // Restore write permission first so the temp dir can be cleaned up.
     tokio::fs::set_permissions(
@@ -169,7 +174,7 @@ async fn adversarial_dangling_symlink_parent() {
         .expect("create dangling symlink");
     let stats = CloneStats::default();
 
-    let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
+    let result = ensure_directory(&link, &operation, &stats, false).await;
 
     assert!(result.is_err(), "a dangling symlink is not a usable parent");
 }
@@ -187,7 +192,7 @@ async fn adversarial_symlink_to_file_parent() {
         .expect("create symlink");
     let stats = CloneStats::default();
 
-    let result = ensure_parent_dir(&link.join("file.txt"), &operation, &stats).await;
+    let result = ensure_directory(&link, &operation, &stats, false).await;
 
     assert!(
         result.is_err(),
@@ -208,7 +213,7 @@ async fn adversarial_symlink_to_directory_parent() {
         .expect("create symlink");
     let stats = CloneStats::default();
 
-    ensure_parent_dir(&link.join("file.txt"), &operation, &stats)
+    ensure_directory(&link, &operation, &stats, false)
         .await
         .expect("a symlink to a directory is a usable parent");
 }
@@ -222,7 +227,7 @@ async fn adversarial_parent_nested_under_a_file() {
         .expect("create blocker file");
     let stats = CloneStats::default();
 
-    let result = ensure_parent_dir(&blocker.join("deep/file.txt"), &operation, &stats).await;
+    let result = ensure_directory(&blocker.join("deep"), &operation, &stats, false).await;
 
     assert!(result.is_err(), "a file cannot contain a directory");
 }
@@ -233,17 +238,43 @@ async fn adversarial_paths_without_a_usable_parent() {
     let stats = CloneStats::default();
 
     // Filesystem root: no parent to create.
-    ensure_parent_dir(&relative_path("/"), &operation, &stats)
+    ensure_directory(&relative_path("/"), &operation, &stats, false)
         .await
         .expect("root must be a no-op");
     // Bare relative name: parent is the empty path.
-    ensure_parent_dir(&relative_path("file.txt"), &operation, &stats)
-        .await
-        .expect("a bare relative name must be a no-op");
+    ensure_directory(
+        &relative_path("file.txt").parent_path(),
+        &operation,
+        &stats,
+        false,
+    )
+    .await
+    .expect("a bare relative name must be a no-op");
     // Empty path.
-    ensure_parent_dir(&RelativePath::new(), &operation, &stats)
+    ensure_directory(&RelativePath::new(), &operation, &stats, false)
         .await
         .expect("empty path must be a no-op");
+}
+
+/// A dry run creates nothing, and records each directory and ancestor once, so a directory two
+/// calls share is listed once.
+#[tokio::test]
+async fn ensure_directory_in_a_dry_run_creates_nothing_and_records_each_directory_once() {
+    let (temp, operation) = create_operation().await;
+    let stats = CloneStats::default();
+
+    for directory in ["a/b/c", "a/b/d", "a/b"] {
+        ensure_directory(&relative_path(directory), &operation, &stats, true)
+            .await
+            .expect("a dry run fails nothing");
+    }
+
+    assert!(!on_disk(&temp, &relative_path("a")).exists());
+    assert_eq!(
+        stats.created_parents.len(),
+        4,
+        "a, a/b, a/b/c and a/b/d are each listed once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -258,7 +289,7 @@ async fn adversarial_concurrent_calls_same_parent() {
         let stats = stats.clone();
         let file = parent.join(format!("file-{index}.txt"));
         tasks.push(lore_spawn!(async move {
-            ensure_parent_dir(&file, &operation, &stats).await
+            ensure_directory(&file.parent_path(), &operation, &stats, false).await
         }));
     }
     for task in tasks {
@@ -778,66 +809,246 @@ async fn a_clone_creates_no_directory_the_view_excludes() {
         .await;
 }
 
-/// A clone creates a directory the view includes whose children the view excludes, though a
-/// re-inclusion opening with a wildcard sends discovery into each of them.
+/// The directories and files below `root`, as sorted paths relative to it, a directory's ending
+/// in `/`.
+fn tree_on_disk(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("list a cloned directory") {
+            let path = entry.expect("a cloned entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("below the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if path.is_dir() {
+                found.push(format!("{relative}/"));
+                pending.push(path);
+            } else {
+                found.push(relative);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Clones a revision holding `entries` under the view `rules`, answering what the clone holds as
+/// [`tree_on_disk`] lists it. An entry ending in `/` is a directory and any other an empty file,
+/// and every ancestor of an entry is a directory.
+async fn cloned_tree(rules: &[&str], entries: &[&str]) -> Vec<String> {
+    let temp = TempDir::new("lore-clone-view-directories-");
+    let repository =
+        working_tree_repository_filtered(temp.path(), crate::helper::test_filter(&[], rules)).await;
+    let state = State::new();
+    let mut staged = Vec::<String>::new();
+    for entry in entries {
+        let mut prefix = String::new();
+        for component in entry.trim_end_matches('/').split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if staged.contains(&prefix) {
+                continue;
+            }
+            let node = if prefix.len() < entry.len() {
+                empty_directory_node()
+            } else {
+                Node {
+                    address: Default::default(),
+                    ..file_node(b"")
+                }
+            };
+            stage_single_node(
+                repository.clone(),
+                state.clone(),
+                relative_path(&prefix),
+                node,
+                Arc::default(),
+                None,
+                FilterMode::empty(),
+            )
+            .await
+            .expect("stage the node");
+            staged.push(prefix.clone());
+        }
+    }
+    let ctx = CloneContext {
+        operation: repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("Starting test operation"),
+        repository,
+        state,
+        options: Arc::default(),
+        stats: Arc::default(),
+        modified_times: Arc::default(),
+    };
+    clone_in_path(ctx).await.expect("clone under the view");
+    tree_on_disk(temp.path())
+        .into_iter()
+        .filter(|path| !path.starts_with(".lore"))
+        .collect()
+}
+
+/// Asserts that a clone of `entries` under each view in `cases` holds exactly what the case lists.
+async fn assert_cloned_trees(cases: &[(&[&str], &[&str], &[&str])]) {
+    for (rules, entries, expected) in cases {
+        assert_eq!(
+            cloned_tree(rules, entries).await,
+            *expected,
+            "a clone of {entries:?} under {rules:?}"
+        );
+    }
+}
+
+/// The view `**`, `!/a/**/*.bat`, `!/a/b/`, `!/a/c/file.txt`: `/a/b`, which a line names, and
+/// `/a/c` and `/a/e/f`, which hold a file the view keeps, are created with `/a` above them, and
+/// `/a/d`, which the walk enters only because the `.bat` re-inclusion could match below it, is
+/// not.
 #[tokio::test]
-async fn a_clone_creates_a_directory_the_view_includes_whose_children_it_excludes() {
+async fn a_clone_under_the_example_view_creates_what_it_names_or_keeps_and_not_a_d() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
-            let temp = TempDir::new("lore-clone-included-directory-");
-            let mut filter = Filter::default();
-            filter
-                .view
-                .add_exclusion("/engine/*")
-                .expect("view exclusion");
-            filter
-                .view
-                .add_inclusion("*/saved/config/")
-                .expect("view inclusion");
-            let repository = working_tree_repository_filtered(temp.path(), filter).await;
-            let empty_file = Node {
-                address: Default::default(),
-                ..file_node(b"")
-            };
-            let state = State::new();
-            for (name, node) in [
-                ("engine", empty_directory_node()),
-                ("engine/saved", empty_directory_node()),
-                ("engine/saved/r.cpp", empty_file),
-            ] {
-                stage_single_node(
-                    repository.clone(),
-                    state.clone(),
-                    relative_path(name),
-                    node,
-                    Arc::default(),
-                    None,
-                    FilterMode::empty(),
-                )
-                .await
-                .expect("stage the node");
-            }
-            let ctx = CloneContext {
-                operation: repository
-                    .file_system()
-                    .begin_operation()
-                    .await
-                    .expect("Starting test operation"),
-                repository,
-                state,
-                options: Arc::default(),
-                stats: Arc::default(),
-                modified_times: Arc::default(),
-            };
+            assert_cloned_trees(&[(
+                &["**", "!/a/**/*.bat", "!/a/b/", "!/a/c/file.txt"],
+                &[
+                    "a/b/x.txt",
+                    "a/c/file.txt",
+                    "a/c/other.txt",
+                    "a/d/some.thing",
+                    "a/e/run.bat",
+                    "a/e/f/deep.bat",
+                ],
+                &[
+                    "a/",
+                    "a/b/",
+                    "a/b/x.txt",
+                    "a/c/",
+                    "a/c/file.txt",
+                    "a/e/",
+                    "a/e/f/",
+                    "a/e/f/deep.bat",
+                    "a/e/run.bat",
+                ],
+            )])
+            .await;
+        })
+        .await;
+}
 
-            clone_in_path(ctx).await.expect("clone under the view");
+/// A clone creates no directory the walk only passes through: one the view includes by its
+/// ancestor's verdict alone, or one it enters because a re-inclusion could match below it, when
+/// nothing below is created. Under a view of extension rules, nested directories holding only
+/// excluded files; under `/a/**`, `a` itself; under `/*` and `!*/Saved/Config/` with no
+/// `Saved/Config` in the revision, `Engine`.
+#[tokio::test]
+async fn a_clone_creates_no_directory_it_only_passes_through() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            assert_cloned_trees(&[
+                (
+                    &["*.bat", "*.uasset"],
+                    &["a/b/c/x.bat", "a/b/y.uasset", "a/z.bat", "d/kept.txt"],
+                    &["d/", "d/kept.txt"],
+                ),
+                (&["/a/**"], &["a/x.txt", "a/b/y.txt", "c.txt"], &["c.txt"]),
+                (
+                    &["/*", "!*/Saved/Config/"],
+                    &["Engine/Build/b.txt", "Engine/Saved/Logs/l.txt"],
+                    &[],
+                ),
+            ])
+            .await;
+        })
+        .await;
+}
 
-            let exists = |path: &str| on_disk(&temp, &relative_path(path)).exists();
-            assert_eq!(
-                (exists("engine"), exists("engine/saved")),
-                (true, false),
-                "the directory the view includes is created and the one it excludes is not"
-            );
+/// A clone creates a directory a view line names, though the view excludes everything in it:
+/// `!/a/b/` under `**`, a line naming a directory the view already includes, each directory a
+/// wildcard re-inclusion matches, and the how-to's view that keeps `Engine/Content` empty. Each
+/// ancestor is created as its parent.
+#[tokio::test]
+async fn a_clone_creates_a_directory_a_view_line_names() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            assert_cloned_trees(&[
+                (
+                    &["**", "!/a/b/", "/a/b/*"],
+                    &["a/b/x.txt", "a/b/c/y.txt", "a/z.txt"],
+                    &["a/", "a/b/"],
+                ),
+                (
+                    &["!/a/b/", "/a/b/*"],
+                    &["a/b/x.txt", "a/b/c/y.txt"],
+                    &["a/", "a/b/"],
+                ),
+                (
+                    &["/*", "!*/Saved/Config/", "/*/Saved/Config/*"],
+                    &[
+                        "Engine/Saved/Config/a.ini",
+                        "Game/Saved/Config/b.ini",
+                        "Game/Saved/Logs/l.txt",
+                    ],
+                    &[
+                        "Engine/",
+                        "Engine/Saved/",
+                        "Engine/Saved/Config/",
+                        "Game/",
+                        "Game/Saved/",
+                        "Game/Saved/Config/",
+                    ],
+                ),
+                (
+                    &["/*", "!/Engine/Content/", "/Engine/Content/*"],
+                    &["Engine/Content/a.uasset", "Engine/Source/s.cpp", "top.txt"],
+                    &["Engine/", "Engine/Content/"],
+                ),
+            ])
+            .await;
+        })
+        .await;
+}
+
+/// A clone creates every directory that holds, at any depth, an entry it creates: the chain above
+/// a kept file deep below directories no line names, the parent of a file a line names, and a
+/// directory the repository holds empty with the chain above it.
+#[tokio::test]
+async fn a_clone_creates_each_directory_holding_what_it_keeps() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            assert_cloned_trees(&[
+                (
+                    &["*.bat"],
+                    &["a/b/c/d/kept.txt", "a/b/x.bat"],
+                    &["a/", "a/b/", "a/b/c/", "a/b/c/d/", "a/b/c/d/kept.txt"],
+                ),
+                (
+                    &["**", "!/a/c/file.txt"],
+                    &["a/c/file.txt", "a/c/other.txt"],
+                    &["a/", "a/c/", "a/c/file.txt"],
+                ),
+                (&["*.bat"], &["e/f/", "e/g.bat"], &["e/", "e/f/"]),
+            ])
+            .await;
+        })
+        .await;
+}
+
+/// A clone with no view creates every directory the revision holds, empty or not.
+#[tokio::test]
+async fn a_clone_with_no_view_creates_every_directory() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            assert_cloned_trees(&[(
+                &[],
+                &["a/b/x.bat", "c/", "d/e/"],
+                &["a/", "a/b/", "a/b/x.bat", "c/", "d/", "d/e/"],
+            )])
+            .await;
         })
         .await;
 }
@@ -1086,6 +1297,272 @@ async fn a_clone_leaves_a_name_another_branch_holds() {
                     .ok(),
                 Some(holder)
             );
+        })
+        .await;
+}
+
+/// Copies the directory `from` to `to`, files and directories alike.
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("make the copy");
+    for entry in std::fs::read_dir(from).expect("list the directory") {
+        let entry = entry.expect("read an entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("stat an entry").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy a file");
+        }
+    }
+}
+
+/// A clone or create at the path of a registered virtual instance, here one whose checkout is gone
+/// and whose external directory names FUSE, is refused with `InvalidArguments` before anything is
+/// written at the path. A write-mode open of an unregistered instance there registers nothing,
+/// and the virtual instance stays registered.
+#[tokio::test]
+async fn creating_at_a_registered_virtual_instance_path_is_refused_and_writes_nothing() {
+    use lore_revision::global::external_dir::external_dir_for_instance;
+    use lore_revision::global::external_dir::resolve::resolve;
+    use lore_revision::instance::InstanceId;
+    use lore_revision::instance::instance_key;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::DOT_LORE;
+    use lore_revision::repository::INSTANCE;
+    use lore_revision::repository::RepositoryAccess;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+    use lore_revision::repository::load_and_connect_with_token;
+
+    let global = TempDir::new("lore-clone-virtual-path-global-");
+    let shared = TempDir::new("lore-clone-virtual-path-store-");
+    let parent = TempDir::new("lore-clone-virtual-path-");
+    let held = TempDir::new("lore-clone-virtual-path-held-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let path = parent.path().join("instance");
+            std::fs::create_dir(&path).expect("make the instance path");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/virtual-path".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |config: RepositoryConfig| {
+                let path = path.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                }
+            };
+            let virtual_instance = create(config.clone()).await.expect("create the instance");
+            let virtual_id = virtual_instance.instance_id;
+            drop(virtual_instance);
+            copy_tree(&path.join(DOT_LORE), held.path());
+            std::fs::remove_dir_all(path.join(DOT_LORE)).expect("leave an empty mount point");
+            let state = resolve().expect("resolve the external root");
+            let dot_lore = external_dir_for_instance(&state, virtual_id)
+                .expect("the external directory")
+                .join(lore_revision::repository::DOT_LORE);
+            std::fs::create_dir_all(&dot_lore).expect("make the external directory");
+            std::fs::write(
+                dot_lore.join("config.toml"),
+                b"[vfs]\nvfs_type = \"Fuse\"\n",
+            )
+            .expect("write the config");
+
+            let refused = create(config).await;
+
+            match refused {
+                Err(error) => assert!(error.is_invalid_arguments(), "{error}"),
+                Ok(_) => panic!("creating at a virtual instance's path is refused"),
+            }
+            assert_eq!(
+                std::fs::read_dir(&path).expect("list the path").count(),
+                0,
+                "nothing is written at the path"
+            );
+
+            copy_tree(held.path(), &path.join(DOT_LORE));
+            let unregistered = InstanceId::generate();
+            std::fs::write(path.join(DOT_LORE).join(INSTANCE), unregistered.data())
+                .expect("give the checkout an unregistered instance");
+            let token = RepositoryWriteToken::acquire(&path).await;
+            let opened =
+                load_and_connect_with_token(&path, RepositoryAccess::ReadWrite, Some(token))
+                    .await
+                    .expect("the open goes ahead");
+            let registered = |instance_id| {
+                let opened = opened.clone();
+                async move {
+                    let (key, key_type) = instance_key(opened.salt(), instance_id);
+                    opened
+                        .read_mutable_store()
+                        .load(opened.id, key, key_type)
+                        .await
+                        .is_ok_and(|registration| !registration.is_zero())
+                }
+            };
+            assert!(
+                !registered(unregistered).await,
+                "the open registers nothing"
+            );
+            assert!(
+                registered(virtual_id).await,
+                "the virtual instance stays registered"
+            );
+        })
+        .await;
+}
+
+/// A creation over a shared store that already exists opens each of its stores once, registers the
+/// new instance in it, and leaves the instances registered before it.
+#[tokio::test]
+async fn creating_over_an_existing_shared_store_opens_it_once_and_registers_the_instance() {
+    use lore_revision::instance::instance_key;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+    use lore_revision::repository::store_opens::opens_in;
+    use lore_revision::shared_store::get_shared_store_path_for_repo;
+
+    let global = TempDir::new("lore-create-shared-global-");
+    let shared = TempDir::new("lore-create-shared-store-");
+    let parent = TempDir::new("lore-create-shared-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/create-shared".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |name: &str| {
+                let path = parent.path().join(name);
+                let config = config.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                    .expect("create the instance")
+                }
+            };
+            let first = create("first").await;
+            let first_id = first.instance_id;
+            drop(first);
+            let store = get_shared_store_path_for_repo(&config)
+                .await
+                .expect("find the shared store")
+                .expect("the shared store exists");
+            let before = opens_in(&store);
+
+            let second = create("second").await;
+
+            let after = opens_in(&store);
+            assert_eq!(
+                (
+                    after.immutable - before.immutable,
+                    after.mutable - before.mutable
+                ),
+                (1, 1),
+                "the creation opens each store once"
+            );
+
+            for instance_id in [first_id, second.instance_id] {
+                let (key, key_type) = instance_key(second.salt(), instance_id);
+                let registration = second
+                    .read_mutable_store()
+                    .load(second.id, key, key_type)
+                    .await
+                    .expect("the instance is registered");
+                assert!(!registration.is_zero());
+            }
+        })
+        .await;
+}
+
+/// A creation over a shared store that already exists refuses a path whose Lore directory holds a
+/// mutable store of its own.
+#[tokio::test]
+async fn creating_over_an_existing_shared_store_refuses_a_local_mutable_store() {
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::DOT_LORE;
+    use lore_revision::repository::RepositoryConfig;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::repository::SharedStoreToUseConfig;
+    use lore_revision::repository::create_local;
+
+    let global = TempDir::new("lore-create-local-mutable-global-");
+    let shared = TempDir::new("lore-create-local-mutable-store-");
+    let parent = TempDir::new("lore-create-local-mutable-");
+    LORE_CONTEXT
+        .scope(crate::helper::execution_in(global.path()), async {
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+            let config = RepositoryConfig {
+                remote_url: Some("lore://127.0.0.1:1/create-local-mutable".to_owned()),
+                shared_store_to_use: Some(SharedStoreToUseConfig {
+                    use_shared_store: Some(true),
+                    shared_store_path: Some(shared.path().display().to_string()),
+                }),
+                ..Default::default()
+            };
+            let create = |path: std::path::PathBuf| {
+                let config = config.clone();
+                async move {
+                    let token = RepositoryWriteToken::acquire(&path).await;
+                    create_local(
+                        &path,
+                        &token,
+                        repository_id,
+                        BranchId::from(uuid::Uuid::now_v7()),
+                        branch::DEFAULT_DEFAULT_NAME.to_string(),
+                        config,
+                        false,
+                    )
+                    .await
+                }
+            };
+            drop(
+                create(parent.path().join("first"))
+                    .await
+                    .expect("create the shared store's first instance"),
+            );
+            let second = parent.path().join("second");
+            std::fs::create_dir_all(second.join(DOT_LORE).join("mutable"))
+                .expect("make a local mutable store");
+
+            let refused = create(second).await;
+
+            match refused {
+                Err(error) => assert!(error.to_string().contains("local mutable store"), "{error}"),
+                Ok(_) => panic!("a local mutable store is refused"),
+            }
         })
         .await;
 }

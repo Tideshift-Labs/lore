@@ -22,6 +22,7 @@ use crate::drain::QuinnConnectionRegistry;
 use crate::quic::StreamHandlerFactory;
 use crate::quic::initial_cwnd::InitialCwndBytes;
 
+#[lore_macro::test_pub]
 pub struct QuinnConfig {
     // In observability, what is the label that distinguishes this Quinn
     // server from others?

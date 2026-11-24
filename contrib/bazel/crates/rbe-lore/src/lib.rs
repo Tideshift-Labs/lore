@@ -906,6 +906,7 @@ impl LoreBlobStore {
                 // upstream write makes it durable. Off, the local tier holds existence records
                 // and reads go upstream; see `LocalCache`.
                 local_cache: self.local_cache.blobs as u8,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -1009,6 +1010,8 @@ impl LoreBlobStore {
                 path: path.to_string_lossy().as_ref().into(),
                 remote_write: self.upstream as u8,
                 local_cache: self.local_cache.files as u8,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -1218,10 +1221,10 @@ fn codes_insert(map: &Arc<Mutex<HashMap<u64, Outcome>>>, id: u64, error: &LoreEr
         .insert(id, (error.error_code, error.message.as_str().to_string()));
 }
 
-/// Make Lore's writes durable. Close's flush is otherwise fire-and-forget, so without this a
-/// restart cannot reuse the on-disk repo -- which for a cold/warm benchmark would silently
-/// throw away the warm cache. Run on a dedicated thread so it never observes an ambient tokio
-/// runtime; it then flushes via Lore's shared runtime, sidestepping `block_in_place` ordering.
+/// Make Lore's writes durable. Without this a restart cannot reuse the on-disk repo -- which for
+/// a cold/warm benchmark would silently throw away the warm cache. Run on a dedicated thread so
+/// it never observes an ambient tokio runtime; it then flushes via Lore's shared runtime,
+/// sidestepping `block_in_place` ordering.
 pub fn shutdown_lore() {
     let _ = std::thread::spawn(lore::shutdown).join();
 }

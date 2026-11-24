@@ -3,6 +3,7 @@
 use std::fmt;
 
 use lore_base::types::RepositoryId;
+use lore_proto::lore::error::v1::ErrorReason;
 use lore_proto::lore::user::v1::RepositoryRegisterRequest;
 use lore_proto::lore::user::v1::RepositoryUnregisterRequest;
 use lore_proto::rebac::CreateResourceRequest;
@@ -10,6 +11,7 @@ use lore_proto::rebac::DeleteResourceRequest;
 use lore_revision::environment::EnvironmentConfig;
 use tonic::Code;
 use tonic::Status;
+use tonic_types::StatusExt;
 use tracing::info;
 
 use super::auth::grpc_get_repository_registry_client;
@@ -89,6 +91,7 @@ impl RepositoryRegistry {
                         result.map(drop),
                         repository_id,
                         name,
+                        "name",
                         "repository registry RepositoryRegister",
                     ),
                 }
@@ -174,8 +177,26 @@ async fn repository_create_auth_resource(
         client.create_resource(request).await.map(drop),
         repository_id,
         name,
+        "resource_name",
         "auth create_resource",
     )
+}
+
+const LORE_ERROR_DOMAIN: &str = "lore.error.v1";
+const LORE_ERROR_FIELD_KEY: &str = "field";
+
+/// `RebacApi` answers a rejected name with the same `ErrorInfo`, naming its own
+/// request field, though its proto, which is frozen, does not document it.
+fn is_invalid_name(err: &Status, name_field: &str) -> bool {
+    err.code() == Code::InvalidArgument
+        && err.get_error_details().error_info().is_some_and(|info| {
+            info.domain == LORE_ERROR_DOMAIN
+                && ErrorReason::from_str_name(&info.reason).is_some()
+                && info
+                    .metadata
+                    .get(LORE_ERROR_FIELD_KEY)
+                    .is_some_and(|field| field == name_field)
+        })
 }
 
 /// What a registration's answer means for the create. A repository already
@@ -185,6 +206,7 @@ fn add_outcome(
     result: Result<(), Status>,
     repository_id: RepositoryId,
     name: &str,
+    name_field: &str,
     rpc: &str,
 ) -> Result<(), Status> {
     match result {
@@ -216,16 +238,12 @@ fn add_outcome(
             ))
             // todo(plockhart): Once auth service supports Richer Error Model, change to look for an error code
         }
-        Err(err)
-            if err.code() == Code::InvalidArgument
-                && err
-                    .message()
-                    .contains("Missing resource context in resourceName") =>
-        {
-            info!(auth_error = ?err, requested_name = name, "Repository registration failed - invalid name was provided");
-            Err(Status::invalid_argument(
-                "Invalid repository name - missing Organization context",
-            ))
+        Err(err) if is_invalid_name(&err, name_field) => {
+            info!(auth_error = ?err, requested_name = name, "Repository registration failed - invalid name");
+            Err(Status::invalid_argument(format!(
+                "Invalid repository name: {}",
+                err.message()
+            )))
         }
         Err(err) => Err(warn_error_to_status(&err, |err| {
             Status::internal(format!("Failed to call {rpc}: {err}"))

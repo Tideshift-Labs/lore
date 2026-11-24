@@ -78,6 +78,20 @@ pub struct SharedStoreConfig {
     pub store_config: Option<StoreConfig>,
 }
 
+impl SharedStoreConfig {
+    /// The GC options an open of this store runs with: the store's own limits for an open that
+    /// collects, so every instance over it collects to the same limits, and `open` otherwise. A
+    /// limit or delay the store's config leaves out is the default.
+    pub fn gc_options(&self, open: ImmutableStoreCreateOptions) -> ImmutableStoreCreateOptions {
+        match &self.store_config {
+            Some(store_config) if open.collects() => {
+                store_config.with_default_limits().to_options()
+            }
+            _ => open,
+        }
+    }
+}
+
 // Name of the shared store directory created inside the user provided directory
 pub const SHARED_STORE_DIR: &str = "shared_store";
 // Inside SHARED_STORE_DIR
@@ -163,6 +177,7 @@ pub async fn create_shared_store(
     path: Option<PathBuf>,
     remote_url: String,
     make_default: bool,
+    store_config: StoreConfig,
 ) -> Result<(), SharedStoreError> {
     let execution = execution_context();
     let global_cli_args = execution.globals();
@@ -212,6 +227,7 @@ pub async fn create_shared_store(
         &directory_containing_shared_store,
         &shared_store_path,
         Some(remote_url.clone()),
+        store_config,
     )
     .await?;
 
@@ -244,22 +260,16 @@ async fn create_shared_store_at(
     directory_containing_shared_store: &Path,
     shared_store_path: &Path,
     remote_url: Option<String>,
+    store_config: StoreConfig,
 ) -> Result<(), SharedStoreError> {
     let shared_store_config = SharedStoreConfig {
         remote_url,
-        store_config: Some(StoreConfig::global_default()),
+        store_config: Some(store_config),
     };
-
-    let options = shared_store_config
-        .store_config
-        .as_ref()
-        .map_or(ImmutableStoreCreateOptions::none(), |config| {
-            config.to_options()
-        });
 
     let immutable_store = immutable::create(
         Some(shared_store_path),
-        options,
+        ImmutableStoreCreateOptions::none(),
         false,
         immutable::client_settings(
             shared_store_config
@@ -271,8 +281,6 @@ async fn create_shared_store_at(
     )
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
-
-    lore_storage::maintenance::spawn_gc(&immutable_store, &options);
 
     mutable::create(
         Some(shared_store_path),
@@ -444,6 +452,7 @@ pub async fn ensure_shared_store_for_repo(
             &directory_with_shared_store,
             &shared_store_path,
             config.remote_url.clone(),
+            StoreConfig::client_default(),
         )
         .await?;
     }
@@ -476,13 +485,35 @@ pub async fn ensure_shared_store_for_repo(
 pub async fn get_shared_store_path_for_repo(
     config: &RepositoryConfig,
 ) -> Result<Option<PathBuf>, SharedStoreError> {
+    Ok(get_shared_store_for_repo(config)
+        .await?
+        .map(|(shared_store_path, _)| shared_store_path))
+}
+
+/// The directory of the shared store `config` names, found as [`get_shared_store_for_repo`] finds
+/// it, without reading the store's config. `None` where `config` names no shared store.
+pub async fn locate_shared_store_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<PathBuf>, SharedStoreError> {
+    let Some(shared_store_to_use_config) = config
+        .shared_store_to_use
+        .as_ref()
+        .filter(|to_use| to_use.use_shared_store.unwrap_or(false))
+    else {
+        return Ok(None);
+    };
+    let directory_with_shared_store =
+        resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
+    find_existing_shared_store_in_dir(directory_with_shared_store).map(Some)
+}
+
+/// The path and config of the shared store a repository uses, as
+/// [`get_shared_store_path_for_repo`] finds it.
+pub async fn get_shared_store_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<(PathBuf, SharedStoreConfig)>, SharedStoreError> {
     Ok(
-        if let Some(shared_store_to_use_config) = config.shared_store_to_use.as_ref()
-            && shared_store_to_use_config.use_shared_store.unwrap_or(false)
-        {
-            let directory_with_shared_store =
-                resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
-            let shared_store_path = find_existing_shared_store_in_dir(directory_with_shared_store)?;
+        if let Some(shared_store_path) = locate_shared_store_for_repo(config).await? {
             let shared_store_config =
                 load_shared_store_config(&shared_store_path)
                     .await
@@ -496,7 +527,7 @@ pub async fn get_shared_store_path_for_repo(
                     shared_store_config.remote_url.unwrap_or_default(),
                 )));
             }
-            Some(shared_store_path)
+            Some((shared_store_path, shared_store_config))
         } else {
             None
         },

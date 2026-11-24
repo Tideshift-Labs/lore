@@ -527,6 +527,7 @@ async fn run_case(v0: bool, refusal: u8) {
             rpc.clone(),
             mutable,
             repository.into(),
+            lore_revision::state::allow_all_repositories(),
         ),
     );
     let execution = Arc::new(lore_revision::interface::ExecutionContext::new_server(

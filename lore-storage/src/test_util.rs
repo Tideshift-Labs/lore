@@ -4,23 +4,51 @@
 //! `test-util`, so a test can count the decodes, hashes and fetches a read costs, answer a remote
 //! fetch without a remote, order what concurrent reads, stores and compactions do, fail packfile
 //! opens, writes, syncs and metadata reads and store directory stats or keep writes in flight,
-//! interrupt a payload gate hold, hold a read's memory past the read, and count the tasks the store
-//! runs of its own accord.
+//! interrupt a payload gate hold, hold a read's memory past the read, refuse the lock a file read
+//! takes on its temporary file, see it wait for that lock or find the file moved, hold the rename
+//! that finishes the file, and count the tasks the store runs of its own accord. A mutable store wrapper shows a test each call it
+//! forwards, so the test can fail, record or follow up the call, and can answer zero for the keys
+//! its store doesn't hold.
+//! An immutable store wrapper shows a test each content call it forwards, so the test can fail or
+//! record the call.
 
 use std::cell::Cell;
 use std::cell::RefCell;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::BoxFuture;
 use tokio::sync::Notify;
 
+use crate::CallerBuffer;
 use crate::FlushOptions;
+use crate::gc_event::GcEventSinkRef;
+use crate::immutable_store::CopyBehavior;
+use crate::immutable_store::CorrelationHold;
+use crate::immutable_store::ImmutableStore;
+use crate::immutable_store::StoreError;
+use crate::local::store_lock::StoreGuard;
+use crate::local::store_lock::StoreLock;
+use crate::mutable_store::MutableStore;
+use crate::store_types::KeyType;
+use crate::store_types::KeyValueStream;
+use crate::store_types::PayloadRead;
+use crate::store_types::StoreGetData;
+use crate::store_types::StoreMatch;
+use crate::store_types::StoreMatchResult;
+use crate::store_types::StoreObliterateStats;
 use crate::types::Address;
+use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::Hash;
+use crate::types::HealResult;
+use crate::types::Partition;
 
 thread_local! {
     static DECODES: Cell<usize> = const { Cell::new(0) };
@@ -46,6 +74,9 @@ thread_local! {
 
 tokio::task_local! {
     static UNVALIDATED_PUTS: ();
+    static LOCKS_REFUSED: ();
+    static LOCK_WAITS: Arc<Notify>;
+    static TEMPORARY_FILES_MOVED: ();
 }
 
 /// A point where [`pause_at`] holds a store, a read, a list, a flush or a compaction.
@@ -204,6 +235,12 @@ pub(crate) fn take_packfile_write_failure() -> bool {
 /// Makes the next `count` packfile syncs on this thread fail, each once it has synced.
 pub fn fail_packfile_syncs(count: usize) {
     FAILED_SYNCS.with(|failed| failed.set(count));
+}
+
+/// How many of the packfile syncs [`fail_packfile_syncs`] asked to fail on this thread have not
+/// failed yet.
+pub fn packfile_sync_failures_left() -> usize {
+    FAILED_SYNCS.with(Cell::get)
 }
 
 /// The result of this packfile sync, a failure if [`fail_packfile_syncs`] asked for one.
@@ -385,6 +422,69 @@ pub(crate) fn unvalidated_puts_accepted() -> bool {
     UNVALIDATED_PUTS.try_with(|()| ()).is_ok()
 }
 
+/// Runs `read`, each attempt it makes to lock its temporary file failing as on a file system that
+/// refuses advisory locks. The refusal is the future's, whichever thread polls it.
+pub async fn refusing_locks<F: Future>(read: F) -> F::Output {
+    LOCKS_REFUSED.scope((), read).await
+}
+
+/// Whether the running task is inside [`refusing_locks`].
+pub(crate) fn locks_refused() -> bool {
+    LOCKS_REFUSED.try_with(|()| ()).is_ok()
+}
+
+/// Runs `read`, notifying `waiting` each time it finds the lock of its temporary file held by
+/// another read and waits to try again.
+pub async fn noting_lock_waits<F: Future>(waiting: Arc<Notify>, read: F) -> F::Output {
+    LOCK_WAITS.scope(waiting, read).await
+}
+
+/// Notifies the waiter [`noting_lock_waits`] runs the task with, if any, that it waits for a lock.
+pub(crate) fn note_lock_wait() {
+    let _ = LOCK_WAITS.try_with(|waiting| waiting.notify_one());
+}
+
+/// Runs `read`, each temporary file it locks found moved from its path once locked, as where other
+/// reads keep renaming the files they wrote into place.
+pub async fn moving_temporary_files<F: Future>(read: F) -> F::Output {
+    TEMPORARY_FILES_MOVED.scope((), read).await
+}
+
+/// Whether the running task is inside [`moving_temporary_files`].
+pub(crate) fn temporary_files_moved() -> bool {
+    TEMPORARY_FILES_MOVED.try_with(|()| ()).is_ok()
+}
+
+/// The renames [`hold_rename_of`] holds, by the temporary file each moves. The process's rather
+/// than a thread's or a task's, since the task that renames runs apart from the read.
+static RENAME_HOLDS: parking_lot::Mutex<Vec<(PathBuf, Arc<Pause>)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+/// Holds the next resuming read to finish the temporary file `temporary` before it renames the
+/// file into place, until the returned pause is resumed. `reached` is notified once the task
+/// finishing the file has removed its resume record, still holding the file's lock. The hold is the
+/// process's, so `temporary` must be a path of the test's own.
+pub fn hold_rename_of(temporary: PathBuf) -> Arc<Pause> {
+    let pause = Arc::new(Pause::default());
+    RENAME_HOLDS.lock().push((temporary, pause.clone()));
+    pause
+}
+
+/// Holds the task finishing `temporary` before its rename if [`hold_rename_of`] armed it.
+pub(crate) async fn rename_point(temporary: &Path) {
+    let pause = {
+        let mut holds = RENAME_HOLDS.lock();
+        holds
+            .iter()
+            .position(|(armed, _)| armed == temporary)
+            .map(|position| holds.remove(position).1)
+    };
+    if let Some(pause) = pause {
+        pause.reached.notify_one();
+        pause.resume.notified().await;
+    }
+}
+
 /// Runs `hook` once, in the next payload gate hold taken on this thread, after the hold reads the
 /// epoch and before it counts itself.
 pub fn interrupt_next_hold(hook: impl FnOnce() + 'static) {
@@ -441,6 +541,18 @@ pub fn remote_payload(address: Address) -> Option<(Fragment, Bytes)> {
             .iter()
             .rfind(|(served, _, _)| *served == address)
             .map(|(_, fragment, payload)| (*fragment, payload.clone()))
+    })
+}
+
+/// The fragment [`serve_remote`] last set up for `address` on this thread, as a metadata read
+/// answers it: not a fetch, so not counted as one.
+pub fn remote_metadata(address: Address) -> Option<Fragment> {
+    REMOTE.with(|remote| {
+        remote
+            .borrow()
+            .iter()
+            .rfind(|(served, _, _)| *served == address)
+            .map(|(_, fragment, _)| *fragment)
     })
 }
 
@@ -705,6 +817,459 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
         destination_context: crate::types::Context,
         behavior: crate::immutable_store::CopyBehavior,
     ) -> Result<(), crate::immutable_store::StoreError> {
+        self.inner
+            .clone()
+            .copy(
+                source_partition,
+                source_address,
+                destination_partition,
+                destination_context,
+                behavior,
+            )
+            .await
+    }
+}
+
+/// A call a [`HookedStore`] shows its hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreCall {
+    Load,
+    Store,
+    CompareAndSwap,
+    List,
+}
+
+/// Runs before a [`HookedStore`] forwards a call, with the key and key type the call names, and a
+/// zero key for a list. An error fails the call, which then reaches no store.
+type Hook = Box<dyn Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync>;
+
+/// Awaited after a [`HookedStore`] forwards a load, store or compare-and-swap that the store
+/// answers without an error, with the store it wraps, the partition, and the key and key type the
+/// call names. An error fails the call in place of the store's answer.
+pub type Answered = Box<
+    dyn Fn(
+            Arc<dyn MutableStore>,
+            Partition,
+            StoreCall,
+            Hash,
+            KeyType,
+        ) -> BoxFuture<'static, Result<(), StoreError>>
+        + Send
+        + Sync,
+>;
+
+/// Run after a [`HookedStore`] forwards a flush that the store answers without an error.
+type Flushed = Box<dyn Fn() + Send + Sync>;
+
+/// A mutable store that forwards every call to `inner`, after its hook sees each load, store,
+/// compare-and-swap and list, and before its `answered` hook, if any, sees each load, store and
+/// compare-and-swap the store answers without an error, and its `flushed` hook, if any, each
+/// flush. One that keeps zero keys answers a load of a key `inner` holds no value for with zero,
+/// where `inner` answers `AddressNotFound`, as a store that keeps a key set to zero answers.
+pub struct HookedStore {
+    inner: Arc<dyn MutableStore>,
+    hook: Hook,
+    answered: Option<Answered>,
+    flushed: Option<Flushed>,
+    keeps_zero_keys: bool,
+}
+
+impl HookedStore {
+    /// `inner`, with `hook` run before each load, store, compare-and-swap and list it forwards, and
+    /// `answered`, if any, after each load, store and compare-and-swap the store answers without an
+    /// error.
+    pub fn wrap(
+        inner: Arc<dyn MutableStore>,
+        hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
+        answered: Option<Answered>,
+    ) -> Arc<Self> {
+        Self::hooked(inner, Box::new(hook), answered, None)
+    }
+
+    /// [`wrap`](Self::wrap), with `flushed` also run after each flush the store answers without an
+    /// error.
+    pub fn wrap_flushing(
+        inner: Arc<dyn MutableStore>,
+        hook: impl Fn(StoreCall, Hash, KeyType) -> Result<(), StoreError> + Send + Sync + 'static,
+        answered: Option<Answered>,
+        flushed: impl Fn() + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::hooked(inner, Box::new(hook), answered, Some(Box::new(flushed)))
+    }
+
+    fn hooked(
+        inner: Arc<dyn MutableStore>,
+        hook: Hook,
+        answered: Option<Answered>,
+        flushed: Option<Flushed>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            hook,
+            answered,
+            flushed,
+            keeps_zero_keys: false,
+        })
+    }
+
+    /// `inner`, keeping zero keys: a load of a key `inner` holds no value for answers zero.
+    pub fn keeping_zero_keys(inner: Arc<dyn MutableStore>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            hook: Box::new(|_, _, _| Ok(())),
+            answered: None,
+            flushed: None,
+            keeps_zero_keys: true,
+        })
+    }
+
+    /// Runs the `answered` hook, if any, on a call the store answered without an error.
+    async fn answered(
+        &self,
+        partition: Partition,
+        call: StoreCall,
+        key: Hash,
+        key_type: KeyType,
+    ) -> Result<(), StoreError> {
+        match &self.answered {
+            Some(answered) => answered(self.inner.clone(), partition, call, key, key_type).await,
+            None => Ok(()),
+        }
+    }
+}
+
+/// An `answered` hook for [`HookedStore::wrap`] that awaits the future `hook` returns.
+pub fn answered<Answer>(
+    hook: impl Fn(Arc<dyn MutableStore>, Partition, StoreCall, Hash, KeyType) -> Answer
+    + Send
+    + Sync
+    + 'static,
+) -> Option<Answered>
+where
+    Answer: Future<Output = Result<(), StoreError>> + Send + 'static,
+{
+    Some(Box::new(
+        move |inner: Arc<dyn MutableStore>,
+              partition: Partition,
+              call: StoreCall,
+              key: Hash,
+              key_type: KeyType|
+              -> BoxFuture<'static, Result<(), StoreError>> {
+            Box::pin(hook(inner, partition, call, key, key_type))
+        },
+    ))
+}
+
+#[async_trait::async_trait]
+impl MutableStore for HookedStore {
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.inner.clone().hold_for_command().await
+    }
+
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    async fn load(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        key_type: KeyType,
+    ) -> Result<Hash, StoreError> {
+        (self.hook)(StoreCall::Load, key, key_type)?;
+        let value = match self.inner.clone().load(partition, key, key_type).await {
+            Err(err) if self.keeps_zero_keys && err.is_address_not_found() => Hash::default(),
+            loaded => loaded?,
+        };
+        self.answered(partition, StoreCall::Load, key, key_type)
+            .await?;
+        Ok(value)
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<(), StoreError> {
+        (self.hook)(StoreCall::Store, key, key_type)?;
+        self.inner
+            .clone()
+            .store(partition, key, value, key_type)
+            .await?;
+        self.answered(partition, StoreCall::Store, key, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: Partition,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> Result<Hash, StoreError> {
+        (self.hook)(StoreCall::CompareAndSwap, key, key_type)?;
+        let held = self
+            .inner
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await?;
+        self.answered(partition, StoreCall::CompareAndSwap, key, key_type)
+            .await?;
+        Ok(held)
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: Partition,
+        key_type: KeyType,
+    ) -> Result<KeyValueStream, StoreError> {
+        (self.hook)(StoreCall::List, Hash::default(), key_type)?;
+        self.inner.clone().list(partition, key_type).await
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await?;
+        if let Some(flushed) = &self.flushed {
+            flushed();
+        }
+        Ok(())
+    }
+}
+
+/// A content call a [`HookedImmutableStore`] shows its hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImmutableCall {
+    /// A payload read, through `get` or `get_into`.
+    Get,
+    GetMetadata,
+    /// A query, shown once for each address it names.
+    Query,
+    Put,
+    /// A copy, shown with its source partition and address.
+    Copy,
+    Obliterate,
+    Heal,
+}
+
+/// Runs before a [`HookedImmutableStore`] forwards a content call, with the call and the partition
+/// and address it names. An error fails the call, which then reaches no store.
+type ImmutableHook =
+    Box<dyn Fn(ImmutableCall, Partition, Address) -> Result<(), StoreError> + Send + Sync>;
+
+/// An immutable store that forwards every call to `inner`, after its hook sees each content call
+/// ([`ImmutableCall`]).
+pub struct HookedImmutableStore {
+    inner: Arc<dyn ImmutableStore>,
+    hook: ImmutableHook,
+}
+
+impl HookedImmutableStore {
+    /// `inner`, with `hook` run before each content call it forwards.
+    pub fn wrap(
+        inner: Arc<dyn ImmutableStore>,
+        hook: impl Fn(ImmutableCall, Partition, Address) -> Result<(), StoreError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            hook: Box::new(hook),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl ImmutableStore for HookedImmutableStore {
+    fn is_local(&self) -> bool {
+        self.inner.is_local()
+    }
+
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.inner.clone().hold_for_command().await
+    }
+
+    fn try_join_claim(&self) -> Option<StoreGuard> {
+        self.inner.try_join_claim()
+    }
+
+    fn store_lock(&self) -> Option<Arc<StoreLock>> {
+        self.inner.store_lock()
+    }
+
+    fn hold_correlation(&self, correlation_id: &str) -> Option<CorrelationHold> {
+        self.inner.hold_correlation(correlation_id)
+    }
+
+    async fn hold_for_task(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        self.inner.clone().hold_for_task().await
+    }
+
+    fn isolates_partitions(&self) -> bool {
+        self.inner.isolates_partitions()
+    }
+
+    fn read_scope(&self) -> StoreMatch {
+        self.inner.read_scope()
+    }
+
+    fn query_scope(&self) -> StoreMatch {
+        self.inner.query_scope()
+    }
+
+    async fn get(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        (self.hook)(ImmutableCall::Get, partition, address)?;
+        self.inner.clone().get(partition, address).await
+    }
+
+    async fn get_into(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        dst: &mut CallerBuffer,
+    ) -> Result<(Fragment, PayloadRead), StoreError> {
+        (self.hook)(ImmutableCall::Get, partition, address)?;
+        self.inner.clone().get_into(partition, address, dst).await
+    }
+
+    async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
+        self.inner.clone().is_available(timeout).await
+    }
+
+    async fn query(
+        self: Arc<Self>,
+        partition: Partition,
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        for address in addresses {
+            (self.hook)(ImmutableCall::Query, partition, *address)?;
+        }
+        self.inner
+            .clone()
+            .query(partition, addresses, results)
+            .await
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        (self.hook)(ImmutableCall::GetMetadata, partition, address)?;
+        self.inner.clone().get_metadata(partition, address).await
+    }
+
+    async fn put(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+        force: bool,
+    ) -> Result<(), StoreError> {
+        (self.hook)(ImmutableCall::Put, partition, address)?;
+        self.inner
+            .clone()
+            .put(partition, address, fragment, payload, force)
+            .await
+    }
+
+    async fn obliterate(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        (self.hook)(ImmutableCall::Obliterate, partition, address)?;
+        self.inner
+            .clone()
+            .obliterate(partition, address, stats)
+            .await
+    }
+
+    async fn evict(
+        self: Arc<Self>,
+        max_capacity: usize,
+        sync_data: bool,
+        sink: Option<GcEventSinkRef>,
+    ) -> Result<usize, StoreError> {
+        self.inner
+            .clone()
+            .evict(max_capacity, sync_data, sink)
+            .await
+    }
+
+    async fn compact(
+        self: Arc<Self>,
+        max_size: usize,
+        at: Option<usize>,
+        sync_data: bool,
+        sink: Option<GcEventSinkRef>,
+    ) -> Result<Option<usize>, StoreError> {
+        self.inner
+            .clone()
+            .compact(max_size, at, sync_data, sink)
+            .await
+    }
+
+    async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+        self.inner.clone().compact_resume_at().await
+    }
+
+    async fn load_index(self: Arc<Self>) -> Result<(), StoreError> {
+        self.inner.clone().load_index().await
+    }
+
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        self.inner.clone().stop_gc(terminate).await;
+    }
+
+    fn max_query_batch(&self) -> Option<usize> {
+        self.inner.max_query_batch()
+    }
+
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
+        self.inner.clone().flush(options).await
+    }
+
+    async fn fragment_count(self: Arc<Self>) -> Option<usize> {
+        self.inner.clone().fragment_count().await
+    }
+
+    async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+        self.inner.clone().verify(heal).await
+    }
+
+    async fn heal(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<HealResult, StoreError> {
+        (self.hook)(ImmutableCall::Heal, partition, address)?;
+        self.inner.clone().heal(partition, address).await
+    }
+
+    async fn settle(self: Arc<Self>, partition: Partition, address: Address) {
+        self.inner.clone().settle(partition, address).await;
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        behavior: CopyBehavior,
+    ) -> Result<(), StoreError> {
+        (self.hook)(ImmutableCall::Copy, source_partition, source_address)?;
         self.inner
             .clone()
             .copy(

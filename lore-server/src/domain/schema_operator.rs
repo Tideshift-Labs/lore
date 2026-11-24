@@ -185,8 +185,7 @@ fn print_results(results: &[ConstraintValidation], json: bool) {
         let detail = result
             .outcome
             .detail()
-            .map(|detail| format!(": {detail}"))
-            .unwrap_or_default();
+            .map_or_default(|detail| format!(": {detail}"));
         println!(
             "{:<17} {}.{} ({} ms){detail}",
             result.outcome.label(),

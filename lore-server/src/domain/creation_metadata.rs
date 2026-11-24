@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::immutable_store::creation_metadata::CreationMetadataStore;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Status;
 
 use super::GovernedRepositoryCreate;
@@ -42,6 +43,7 @@ impl GovernedRepositoryCreate {
             uploads.clone(),
             mutable,
             repository.id,
+            no_link_traversal(),
         ));
         Ok(Some(CreationMetadataContext {
             repository: context,

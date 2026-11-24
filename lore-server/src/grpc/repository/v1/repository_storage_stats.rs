@@ -14,7 +14,6 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_verified_token;
-use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 
 /// `lore.repository.v1.RepositoryService.RepositoryStorageStats` handler.
 ///
@@ -50,12 +49,13 @@ pub async fn handler(
     // before the handler; re-check it through the configured authorizer the
     // sibling read RPCs use. Auth-OFF selects AllowAll, so behavior there is
     // unchanged. The denial status propagates as-is (CR-016).
-    check_repository_query_authorization(
-        authorizer.as_ref(),
-        get_verified_token(&extensions).as_ref(),
-        repository_id.into(),
-    )
-    .await?;
+    // f2013946: a failed check keeps its own status, as a denial always did.
+    authorizer
+        .check_repository_lookup(
+            get_verified_token(&extensions).as_ref(),
+            repository_id.into(),
+        )
+        .await?;
 
     let stats = immutable_store
         .repository_stats(Partition::from(repository_id))

@@ -660,6 +660,9 @@ async fn remote_put_retry(
 /// leader is spawned, the permit moves into the leader task; if the call
 /// becomes a follower or short-circuits, the permit is dropped immediately.
 ///
+/// The remote is not asked first whether it holds the address ([`WriteOptions::remote_query`]):
+/// the content writes, such as [`write_content`], are what ask it.
+///
 /// Returns `store_fragment_publishing`'s future itself: a future of its own would hold the
 /// arguments again beside it.
 #[allow(clippy::too_many_arguments)]
@@ -680,12 +683,45 @@ pub fn store_fragment(
         address,
         fragment,
         Payload::Shared(buffer),
-        cache_local,
+        FragmentOptions::new(cache_local, false),
         remote_session,
         writes,
         permit,
         None,
     )
+}
+
+/// What [`WriteOptions`] asks of each fragment a write stores, in one byte: keeping its payload
+/// locally ([`WriteOptions::cache_local`]), and asking the remote first
+/// ([`WriteOptions::remote_query`]). One byte rather than a `bool` each, since every future that
+/// stores a fragment holds it for its whole life.
+#[derive(Clone, Copy)]
+pub(crate) struct FragmentOptions(u8);
+
+impl FragmentOptions {
+    const CACHE_LOCAL: u8 = 1;
+    const REMOTE_QUERY: u8 = 2;
+
+    /// Keep the payload locally where `cache_local`, and ask the remote first where
+    /// `remote_query`.
+    pub(crate) fn new(cache_local: bool, remote_query: bool) -> Self {
+        let cache_local = if cache_local { Self::CACHE_LOCAL } else { 0 };
+        let remote_query = if remote_query { Self::REMOTE_QUERY } else { 0 };
+        Self(cache_local | remote_query)
+    }
+
+    /// What `flags` asks of each fragment.
+    pub(crate) fn of(flags: WriteOptions) -> Self {
+        Self::new(flags.cache_local(), flags.remote_query)
+    }
+
+    fn cache_local(self) -> bool {
+        self.0 & Self::CACHE_LOCAL != 0
+    }
+
+    fn remote_query(self) -> bool {
+        self.0 & Self::REMOTE_QUERY != 0
+    }
 }
 
 /// The payload a store writes: a buffer the stores and transports can keep, or content its caller
@@ -793,6 +829,10 @@ impl FusedPublish {
 ///
 /// A lent payload is stored inline too, as the dispatched leader outlives the call.
 ///
+/// `options` asks for the payload to be kept locally, and for the remote to be asked whether it
+/// holds the address before the payload is prepared, as [`WriteOptions::remote_query`] describes;
+/// see [`leader_body`].
+///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
 pub(crate) fn store_fragment_publishing(
@@ -801,7 +841,7 @@ pub(crate) fn store_fragment_publishing(
     address: Address,
     fragment: Fragment,
     buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
@@ -850,7 +890,7 @@ pub(crate) fn store_fragment_publishing(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 &tracker,
                 &writes,
@@ -864,7 +904,7 @@ pub(crate) fn store_fragment_publishing(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 &writes,
                 permit,
@@ -916,7 +956,7 @@ fn store_fragment_inline(
     address: Address,
     fragment: Fragment,
     buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     writes: &WriteContext,
     permit: Option<OwnedSemaphorePermit>,
@@ -929,7 +969,7 @@ fn store_fragment_inline(
 
         if is_fully_satisfied(
             &query,
-            cache_local,
+            options.cache_local(),
             stored_local,
             &remote_session,
             stored_durable,
@@ -959,7 +999,7 @@ fn store_fragment_inline(
                 address,
                 fragment,
                 buffer,
-                cache_local,
+                options,
                 remote_session,
                 query,
                 None,
@@ -1004,7 +1044,7 @@ fn store_fragment_inline(
             address,
             fragment,
             buffer,
-            cache_local,
+            options,
             remote_session,
             query,
             guard,
@@ -1052,7 +1092,7 @@ async fn store_fragment_dispatched(
     address: Address,
     fragment: Fragment,
     buffer: Bytes,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: &WriteTracker,
     writes: &WriteContext,
@@ -1083,7 +1123,7 @@ async fn store_fragment_dispatched(
 
     if is_fully_satisfied(
         &query,
-        cache_local,
+        options.cache_local(),
         stored_local,
         &remote_session,
         stored_durable,
@@ -1112,7 +1152,7 @@ async fn store_fragment_dispatched(
         address,
         fragment,
         Payload::Shared(buffer),
-        cache_local,
+        options,
         remote_session,
         query,
         Some(guard),
@@ -1340,10 +1380,18 @@ struct Placement {
     published: bool,
 }
 
-/// Performs the work for [`store_fragment`]. Optionally duplicates an association the peer already
-/// holds. Otherwise, prepares a payload by loading an existing local payload whose sizes pass
+/// Performs the work for [`store_fragment`]. Duplicates an association the peer already holds
+/// where the local store knows one. Where `options` asks the remote first and no copy made the
+/// fragment durable or was throttled, asks the peer whether it holds the address
+/// ([`remote_fragment`]), and a hit makes the fragment durable as an upload would. Prepares a
+/// payload where one is still wanted, by loading an existing local payload whose sizes pass
 /// [`crate::read::check_payload_sizes`], or by compressing the content. Uploads the payload unless
-/// the peer throttled the copy, then writes the terminal entry.
+/// the fragment is durable or the peer throttled the copy, then writes the terminal entry.
+///
+/// A hit on a write that does not keep its payload locally records the peer's fragment as a
+/// header-only entry through the terminal write every durable fragment without a local payload
+/// takes, having loaded, compressed and sent nothing. One that keeps it still prepares and keeps
+/// the payload, and only the upload is spared.
 ///
 /// Returns where the payload ended up.
 ///
@@ -1360,7 +1408,7 @@ fn leader_body(
     address: Address,
     mut fragment: Fragment,
     mut buffer: Payload<'_>,
-    cache_local: bool,
+    options: FragmentOptions,
     remote_session: Option<Arc<StorageSession>>,
     query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
@@ -1447,7 +1495,28 @@ fn leader_body(
             }
         }
 
-        let payload_wanted = !stored_durable || cache_local;
+        // After the copy, which sends no payload either: a fragment it made durable costs no round
+        // trip, and one it refused is still asked about. A peer that throttled the copy is not
+        // asked, and the fragment stays local as below. Before the payload: a hit leaves none to
+        // prepare.
+        if options.remote_query()
+            && !stored_durable
+            && !copy_throttled
+            && let Some(session) = remote_session.as_deref()
+        {
+            let held = remote_fragment(session, &address, &fragment).await;
+            if let Some(stats) = stats {
+                stats.remote_query(held.map(|held| u64::from(held.size_payload)));
+            }
+            if let Some(held) = held {
+                stored_durable = true;
+                if !options.cache_local() {
+                    fragment = held;
+                }
+            }
+        }
+
+        let payload_wanted = !stored_durable || options.cache_local();
 
         // For a partial match try loading the payload from local store instead of recompressing
         if payload_wanted && stored_local {
@@ -1579,7 +1648,7 @@ fn leader_body(
             fragment.flags &= !FragmentFlags::PayloadStoredDurable;
         }
 
-        let (payload, permit) = if !stored_durable || cache_local {
+        let (payload, permit) = if !stored_durable || options.cache_local() {
             (Some(buffer.into_shared()), permit)
         } else {
             drop(buffer);
@@ -1602,6 +1671,54 @@ fn leader_body(
             published,
         })
     }
+}
+
+/// The fragment the peer holds for `address`, marked stored durable, where it describes the same
+/// content as `fragment`: the same content size, the same kind of payload, and a header a local
+/// store takes. `None` for a miss, a query that failed, or a header that does not describe the
+/// content, each of which leaves the write to make the fragment durable itself. Logs a failed query
+/// and a header that does not describe the content, but not a miss, the expected answer for content
+/// the peer lacks.
+///
+/// Asks for the exact address. A peer serves its own read scope, which for a server is the exact
+/// association.
+///
+/// Asks [`StorageSession::get_metadata`] directly. [`crate::read::fetch_metadata`] maps each miss
+/// into a [`StorageError`], an allocation per fragment the peer lacks on the write's hot path, and,
+/// unless `no_local_write` is set, records the answer before the write checks it. The write records
+/// a hit only after the check, through its terminal write, which fails the write where the local
+/// store refuses the entry.
+async fn remote_fragment(
+    session: &StorageSession,
+    address: &Address,
+    fragment: &Fragment,
+) -> Option<Fragment> {
+    let mut held = match session.get_metadata(address).await {
+        Ok(held) => held,
+        Err(err) => {
+            if !err.is_not_found() {
+                lore_base::lore_debug!(
+                    "Query for {} in context {} failed ({err:?})",
+                    address.hash,
+                    address.context
+                );
+            }
+            return None;
+        }
+    };
+    held.flags |= FragmentFlags::PayloadStoredDurable;
+    let describes = held.size_content == fragment.size_content
+        && (held.flags ^ fragment.flags) & FragmentFlags::PayloadFragmented == 0
+        && crate::immutable_store::put_is_valid(&held, None);
+    if !describes {
+        lore_base::lore_debug!(
+            "Remote holds {} in context {} as {held:?}, which does not describe content of {} bytes",
+            address.hash,
+            address.context,
+            fragment.size_content
+        );
+    }
+    describes.then_some(held)
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -1722,7 +1839,7 @@ pub(crate) async fn write_content_publishing(
         address,
         fragment,
         Payload::Shared(buffer),
-        flags.cache_local(),
+        FragmentOptions::of(flags),
         remote_session,
         writes,
         permit,
@@ -1838,7 +1955,7 @@ fn write_single_fragment(
             address,
             fragment,
             buffer,
-            flags.cache_local(),
+            FragmentOptions::of(flags),
             remote_session,
             writes,
             permit,
@@ -2341,7 +2458,7 @@ impl<'a> ContentHashMemo<'a> {
     /// the content could not be read.
     ///
     /// The whole content is resident while it is hashed, so the budget for it comes from the
-    /// fragment limiter that bounds every other buffer of a fragment's size.
+    /// fragment limiter.
     async fn whole_content_hash(&self, file_size: usize) -> Option<Hash> {
         if let Some(hash) = self.established.whole.get() {
             return Some(*hash);
@@ -2586,10 +2703,10 @@ struct SublistSource<'a> {
 /// each allocating and filling its own buffer.
 ///
 /// A chunk that no longer matches returns [`FileMatch::Differs`] immediately, and a walk
-/// that cannot proceed at all — a sublist that fails to load or is not a list — returns
-/// [`FileMatch::Indeterminate`]. A list that merely misdescribes the content reads as a
-/// difference rather than as indeterminate, since the list is what defines the ranges being
-/// hashed: wrong offsets simply hash the wrong bytes.
+/// that cannot proceed at all — a sublist that fails to load or is not a list, or a hole,
+/// which this walk does not compare — returns [`FileMatch::Indeterminate`]. A list that
+/// merely misdescribes the content reads as a difference rather than as indeterminate, since
+/// the list is what defines the ranges being hashed: wrong offsets simply hash the wrong bytes.
 ///
 /// The walk stops having read at most one window more than it compared, where reading per
 /// chunk stopped exactly at the mismatch — the cost of not paying a round trip per chunk on
@@ -2624,6 +2741,10 @@ async fn compare_previous_chunks(
 
     while index < chunks.len() {
         let current = chunks[index];
+        if current.is_hole() {
+            lore_base::lore_trace!("Previous chunk {index} is a hole, cannot compare {source}");
+            return Ok(FileMatch::Indeterminate);
+        }
         let start = current.offset_content;
         let Some(end) = chunk_end(&chunks, index, file_size) else {
             lore_base::lore_trace!(

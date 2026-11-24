@@ -86,12 +86,15 @@
 //!   meets carrying the name is the answer, whatever moved. A mark of another State's block, or of
 //!   a node no longer a directory, is stale. Staging counts its own adds into a marked directory
 //!   (`ChainMark::count_own_prepend`), so they never make its search stale nor show as moves.
-//!   Staging's claim of a child answers from its listing where that holds the name unclaimed, else
-//!   from the search. A checked attach or reattach whose publish found the chain changed searches
-//!   again with a mark read before its lookup that missed (`find_subnode_since`): on a served
-//!   State and under a shared claim C3 keeps the mark's head the same node; under an exclusive
-//!   claim the search rests on C9, no other writer adding the name, and on frees running where no
-//!   lookup does.
+//!   Staging's claim of a child answers from its listing where that holds the name unclaimed, or
+//!   where the chain changed since only by staging's own adds (`ChainMark::unchanged`, a read of
+//!   the count with no lock that the stress suite's model holds to the count, as it holds
+//!   `ChainMark::reattached`) and it made none or no two of the directory's entries carry one name
+//!   hash, else from the search. A checked attach or reattach whose publish found the chain
+//!   changed searches again with a mark read before its lookup that missed (`find_subnode_since`):
+//!   on a served State and under a shared claim C3 keeps the mark's head the same node; under an
+//!   exclusive claim the search rests on C9, no other writer adding the name, and on frees running
+//!   where no lookup does.
 //! - **C5. Counts and logs.** Every chain change but those this clause exempts is counted on its
 //!   directory and, where a listing watches the directory, logged; or the log is skipped forward.
 //!   Prepending or detaching a node counts 1, the discard tier's detach included. Moving a node
@@ -240,13 +243,18 @@
 //! - **Staging's listings.** No one else writes a directory staging holds a listing of: a
 //!   precondition, not a check. Staging deserializes a State of its own under the instance's
 //!   per-path write lock, its tasks each list and write their own directory, and the C API writes
-//!   an in-memory State of its own. One exception is reachable: a repository linked at two mount
-//!   paths gives two staging tasks the one linked State, so both may add the same name. No writer
-//!   runs beside a listing of staging's, so staging leaves four races open: it takes a child its
-//!   listing answered as given though the child was renamed, moved or removed since; its update's
-//!   reads of the child race a rename, where the case-mismatch path renames the child back or moves
-//!   the file; its branch for a nested repository's root queues the claim's answer unchecked; and
-//!   its unclaimed pass takes a child moved out for absent.
+//!   an in-memory State of its own. A `lore dirty` walk lists each directory it walks the same
+//!   way, one task under the exclusive claim. The task spawning a stage's walks lists a directory
+//!   its targets share while the walks it spawned write into it, which holds since the targets are
+//!   disjoint once their case is unified, and two below one child of the directory start their
+//!   walks below that child: no walk writes the child another target names. One exception is
+//!   reachable: a repository linked at two mount paths gives two staging tasks the one linked
+//!   State, so both may add the same name.
+//!   No writer runs beside a listing of staging's, so staging leaves four races open: it takes a
+//!   child its listing answered as given though the child was renamed, moved or removed since; its
+//!   update's reads of the child race a rename, where the case-mismatch path renames the child back
+//!   or moves the file; its branch for a nested repository's root queues the claim's answer
+//!   unchecked; and its unclaimed pass takes a child moved out for absent.
 //! - **Unserved climbs.** An unserved mark dropped between levels, a clear dropped between clearing
 //!   an ancestor and marking it again, and an add dropped between publishing its node and marking
 //!   the parent leave a dirty node below a clean directory. A climb that fails midway, on a block
@@ -255,7 +263,9 @@
 //!   but for a restore, which climbs right after it changes its node, so dropping them once the
 //!   climb is done leaves none of this, though a climb of theirs dropped while it loads a block, or
 //!   failing on one it cannot load, still can; the delete's batch runs in a task a dropped call
-//!   does not stop.
+//!   does not stop. The C API delete's check for a tracked node below an added directory does not
+//!   depend on these marks: it runs only once a move noted such a node, before any mark
+//!   ([`State::may_hold_tracked_below_added`]), and then walks every directory of the subtree.
 //! - **Clearing above a discarded node.** `clear_propagation` reads an ancestor's children and then
 //!   clears the ancestor with nothing held between (H21's pattern), so it runs only with no mark
 //!   beside it: after a walk's tasks drain (`apply_pending_discards`), and in `lore dirty`'s loop

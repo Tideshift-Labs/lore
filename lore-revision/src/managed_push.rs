@@ -136,4 +136,22 @@ impl ManagedPushRunner {
         }
         result
     }
+
+    /// FORK-LOCAL (Tideshift, SYNC5): run `future`, a local write of the push that dispatches
+    /// nothing (upstream's killed-push record), between stages: it waits for a running stage, and
+    /// it is refused while a stage stays unresolved, so nothing writes past the latch.
+    pub async fn run_unlatched<T, E, F>(&self, future: F) -> Result<T, E>
+    where
+        E: ErrorSet + lore_error_set::HasAll<<ProtocolError as ErrorSet>::Variants> + FfiError,
+        F: Future<Output = Result<T, E>>,
+    {
+        let _serial = self.serial.lock().await;
+        if self.blocked.load(Ordering::SeqCst) {
+            return Err(ProtocolError::internal(
+                "A previous push stage remains unresolved",
+            ))
+            .forward::<E>("recording a pushed revision");
+        }
+        future.await
+    }
 }

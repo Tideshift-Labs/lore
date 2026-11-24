@@ -188,6 +188,7 @@ async fn push_revision(
 ) -> Hash {
     branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         revision,
         crate::util::test_support::PUSH_ANY,
@@ -350,6 +351,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
 
@@ -393,6 +395,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
 
@@ -435,6 +438,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
             let root = serialize_empty_revision(&repository, Hash::default(), 1).await;
@@ -478,6 +482,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
             let root = serialize_empty_revision(&repository, Hash::default(), 1).await;
@@ -520,6 +525,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             // Freshly created branch — no revision pushed yet, so
             // `load_latest` returns a zero hash and the diff is against
@@ -562,6 +568,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
 
@@ -623,6 +630,7 @@ mod collect_push_lock_conflicts_tests {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let branch_id = create_root_branch(&repository, "main").await;
             let root = serialize_empty_revision(&repository, Hash::default(), 1).await;

@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use futures::FutureExt;
 use lore_base::error::OutcomeUnknown;
 use lore_error_set::prelude::*;
 use serde::Serialize;
 
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
@@ -45,7 +45,6 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_trace;
 use crate::lore_warn;
-use crate::node::Node;
 use crate::progress::DiscoveryStats;
 use crate::repository;
 use crate::repository::MERGE_ARTIFACT_SUFFIXES;
@@ -88,6 +87,9 @@ pub struct LoreRevisionSyncTargetEventData {
     pub remote_available: u8,
     /// Remote branch query returned an authoritative answer, identity is authorized to access the repository.
     pub remote_authorized: u8,
+    /// No valid login reached the remote: none is stored for its server, it expired and could not
+    /// be refreshed, or the remote rejected the token presented.
+    pub remote_unauthenticated: u8,
 }
 
 /// Progress counters reported while a sync updates the working files.
@@ -101,7 +103,7 @@ pub struct LoreRevisionSyncProgressEventData {
     pub file_update_total: usize,
     /// Number of files deleted so far.
     pub file_delete: usize,
-    /// Total number of files to delete.
+    /// Total number of files to delete, which can grow while a sync runs.
     pub file_delete_total: usize,
     /// Number of files merged automatically so far.
     pub file_automerge: usize,
@@ -162,6 +164,7 @@ pub enum SyncError {
     InvalidPath,
     LayerNotFound,
     LinkNotFound,
+    LinkPinsDiverge,
     LinkPathNotFound,
     LockNotFound,
     LockNotOwned,
@@ -358,8 +361,10 @@ async fn sync_store_view(
     Ok(())
 }
 
-/// Records `revision` as `branch`'s latest, convergent with the remote that answered
-/// for it, and as the revision last synced to.
+/// Records `revision` as `branch`'s latest, convergent, and as the revision last synced to. The
+/// caller passes only a revision known to be on the remote's history line for the branch: the
+/// remote latest, or a revision [`revision_advances_branch_latest`] finds the remote holds at its
+/// number.
 async fn sync_store_branch_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -374,6 +379,7 @@ async fn sync_store_branch_latest(
 }
 
 /// Where the branch being synced stands, for the branch latest decision.
+#[lore_macro::test_pub]
 struct SyncBranchLatest {
     /// The branch's latest on the remote, zero where the remote did not answer for it.
     remote_latest: Hash,
@@ -387,14 +393,39 @@ struct SyncBranchLatest {
     anchor: BranchId,
 }
 
+/// Whether the remote can answer for the history line of the branch being synced: it holds the
+/// branch's latest, the revision being synced to is taken on the branch the instance is on, and the
+/// search reads the remote, which `--local` and `--offline` don't.
+fn remote_answers_for(branch: &SyncBranchLatest) -> bool {
+    !branch.remote_latest.is_zero()
+        && branch.target == branch.anchor
+        && !matches!(
+            execution_context().globals().search_location(),
+            ResolveSearchLocation::Local
+        )
+}
+
+/// The revision the remote numbers `revision_number` on `branch`: it reads the remote latest of
+/// `branch` and the remote's revision list at the number, and walks the line from the remote latest
+/// where the list doesn't answer. Zero where the remote numbers none, and `None` where a request
+/// fails.
+fn remote_numbered(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+) -> impl Future<Output = Option<Hash>> {
+    super::resolve_revision_number(repository, branch, revision_number, true, false).map(Result::ok)
+}
+
 /// Whether the branch latest advances to `revision`, numbered `revision_number` on the
 /// branch it was created on.
 ///
 /// The latest advances only to a revision numbered above the one the branch stands at,
 /// and only where the remote holds that revision at that number: its own tip answers for
-/// itself, anything else is asked for. It is recorded convergent, which only the remote
-/// answers for: a revision named by its whole hash is parsed rather than looked up, so a
-/// search that reads no remote — `--local` or `--offline` — advances nothing.
+/// itself, anything else is asked for ([`remote_numbered`]). It is recorded convergent,
+/// which only the remote answers for: a revision named by its whole hash is parsed rather
+/// than looked up, so a search that reads no remote — `--local` or `--offline` — advances
+/// nothing ([`remote_answers_for`]).
 ///
 /// A remote carried back to an earlier revision leaves a tip numbered at or below the
 /// latest, which the branch keeps: the revisions it already tracks are not the remote's
@@ -414,14 +445,7 @@ async fn revision_advances_branch_latest(
     revision_number: u64,
     branch: &SyncBranchLatest,
 ) -> bool {
-    if branch.remote_latest.is_zero()
-        || branch.diverged
-        || branch.target != branch.anchor
-        || matches!(
-            execution_context().globals().search_location(),
-            ResolveSearchLocation::Local
-        )
-    {
+    if branch.diverged || !remote_answers_for(branch) {
         return false;
     }
 
@@ -435,15 +459,94 @@ async fn revision_advances_branch_latest(
         }
     }
 
-    if revision == branch.remote_latest {
-        return true;
-    }
+    revision == branch.remote_latest
+        || remote_numbered(repository, branch.anchor, revision_number).await == Some(revision)
+}
 
-    matches!(
-        super::resolve_revision_number(repository, branch.anchor, revision_number, true, false)
-            .await,
-        Ok(remote_revision) if remote_revision == revision
-    )
+/// What a sync records for the latest of the branch it syncs.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy)]
+enum LatestRecord {
+    /// Nothing.
+    Unchanged,
+    /// The revision synced to, as the latest, convergent, and as the last synchronized revision
+    /// ([`revision_advances_branch_latest`]).
+    Advanced,
+    /// The divergent latest, the remote latest, in sync with the remote
+    /// ([`branch::record_in_sync`]).
+    InSync,
+    /// The divergent latest, on the remote's history line below the remote latest, convergent
+    /// ([`branch::clear_divergent_status`]).
+    Convergent,
+}
+
+/// What a sync to `revision`, numbered `revision_number`, records for the latest `branch`
+/// describes: a sync given a revision, `requested`, advances a convergent latest
+/// ([`revision_advances_branch_latest`]), and any sync records the divergent latest in sync or
+/// convergent where `revision` is that latest and the remote confirms it on its history line for
+/// the branch.
+///
+/// The remote latest is confirmed by the branch query the sync made. A sync given a revision
+/// confirms it only where the remote answers for the branch ([`remote_answers_for`]), and confirms
+/// a revision below the remote latest by asking the remote for its number ([`remote_numbered`]). A
+/// sync given no revision asks nothing more. A branch point isn't confirmed: it is taken on the
+/// branch the branch being synced was created from.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn branch_latest_record(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    revision_number: u64,
+    requested: bool,
+    branch: SyncBranchLatest,
+) -> impl Future<Output = LatestRecord> {
+    async move {
+        if !branch.diverged {
+            let advances = requested
+                && revision_advances_branch_latest(repository, revision, revision_number, &branch)
+                    .await;
+            return if advances {
+                LatestRecord::Advanced
+            } else {
+                LatestRecord::Unchanged
+            };
+        }
+        if revision != branch.local_latest
+            || branch.remote_latest.is_zero()
+            || (requested && !remote_answers_for(&branch))
+        {
+            return LatestRecord::Unchanged;
+        }
+        if revision == branch.remote_latest {
+            return LatestRecord::InSync;
+        }
+        if requested
+            && remote_numbered(repository, branch.anchor, revision_number).await == Some(revision)
+        {
+            return LatestRecord::Convergent;
+        }
+        LatestRecord::Unchanged
+    }
+}
+
+/// Records `latest`, the divergent local latest of `branch` the sync read, as `record` says: in
+/// sync or convergent. Writes nothing for any other record.
+async fn store_confirmed_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    record: LatestRecord,
+) -> Result<(), SyncError> {
+    match record {
+        LatestRecord::InSync => branch::record_in_sync(repository, branch, latest, true).await,
+        LatestRecord::Convergent => {
+            branch::clear_divergent_status(repository.clone(), branch, latest).await
+        }
+        LatestRecord::Unchanged | LatestRecord::Advanced => Ok(()),
+    }
+    .forward::<SyncError>("Failed to clear the branch latest status")
 }
 
 /// Caches the target state's records ([`State::cache_fragments`]) for an offline commit,
@@ -483,20 +586,24 @@ async fn cache_target_fragments(
 ///
 /// A provider that holds its state in a `State` ([`FilesystemProvider::holds_state`]) holds whole
 /// revisions, keeps its local changes itself and holds no files for a layer to be written into,
-/// so a sync restricted to a dependency set, one resetting local changes, and one carrying layers
-/// are refused there.
+/// so a sync restricted to a dependency set and one carrying layers are refused there. It resets
+/// its local changes itself
+/// ([`HoldOptions::reset_local`](crate::fs::filesystem_provider::HoldOptions::reset_local)).
 pub(crate) async fn sync(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    if repository.file_system().holds_state() {
-        if !options.root_files.is_empty() {
-            return Err(hold::refused("restrict a sync to a dependency set").into());
+    if repository.file_system().holds_state() && !options.root_files.is_empty() {
+        return Err(hold::refused("restrict a sync to a dependency set").into());
+    }
+    if !options.root_files.is_empty() && !repository.file_system().supports_dependency_sync() {
+        return Err(InvalidArguments {
+            reason: "A sync restricted to a dependency set (--root-file) is not supported on an \
+                     SWFS-backed instance"
+                .into(),
         }
-        if options.reset {
-            return Err(hold::refused("reset local changes in a sync").into());
-        }
+        .into());
     }
     let repository_current = repository.clone();
     let (repository, view_file) = match sync_load_view(&options).await? {
@@ -553,9 +660,10 @@ pub(crate) async fn sync(
             .flatten()
         && !staged_revision.is_zero()
     {
-        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
-            .await
-            .forward::<SyncError>("Failed to deserialize staged state")?;
+        let state_staged =
+            state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                .await
+                .forward::<SyncError>("Failed to deserialize staged state")?;
         if state_staged
             .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
             .await
@@ -595,10 +703,6 @@ pub(crate) async fn sync(
     let local_latest = branch::load_latest(repository.clone(), anchor_branch)
         .await
         .unwrap_or_default();
-    let mut remote_latest = Hash::default();
-    let mut remote_available = false;
-    let mut remote_authorized = false;
-
     // Unreadable answers for divergent: what is not known to stand in the remote's
     // history is what the divergence handling below exists for.
     let mut local_latest_diverged =
@@ -606,31 +710,15 @@ pub(crate) async fn sync(
             .await
             .unwrap_or(true);
 
-    match repository.remote().await {
-        Ok(remote) => {
-            remote_available = true;
-            match branch::load_remote(remote.clone(), repository.id, anchor_branch).await {
-                Ok(status) => {
-                    remote_latest = status.latest;
-                    remote_authorized = true;
-                }
-                Err(err) if err.is_branch_not_found() => {
-                    remote_authorized = true;
-                }
-                Err(err) => {
-                    lore_debug!("Remote branch query failed: {err}");
-                }
-            }
-            lore_debug!("Remote latest revision is {remote_latest}");
-        }
-        // No remote configured for this repository, nothing to report
-        Err(err) if err.is_no_remote() => {}
-        // Remote is configured but the connection failed
-        Err(err) => {
-            lore_debug!("Remote connection failed: {err}");
-            remote_available = true;
-        }
-    }
+    let branch::RemoteLatest {
+        latest: remote_latest,
+        configured: remote_configured,
+        authorized: remote_authorized,
+        unauthenticated: remote_unauthenticated,
+        ..
+    } = branch::resolve_remote_latest(&repository, anchor_branch).await;
+    let remote_latest = remote_latest.unwrap_or_default();
+    lore_debug!("Remote latest revision is {remote_latest}");
 
     let mut revision;
     if let Some(requested_revision) = requested_revision {
@@ -753,8 +841,7 @@ pub(crate) async fn sync(
         .remote()
         .await
         .clone()
-        .map(|remote| remote.remote_url.to_string())
-        .unwrap_or_default();
+        .map_or_default(|remote| remote.remote_url.to_string());
 
     // Named for the branch the instance is on, which the source revision below
     // belongs to.
@@ -783,21 +870,21 @@ pub(crate) async fn sync(
 
     // Decided here because layer matching above settles which revision the sync carries
     // the working tree to, and the latest records that one.
-    if options.revision.is_some()
-        && revision_advances_branch_latest(
-            repository.clone(),
-            revision,
-            revision_number,
-            &SyncBranchLatest {
-                remote_latest,
-                local_latest,
-                diverged: local_latest_diverged,
-                target: target_branch,
-                anchor: anchor_branch,
-            },
-        )
-        .await
-    {
+    let record = branch_latest_record(
+        repository.clone(),
+        revision,
+        revision_number,
+        options.revision.is_some(),
+        SyncBranchLatest {
+            remote_latest,
+            local_latest,
+            diverged: local_latest_diverged,
+            target: target_branch,
+            anchor: anchor_branch,
+        },
+    )
+    .await;
+    if matches!(record, LatestRecord::Advanced) {
         location = LoreBranchLocation::Remote;
     }
 
@@ -844,8 +931,9 @@ pub(crate) async fn sync(
         target_revision_number: state_target.revision_number(),
         is_latest: at_latest.into(),
         local: (location == LoreBranchLocation::Local).into(),
-        remote_available: remote_available.into(),
+        remote_available: remote_configured.into(),
         remote_authorized: remote_authorized.into(),
+        remote_unauthenticated: remote_unauthenticated.into(),
     })
     .send();
 
@@ -864,19 +952,19 @@ pub(crate) async fn sync(
     // revision syncs must retain the old behavior so moving backwards cannot discard
     // newer local history.
     if revision == current_revision && !force && !options.reset && !moves_branch && !view_change {
-        // Not moving branch, so `anchor_branch` is the branch synced to and the
-        // one `local_latest` was read for.
-        if !execution_context().globals().dry_run() && should_store_remote_latest {
-            branch::store_latest(
-                repository.clone(),
-                anchor_branch,
-                local_latest,
-                revision,
-                BranchLatestStatus::Convergent,
-            )
-            .await
-            .forward::<SyncError>("Failed to store revision as current branch latest")?;
-            branch::store_last_sync(repository.clone(), anchor_branch, revision).await;
+        // A working tree already at the revision is not the latest recording it.
+        // FORK-LOCAL (Tideshift): the fork's `should_store_remote_latest` (a head sync, or a
+        // caller-proven pinned remote target) decides the store in place of upstream's
+        // "a revision was given and it is remote". Not moving branch, so `anchor_branch` is the
+        // branch synced to and the one `local_latest` was read for.
+        if !execution_context().globals().dry_run() {
+            if should_store_remote_latest {
+                branch::store_synced_latest(&repository, anchor_branch, local_latest, revision)
+                    .await
+                    .forward::<SyncError>("Failed to store revision as current branch latest")?;
+            } else {
+                store_confirmed_latest(&repository, anchor_branch, local_latest, record).await?;
+            }
         }
         // The workspace is at the target, but its records may not be local: a clone whose
         // cache failed writes the anchor all the same. Local lookups settle the common case.
@@ -1004,6 +1092,7 @@ pub(crate) async fn sync(
 
         if !layers.is_empty() {
             Box::pin(sync_layers(
+                operation.clone(),
                 repository_current,
                 repository.clone(),
                 token,
@@ -1077,6 +1166,10 @@ pub(crate) async fn sync(
         Ok(())
     })
     .await?;
+
+    if !execution_context().globals().dry_run() {
+        store_confirmed_latest(&repository, anchor_branch, local_latest, record).await?;
+    }
 
     LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
         branch: target_branch,
@@ -1285,8 +1378,10 @@ fn layer_context_under(
 /// Carries every layer in `layers` to its revision, and to the view `repository_target` holds.
 ///
 /// `repository_current` is the context the working tree stands under, from which each mount's own
-/// from-side context is drawn.
+/// from-side context is drawn. Each layer is synced within `operation`, the sync's own: an SWFS
+/// instance refuses an operation opened inside another (ADR-00036).
 async fn sync_layers(
+    operation: Arc<InstanceOperationImpl>,
     repository_current: Arc<RepositoryContext>,
     repository_target: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1347,64 +1442,63 @@ async fn sync_layers(
         let rebases = moved && !layer.staged.is_zero() && layer.staged != layer.current;
 
         // TODO(mjansson): Sync disjoint layers in parallel
-        with_operation::<_, SyncError, _>(
-            layer_repository_target.file_system(),
-            async |operation| {
-                Box::pin(layer::sync_in_operation(
-                    operation.clone(),
-                    layer_repository_current,
-                    layer_repository_target.clone(),
-                    layer_current,
-                    layer_target,
-                    mount_path.clone(),
-                    source_path.clone(),
-                    options.clone(),
-                ))
-                .await
-                .forward::<SyncError>("Failed to synchornize a layer")?;
-                let modified_times = operation.take_modified_times();
+        // Within the sync's own operation: an SWFS instance refuses a second, and a layer is
+        // synced through the mount its parent is served from (ADR-00036).
+        async {
+            Box::pin(layer::sync_in_operation(
+                operation.clone(),
+                layer_repository_current,
+                layer_repository_target.clone(),
+                layer_current,
+                layer_target,
+                mount_path.clone(),
+                source_path.clone(),
+                options.clone(),
+            ))
+            .await
+            .forward::<SyncError>("Failed to synchornize a layer")?;
+            let modified_times = operation.take_modified_times();
 
-                layer::store_layer_current(
+            layer::store_layer_current(
+                repository_target.clone(),
+                token,
+                mount_path.as_str(),
+                layer.repository,
+                layer_revision,
+                moved.then_some(Hash::default()),
+            )
+            .await
+            .forward::<SyncError>("Failed to synchornize a layer")?;
+            modified_times.store(layer_repository_target.clone()).await;
+
+            if rebases
+                && let Some(staged) = state::rebase_staged_state_in(
+                    &operation,
+                    layer_repository_target.clone(),
+                    layer.staged,
+                    layer_revision,
+                    execution_context().globals().force() && !view_moved,
+                    true,
+                    Some(state::LayerPaths {
+                        source: &source_path,
+                        mount: &mount_path,
+                    }),
+                )
+                .await
+                .forward::<SyncError>("Failed to rebase layer staged state")?
+            {
+                layer::store_layer_staged(
                     repository_target.clone(),
                     token,
                     mount_path.as_str(),
                     layer.repository,
-                    layer_revision,
-                    moved.then_some(Hash::default()),
+                    staged,
                 )
                 .await
                 .forward::<SyncError>("Failed to synchornize a layer")?;
-                modified_times.store(layer_repository_target.clone()).await;
-
-                if rebases
-                    && let Some(staged) = state::rebase_staged_state_in(
-                        &operation,
-                        layer_repository_target.clone(),
-                        layer.staged,
-                        layer_revision,
-                        execution_context().globals().force() && !view_moved,
-                        true,
-                        Some(state::LayerPaths {
-                            source: &source_path,
-                            mount: &mount_path,
-                        }),
-                    )
-                    .await
-                    .forward::<SyncError>("Failed to rebase layer staged state")?
-                {
-                    layer::store_layer_staged(
-                        repository_target.clone(),
-                        token,
-                        mount_path.as_str(),
-                        layer.repository,
-                        staged,
-                    )
-                    .await
-                    .forward::<SyncError>("Failed to synchornize a layer")?;
-                }
-                Ok(())
-            },
-        )
+            }
+            Ok::<(), SyncError>(())
+        }
         .await?;
     }
 
@@ -1471,7 +1565,7 @@ pub struct SyncVerifyArgs {
 pub async fn sync_verify_filesystem(
     _repository: Arc<RepositoryContext>,
     args: Arc<SyncVerifyArgs>,
-) -> Result<Arc<Vec<NodeChange>>, SyncError> {
+) -> Result<crate::fs::realize::VerifiedChanges, SyncError> {
     crate::fs::realize::verify_filesystem_for_changes(args).await
 }
 
@@ -1480,6 +1574,9 @@ pub struct SyncVerifyStats {
     pub file_conflict: AtomicUsize,
     pub file_retain: AtomicUsize,
     pub file_replace: AtomicUsize,
+    /// Set once a change refuses the sync for local modifications, so a check of a deleted
+    /// directory's working tree still running stops at the next difference it finds.
+    pub refused: AtomicBool,
 }
 
 #[derive(Default)]
@@ -1496,27 +1593,50 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
-    pub kept_moves: KeptMoves,
+    pub kept_renames: KeptRenames,
 }
 
-/// The moves a realize carries out without their rename, leaving the source where it stands: the
-/// rename was refused, and the destination names the source's own entry or cannot be told apart
-/// from it. Counted, with the first, for the one warning the realize ends with.
+impl SyncRealizeStats {
+    /// Sends a progress event with the counts as they stand, in order with the other progress
+    /// events of the sync ([`DiscoveryStats::send_progress`]).
+    pub fn send_progress(&self) {
+        self.discovery.send_progress(|| {
+            self.send_progress_event();
+        });
+    }
+
+    /// Sends a progress event with the counts as they stand, without the order lock
+    /// ([`DiscoveryStats::send_progress`] holds it).
+    pub(crate) fn send_progress_event(&self) {
+        LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(self)).send();
+    }
+}
+
+impl AsRef<DiscoveryStats> for SyncRealizeStats {
+    fn as_ref(&self) -> &DiscoveryStats {
+        &self.discovery
+    }
+}
+
+/// Renames left undone, which leave their source where it stands: ones the file system refused,
+/// and ones that would carry a layer's mount away from where the layer is mounted. Counted, with
+/// the first, for one warning.
 #[derive(Default)]
-pub struct KeptMoves {
+pub struct KeptRenames {
     pub count: AtomicUsize,
-    pub first: std::sync::OnceLock<KeptMove>,
+    pub first: std::sync::OnceLock<KeptRename>,
 }
 
-/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
-pub struct KeptMove {
+/// A rename [`KeptRenames`] counts: where it is from and to, and why it was left undone.
+pub struct KeptRename {
     pub from: RelativePath,
     pub to: RelativePath,
     pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {
-    pub fn new(stats: &Arc<SyncRealizeStats>) -> Self {
+    /// The counts of `stats` as they stand.
+    pub fn new(stats: &SyncRealizeStats) -> Self {
         // Read update totals from discovery stats directly since they are
         // incrementally updated by the producer. This ensures file_update_total
         // and bytes_update_total always reflect the current discovered total,
@@ -1541,7 +1661,7 @@ pub async fn realize_changes(
     changes: Arc<Vec<NodeChange>>,
     state_stage: Option<Arc<State>>,
     dry_run: bool,
-    is_merge: bool,
+    merge_current: Option<Arc<State>>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     shim_with_operation(repository.file_system(), async |operation| {
@@ -1549,9 +1669,12 @@ pub async fn realize_changes(
             repository,
             operation,
             changes,
+            &[],
+            None, /* No subtrees */
             state_stage,
             dry_run,
-            is_merge,
+            merge_current.map(crate::fs::realize::MergeCurrent::new),
+            None, /* No view change */
             stats,
         )
         .await
@@ -1589,15 +1712,6 @@ pub async fn realize_conflicts(
     })
     .await
     .map(discard_modified_times)?
-}
-
-pub async fn realize_scratch_file(
-    repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
-    node: Node,
-    stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
-    crate::fs::realize::realize_scratch_file(repository, path, node, stats).await
 }
 
 /// Whether the working tree holds any of the copies a conflicted merge left beside `path`.

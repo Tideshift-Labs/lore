@@ -155,6 +155,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         _: Partition,
         _: usize,
         _: &Arc<SuppliedCredentials>,
+        _: lore_transport::quic::client::CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         unsupported()
     }
@@ -227,6 +228,7 @@ async fn connection(scheme: &str) -> Arc<Connection> {
         "",
         "",
         lore_transport::auth::AuthMode::Auto,
+        None,
     )
     .await
     .expect("connect builds a connection without reaching any service")

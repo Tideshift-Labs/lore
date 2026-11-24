@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
@@ -27,6 +28,7 @@ use lore_fuse::init::InitConfig;
 use lore_fuse::mount::MountAccess;
 use lore_fuse::mount::MountOptions;
 use lore_fuse::mount::unmount_path;
+use lore_fuse::mount::unmount_path_retrying_busy;
 use lore_fuse::reply::Errno;
 use lore_fuse::reply::ReadFault;
 use lore_fuse::session::Session;
@@ -46,11 +48,15 @@ use lore_revision::state::Detach;
 use lore_revision::state::Rewrite;
 use lore_storage::hash::hash_string;
 
+use crate::dirty_move_fixture::committed_paths;
+use crate::dirty_move_fixture::held_at;
 use crate::fs::fuse::bench_stats;
 use crate::fs::fuse::fuse_fixture;
 use crate::fs::fuse::fuse_test_util;
 use crate::fs::fuse::holding_store;
 use crate::fs::fuse::staged_state;
+
+mod needs_fuse;
 
 const MAX_READ: u32 = 1 << 20;
 const BASE_TIME: u64 = 1_700_000_000_000;
@@ -79,8 +85,9 @@ struct Mounted {
 impl Mounted {
     /// Unmounts and stops serving, as a service stop does.
     async fn unmount(self) {
-        let root = self.root.clone();
-        blocking(move || unmount_path(&root, false).expect("an idle mount unmounts")).await;
+        unmount_path_retrying_busy(&self.root, Instant::now())
+            .await
+            .expect("an idle mount unmounts");
         tokio::time::timeout(Duration::from_secs(5), self.session.shutdown())
             .await
             .expect("shutdown completes");
@@ -104,6 +111,15 @@ impl Instance {
     async fn with_revisions(revisions: &[&[(&str, &[u8])]]) -> Self {
         Self {
             fixture: fuse_fixture::released_revisions(revisions).await,
+            external: TempDir::new("lore-fuse-write-mount-instance-"),
+        }
+    }
+
+    /// An instance at a revision that makes `moved` on `files` ([`fuse_fixture::released_moving`]),
+    /// whose parent holds `files`.
+    async fn with_moves(files: &[(&str, &[u8])], moved: &[(&str, &str)]) -> Self {
+        Self {
+            fixture: fuse_fixture::released_moving(&[files, &[]], moved).await,
             external: TempDir::new("lore-fuse-write-mount-instance-"),
         }
     }
@@ -147,27 +163,44 @@ impl Instance {
             .expect("the staged State loads")
     }
 
+    /// The creation arguments of the instance's context over `immutable`, its immutable store or
+    /// one standing in for it.
+    fn args_over(
+        &self,
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+    ) -> lore_revision::repository::RepositoryContextCreationArgs {
+        use fuse_fixture::RepositoryContextCreationArgsExt as _;
+
+        let fixture = &self.fixture;
+        fuse_fixture::default_repository_creation_args(immutable, fixture.mutable.clone())
+            .with_path(&fixture.path)
+            .with_id(fixture.repository.id)
+            .with_instance_id(fixture.repository.instance_id)
+    }
+
     /// The instance's context holding `token`, with no filesystem of its own: for a store write
     /// another command makes while one holds the token.
     fn writing(
         &self,
         token: &lore_revision::repository::RepositoryWriteToken,
     ) -> Arc<lore_revision::repository::RepositoryContext> {
-        use fuse_fixture::RepositoryContextCreationArgsExt as _;
-
-        let fixture = &self.fixture;
         Arc::new(
             lore_revision::repository::RepositoryContext::new(
-                fuse_fixture::default_repository_creation_args(
-                    fixture.immutable.clone(),
-                    fixture.mutable.clone(),
-                )
-                .with_path(&fixture.path)
-                .with_id(fixture.repository.id)
-                .with_instance_id(fixture.repository.instance_id),
+                self.args_over(self.fixture.immutable.clone()),
             )
             .with_write_token(token.share()),
         )
+    }
+
+    /// The instance's context over `immutable` in place of its immutable store, with no
+    /// filesystem of its own.
+    fn context_over(
+        &self,
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        Arc::new(lore_revision::repository::RepositoryContext::new(
+            self.args_over(immutable),
+        ))
     }
 
     /// The instance's context with `fs` as its filesystem, as a command relayed to the service
@@ -177,23 +210,46 @@ impl Instance {
         fs: &Arc<FuseFilesystem>,
         token: Option<lore_revision::repository::RepositoryWriteToken>,
     ) -> Arc<lore_revision::repository::RepositoryContext> {
-        use fuse_fixture::RepositoryContextCreationArgsExt as _;
-
-        let fixture = &self.fixture;
-        let context = lore_revision::repository::RepositoryContext::new(
-            fuse_fixture::default_repository_creation_args(
-                fixture.immutable.clone(),
-                fixture.mutable.clone(),
-            )
-            .with_path(&fixture.path)
-            .with_id(fixture.repository.id)
-            .with_instance_id(fixture.repository.instance_id)
-            .with_filesystem_provider(Arc::new(FuseProvider(fs.clone()))),
-        );
+        let context = self.unshared_command_context(fs);
         Arc::new(match token {
             Some(token) => context.with_write_token(token),
             None => context,
         })
+    }
+
+    /// [`Self::command_context`] holding `token` and the instance's repository lock, and with it
+    /// the instance's modified-time records, as a command relayed to the service holds them.
+    async fn locked_command_context(
+        &self,
+        fs: &Arc<FuseFilesystem>,
+        token: lore_revision::repository::RepositoryWriteToken,
+    ) -> Arc<lore_revision::repository::RepositoryContext> {
+        let (lock, stores) = lore_revision::repository::get_or_create_repository_lock(
+            self.fixture.path.join(".lore"),
+            lore_storage::local::store_lock::StoreHold::default(),
+            true,
+            lore_revision::repository::LockSharing::Shared,
+        )
+        .await
+        .expect("the repository lock");
+        Arc::new(
+            self.unshared_command_context(fs)
+                .with_repository_lock(lock, stores)
+                .with_write_token(token),
+        )
+    }
+
+    /// The instance's context with `fs` as its filesystem, holding no token or lock.
+    fn unshared_command_context(
+        &self,
+        fs: &Arc<FuseFilesystem>,
+    ) -> lore_revision::repository::RepositoryContext {
+        use fuse_fixture::RepositoryContextCreationArgsExt as _;
+
+        lore_revision::repository::RepositoryContext::new(
+            self.args_over(self.fixture.immutable.clone())
+                .with_filesystem_provider(Arc::new(FuseProvider(fs.clone()))),
+        )
     }
 
     /// Mounts a fresh provider over the instance read-write, as the service does.
@@ -356,311 +412,6 @@ fn names(dir: &Path) -> Vec<String> {
         .collect();
     names.sort();
     names
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn files_written_through_the_mount_read_back() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("keep.txt", b"k")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    let big = pattern(3 << 20, 5);
-    let expected = big.clone();
-
-    blocking(move || {
-        std::fs::write(root.join("small.txt"), b"hello mount").expect("write small");
-        let mut file = std::fs::File::create(root.join("big.bin")).expect("create big");
-        for chunk in big.chunks(1 << 20) {
-            file.write_all(chunk).expect("write chunk");
-        }
-        drop(file);
-        assert_eq!(
-            std::fs::read(root.join("small.txt")).expect("read small"),
-            b"hello mount"
-        );
-        assert!(std::fs::read(root.join("big.bin")).expect("read big") == expected);
-        assert_eq!(
-            std::fs::metadata(root.join("big.bin")).expect("stat").len(),
-            3 << 20
-        );
-        assert_eq!(names(&root), vec!["big.bin", "keep.txt", "small.txt"]);
-    })
-    .await;
-    assert_eq!(
-        std::fs::metadata(instance.write_dir().join("big.bin"))
-            .expect("the host file")
-            .len(),
-        3 << 20
-    );
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn writing_a_temporary_then_renaming_it_over_the_output_replaces_it() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("Binaries/app", b"tracked build")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-
-    blocking(move || {
-        let bin = root.join("Binaries");
-        for build in [&b"first build"[..], b"second build"] {
-            std::fs::write(bin.join("app.tmp"), build).expect("write temporary");
-            std::fs::rename(bin.join("app.tmp"), bin.join("app")).expect("rename over");
-            assert_eq!(std::fs::read(bin.join("app")).expect("read"), build);
-        }
-        assert_eq!(names(&bin), vec!["app"]);
-    })
-    .await;
-    assert_eq!(
-        std::fs::read(instance.write_dir().join("Binaries/app")).expect("the host file"),
-        b"second build"
-    );
-    m.unmount().await;
-}
-
-/// A directory listed around each save through a temporary never lists the temporary once its
-/// rename returned, though the kernel caches the listing (`CACHE_DIR`) and the provider patches
-/// its own.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_listing_after_a_save_returns_omits_the_temporary() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("Binaries/app", b"tracked build")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-
-    // A name the provider makes without telling the kernel, the directory's time kept, stays out
-    // of the listing the kernel cached: the listings below can come from that cache. Memory
-    // pressure may drop the cache between two listings, so one served from it of three is enough.
-    let bin = root.join("Binaries");
-    let listed = |bin: PathBuf| blocking(move || names(&bin));
-    LORE_CONTEXT
-        .scope(fuse_fixture::setup_test_execution(), async {
-            let dir = lookup(&m.fs, ROOT_INO, "Binaries").await.expect("Binaries");
-            let mut cached = Vec::new();
-            for _ in 0..3 {
-                assert_eq!(listed(bin.clone()).await, vec!["app"]);
-                let mtime = m.fs.inodes().get(dir).expect("Binaries").mtime;
-                create_with(&m.fs, dir, "unseen.tmp", b"unseen").await;
-                m.fs.inodes().get_mut(dir).expect("Binaries").mtime = mtime;
-                cached = listed(bin.clone()).await;
-                m.fs.unlink(&request(), dir, b"unseen.tmp")
-                    .await
-                    .expect("unlink");
-                if cached == ["app"] {
-                    break;
-                }
-            }
-            assert_eq!(
-                cached,
-                vec!["app"],
-                "the kernel serves the listing it cached"
-            );
-        })
-        .await;
-
-    blocking(move || {
-        let bin = root.join("Binaries");
-        for save in 0..200u32 {
-            assert_eq!(names(&bin), vec!["app"], "before save {save}");
-            let temporary = format!("app-{save}.tmp");
-            std::fs::write(bin.join(&temporary), save.to_le_bytes()).expect("write temporary");
-            assert_eq!(
-                names(&bin),
-                vec!["app".to_string(), temporary.clone()],
-                "during save {save}"
-            );
-            std::fs::rename(bin.join(&temporary), bin.join("app")).expect("rename over");
-        }
-        assert_eq!(names(&bin), vec!["app"]);
-        assert_eq!(
-            std::fs::read(bin.join("app")).expect("read"),
-            199u32.to_le_bytes()
-        );
-    })
-    .await;
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn truncating_a_tracked_file_keeps_its_inode_and_advances_its_mtime() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("Source/a.cpp", b"int a;")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-
-    blocking(move || {
-        let path = root.join("Source/a.cpp");
-        let before = std::fs::metadata(&path).expect("stat");
-        std::thread::sleep(Duration::from_millis(20));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&path)
-            .expect("open for rewrite");
-        file.write_all(b"int b = 2;").expect("rewrite");
-        drop(file);
-        let after = std::fs::metadata(&path).expect("stat");
-        assert_eq!(after.ino(), before.ino(), "a rewrite keeps the inode");
-        assert!(
-            (after.mtime(), after.mtime_nsec()) > (before.mtime(), before.mtime_nsec()),
-            "a rewrite advances the mtime"
-        );
-        assert_eq!(after.len(), 10);
-        assert_eq!(std::fs::read(&path).expect("read"), b"int b = 2;");
-    })
-    .await;
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn unlink_mkdir_rmdir_and_listings_through_the_mount() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"a"), ("dir/b.txt", b"b"), ("c.txt", b"c")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-
-    blocking(move || {
-        std::fs::remove_file(root.join("a.txt")).expect("unlink tracked");
-        std::fs::write(root.join("new.txt"), b"n").expect("write");
-        std::fs::remove_file(root.join("new.txt")).expect("unlink new");
-        std::fs::create_dir(root.join("made")).expect("mkdir");
-        std::fs::write(root.join("made/f"), b"f").expect("write");
-        let refused = std::fs::remove_dir(root.join("made")).expect_err("not empty");
-        assert_eq!(refused.raw_os_error(), Some(libc::ENOTEMPTY));
-        std::fs::remove_file(root.join("made/f")).expect("unlink");
-        std::fs::remove_dir(root.join("made")).expect("rmdir");
-        std::fs::create_dir(root.join("Saved")).expect("mkdir");
-
-        assert_eq!(names(&root), vec!["Saved", "c.txt", "dir"]);
-        assert!(!root.join("a.txt").exists());
-        std::fs::write(root.join("dir/c.o"), b"o").expect("write in tracked dir");
-        assert_eq!(names(&root.join("dir")), vec!["b.txt", "c.o"]);
-        std::os::unix::fs::symlink("dir/b.txt", root.join("link")).expect("symlink");
-        assert_eq!(
-            std::fs::read_link(root.join("link")).expect("readlink"),
-            Path::new("dir/b.txt")
-        );
-        assert_eq!(
-            std::fs::read(root.join("link")).expect("read through"),
-            b"b"
-        );
-    })
-    .await;
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_shared_writable_mapping_writes_through_to_the_host_file() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("keep.txt", b"k")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    let len = (256 << 10) + 123;
-    let data = pattern(len, 11);
-    let expected = data.clone();
-
-    blocking(move || {
-        let path = root.join("linked.elf");
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .expect("create output");
-        file.set_len(len as u64).expect("size output");
-        // SAFETY: a fresh shared mapping of `len` bytes of an open file.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(
-            mapped,
-            libc::MAP_FAILED,
-            "{}",
-            std::io::Error::last_os_error()
-        );
-        // SAFETY: the mapping is `len` bytes, readable and writable, until the munmap below.
-        let view = unsafe { std::slice::from_raw_parts_mut(mapped.cast::<u8>(), len) };
-        view.copy_from_slice(&data);
-        // SAFETY: `mapped` is the live mapping of `len` bytes.
-        assert_eq!(unsafe { libc::msync(mapped, len, libc::MS_SYNC) }, 0);
-        // SAFETY: as above; the view is not used past this point.
-        assert_eq!(unsafe { libc::munmap(mapped, len) }, 0);
-        drop(file);
-        assert!(std::fs::read(&path).expect("read back") == data);
-    })
-    .await;
-    assert!(
-        std::fs::read(instance.write_dir().join("linked.elf")).expect("the host file") == expected,
-        "the mapping's pages reached the host file"
-    );
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_build_shaped_burst_creates_and_renames_two_thousand_files() {
-    skip_without_fuse!();
-    const THREADS: usize = 8;
-    const PER_THREAD: usize = 250;
-    let instance = Instance::new(&[("Engine/Build/Build.version", b"{}")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-
-    blocking(move || {
-        std::thread::scope(|scope| {
-            for thread in 0..THREADS {
-                let root = &root;
-                scope.spawn(move || {
-                    for i in 0..PER_THREAD {
-                        let dir = root.join(format!(
-                            "Engine/Intermediate/Build/Linux/Module{}/Sub{}",
-                            thread % 4,
-                            i % 10
-                        ));
-                        std::fs::create_dir_all(&dir).expect("create_dir_all");
-                        let temp = dir.join(format!("t{thread}-{i}.o.tmp"));
-                        std::fs::write(&temp, format!("object {thread} {i}")).expect("write");
-                        std::fs::rename(&temp, dir.join(format!("t{thread}-{i}.o")))
-                            .expect("rename");
-                    }
-                });
-            }
-        });
-        let mut count = 0;
-        let mut pending = vec![root.join("Engine/Intermediate")];
-        while let Some(dir) = pending.pop() {
-            for entry in std::fs::read_dir(&dir).expect("read_dir") {
-                let entry = entry.expect("dirent");
-                let file_type = entry.file_type().expect("file type");
-                if file_type.is_dir() {
-                    pending.push(entry.path());
-                } else {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    assert!(name.ends_with(".o"), "{name}");
-                    count += 1;
-                }
-            }
-        }
-        assert_eq!(count, THREADS * PER_THREAD);
-        assert_eq!(
-            std::fs::read_to_string(
-                root.join("Engine/Intermediate/Build/Linux/Module3/Sub9/t7-249.o")
-            )
-            .expect("read"),
-            "object 7 249"
-        );
-        assert_eq!(names(&root.join("Engine")), vec!["Build", "Intermediate"]);
-    })
-    .await;
-    m.unmount().await;
 }
 
 /// An ordinary clone versions no symlink: its status walk skips one (`file_list_item`), so a new
@@ -1805,89 +1556,6 @@ async fn a_dirty_mark_through_the_mount_records_the_action_alone() {
             );
         })
         .await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_status_records_the_mount_writes_in_the_staged_state_and_they_survive_a_remount() {
-    use lore_revision::interface::LoreFileAction;
-    use lore_revision::node::NodeExtFlags;
-    use staged_state::Action;
-
-    skip_without_fuse!();
-    let instance = Instance::new(&[
-        ("a.txt", b"alpha"),
-        ("gone.txt", b"gone"),
-        ("old.txt", b"old"),
-    ])
-    .await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::create_dir_all(root.join("Saved/Logs")).expect("mkdir");
-        std::fs::write(root.join("Saved/Logs/build.log"), b"log").expect("write");
-        std::fs::remove_file(root.join("gone.txt")).expect("unlink");
-        std::fs::write(root.join("a.txt"), b"ALPHA").expect("rewrite tracked");
-        std::fs::rename(root.join("old.txt"), root.join("new.txt")).expect("rename tracked");
-    })
-    .await;
-    let token =
-        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let reported =
-        staged_state::status_files(instance.command_context(&m.fs, Some(token)), false).await;
-
-    let none = NodeExtFlags::NoFlags;
-    let staged = instance.staged().await;
-    assert_eq!(
-        staged_state::dirty_actions(&instance.fixture.repository, &staged).await,
-        [
-            ("Saved", (Action::Add, none)),
-            ("Saved/Logs", (Action::Add, none)),
-            ("Saved/Logs/build.log", (Action::Add, none)),
-            ("a.txt", (Action::Modify, none)),
-            ("gone.txt", (Action::Delete, none)),
-            ("new.txt", (Action::Add, none)),
-            ("old.txt", (Action::Delete, none)),
-        ]
-        .into_iter()
-        .map(|(path, action)| (path.to_string(), action))
-        .collect()
-    );
-    assert_eq!(
-        reported,
-        [
-            ("Saved", LoreFileAction::Add),
-            ("Saved/Logs", LoreFileAction::Add),
-            ("Saved/Logs/build.log", LoreFileAction::Add),
-            ("a.txt", LoreFileAction::Keep),
-            ("gone.txt", LoreFileAction::Delete),
-            ("new.txt", LoreFileAction::Add),
-            ("old.txt", LoreFileAction::Delete),
-        ]
-        .into_iter()
-        .map(|(path, action)| (path.to_string(), (action, true)))
-        .collect()
-    );
-    m.unmount().await;
-
-    let again = instance.mount().await;
-    let root = again.root.clone();
-    blocking(move || {
-        assert_eq!(names(&root), vec!["Saved", "a.txt", "new.txt"]);
-        assert_eq!(
-            std::fs::read(root.join("Saved/Logs/build.log")).expect("read"),
-            b"log"
-        );
-        assert_eq!(std::fs::read(root.join("a.txt")).expect("read"), b"ALPHA");
-        assert_eq!(std::fs::read(root.join("new.txt")).expect("read"), b"old");
-        assert!(!root.join("gone.txt").exists());
-        assert!(!root.join("old.txt").exists());
-    })
-    .await;
-    assert!(
-        !instance.external.path().join("whiteouts").exists(),
-        "no whiteout log is kept beside write/"
-    );
-    again.unmount().await;
 }
 
 /// The provider over a fresh rebuild of `instance`, not mounted: requests go to it directly.
@@ -7963,13 +7631,7 @@ async fn a_create_on_a_zero_revision_mount_attaches_on_the_worker_in_a_fresh_blo
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
             let store = holding_store::HoldingStore::new(instance.fixture.immutable.clone());
-            let repository = Arc::new(
-                lore_revision::repository::RepositoryContext::new_server_context(
-                    store.clone(),
-                    instance.fixture.mutable.clone(),
-                    instance.fixture.repository.id,
-                ),
-            );
+            let repository = instance.context_over(store.clone());
             let fs = FuseFilesystem::new_writable(
                 repository,
                 lore_revision::state::State::new(),
@@ -8463,53 +8125,6 @@ async fn chain_log_bytes_total_the_logs_of_listed_directories() {
         .await;
 }
 
-/// Unmounting a provider whose directories hold chain logs frees their blocks, the blocks the
-/// logs' patches name included: a patch holds its node's block weakly.
-#[tokio::test(flavor = "multi_thread")]
-// The writes go through the mount, as a user's do.
-#[allow(clippy::disallowed_methods)]
-async fn an_unmounted_provider_frees_the_blocks_its_chain_logs_name() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("dir/a.txt", b"a")]).await;
-    let mounted = instance.mount().await;
-    blocking({
-        let root = mounted.root.clone();
-        move || {
-            std::fs::symlink_metadata(root.join("dir/a.txt")).expect("dir/a.txt");
-            std::fs::write(root.join("dir/new.txt"), b"n").expect("create");
-            std::fs::rename(root.join("dir/new.txt"), root.join("dir/moved.txt")).expect("rename");
-        }
-    })
-    .await;
-    let blocks = LORE_CONTEXT
-        .scope(fuse_fixture::setup_test_execution(), async {
-            let fs = &mounted.fs;
-            assert!(
-                fs.chain_log_bytes() >= initial_log_bytes(2),
-                "the listings installed chain logs"
-            );
-            let mut blocks = Vec::new();
-            for path in ["dir", "dir/moved.txt"] {
-                let node = node_at(&instance, fs, path).await;
-                let block = fs
-                    .served()
-                    .state
-                    .resident_block(lore_revision::node::NodeBlock::index(node))
-                    .expect("a resident block");
-                blocks.push(Arc::downgrade(&block));
-            }
-            blocks
-        })
-        .await;
-    mounted.unmount().await;
-    for (path, block) in ["dir", "dir/moved.txt"].iter().zip(&blocks) {
-        assert!(
-            block.upgrade().is_none(),
-            "the block of {path} outlived the provider"
-        );
-    }
-}
-
 /// A provider over `instance` reading through a store the test can hold, not mounted; the
 /// instance's tree records file metadata.
 async fn holding_provider(
@@ -8526,13 +8141,7 @@ async fn holding_provider(
         "the tree records file metadata"
     );
     let store = holding_store::HoldingStore::new(instance.fixture.immutable.clone());
-    let repository = Arc::new(
-        lore_revision::repository::RepositoryContext::new_server_context(
-            store.clone(),
-            instance.fixture.mutable.clone(),
-            instance.fixture.repository.id,
-        ),
-    );
+    let repository = instance.context_over(store.clone());
     let fs = FuseFilesystem::new_writable(
         repository,
         instance.fixture.state.clone(),
@@ -9356,47 +8965,6 @@ async fn an_rmdir_of_a_directory_holding_only_hidden_children_succeeds() {
         .await;
 }
 
-/// `rm -rf` of a tree whose listings are warm defers no request: each UNLINK and RMDIR is
-/// answered on its worker, an RMDIR finding its emptied directory in the State.
-#[tokio::test(flavor = "multi_thread")]
-async fn rm_rf_of_a_warm_tree_defers_no_request() {
-    skip_without_fuse!();
-    let paths: Vec<String> = (0..20)
-        .flat_map(|dir| (0..20).map(move |file| format!("tree/d{dir:02}/f{file:02}.txt")))
-        .collect();
-    let files: Vec<(&str, &[u8])> = paths
-        .iter()
-        .map(|path| (path.as_str(), &b"x"[..]))
-        .collect();
-    let instance = Instance::new(&files).await;
-    let m = instance.mount().await;
-    let tree = m.root.join("tree");
-    let walked = tree.clone();
-    let listed = blocking(move || {
-        let mut files = 0;
-        for dir in std::fs::read_dir(&walked).expect("tree") {
-            for file in std::fs::read_dir(dir.expect("dir").path()).expect("dir") {
-                std::fs::metadata(file.expect("file").path()).expect("stat");
-                files += 1;
-            }
-        }
-        files
-    })
-    .await;
-    assert_eq!(listed, 400);
-    let deferred = m.session.deferred_requests();
-
-    let removed = tree.clone();
-    blocking(move || std::fs::remove_dir_all(&removed).expect("rm -rf")).await;
-    assert_eq!(
-        m.session.deferred_requests() - deferred,
-        0,
-        "rm -rf of a warm tree defers no request"
-    );
-    assert!(!tree.exists());
-    m.unmount().await;
-}
-
 /// UNLINK of a file the revision holds detaches its node before the reply and appends its path
 /// to the deletion list: LOOKUP misses it, READDIR no longer lists it.
 #[tokio::test(flavor = "multi_thread")]
@@ -10139,94 +9707,6 @@ async fn writes_from_many_threads_into_one_directory_are_all_served() {
             );
         })
         .await;
-}
-
-/// READ and WRITE latency of an open local file: 4 KiB `O_DIRECT` requests, each reaching the
-/// provider, timed at the client, with the provider's own figures from the session's metrics.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark"]
-async fn bench_local_file_read_and_write_latency() {
-    use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    use lore_fuse::abi::Opcode;
-    skip_without_fuse!();
-    const SAMPLES: usize = 20_000;
-    const LEN: usize = 4096;
-    const SPAN: usize = 256;
-    let instance = Instance::new(&[("keep.txt", b"k")]).await;
-    let m = instance.mount().await;
-    let path = m.root.join("local.bin");
-    let (mut writes, mut reads) = blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_DIRECT)
-            .open(&path)
-            .expect("create through the mount");
-        let buf = fuse_test_util::Aligned::new(LEN);
-        let pwrite = |offset: usize| {
-            // SAFETY: the fd is open and `buf` holds `LEN` readable bytes.
-            let n = unsafe {
-                libc::pwrite(
-                    file.as_raw_fd(),
-                    buf.as_slice().as_ptr().cast(),
-                    LEN,
-                    offset as libc::off_t,
-                )
-            };
-            assert_eq!(
-                n,
-                LEN as isize,
-                "pwrite: {}",
-                std::io::Error::last_os_error()
-            );
-        };
-        for block in 0..SPAN {
-            pwrite(block * LEN);
-        }
-        let mut writes = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let started = std::time::Instant::now();
-            pwrite((i % SPAN) * LEN);
-            writes.push(started.elapsed().as_nanos() as u64);
-        }
-        let mut reads = Vec::with_capacity(SAMPLES);
-        for i in 0..SAMPLES {
-            let started = std::time::Instant::now();
-            assert_eq!(
-                fuse_test_util::pread(&file, &buf, LEN, ((i % SPAN) * LEN) as u64),
-                LEN
-            );
-            reads.push(started.elapsed().as_nanos() as u64);
-        }
-        (writes, reads)
-    })
-    .await;
-    let write = bench_stats::Summary::of(&mut writes);
-    let read = bench_stats::Summary::of(&mut reads);
-    let metrics = m.session.metrics();
-    let (served_write, served_read) = (
-        metrics.snapshot(Opcode::Write),
-        metrics.snapshot(Opcode::Read),
-    );
-    println!(
-        "local WRITE 4 KiB O_DIRECT ({SAMPLES}): client p50 {:.1} us p99 {:.1} us | daemon-side p50 {:.1} us p99 {:.1} us",
-        write.p50 as f64 / 1000.0,
-        write.p99 as f64 / 1000.0,
-        served_write.p50_ns as f64 / 1000.0,
-        served_write.p99_ns as f64 / 1000.0
-    );
-    println!(
-        "local READ 4 KiB O_DIRECT ({SAMPLES}): client p50 {:.1} us p99 {:.1} us | daemon-side p50 {:.1} us p99 {:.1} us",
-        read.p50 as f64 / 1000.0,
-        read.p99 as f64 / 1000.0,
-        served_read.p50_ns as f64 / 1000.0,
-        served_read.p99_ns as f64 / 1000.0
-    );
-    m.unmount().await;
 }
 
 /// A commit's flip landing between a WRITE's copy-up check and its host write, simulated from
@@ -11154,27 +10634,66 @@ async fn commit_through(
     fs: &Arc<FuseFilesystem>,
     dry_run: bool,
 ) -> Result<Hash, String> {
-    use lore_revision::interface::ExecutionContext;
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreGlobalArgs;
-    use lore_revision::interface::LoreString;
-    use lore_revision::relay::EventDispatcher;
-    use lore_revision::repository::RepositoryWriteToken;
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    commit_in(
+        instance,
+        instance.command_context(fs, Some(token.share())),
+        &token,
+        dry_run,
+    )
+    .await
+}
 
-    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(fs, Some(token.share()));
+/// [`commit_through`] under the instance's repository lock, as the service runs a command, so
+/// the commit records its times in the instance's records.
+async fn commit_locked_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> Result<Hash, String> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = instance.locked_command_context(fs, token.share()).await;
+    commit_in(instance, context, &token, false).await
+}
+
+/// Stages the working tree and commits it through `context`, which holds `token`; answers the
+/// stored revision, or the error as text.
+async fn commit_in(
+    instance: &Instance,
+    context: Arc<lore_revision::repository::RepositoryContext>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    dry_run: bool,
+) -> Result<Hash, String> {
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreString;
+
     LORE_CONTEXT
         .scope(
             fuse_fixture::setup_test_execution(),
             lore_revision::file::stage::stage(
                 context.clone(),
-                &token,
+                token,
                 LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
                 lore_revision::stage::StageOptions::default(),
             ),
         )
         .await
         .map_err(|error| format!("stage: {error}"))?;
+    commit_staged_in(context, token, dry_run).await
+}
+
+/// Commits what is staged through `context`, which holds `token`; answers the stored revision,
+/// or the error as text.
+async fn commit_staged_in(
+    context: Arc<lore_revision::repository::RepositoryContext>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    dry_run: bool,
+) -> Result<Hash, String> {
+    use lore_revision::interface::ExecutionContext;
+    use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::relay::EventDispatcher;
+
     let execution = Arc::new(ExecutionContext::new_client_with_user_id(
         LoreGlobalArgs {
             dry_run: u8::from(dry_run),
@@ -11188,7 +10707,7 @@ async fn commit_through(
             execution,
             lore_revision::commit::commit_boxed(
                 context,
-                &token,
+                token,
                 lore_revision::commit::CommitOptions::new("commit through the mount".to_string()),
             ),
         )
@@ -11199,7 +10718,14 @@ async fn commit_through(
 /// Stages the working tree through `fs`, as `lore stage` relayed to the service does; answers
 /// the staged revision, or the error as text.
 async fn stage_through(instance: &Instance, fs: &Arc<FuseFilesystem>) -> Result<Hash, String> {
-    stage_hosts_through(instance, fs, vec![instance.fixture.path.clone()]).await
+    stage_hosts_through(
+        instance,
+        fs,
+        vec![instance.fixture.path.clone()],
+        Default::default(),
+        Default::default(),
+    )
+    .await
 }
 
 /// [`stage_through`] of `paths` alone, as `lore stage <paths>` names them.
@@ -11212,13 +10738,17 @@ async fn stage_paths_through(
         .iter()
         .map(|path| instance.fixture.path.join(path))
         .collect();
-    stage_hosts_through(instance, fs, hosts).await
+    stage_hosts_through(instance, fs, hosts, Default::default(), Default::default()).await
 }
 
+/// Stages `hosts` through `fs` with `options` under `globals`, as `lore stage <hosts>` relayed to
+/// the service does; answers the staged revision, or the error as text.
 async fn stage_hosts_through(
     instance: &Instance,
     fs: &Arc<FuseFilesystem>,
     hosts: Vec<PathBuf>,
+    globals: lore_revision::interface::LoreGlobalArgs,
+    options: lore_revision::stage::StageOptions,
 ) -> Result<Hash, String> {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
@@ -11227,12 +10757,12 @@ async fn stage_hosts_through(
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
     LORE_CONTEXT
         .scope(
-            fuse_fixture::setup_test_execution(),
+            fuse_fixture::test_execution_with(globals),
             lore_revision::file::stage::stage(
                 instance.command_context(fs, Some(token.share())),
                 &token,
                 LoreArray::from_vec(hosts.iter().map(LoreString::from).collect()),
-                lore_revision::stage::StageOptions::default(),
+                options,
             ),
         )
         .await
@@ -11253,6 +10783,27 @@ async fn commit_staged_holding(
     fs: &Arc<FuseFilesystem>,
     token: &lore_revision::repository::RepositoryWriteToken,
 ) -> Result<Hash, String> {
+    try_commit_staged_holding(instance, fs, token)
+        .await
+        .map_err(|error| format!("commit: {error}"))
+}
+
+/// [`commit_staged`], answering the commit's error as it is.
+async fn try_commit_staged(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> Result<Hash, lore_revision::commit::CommitError> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    try_commit_staged_holding(instance, fs, &token).await
+}
+
+/// [`try_commit_staged`] under `token`, which the caller holds.
+async fn try_commit_staged_holding(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+) -> Result<Hash, lore_revision::commit::CommitError> {
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::relay::EventDispatcher;
@@ -11272,7 +10823,6 @@ async fn commit_staged_holding(
             ),
         )
         .await
-        .map_err(|error| format!("commit: {error}"))
 }
 
 /// Gives `write/<name>` the modified time `mtime`.
@@ -11283,21 +10833,6 @@ fn set_host_time(instance: &Instance, name: &str, mtime: std::time::SystemTime) 
         .expect(name)
         .set_modified(mtime)
         .expect("a modified time");
-}
-
-/// Waits until the filesystem stamps later than the time the provider measures `write/<name>`
-/// at, the later of its modification and its status change, so that a commit from now on
-/// records it. Setting a time stamps the status change with the current tick, and a commit
-/// whose clock reads that tick records no time it cannot tell apart from a later write.
-async fn wait_past_host_time(instance: &Instance, fs: &Arc<FuseFilesystem>, name: &str) {
-    let metadata = std::fs::metadata(instance.write_dir().join(name)).expect(name);
-    let millis = |seconds: i64, nanos: i64| {
-        u64::try_from(seconds).unwrap_or_default() * 1000
-            + u64::try_from(nanos).unwrap_or_default() / 1_000_000
-    };
-    let measured = millis(metadata.mtime(), metadata.mtime_nsec())
-        .max(millis(metadata.ctime(), metadata.ctime_nsec()));
-    lore_revision::state::wait_until_settled(&instance.command_context(fs, None), measured).await;
 }
 
 /// The State of `revision`, loaded afresh.
@@ -11352,18 +10887,35 @@ async fn fs_node(instance: &Instance, fs: &FuseFilesystem, path: &str) -> Node {
 /// The record `revision` holds at `path`.
 async fn committed_node(instance: &Instance, revision: Hash, path: &str) -> Node {
     let state = state_at(instance, revision).await;
+    node_in(instance, &state, path)
+        .await
+        .expect("a committed node")
+}
+
+/// The record `state` holds at `path`; `None` where it holds nothing there.
+async fn node_in(
+    instance: &Instance,
+    state: &lore_revision::state::State,
+    path: &str,
+) -> Option<Node> {
     let repository = instance.fixture.repository.clone();
     let mut node = ROOT_NODE;
     for name in path.split('/').filter(|name| !name.is_empty()) {
-        node = state
+        node = match state
             .find_subnode(repository.clone(), node, hash_string(name))
             .await
-            .expect("a committed node on the path");
+        {
+            Ok(node) => node,
+            Err(error) if error.is_node_not_found() => return None,
+            Err(error) => panic!("the lookup of {path}: {error}"),
+        };
     }
-    state
-        .node(repository, node)
-        .await
-        .expect("a committed node")
+    Some(
+        state
+            .node(repository, node)
+            .await
+            .expect("the node's record"),
+    )
 }
 
 fn is_local(node: &Node) -> bool {
@@ -11437,6 +10989,481 @@ async fn a_committed_file_is_served_from_the_revision_and_leaves_write() {
             assert_eq!(fs.served().revision(), revision);
             assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
             assert_eq!(fs.commit_outcomes(), (1, 0));
+        })
+        .await;
+}
+
+/// The paths a status through `fs` reports under the instance's write token, as `lore status`
+/// relayed to the service reports them.
+async fn changed_paths_holding_token(instance: &Instance, fs: &Arc<FuseFilesystem>) -> Vec<String> {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    staged_state::status_files(instance.command_context(fs, Some(token.share())), false)
+        .await
+        .into_keys()
+        .collect()
+}
+
+/// Asserts that `path` is served from the store: its node holds the address `revision` holds
+/// there, clean, and `write/` holds no copy of it.
+async fn assert_served_from(instance: &Instance, fs: &FuseFilesystem, path: &str, revision: Hash) {
+    assert!(
+        !instance.write_dir().join(path).exists(),
+        "write/{path} is left behind"
+    );
+    let node = fs_node(instance, fs, path).await;
+    assert_eq!(
+        node.address,
+        committed_node(instance, revision, path).await.address
+    );
+    assert!(!node.is_dirty() && !is_local(&node), "{node:?}");
+}
+
+/// Writes `path` through `fs` with other content of its size and writes `content`, what the
+/// revision holds there, back, which leaves it a local file holding the revision's content, and
+/// dates its host file an hour back, older than the clock a later diff reads; answers its inode.
+async fn rewrite_identically(
+    instance: &Instance,
+    fs: &FuseFilesystem,
+    path: &str,
+    content: &[u8],
+) -> u64 {
+    let ino = lookup_path(fs, path).await.expect(path);
+    fs.write(&request(), ino, 0, 0, &content.to_ascii_uppercase(), 0)
+        .await
+        .expect("write");
+    fs.write(&request(), ino, 0, 0, content, 0)
+        .await
+        .expect("write back");
+    set_host_time(
+        instance,
+        path,
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
+    ino
+}
+
+/// A file rewritten through the mount with the content the revision holds is served from the
+/// store by a status under the write token: its node takes the revision's address, clean, its
+/// inode turns store-served, and `write/` holds it no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_under_the_token_serves_an_identical_rewrite_from_the_revision() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            assert!(
+                !fs.inodes()
+                    .get(ino)
+                    .expect("the inode")
+                    .kind
+                    .is_local_file(),
+                "the inode still reads write/"
+            );
+            assert_eq!(read(&fs, ino, 64).await, b"alpha");
+            assert_eq!(fs.commit_outcomes(), (0, 0));
+        })
+        .await;
+}
+
+/// A status without the write token, which records nothing, leaves an identical rewrite local.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_without_the_token_leaves_an_identical_rewrite_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+        })
+        .await;
+}
+
+/// A stage serves an identical rewrite from the store, as a status under the token does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_serves_an_identical_rewrite_from_the_revision() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            stage_through(&instance, &fs).await.expect("stage");
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+        })
+        .await;
+}
+
+/// A stage naming several directories serves the identical rewrites below them from the store
+/// once, as its operation ends, rather than once per directory it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_of_several_directories_serves_their_identical_rewrites_once() {
+    let instance = Instance::new(&[("d1/a.txt", b"alpha"), ("d2/b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "d1/a.txt", b"alpha").await;
+            rewrite_identically(&instance, &fs, "d2/b.txt", b"bee").await;
+            let serves = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            fs.set_commit_hook(commit_step(&fs, {
+                let serves = serves.clone();
+                move |_| {
+                    serves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async {}
+                }
+            }));
+
+            stage_paths_through(&instance, &fs, &["d1", "d2"])
+                .await
+                .expect("stage");
+
+            assert_eq!(serves.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let revision = fs.served().revision();
+            assert_served_from(&instance, &fs, "d1/a.txt", revision).await;
+            assert_served_from(&instance, &fs, "d2/b.txt", revision).await;
+        })
+        .await;
+}
+
+/// A write landing between a status's read of an identical rewrite and its flip keeps the file
+/// local, holding the write, and the next status reports it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_racing_the_flip_of_an_identical_rewrite_keeps_it_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.set_commit_hook(commit_step(&fs, move |fs| async move {
+                fs.write(&request(), ino, 0, 0, b"OMEGA", 0)
+                    .await
+                    .expect("the racing write");
+            }));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+            assert_eq!(read(&fs, ino, 64).await, b"OMEGA");
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A file moved away and back between a status's read of it and its flip is served from the
+/// store, and the deletion its move recorded leaves the list, so a remount serves the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_move_away_and_back_racing_the_flip_of_an_identical_rewrite_leaves_no_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.set_commit_hook(commit_step(&fs, |fs| async move {
+                fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"b.txt", 0)
+                    .await
+                    .expect("rename away");
+                fs.rename(&request(), ROOT_INO, b"b.txt", ROOT_INO, b"a.txt", 0)
+                    .await
+                    .expect("rename back");
+            }));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt")
+                .await
+                .expect("a.txt survives the remount");
+            assert_eq!(read(&remounted, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file a write rewrote with the committed content while a commit stored it stays local after
+/// the commit, and the next status under the write token serves it from the committed revision,
+/// once its time is older than the clock the status reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_serves_a_file_a_commit_left_local_holding_the_committed_content() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ALPHA", 0)
+                .await
+                .expect("write");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"ALPHA", 0)
+                            .await
+                            .expect("the racing write");
+                    }
+                }
+            }));
+            let revision = commit_through(&instance, &fs, false).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+            assert!(instance.write_dir().join("a.txt").exists());
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", revision).await;
+            assert_eq!(read(&fs, ino, 64).await, b"ALPHA");
+        })
+        .await;
+}
+
+/// A local file no inode holds, holding the revision's content, is served from the store by a
+/// status under the write token, and a lookup makes a store-served inode of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_serves_an_unheld_identical_local_file_from_the_revision() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    plant(&instance, &[("a.txt", b"alpha")]);
+    std::fs::set_permissions(
+        instance.write_dir().join("a.txt"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("the permissions a copy-up gives");
+    set_host_time(
+        &instance,
+        "a.txt",
+        std::time::SystemTime::now() - Duration::from_secs(3600),
+    );
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert!(
+                !fs.inodes()
+                    .get(ino)
+                    .expect("the inode")
+                    .kind
+                    .is_local_file()
+            );
+            assert_eq!(read(&fs, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file a status serves from the store reports the time it showed while local: the inode held
+/// across the flip, a lookup after a FORGET and a remount all report it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_status_serves_from_the_revision_reports_the_time_it_showed() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            let shown = reported_time(&fs, ino).await;
+
+            assert_eq!(
+                changed_paths_holding_token(&instance, &fs).await,
+                Vec::<String>::new()
+            );
+
+            assert!(!instance.write_dir().join("a.txt").exists());
+            assert_eq!(reported_time(&fs, ino).await, shown, "held");
+            fs.forget(ino, 1);
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(reported_time(&fs, ino).await, shown, "after a FORGET");
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(
+                reported_time(&remounted, ino).await,
+                shown,
+                "after a remount"
+            );
+        })
+        .await;
+}
+
+/// A file moved away and back keeps its node over the deletion its move recorded, which the next
+/// mount applies unless `write/` holds the file: a status leaves it local though it holds the
+/// revision's content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_local_over_a_recorded_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"b.txt", 0)
+                .await
+                .expect("rename away");
+            fs.rename(&request(), ROOT_INO, b"b.txt", ROOT_INO, b"a.txt", 0)
+                .await
+                .expect("rename back");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+            drop(fs);
+            let remounted = provider(&instance).await;
+            let ino = lookup(&remounted, ROOT_INO, "a.txt")
+                .await
+                .expect("a.txt survives the remount");
+            assert_eq!(read(&remounted, ino, 64).await, b"alpha");
+        })
+        .await;
+}
+
+/// A file holding the revision's content whose permissions a chmod changed stays local after a
+/// status under the write token, keeping them: served from the store, it would report those of
+/// a file the store serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_with_other_permissions_local() {
+    use lore_fuse::abi::SetattrIn;
+    use lore_fuse::abi::entry::setattr_valid;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            let chmod = SetattrIn {
+                valid: setattr_valid::MODE,
+                mode: libc::S_IFREG | 0o600,
+                ..SetattrIn::default()
+            };
+            fs.setattr(&request(), ino, &chmod).await.expect("chmod");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert_eq!(
+                fs.getattr(&request(), ino).await.expect("attr").attr.mode,
+                libc::S_IFREG | 0o600
+            );
+        })
+        .await;
+}
+
+/// A file holding the revision's content under a case-only respell stays local after a status
+/// under the write token: the revision spells it otherwise, so served from the store it would
+/// lose the respell at the next mount.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_leaves_an_identical_file_respelled_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.rename(&request(), ROOT_INO, b"a.txt", ROOT_INO, b"A.txt", 0)
+                .await
+                .expect("the respell");
+            stage_hosts_through(
+                &instance,
+                &fs,
+                vec![instance.fixture.path.join("A.txt")],
+                Default::default(),
+                lore_revision::stage::StageOptions {
+                    case_change: lore_revision::stage::StageCaseChange::Rename,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stage");
+
+            changed_paths_holding_token(&instance, &fs).await;
+
+            assert!(instance.write_dir().join("A.txt").exists());
+            drop(fs);
+            let remounted = provider(&instance).await;
+            assert_eq!(listed(&remounted, ROOT_INO).await, vec!["A.txt"]);
+        })
+        .await;
+}
+
+/// A dry-run stage writes nothing through the mount, so it leaves an identical rewrite local.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_stage_leaves_an_identical_rewrite_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+
+            stage_hosts_through(
+                &instance,
+                &fs,
+                vec![instance.fixture.path.clone()],
+                lore_revision::interface::LoreGlobalArgs {
+                    dry_run: 1,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .expect("the dry run");
+
+            assert!(instance.write_dir().join("a.txt").exists());
+            assert!(is_local(&fs_node(&instance, &fs, "a.txt").await));
+        })
+        .await;
+}
+
+/// A status without the write token records the time of an identical rewrite, which a later
+/// stage does not answer by: it reads the file, and serves it from the store.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_serves_an_identical_rewrite_a_status_without_the_token_timed() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "a.txt", b"alpha").await;
+            changed_paths(&instance, &fs).await;
+            assert!(instance.write_dir().join("a.txt").exists());
+
+            stage_through(&instance, &fs).await.expect("stage");
+
+            assert_served_from(&instance, &fs, "a.txt", fs.served().revision()).await;
         })
         .await;
 }
@@ -11590,9 +11617,7 @@ async fn located_after_a_settle_reads_the_new_address() {
                 ContentSource::Virtual(VirtualContent::Immutable { address, size }) => {
                     assert_eq!((address, size), (committed.address, 6));
                 }
-                other @ ContentSource::File(_) => {
-                    panic!("expected the committed address, got {other}")
-                }
+                other => panic!("expected the committed address, got {other}"),
             }
         })
         .await;
@@ -11639,64 +11664,6 @@ async fn a_content_change_in_a_listed_directory_costs_no_build() {
             assert_eq!(fs.listings_built(), built, "record changes cost no build");
         })
         .await;
-}
-
-/// A file the kernel holds open across its commit keeps its inode number and modification time,
-/// reads the committed bytes through the open descriptor, and takes a later write through it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_committed_file_keeps_its_inode_number_mtime_and_open_descriptor() {
-    use std::os::unix::fs::FileExt as _;
-
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
-    let m = instance.mount().await;
-    let path = m.root.join("a.txt");
-    let (file, before) = blocking(move || {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .expect("open a.txt");
-        file.write_all_at(b"ALPHA", 0)
-            .expect("write through the mount");
-        let before = file.metadata().expect("fstat");
-        (file, before)
-    })
-    .await;
-    let ino = lookup(&m.fs, ROOT_INO, "a.txt").await.expect("a.txt");
-    let mtime = m.fs.getattr(&request(), ino).await.expect("getattr").attr;
-
-    commit_through(&instance, &m.fs, false)
-        .await
-        .expect("commit");
-
-    assert!(!instance.write_dir().join("a.txt").exists());
-    assert_eq!(lookup(&m.fs, ROOT_INO, "a.txt").await, Ok(ino));
-    assert_eq!(before.ino(), ino);
-    let after = m.fs.getattr(&request(), ino).await.expect("getattr").attr;
-    assert_eq!(
-        (after.mtime, after.mtimensec / 1_000_000),
-        (mtime.mtime, mtime.mtimensec / 1_000_000),
-        "the commit moved the modification time"
-    );
-    let (committed, rewritten) = blocking(move || {
-        let mut committed = vec![0; 16];
-        let n = file.read_at(&mut committed, 0).expect("read the open file");
-        committed.truncate(n);
-        file.write_all_at(b"Z", 0).expect("write after the commit");
-        let mut rewritten = vec![0; 16];
-        let n = file.read_at(&mut rewritten, 0).expect("read again");
-        rewritten.truncate(n);
-        (committed, rewritten)
-    })
-    .await;
-    assert_eq!(committed, b"ALPHA");
-    assert_eq!(rewritten, b"ZLPHA");
-    assert_eq!(
-        std::fs::read(instance.write_dir().join("a.txt")).expect("write/a.txt"),
-        b"ZLPHA"
-    );
-    m.unmount().await;
 }
 
 /// A write landing between the commit's read and its flip leaves the file dirty under `write/`
@@ -13349,6 +13316,1048 @@ async fn an_add_staged_then_removed_leaves_the_staged_state_at_the_next_stage() 
         .await;
 }
 
+/// Runs `case` for each of `variants` in turn, then fails naming each variant that failed with its
+/// panic, so a failing variant hides none of those after it.
+async fn each_variant<V, F>(variants: impl IntoIterator<Item = V>, case: impl Fn(V) -> F)
+where
+    V: Copy + std::fmt::Debug,
+    F: std::future::Future<Output = ()>,
+{
+    use futures::FutureExt as _;
+
+    let mut failed = Vec::new();
+    for variant in variants {
+        if let Err(panic) = std::panic::AssertUnwindSafe(case(variant))
+            .catch_unwind()
+            .await
+        {
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("a panic without a message");
+            failed.push(format!("{variant:?}: {message}"));
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "{} variants failed:\n{}",
+        failed.len(),
+        failed.join("\n")
+    );
+}
+
+/// What runs between the removal through the mount of a node holding a staged change and the
+/// commit after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterRemoval {
+    /// Nothing: the commit follows the removal.
+    Nothing,
+    /// A remount, which builds the filesystem State again from the revision, the deletion list
+    /// and `write/`.
+    Remount,
+    /// A status with `--scan`, which holds the write token and saves its marks in the staged
+    /// State.
+    Status,
+    /// A stage of the working tree.
+    Stage,
+}
+
+impl AfterRemoval {
+    const ALL: [AfterRemoval; 4] = [
+        AfterRemoval::Nothing,
+        AfterRemoval::Remount,
+        AfterRemoval::Status,
+        AfterRemoval::Stage,
+    ];
+
+    /// Each of [`Self::ALL`] beside a flag a test varies, false then true.
+    fn with_flag() -> impl Iterator<Item = (bool, AfterRemoval)> {
+        [false, true]
+            .into_iter()
+            .flat_map(|flag| Self::ALL.map(|after| (flag, after)))
+    }
+
+    /// Runs over `fs`, answering the provider the commit goes through.
+    async fn run(self, instance: &Instance, fs: Arc<FuseFilesystem>) -> Arc<FuseFilesystem> {
+        match self {
+            AfterRemoval::Nothing => fs,
+            AfterRemoval::Remount => {
+                drop(fs);
+                provider(instance).await
+            }
+            AfterRemoval::Status => {
+                let token = lore_revision::repository::RepositoryWriteToken::acquire(
+                    &instance.fixture.path,
+                )
+                .await;
+                staged_state::status_files(
+                    instance.command_context(&fs, Some(token.share())),
+                    true,
+                )
+                .await;
+                fs
+            }
+            AfterRemoval::Stage => {
+                stage_through(instance, &fs).await.expect("the stage");
+                fs
+            }
+        }
+    }
+}
+
+/// Moves `from` to `to` through the instance operation and stages the move, as `lore stage move`
+/// relayed to the service stages it.
+async fn staged_move_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = renamed_through(instance, fs, &token, from, to).await;
+    lore_revision::file::stage::stage_move(
+        context,
+        &token,
+        host_path(instance, from),
+        host_path(instance, to),
+        lore_revision::stage::StageOptions {
+            scan: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("the staged move");
+}
+
+/// Moves `from` to `to` through the instance operation and marks the move dirty, not staged, as
+/// `lore file dirty move` relayed to the service marks it.
+async fn dirty_move_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = renamed_through(instance, fs, &token, from, to).await;
+    lore_revision::file::dirty::dirty_move(
+        context,
+        host_path(instance, from),
+        host_path(instance, to),
+    )
+    .await
+    .expect("the move marked dirty");
+}
+
+/// Moves `from` to `to` through the instance operation, under `token`, as a command relayed to the
+/// service moves a path; answers the command's context.
+async fn renamed_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    token: &lore_revision::repository::RepositoryWriteToken,
+    from: &str,
+    to: &str,
+) -> Arc<lore_revision::repository::RepositoryContext> {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+
+    let context = instance.command_context(fs, Some(token.share()));
+    let operation = context
+        .file_system()
+        .begin_operation()
+        .await
+        .expect("an operation");
+    operation
+        .rename(&relative(from), &relative(to))
+        .await
+        .expect("the move through the operation");
+    context
+}
+
+/// Marks `path` dirty, as `lore file dirty` relayed to the service marks it.
+async fn dirtied_through(instance: &Instance, fs: &Arc<FuseFilesystem>, path: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    lore_revision::file::dirty::dirty(
+        instance.command_context(fs, Some(token.share())),
+        lore_revision::interface::LoreArray::from_vec(vec![
+            lore_revision::interface::LoreString::from(&instance.fixture.path.join(path)),
+        ]),
+    )
+    .await
+    .expect("the path marked dirty");
+}
+
+/// The path of the instance's `path` on the host, as a command names it.
+fn host_path(instance: &Instance, path: &str) -> String {
+    instance
+        .fixture
+        .path
+        .join(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The record the instance's staged State holds at `path`; `None` where no staged State is stored
+/// or it holds nothing there.
+async fn staged_node(instance: &Instance, path: &str) -> Option<Node> {
+    let staged = lore_revision::instance::load_staged_revision(&instance.fixture.repository)
+        .await
+        .expect("the staged anchor reads")?;
+    let state =
+        lore_revision::state::State::deserialize(instance.fixture.repository.clone(), staged)
+            .await
+            .expect("the staged State loads");
+    node_in(instance, &state, path).await
+}
+
+/// What the staged State holds at a path whose staged move a removal through the mount took away.
+#[derive(Clone, Copy, Debug)]
+enum Kept {
+    /// The staged move, marked dirty where `dirty`, and not as deleted.
+    Move { dirty: bool },
+    /// The deletion a stage of the removal stages.
+    Deleted,
+}
+
+/// Asserts that the staged State holds `path` as `kept` says; `case` names the run.
+async fn assert_staged_kept(instance: &Instance, path: &str, kept: Kept, case: &str) {
+    let node = staged_node(instance, path)
+        .await
+        .unwrap_or_else(|| panic!("the staged State holds {path}: {case}"));
+    let holds = match kept {
+        Kept::Move { dirty } => {
+            node.is_staged_move() && node.is_dirty() == dirty && !node.is_deleted()
+        }
+        Kept::Deleted => node.is_staged_delete(),
+    };
+    assert!(holds, "{path} is not {kept:?}: {case}: {node:?}");
+}
+
+/// A staged file move whose file is then removed through the mount keeps the move in the staged
+/// State, marked dirty alone by a status or staged as deleted by a stage, and the commit deletes
+/// the file, as on an ordinary instance: the revision holds it at neither path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_move_removed_through_the_mount_commits_the_deletion() {
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("d.txt", b"d"), ("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                staged_move_through(&instance, &fs, "d.txt", "e.txt").await;
+                fs.unlink(&request(), ROOT_INO, b"e.txt")
+                    .await
+                    .expect("unlink e.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "e.txt").await, Err(Errno::ENOENT));
+                assert_eq!(listed(&fs, ROOT_INO).await, ["other.txt"], "{after:?}");
+                let kept = match after {
+                    AfterRemoval::Stage => Kept::Deleted,
+                    _ => Kept::Move { dirty: true },
+                };
+                assert_staged_kept(&instance, "e.txt", kept, &format!("{after:?}")).await;
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(revision_content(&instance, revision, "d.txt").await, None);
+                assert_eq!(revision_content(&instance, revision, "e.txt").await, None);
+                assert_eq!(
+                    revision_content(&instance, revision, "other.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"o".as_slice())
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A stage naming a file staged as modified, then removed through the mount, stages its deletion,
+/// and the commit deletes the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_file_edit_removed_through_the_mount_commits_the_deletion() {
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), a, 0, 0, b"ALPHA", 0)
+                .await
+                .expect("write");
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage the edit");
+            assert!(
+                staged_node(&instance, "a.txt")
+                    .await
+                    .is_some_and(|node| node.is_staged_modify())
+            );
+
+            fs.unlink(&request(), ROOT_INO, b"a.txt")
+                .await
+                .expect("unlink a.txt");
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage the removal");
+            let a = staged_node(&instance, "a.txt").await.expect("a.txt");
+            assert!(a.is_staged_delete(), "a.txt: {a:?}");
+            let revision = commit_staged(&instance, &fs).await.expect("the commit");
+            assert_eq!(revision_content(&instance, revision, "a.txt").await, None);
+            assert_eq!(
+                revision_content(&instance, revision, "b.txt")
+                    .await
+                    .as_deref(),
+                Some(b"bee".as_slice())
+            );
+        })
+        .await;
+}
+
+/// A staged directory move whose directory is then removed through the mount, a directory made
+/// at its committed path or not, keeps the move in the staged State, marked dirty alone by a
+/// status, a stage staging the file's deletion, and the commit applies the rules an ordinary
+/// instance applies to a staged move gone from its path: with no directory at the committed path
+/// it deletes the directory and its file; with one there it leaves the move out, and a stage,
+/// which stages the directory made, has it commit the deletion and the directory made.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_directory_move_removed_through_the_mount_commits_as_an_ordinary_instance() {
+    each_variant(
+        AfterRemoval::with_flag(),
+        |(made_again, after)| async move {
+            let instance = Instance::new(&[("d/k.txt", b"k"), ("other.txt", b"o")]).await;
+            LORE_CONTEXT
+                .scope(fuse_fixture::setup_test_execution(), async {
+                    let fs = provider(&instance).await;
+                    staged_move_through(&instance, &fs, "d", "e").await;
+                    if made_again {
+                        fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                            .await
+                            .expect("mkdir d");
+                    }
+                    let e = lookup(&fs, ROOT_INO, "e").await.expect("e");
+                    fs.unlink(&request(), e, b"k.txt")
+                        .await
+                        .expect("unlink e/k.txt");
+                    fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir e");
+                    let fs = after.run(&instance, fs).await;
+
+                    let case = format!("{after:?}, made again {made_again}");
+                    assert_eq!(lookup(&fs, ROOT_INO, "e").await, Err(Errno::ENOENT));
+                    let held: &[&str] = if made_again {
+                        &["d", "other.txt"]
+                    } else {
+                        &["other.txt"]
+                    };
+                    assert_eq!(listed(&fs, ROOT_INO).await, held, "{case}");
+                    assert_staged_kept(&instance, "e", Kept::Move { dirty: true }, &case).await;
+                    let kept = match after {
+                        AfterRemoval::Stage => Kept::Deleted,
+                        AfterRemoval::Status => Kept::Move { dirty: true },
+                        _ => Kept::Move { dirty: false },
+                    };
+                    assert_staged_kept(&instance, "e/k.txt", kept, &case).await;
+                    let made = staged_node(&instance, "d").await;
+                    let held = match after {
+                        _ if !made_again => made.is_none(),
+                        AfterRemoval::Status => {
+                            made.is_some_and(|node| node.is_dirty_add() && !node.is_staged())
+                        }
+                        AfterRemoval::Stage => made.is_some_and(|node| node.is_staged_add()),
+                        _ => made.is_none(),
+                    };
+                    assert!(held, "d: {case}: {made:?}");
+
+                    let committed = try_commit_staged(&instance, &fs).await;
+                    if made_again && after != AfterRemoval::Stage {
+                        assert!(
+                            committed
+                                .as_ref()
+                                .is_err_and(|error| error.is_nothing_staged()),
+                            "{case}: {committed:?}"
+                        );
+                        return;
+                    }
+                    let revision = committed.expect("the commit");
+                    let state = state_at(&instance, revision).await;
+                    assert_eq!(
+                        node_in(&instance, &state, "d")
+                            .await
+                            .is_some_and(|node| node.is_directory()),
+                        made_again,
+                        "{case}"
+                    );
+                    for gone in ["d/k.txt", "e"] {
+                        assert!(
+                            node_in(&instance, &state, gone).await.is_none(),
+                            "{case}: {gone}"
+                        );
+                    }
+                    assert_eq!(
+                        revision_content(&instance, revision, "other.txt")
+                            .await
+                            .as_deref(),
+                        Some(b"o".as_slice())
+                    );
+                })
+                .await;
+        },
+    )
+    .await;
+}
+
+/// A staged add removed through the mount leaves the staged State at the next mark, as a reverted
+/// add leaves it on an ordinary instance, and the commit has nothing to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_add_removed_through_the_mount_leaves_the_staged_state_at_the_next_mark() {
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+                stage_paths_through(&instance, &fs, &["n.txt"])
+                    .await
+                    .expect("stage the add");
+                fs.unlink(&request(), ROOT_INO, b"n.txt")
+                    .await
+                    .expect("unlink n.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "n.txt").await, Err(Errno::ENOENT));
+                assert_eq!(listed(&fs, ROOT_INO).await, ["other.txt"], "{after:?}");
+                let staged = staged_node(&instance, "n.txt").await;
+                let marked = matches!(after, AfterRemoval::Status | AfterRemoval::Stage);
+                assert_eq!(
+                    staged.is_none(),
+                    marked,
+                    "n.txt after {after:?}: {staged:?}"
+                );
+                assert!(staged.is_none_or(|node| node.is_staged_add()), "{staged:?}");
+                let committed = try_commit_staged(&instance, &fs).await;
+                assert!(
+                    committed
+                        .as_ref()
+                        .is_err_and(|error| error.is_nothing_staged()),
+                    "{after:?}: {committed:?}"
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// Marks `to` dirty as a copy of `from`, as `lore file dirty copy` relayed to the service does.
+async fn dirty_copy_through(instance: &Instance, fs: &Arc<FuseFilesystem>, from: &str, to: &str) {
+    let token =
+        lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    lore_revision::file::dirty::dirty_copy(
+        instance.command_context(fs, Some(token.share())),
+        host_path(instance, from),
+        host_path(instance, to),
+    )
+    .await
+    .expect("the copy marked dirty");
+}
+
+/// A staged copy removed through the mount leaves the staged State as an ordinary instance leaves
+/// it. A copy `lore stage --scan` stages, as modified, stays staged past a status, as `lore file
+/// dirty` leaves it; one the provider's own stage stages as added leaves at the next mark, as a
+/// reverted add does. Either leaves at the next stage, and the commit has nothing to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_copy_removed_through_the_mount_leaves_the_staged_state_as_an_ordinary_instance() {
+    each_variant(AfterRemoval::with_flag(), |(scan, after)| async move {
+        let instance = Instance::new(&[("d.txt", b"d"), ("other.txt", b"o")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                create_with(&fs, ROOT_INO, "c.txt", b"d").await;
+                dirty_copy_through(&instance, &fs, "d.txt", "c.txt").await;
+                stage_hosts_through(
+                    &instance,
+                    &fs,
+                    vec![instance.fixture.path.join("c.txt")],
+                    Default::default(),
+                    lore_revision::stage::StageOptions {
+                        scan,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("stage the copy");
+                let case = format!("{after:?}, scan {scan}");
+                let staged = staged_node(&instance, "c.txt")
+                    .await
+                    .expect("the staged copy");
+                assert!(
+                    staged.is_staged() && staged.is_staged_add() != scan,
+                    "{case}: {staged:?}"
+                );
+                fs.unlink(&request(), ROOT_INO, b"c.txt")
+                    .await
+                    .expect("unlink c.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "c.txt").await, Err(Errno::ENOENT));
+                let keeps = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => true,
+                    AfterRemoval::Status => scan,
+                    AfterRemoval::Stage => false,
+                };
+                assert_eq!(
+                    staged_node(&instance, "c.txt").await.map(|node| node.flags),
+                    keeps.then_some(staged.flags),
+                    "c.txt: {case}"
+                );
+                let committed = try_commit_staged(&instance, &fs).await;
+                assert!(
+                    committed
+                        .as_ref()
+                        .is_err_and(|error| error.is_nothing_staged()),
+                    "{case}: {committed:?}"
+                );
+            })
+            .await;
+    })
+    .await;
+}
+
+/// An add a merge staged, not marked dirty, removed through the mount stays in the staged State
+/// through every mark: each status marks it dirty alone, and a stage stages its deletion, as a
+/// scanning stage on an ordinary instance does. Whatever runs between, the commit stores the merge
+/// without it, as on an ordinary instance.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_add_removed_through_the_mount_stays_in_the_staged_state_through_every_mark()
+{
+    each_variant(AfterRemoval::ALL, |after| async move {
+        let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                let (feature, theirs) = feature_branch_and_revision(&instance, &fs).await;
+                merge_through(&instance, &fs, feature)
+                    .await
+                    .expect("the merge");
+                let merged = staged_node(&instance, "new.txt")
+                    .await
+                    .expect("the merged add");
+                assert!(
+                    merged.is_staged_add() && merged.is_staged_merge() && !merged.is_dirty(),
+                    "{merged:?}"
+                );
+                lookup(&fs, ROOT_INO, "new.txt").await.expect("new.txt");
+                fs.unlink(&request(), ROOT_INO, b"new.txt")
+                    .await
+                    .expect("unlink new.txt");
+                let fs = after.run(&instance, fs).await;
+
+                assert_eq!(lookup(&fs, ROOT_INO, "new.txt").await, Err(Errno::ENOENT));
+                let node = staged_node(&instance, "new.txt")
+                    .await
+                    .unwrap_or_else(|| panic!("the staged State holds new.txt: {after:?}"));
+                let kept = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => node.flags == merged.flags,
+                    AfterRemoval::Status => node.flags == merged.flags | NodeFlags::Dirty.bits(),
+                    AfterRemoval::Stage => node.is_staged_delete() && node.is_staged_merge(),
+                };
+                assert!(kept, "new.txt after {after:?}: {node:?}");
+                if after == AfterRemoval::Status {
+                    for status in ["second", "third"] {
+                        changed_paths_holding_token(&instance, &fs).await;
+                        let node = staged_node(&instance, "new.txt")
+                            .await
+                            .unwrap_or_else(|| panic!("the {status} status keeps new.txt"));
+                        assert_eq!(
+                            node.flags,
+                            merged.flags | NodeFlags::Dirty.bits(),
+                            "the {status} status: {node:?}"
+                        );
+                    }
+                }
+
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+                assert_eq!(
+                    revision_content(&instance, revision, "a.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"ALPHA".as_slice())
+                );
+                for gone in ["b.txt", "new.txt"] {
+                    assert_eq!(
+                        revision_content(&instance, revision, gone).await,
+                        None,
+                        "{after:?}: {gone}"
+                    );
+                }
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A directory a merge staged as an add, removed through the mount with the file it holds, stays
+/// in the staged State through every mark with that file, each status marking both dirty alone,
+/// and the commit stores the merge without them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_directory_removed_through_the_mount_stays_in_the_staged_state_through_every_mark()
+ {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let feature = create_branch_id_through(&instance, &fs, "feature").await;
+            switch_through(&instance, &fs, "feature")
+                .await
+                .expect("switch to feature");
+            let added = fs
+                .mkdir(&request(), ROOT_INO, b"added", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir added")
+                .ino;
+            create_with(&fs, added, "x.txt", b"x").await;
+            let theirs = commit_through(&instance, &fs, false)
+                .await
+                .expect("commit on feature");
+            switch_through(&instance, &fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+                .await
+                .expect("switch back");
+            merge_through(&instance, &fs, feature)
+                .await
+                .expect("the merge");
+            let mut merged = Vec::new();
+            for path in ["added", "added/x.txt"] {
+                let node = staged_node(&instance, path).await.expect("the merged add");
+                assert!(
+                    node.is_staged_add() && node.is_staged_merge() && !node.is_dirty(),
+                    "{path}: {node:?}"
+                );
+                merged.push((path, node.flags));
+            }
+            let added = lookup(&fs, ROOT_INO, "added").await.expect("added");
+            lookup(&fs, added, "x.txt").await.expect("added/x.txt");
+            fs.unlink(&request(), added, b"x.txt")
+                .await
+                .expect("unlink added/x.txt");
+            fs.rmdir(&request(), ROOT_INO, b"added")
+                .await
+                .expect("rmdir added");
+
+            for status in ["first", "second"] {
+                changed_paths_holding_token(&instance, &fs).await;
+                for (path, flags) in &merged {
+                    let node = staged_node(&instance, path)
+                        .await
+                        .unwrap_or_else(|| panic!("the {status} status keeps {path}"));
+                    assert_eq!(
+                        node.flags,
+                        flags | NodeFlags::Dirty.bits(),
+                        "the {status} status: {path}: {node:?}"
+                    );
+                }
+            }
+
+            let revision = commit_staged(&instance, &fs).await.expect("the commit");
+            assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+            assert_eq!(
+                revision_content(&instance, revision, "added/x.txt").await,
+                None
+            );
+        })
+        .await;
+}
+
+/// An add a merge staged, removed through the mount and made again with the content the merge
+/// staged after one status or two, is the merge's add once more: the merge commit records it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_staged_add_made_again_after_statuses_is_committed_with_the_merge() {
+    for statuses in [1, 2] {
+        let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                let (feature, theirs) = feature_branch_and_revision(&instance, &fs).await;
+                merge_through(&instance, &fs, feature)
+                    .await
+                    .expect("the merge");
+                lookup(&fs, ROOT_INO, "new.txt").await.expect("new.txt");
+                fs.unlink(&request(), ROOT_INO, b"new.txt")
+                    .await
+                    .expect("unlink new.txt");
+                for _ in 0..statuses {
+                    changed_paths_holding_token(&instance, &fs).await;
+                }
+                create_with(&fs, ROOT_INO, "new.txt", b"new").await;
+                changed_paths_holding_token(&instance, &fs).await;
+                let node = staged_node(&instance, "new.txt")
+                    .await
+                    .unwrap_or_else(|| panic!("{statuses} statuses: new.txt is held"));
+                assert!(
+                    node.is_staged_add() && node.is_staged_merge(),
+                    "{statuses} statuses: {node:?}"
+                );
+
+                let revision = commit_staged(&instance, &fs).await.expect("the commit");
+                assert_eq!(state_at(&instance, revision).await.parent_other(), theirs);
+                assert_eq!(
+                    revision_content(&instance, revision, "new.txt")
+                        .await
+                        .as_deref(),
+                    Some(b"new".as_slice()),
+                    "{statuses} statuses"
+                );
+            })
+            .await;
+    }
+}
+
+/// A stage naming a file a merge left in conflict, removed through the mount, stages its deletion
+/// and leaves the conflict unresolved, and the commit refuses it, as on an ordinary instance. A
+/// stage of its own naming a tracked file the merge left alone, removed beside it, stages its
+/// deletion.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conflicted_file_removed_through_the_mount_is_staged_deleted_and_stays_unresolved() {
+    let instance = Instance::new(&[("a.txt", b"base\n"), ("b.txt", b"bee\n")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let feature = conflicting_feature_branch(&instance, &fs).await;
+            let merged = merge_through(&instance, &fs, feature).await;
+            assert!(
+                staged_node(&instance, "a.txt")
+                    .await
+                    .is_some_and(|node| node.is_staged_merge_unresolved()),
+                "a.txt in conflict: {merged:?}"
+            );
+
+            for name in ["a.txt", "b.txt"] {
+                fs.unlink(&request(), ROOT_INO, name.as_bytes())
+                    .await
+                    .unwrap_or_else(|errno| panic!("unlink {name}: {errno:?}"));
+            }
+            stage_paths_through(&instance, &fs, &["a.txt"])
+                .await
+                .expect("stage a.txt");
+            let a = staged_node(&instance, "a.txt").await.expect("a.txt");
+            assert!(
+                a.is_staged_delete() && a.is_staged_merge_unresolved(),
+                "a.txt: {a:?}"
+            );
+            stage_paths_through(&instance, &fs, &["b.txt"])
+                .await
+                .expect("stage b.txt");
+            let b = staged_node(&instance, "b.txt").await.expect("b.txt");
+            assert!(b.is_staged_delete(), "b.txt: {b:?}");
+            let committed = try_commit_staged(&instance, &fs).await;
+            assert!(
+                committed.as_ref().is_err_and(|error| error.is_conflict()),
+                "{committed:?}"
+            );
+        })
+        .await;
+}
+
+/// An instance whose revision holds the files `shape` starts from, each holding its own path.
+async fn removed_move_instance(shape: crate::dirty_move_fixture::RemovedMove) -> Instance {
+    let files: Vec<(&str, &[u8])> = shape
+        .committed_files()
+        .iter()
+        .map(|file| (*file, file.as_bytes()))
+        .collect();
+    Instance::new(&files).await
+}
+
+/// Removes `path`, a file or a directory holding `k.txt`, through `fs`.
+async fn removed_through(fs: &Arc<FuseFilesystem>, path: &str, directory: bool) {
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (lookup_path(fs, parent).await.expect("the parent"), name),
+        None => (ROOT_INO, path),
+    };
+    if directory {
+        let removed = lookup(fs, parent, name).await.expect("the directory");
+        fs.unlink(&request(), removed, b"k.txt")
+            .await
+            .expect("unlink k.txt");
+        fs.rmdir(&request(), parent, name.as_bytes())
+            .await
+            .expect("rmdir");
+    } else {
+        fs.unlink(&request(), parent, name.as_bytes())
+            .await
+            .expect("unlink");
+    }
+}
+
+/// An unstaged dirty move whose target is then removed through the mount, a file or a directory,
+/// moved to a path the revision lacks or to one it holds by other nodes removed first, its
+/// committed path free or taken again, settles as `lore file dirty` settles it on an ordinary
+/// instance ([`RemovedMove::held`]), whether or not a status ran between the move and the removal,
+/// which keeps the move: a status goes back to the committed path and marks it deleted there,
+/// unless that path is taken, which leaves the node its move; a stage stages those marks. The
+/// commit takes nothing until a stage, then the deletion, never the move.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unstaged_dirty_move_removed_through_the_mount_settles_as_lore_file_dirty_settles_it() {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let variants = [Target::Free, Target::Committed]
+        .into_iter()
+        .flat_map(RemovedMove::each)
+        .flat_map(|shape| {
+            AfterRemoval::with_flag().map(move |(status_first, after)| (shape, status_first, after))
+        })
+        .filter(|(shape, _, after)| {
+            !matches!(after, AfterRemoval::Stage) || shape.settles().contains(&Settled::Staged)
+        });
+    each_variant(variants, |(shape, status_first, after)| async move {
+        let instance = removed_move_instance(shape).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                if shape.target == Target::Committed {
+                    removed_through(&fs, shape.to(), shape.directory).await;
+                }
+                dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+                let fs = if status_first {
+                    let fs = AfterRemoval::Status.run(&instance, fs).await;
+                    assert_eq!(
+                        held_at(&instance.fixture.repository, shape.paths()).await,
+                        shape.held(Settled::Unmarked),
+                        "the status keeps the move"
+                    );
+                    fs
+                } else {
+                    fs
+                };
+                if shape.taken && shape.directory {
+                    fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                        .await
+                        .expect("mkdir d");
+                } else if shape.taken {
+                    create_with(&fs, ROOT_INO, "d.txt", b"new").await;
+                }
+                removed_through(&fs, shape.to(), shape.directory).await;
+                let fs = after.run(&instance, fs).await;
+                let settled = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => Settled::Unmarked,
+                    AfterRemoval::Status => Settled::Marked,
+                    AfterRemoval::Stage => Settled::Staged,
+                };
+
+                assert_eq!(
+                    held_at(&instance.fixture.repository, shape.paths()).await,
+                    shape.held(settled),
+                    "{:?}",
+                    shape.paths()
+                );
+                let revision = match try_commit_staged(&instance, &fs).await {
+                    Ok(revision) => Some((revision, state_at(&instance, revision).await)),
+                    Err(error) if error.is_nothing_staged() => None,
+                    Err(error) => panic!("the commit: {error}"),
+                };
+                let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+                let committed = match &revision {
+                    Some((_, state)) => {
+                        Some(committed_paths(&instance.fixture.repository, state, &paths).await)
+                    }
+                    None => None,
+                };
+                assert_eq!(committed, shape.committed(settled));
+                if let (Some((revision, _)), true, false) = (revision, shape.taken, shape.directory)
+                {
+                    assert_eq!(
+                        revision_content(&instance, revision, "d.txt")
+                            .await
+                            .as_deref(),
+                        Some(b"new".as_slice())
+                    );
+                }
+            })
+            .await;
+    })
+    .await;
+}
+
+/// A directory an unstaged dirty move took to a path the revision lacks keeps its move through a
+/// status that reports it, renamed through the mount to a name that differs only in case, and once
+/// removed through the mount settles as `lore file dirty` settles it ([`RemovedMove::held`]).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dirty_moved_directory_renamed_in_case_keeps_its_move_through_a_status() {
+    use crate::dirty_move_fixture::Held;
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let shape = RemovedMove {
+        target: Target::Free,
+        directory: true,
+        taken: false,
+    };
+    let instance = removed_move_instance(shape).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+            fs.rename(&request(), ROOT_INO, b"e", ROOT_INO, b"E", 0)
+                .await
+                .expect("rename e to E");
+            let fs = AfterRemoval::Status.run(&instance, fs).await;
+            assert_eq!(
+                held_at(
+                    &instance.fixture.repository,
+                    &["d", "d/k.txt", "E", "E/k.txt"]
+                )
+                .await,
+                [
+                    Held::Nothing,
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyMove
+                ]
+            );
+
+            removed_through(&fs, "E", true).await;
+            AfterRemoval::Status.run(&instance, fs).await;
+            assert_eq!(
+                held_at(&instance.fixture.repository, shape.paths()).await,
+                shape.held(Settled::Marked),
+                "{:?}",
+                shape.paths()
+            );
+        })
+        .await;
+}
+
+/// An unstaged dirty move into a directory made through the mount and marked dirty as added, by
+/// `lore file dirty` or a status, which is then removed through the mount with what it holds, a
+/// file or a directory moved, its committed path free or taken again, settles as `lore file dirty`
+/// settles it on an ordinary instance ([`RemovedMove::held`]): a status takes the moved node out
+/// of the directory before its discard, back to its committed path and marked deleted there,
+/// unless that path is taken, which keeps the node its move and the directory; a stage stages
+/// those marks. The commit takes nothing until a stage.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unstaged_dirty_move_into_an_added_directory_removed_through_the_mount_settles_as_lore_file_dirty_settles_it()
+ {
+    use crate::dirty_move_fixture::RemovedMove;
+    use crate::dirty_move_fixture::Settled;
+    use crate::dirty_move_fixture::Target;
+
+    let variants = RemovedMove::each(Target::Added)
+        .into_iter()
+        .flat_map(|shape| {
+            [false, true].into_iter().flat_map(move |by_status| {
+                AfterRemoval::ALL.map(move |after| (shape, by_status, after))
+            })
+        });
+    each_variant(variants, |(shape, by_status, after)| async move {
+        let instance = removed_move_instance(shape).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                fs.mkdir(&request(), ROOT_INO, b"n", libc::S_IFDIR | 0o755, 0o022)
+                    .await
+                    .expect("mkdir n");
+                let fs = if by_status {
+                    AfterRemoval::Status.run(&instance, fs).await
+                } else {
+                    dirtied_through(&instance, &fs, "n").await;
+                    fs
+                };
+                dirty_move_through(&instance, &fs, shape.from(), shape.to()).await;
+                if shape.taken && shape.directory {
+                    fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                        .await
+                        .expect("mkdir d");
+                } else if shape.taken {
+                    create_with(&fs, ROOT_INO, "d.txt", b"new").await;
+                }
+                removed_through(&fs, shape.to(), shape.directory).await;
+                fs.rmdir(&request(), ROOT_INO, b"n").await.expect("rmdir n");
+                let fs = after.run(&instance, fs).await;
+                let settled = match after {
+                    AfterRemoval::Nothing | AfterRemoval::Remount => Settled::Unmarked,
+                    AfterRemoval::Status => Settled::Marked,
+                    AfterRemoval::Stage => Settled::Staged,
+                };
+
+                assert_eq!(
+                    held_at(&instance.fixture.repository, shape.paths()).await,
+                    shape.held(settled),
+                    "{:?}",
+                    shape.paths()
+                );
+                let paths: Vec<&str> = shape.paths().iter().copied().chain(["other.txt"]).collect();
+                let committed = match try_commit_staged(&instance, &fs).await {
+                    Ok(revision) => Some(
+                        committed_paths(
+                            &instance.fixture.repository,
+                            &*state_at(&instance, revision).await,
+                            &paths,
+                        )
+                        .await,
+                    ),
+                    Err(error) if error.is_nothing_staged() => None,
+                    Err(error) => panic!("the commit: {error}"),
+                };
+                assert_eq!(committed, shape.committed(settled));
+            })
+            .await;
+    })
+    .await;
+}
+
+/// An unstaged dirty move removed through the mount goes back to its committed place once a status
+/// has discarded the directory made there: the file `d/x.txt` moved to `y.txt`, the directory `d`
+/// moved to `e`, and a directory `e/x.txt` made and marked added, then `y.txt` and `e/x.txt` both
+/// removed. The status discards each add it found removed before it returns a move, as a directory
+/// marked added holds the place until its discard.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_dirty_move_goes_back_to_a_place_a_removed_added_directory_held() {
+    use crate::dirty_move_fixture::Held;
+
+    let instance = Instance::new(&[("d/x.txt", b"x"), ("other.txt", b"o")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            dirty_move_through(&instance, &fs, "d/x.txt", "y.txt").await;
+            dirty_move_through(&instance, &fs, "d", "e").await;
+            let e = lookup(&fs, ROOT_INO, "e").await.expect("e");
+            fs.mkdir(&request(), e, b"x.txt", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir e/x.txt");
+            let fs = AfterRemoval::Status.run(&instance, fs).await;
+            let paths = ["d", "e", "e/x.txt", "y.txt"];
+            let mut held = Vec::new();
+            for path in paths {
+                held.push(Held::of(staged_node(&instance, path).await.as_ref()));
+            }
+            assert_eq!(
+                held,
+                [
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyAdd,
+                    Held::DirtyMove
+                ],
+                "before the removal: {paths:?}"
+            );
+
+            fs.rmdir(&request(), e, b"x.txt")
+                .await
+                .expect("rmdir e/x.txt");
+            fs.unlink(&request(), ROOT_INO, b"y.txt")
+                .await
+                .expect("unlink y.txt");
+            let _fs = AfterRemoval::Status.run(&instance, fs).await;
+            let mut held = Vec::new();
+            for path in paths {
+                held.push(Held::of(staged_node(&instance, path).await.as_ref()));
+            }
+            assert_eq!(
+                held,
+                [
+                    Held::Nothing,
+                    Held::DirtyMove,
+                    Held::DirtyDelete,
+                    Held::Nothing
+                ],
+                "{paths:?}"
+            );
+        })
+        .await;
+}
+
 /// A staged temporary saved over its name before the next stage, which stages the saved file,
 /// leaves the staged State with it: the commit stores the save, and status is clean.
 #[tokio::test(flavor = "multi_thread")]
@@ -13384,11 +14393,10 @@ async fn a_staged_temporary_saved_over_its_name_leaves_the_staged_state() {
         .await;
 }
 
-/// A local file last changed before a commit read the filesystem clock has the time the commit
-/// read it at recorded, the later of its modification and status change: the fixture's clock
-/// reads.
+/// A local file last modified before a commit read the filesystem clock has its modification time
+/// recorded, the time the file shows, though its status changed since.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
+async fn a_commit_records_the_modification_time_of_a_local_file_written_before_its_clock() {
     let instance = Instance::new(&[("a.txt", b"alpha")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -13405,16 +14413,8 @@ async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
                 .expect("a.txt")
                 .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
                 .expect("an older time");
-            let changed = {
-                use std::os::unix::fs::MetadataExt as _;
-
-                let metadata = std::fs::metadata(&host).expect("a.txt");
-                let ctime = u64::try_from(metadata.ctime()).expect("a time") * 1000
-                    + u64::try_from(metadata.ctime_nsec()).expect("a time") / 1_000_000;
-                lore_revision::util::fs::file_mtime(&metadata).max(ctime)
-            };
-            // Past the change's tick, so the commit's clock reads later than it.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            let modified =
+                lore_revision::util::fs::file_mtime(&std::fs::metadata(&host).expect("a.txt"));
 
             commit_through(&instance, &fs, false).await.expect("commit");
             assert_eq!(
@@ -13424,10 +14424,594 @@ async fn a_commit_records_the_time_of_a_local_file_written_before_its_clock() {
                         .expect("a path"),
                 )
                 .await,
-                changed
+                modified
             );
         })
         .await;
+}
+
+/// A local file modified in or after the tick a commit reads its clock in has its modification time
+/// recorded too: the mount waits for the filesystem holding `write/` to stamp later before it serves
+/// the file from the store, so no time is too recent to record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_records_the_modification_time_of_a_local_file_written_after_its_clock() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            fs.forget(ino, 1);
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            );
+            let modified = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("a.txt")).expect("a.txt"),
+            );
+
+            commit_through(&instance, &fs, false).await.expect("commit");
+            assert_eq!(recorded_time(&instance, &fs, "a.txt").await, modified);
+        })
+        .await;
+}
+
+/// A commit holds its flips back until the filesystem holding `write/` stamps later than the
+/// latest time it recorded, up to the limit on the wait: a file dated an hour ahead holds them
+/// back for the whole limit, 10 ms.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_flips_its_files_once_the_clock_passed_the_times_it_recorded() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() + Duration::from_secs(3600),
+            );
+            let reconciled = Arc::new(parking_lot::Mutex::new(None::<Instant>));
+            let held = Arc::new(parking_lot::Mutex::new(None::<Duration>));
+            fs.set_write_hook(Arc::new({
+                let reconciled = reconciled.clone();
+                move |step| {
+                    if step == WriteStep::Reconcile {
+                        *reconciled.lock() = Some(Instant::now());
+                    }
+                    true
+                }
+            }));
+            fs.set_commit_hook(commit_step(&fs, {
+                let held = held.clone();
+                move |_| {
+                    if let Some(reconciled) = *reconciled.lock() {
+                        held.lock().get_or_insert(reconciled.elapsed());
+                    }
+                    async {}
+                }
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+
+            assert_eq!(fs.commit_outcomes(), (1, 0));
+            let held = held
+                .lock()
+                .expect("the flips ran after the reconcile began");
+            assert!(held >= Duration::from_millis(10), "flipped after {held:?}");
+        })
+        .await;
+}
+
+/// A file a write changes at its size while a commit stores it, dated back to the time the commit
+/// read, stays local with no recorded time: a status without the write token reads it and reports
+/// the change, rather than answering it by the time the commit recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_commit_left_local_has_its_recorded_time_cleared() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            let read_at = std::time::SystemTime::now() - Duration::from_secs(3600);
+            set_host_time(&instance, "a.txt", read_at);
+            let host = instance.write_dir().join("a.txt");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let host = host.clone();
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"TWO..", 0)
+                            .await
+                            .expect("the racing write");
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("a.txt")
+                            .set_modified(read_at)
+                            .expect("a modified time");
+                    }
+                }
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+            assert!(instance.write_dir().join("a.txt").exists());
+
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A file a commit leaves local has its record cleared whatever time it holds, as one a status
+/// without the write token recorded for the file before the mount took the swaps lock, and the
+/// mount writes the records back before it settles the directories, ahead of the command's flush:
+/// a status reads the file and reports the change, and the records on disk then hold no time for
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_a_commit_left_local_has_any_recorded_time_cleared_and_written_back() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+    use lore_revision::records::RECORDS_DIR;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), ino, 0, 0, b"ONE..", 0)
+                .await
+                .expect("write");
+            let raced_at = std::time::SystemTime::now() - Duration::from_secs(3600);
+            let raced_millis = raced_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a time after the epoch")
+                .as_millis() as u64;
+            let host = instance.write_dir().join("a.txt");
+            let raced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            fs.set_commit_hook(commit_step(&fs, move |fs| {
+                let first = !raced.swap(true, std::sync::atomic::Ordering::SeqCst);
+                let host = host.clone();
+                async move {
+                    if first {
+                        fs.write(&request(), ino, 0, 0, b"TWO..", 0)
+                            .await
+                            .expect("the racing write");
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("a.txt")
+                            .set_modified(raced_at)
+                            .expect("a modified time");
+                        let served = fs.served();
+                        fs.recorded_times()
+                            .set(&served.repository, &relative("a.txt"), raced_millis)
+                            .await;
+                    }
+                }
+            }));
+            let records = instance.fixture.path.join(".lore").join(RECORDS_DIR);
+            let on_disk = TempDir::new("lore-fuse-records-at-the-settle-");
+            let copied = on_disk.path().join(RECORDS_DIR);
+            fs.set_write_hook(Arc::new(move |step| {
+                if step == WriteStep::DirectoriesSettled {
+                    copy_files(&records, &copied);
+                }
+                true
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(fs.commit_outcomes(), (0, 1));
+
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["a.txt".to_string()]
+            );
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &relative("a.txt"),
+            );
+            let found = InstanceRecords::open(on_disk.path())
+                .await
+                .lookup(&key)
+                .await;
+            assert!(
+                matches!(found, Lookup::Missing(_) | Lookup::Recorded(0)),
+                "the records on disk hold {found:?} for a.txt"
+            );
+        })
+        .await;
+}
+
+/// Runs `lore sync <revision> --forward-changes` through `fs`, as relayed to the service, which
+/// keeps each local file in place.
+async fn sync_forwarding(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    revision: Hash,
+) -> Result<(), lore_revision::revision::sync::SyncError> {
+    let options = lore_revision::revision::sync::SyncOptions {
+        revision: Some(revision.to_string()),
+        forward_changes: true,
+        ..Default::default()
+    };
+    sync_reporting(instance, fs, options, Default::default())
+        .await
+        .0
+}
+
+/// A local file a sync forwarding local changes keeps in place, where the target changes the
+/// file, has the time the swap recorded for its path cleared: a status without the write token
+/// reads the file, though it shows that time, and reports it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_file_a_forwarding_sync_keeps_has_the_time_of_the_swap_cleared() {
+    use lore_revision::fs::hold::SwapPhase;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let ino = lookup_path(&fs, "dir/f.txt").await.expect("dir/f.txt");
+            fs.write(&request(), ino, 0, 0, b"TWO", 0)
+                .await
+                .expect("write");
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &relative("dir/f.txt"),
+            );
+            let host = instance.write_dir().join("dir/f.txt");
+            fs.set_swap_hook(Arc::new(move |phase| {
+                let (records, host) = (records.clone(), host.clone());
+                Box::pin(async move {
+                    if phase == SwapPhase::Removed
+                        && let Lookup::Recorded(swapped) = records.lookup(&key).await
+                    {
+                        std::fs::File::options()
+                            .write(true)
+                            .open(&host)
+                            .expect("dir/f.txt")
+                            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(swapped))
+                            .expect("the swap's time");
+                    }
+                    true
+                })
+            }));
+
+            sync_forwarding(&instance, &fs, first).await.expect("sync");
+
+            assert_eq!(served_at(&fs, "dir/f.txt").await, b"TWO");
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["dir/f.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// A status without the write token that read a local file holding the content of the revision
+/// it began at, while a sync forwarding local changes moved the mount to a revision changing the
+/// file and kept the file in place, records no time for the file: the next status reads it and
+/// reports it. A first status records the file's time, which opens the records to lookups, and
+/// the file is then dated back again, so the second reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_for_a_file_a_sync_moved_the_mount_away_from() {
+    use lore_revision::records::InstanceRecords;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            rewrite_identically(&instance, &fs, "dir/f.txt", b"two").await;
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            set_host_time(
+                &instance,
+                "dir/f.txt",
+                std::time::SystemTime::now() - Duration::from_secs(7200),
+            );
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let pause = records.lookup_pause();
+            pause.arm();
+
+            tokio::join!(changed_paths(&instance, &fs), async {
+                tokio::time::timeout(Duration::from_secs(30), pause.reached())
+                    .await
+                    .expect("the status looks dir/f.txt up");
+                sync_forwarding(&instance, &fs, first).await.expect("sync");
+                pause.resume();
+            });
+
+            assert_eq!(fs.served().revision(), first);
+            assert_eq!(
+                changed_paths(&instance, &fs).await,
+                vec!["dir/f.txt".to_string()]
+            );
+        })
+        .await;
+}
+
+/// The time recorded for `path` in the instance's records.
+async fn record_of(instance: &Instance, path: &str) -> lore_revision::records::Lookup {
+    let records = lore_revision::records::InstanceRecords::open(
+        instance
+            .fixture
+            .repository
+            .dot_dir_path()
+            .expect("a Lore directory"),
+    )
+    .await;
+    let key = lore_revision::state::file_modified_time_record_key(
+        instance.fixture.repository.salt(),
+        &relative(path),
+    );
+    records.lookup(&key).await
+}
+
+/// Rewrites `path` with `content`, which its node holds, has a status record its time, then dates
+/// the file back, so the next status without the write token reads it and records its time.
+async fn identical_rewrite_to_record(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    path: &str,
+    content: &[u8],
+) {
+    rewrite_identically(instance, fs, path, content).await;
+    assert!(
+        !changed_paths(instance, fs)
+            .await
+            .contains(&path.to_string())
+    );
+    set_host_time(
+        instance,
+        path,
+        std::time::SystemTime::now() - Duration::from_secs(7200),
+    );
+}
+
+/// A hook step that tells `reached` it runs, then waits for `resume`.
+fn pause_at(
+    reached: &Arc<tokio::sync::Notify>,
+    resume: &Arc<tokio::sync::Notify>,
+) -> impl Fn(Arc<FuseFilesystem>) -> lore_revision::BoxFuture<'static, ()> + Send + Sync + 'static {
+    let (reached, resume) = (reached.clone(), resume.clone());
+    let armed = std::sync::atomic::AtomicBool::new(true);
+    move |_| {
+        let pauses = armed.swap(false, std::sync::atomic::Ordering::SeqCst);
+        let (reached, resume) = (reached.clone(), resume.clone());
+        Box::pin(async move {
+            if pauses {
+                reached.notify_one();
+                resume.notified().await;
+            }
+        })
+    }
+}
+
+/// A status without the write token that compares a local file while a swap holds the swaps lock
+/// records no time for it, though the swap leaves the file and its node as they stand.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_while_a_swap_holds_the_mount() {
+    use lore_revision::fs::hold::SwapPhase;
+
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            identical_rewrite_to_record(&instance, &fs, "keep/k.txt", b"kept").await;
+            let before = record_of(&instance, "keep/k.txt").await;
+            let (reached, resume) = (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            fs.set_swap_hook(at_first(
+                &fs,
+                SwapPhase::Removed,
+                pause_at(&reached, &resume),
+            ));
+
+            let (synced, during) = tokio::join!(sync_forwarding(&instance, &fs, first), async {
+                tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                    .await
+                    .expect("the swap reaches its removals");
+                changed_paths(&instance, &fs).await;
+                let during = record_of(&instance, "keep/k.txt").await;
+                resume.notify_one();
+                during
+            });
+
+            synced.expect("sync");
+            assert_eq!(during, before);
+        })
+        .await;
+}
+
+/// A status without the write token that looked a local file up before a commit took the swaps
+/// lock, and compares the file while the commit holds it, records no time for it: the mount still
+/// stands at the revision the status compares against until the commit hands it the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_status_records_no_time_while_a_commit_holds_the_mount() {
+    use lore_revision::records::InstanceRecords;
+
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bravo")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            stage_paths_through(&instance, &fs, &["n.txt"])
+                .await
+                .expect("stage");
+            identical_rewrite_to_record(&instance, &fs, "b.txt", b"bravo").await;
+            let before = record_of(&instance, "b.txt").await;
+            let records = InstanceRecords::open(
+                instance
+                    .fixture
+                    .repository
+                    .dot_dir_path()
+                    .expect("a Lore directory"),
+            )
+            .await;
+            let lookup = records.lookup_pause();
+            lookup.arm();
+            let token =
+                lore_revision::repository::RepositoryWriteToken::acquire(&instance.fixture.path)
+                    .await;
+            let context = instance.locked_command_context(&fs, token.share()).await;
+            let (reached, resume, compared) = (
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+                Arc::new(tokio::sync::Notify::new()),
+            );
+            fs.set_commit_hook(commit_step(&fs, pause_at(&reached, &resume)));
+
+            let (_, committed, during) = tokio::join!(
+                async {
+                    changed_paths(&instance, &fs).await;
+                    compared.notify_one();
+                },
+                async {
+                    tokio::time::timeout(Duration::from_secs(30), lookup.reached())
+                        .await
+                        .expect("the status looks b.txt up");
+                    commit_staged_in(context, &token, false).await
+                },
+                async {
+                    tokio::time::timeout(Duration::from_secs(30), reached.notified())
+                        .await
+                        .expect("the commit takes the swaps lock");
+                    lookup.resume();
+                    compared.notified().await;
+                    let during = record_of(&instance, "b.txt").await;
+                    resume.notify_one();
+                    during
+                }
+            );
+
+            committed.expect("commit");
+            assert_eq!(during, before);
+        })
+        .await;
+}
+
+/// A commit writes its times back to the instance's records before it hands the mount the
+/// revision, which then serves the committed file from the store: a crash after the hand-over
+/// keeps the time the file reports.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_writes_its_times_back_before_the_mount_serves_its_files_from_the_store() {
+    use lore_revision::fs::fuse::filesystem::WriteStep;
+    use lore_revision::records::InstanceRecords;
+    use lore_revision::records::Lookup;
+    use lore_revision::records::RECORDS_DIR;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            let modified = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("n.txt")).expect("n.txt"),
+            );
+            let records = instance.fixture.path.join(".lore").join(RECORDS_DIR);
+            let at_hand_over = TempDir::new("lore-fuse-records-at-hand-over-");
+            let copied = at_hand_over.path().join(RECORDS_DIR);
+            fs.set_write_hook(Arc::new(move |step| {
+                if step == WriteStep::Reconcile {
+                    copy_files(&records, &copied);
+                }
+                true
+            }));
+
+            commit_locked_through(&instance, &fs).await.expect("commit");
+            assert!(!instance.write_dir().join("n.txt").exists());
+            let key = lore_revision::state::file_modified_time_record_key(
+                instance.fixture.repository.salt(),
+                &lore_revision::util::path::RelativePath::new_from_initial_path("n.txt")
+                    .expect("a path"),
+            );
+            assert_eq!(
+                InstanceRecords::open(at_hand_over.path())
+                    .await
+                    .lookup(&key)
+                    .await,
+                Lookup::Recorded(modified),
+                "the records on disk at the hand-over hold n.txt's time"
+            );
+        })
+        .await;
+}
+
+/// A commit whose times cannot be written back to the instance's records hands the mount nothing:
+/// the committed file stays local, reporting its own time, rather than served from the store with
+/// a time no record on disk holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_commit_whose_times_cannot_be_written_back_leaves_its_files_local() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
+            let records = instance
+                .fixture
+                .path
+                .join(".lore")
+                .join(lore_revision::records::RECORDS_DIR);
+            std::fs::remove_dir_all(&records).expect("the records directory removed");
+            std::fs::write(&records, b"not a directory").expect("its path taken by a file");
+
+            let revision = commit_locked_through(&instance, &fs).await.expect("commit");
+            assert_eq!(
+                revision_content(&instance, revision, "n.txt").await,
+                Some(b"new".to_vec())
+            );
+            assert!(instance.write_dir().join("n.txt").exists());
+        })
+        .await;
+}
+
+/// Copies the files directly in `from`, where it exists, into `to`.
+fn copy_files(from: &Path, to: &Path) {
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return;
+    };
+    std::fs::create_dir_all(to).expect("the copy's directory");
+    for entry in entries {
+        let entry = entry.expect("an entry");
+        std::fs::copy(entry.path(), to.join(entry.file_name())).expect("a copy");
+    }
 }
 
 /// The modified time recorded for `path`, 0 for none.
@@ -13439,10 +15023,241 @@ async fn recorded_time(instance: &Instance, fs: &Arc<FuseFilesystem>, path: &str
     .await
 }
 
+/// The modification time GETATTR reports for inode `ino`, in milliseconds.
+async fn reported_time(fs: &FuseFilesystem, ino: u64) -> u64 {
+    let attr = fs.getattr(&request(), ino).await.expect("getattr").attr;
+    attr.mtime * 1000 + u64::from(attr.mtimensec) / 1_000_000
+}
+
+/// Edits each of `names` through a provider over `instance` with a time an hour old, resets them
+/// in one reset to `revision`, the served one where `None`, and checks that the reset serves each
+/// from the store again with one time, later than the edits', which the inodes held across the
+/// reset, lookups after a FORGET and a remount report.
+async fn reset_reports_a_time_later_than_the_edits(
+    instance: &Instance,
+    names: &[&str],
+    revision: Option<Hash>,
+) {
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(instance).await;
+            let mut held = Vec::new();
+            let mut edited = 0;
+            for name in names {
+                let ino = lookup(&fs, ROOT_INO, name).await.expect(name);
+                fs.write(&request(), ino, 0, 0, b"EDITED", 0)
+                    .await
+                    .expect("write");
+                set_host_time(
+                    instance,
+                    name,
+                    std::time::SystemTime::now() - Duration::from_secs(3600),
+                );
+                edited = edited.max(reported_time(&fs, ino).await);
+                held.push(ino);
+            }
+
+            reset_through(instance, &fs, names, revision, false)
+                .await
+                .expect("reset");
+            let reset = reported_time(&fs, held[0]).await;
+            assert!(
+                (edited + 1..=lore_revision::util::fs::modified_millis(None)).contains(&reset),
+                "the reset reports {reset}, the edits {edited}"
+            );
+            for (name, &ino) in names.iter().zip(&held) {
+                assert!(!instance.write_dir().join(name).exists(), "{name}");
+                assert_eq!(reported_time(&fs, ino).await, reset, "{name} held");
+                fs.forget(ino, 1);
+                let ino = lookup(&fs, ROOT_INO, name).await.expect(name);
+                assert_eq!(
+                    reported_time(&fs, ino).await,
+                    reset,
+                    "{name} after a FORGET"
+                );
+            }
+            drop(fs);
+            let remounted = provider(instance).await;
+            for name in names {
+                let ino = lookup(&remounted, ROOT_INO, name).await.expect(name);
+                assert_eq!(
+                    reported_time(&remounted, ino).await,
+                    reset,
+                    "{name} after a remount"
+                );
+            }
+        })
+        .await;
+}
+
+/// A reset of a file edited through the mount to the content the mount serves from the store
+/// reports a time later than the edit's, so a build tool rebuilds what the edit built.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_to_the_served_content_reports_a_time_later_than_the_edit() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    reset_reports_a_time_later_than_the_edits(&instance, &["a.txt"], None).await;
+}
+
+/// A reset of files to another revision that holds the content the mount serves for them reports
+/// one time for them, later than the edits', though the reset's collector discards its times for
+/// a revision other than the current one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_files_to_another_revision_holding_their_served_content_reports_one_later_time()
+{
+    let instance = Instance::with_revisions(&[
+        &[("a.txt", b"alpha"), ("b.txt", b"bee"), ("c.txt", b"one")],
+        &[("c.txt", b"two")],
+    ])
+    .await;
+    let first = instance.fixture.state.parent_self();
+    reset_reports_a_time_later_than_the_edits(&instance, &["a.txt", "b.txt"], Some(first)).await;
+}
+
+/// An inode made of a file an operation serves from the store again, before the operation ends,
+/// reports the time the operation answers for the file, not the time recorded before it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inode_made_before_a_restoring_operation_ends_reports_its_time() {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+    use lore_revision::fs::fuse::operation::FuseOperation;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let revision_node = fs_node(&instance, &fs, "a.txt").await;
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            fs.write(&request(), a, 0, 0, b"EDITED", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "a.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+            fs.forget(a, 1);
+
+            let operation = FuseOperation::new(fs.clone());
+            let restored = operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &RelativePath::new_from_initial_path("a.txt").expect("path"),
+                )
+                .await
+                .expect("the restore");
+            assert!(
+                !instance.write_dir().join("a.txt").exists(),
+                "a.txt is served from the store"
+            );
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(reported_time(&fs, a).await, restored.mtime());
+        })
+        .await;
+}
+
+/// An operation reads the time it records for the files it serves from the store again as it
+/// first serves one, not as it first writes a file of the mounted revision: the first file it
+/// serves from the store after it writes another local reports a later time than that file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restoring_operation_reads_its_time_as_it_first_serves_a_file_from_the_store() {
+    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+    use lore_revision::fs::fuse::operation::FuseOperation;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let revision_node = fs_node(&instance, &fs, "b.txt").await;
+            let b = lookup(&fs, ROOT_INO, "b.txt").await.expect("b.txt");
+            fs.write(&request(), b, 0, 0, b"EDITED", 0)
+                .await
+                .expect("write");
+            fs.forget(b, 1);
+
+            let operation = FuseOperation::new(fs.clone());
+            let path = |name| RelativePath::new_from_initial_path(name).expect("path");
+            operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &path("a.txt"),
+                )
+                .await
+                .expect("the local write");
+            assert!(
+                instance.write_dir().join("a.txt").exists(),
+                "a.txt is local"
+            );
+            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            let written = reported_time(&fs, a).await;
+            let dot_dir = instance.fixture.repository.dot_dir_path().ok();
+            while lore_revision::state::time_before_next_write(dot_dir).await <= written {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let restored = operation
+                .write_node(
+                    instance.fixture.repository.clone(),
+                    &revision_node,
+                    &path("b.txt"),
+                )
+                .await
+                .expect("the restore");
+            assert!(
+                !instance.write_dir().join("b.txt").exists(),
+                "b.txt is served from the store"
+            );
+            assert!(
+                restored.mtime() > written,
+                "b.txt reports {}, a.txt {written}",
+                restored.mtime()
+            );
+        })
+        .await;
+}
+
+/// An inode the kernel holds at a file edited locally across a sync resetting local changes
+/// reports the time the sync records for the path, which a lookup after a FORGET reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_inode_held_across_a_reset_sync_reports_the_time_the_sync_records() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            set_host_time(
+                &instance,
+                "keep/k.txt",
+                std::time::SystemTime::now() - Duration::from_secs(3600),
+            );
+            let edited = reported_time(&fs, k).await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            let held = reported_time(&fs, k).await;
+            assert!(
+                held > edited,
+                "the held inode reports {held}, the edit {edited}"
+            );
+            fs.forget(k, 1);
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(reported_time(&fs, k).await, held);
+        })
+        .await;
+}
+
 /// A save over a file inside a commit, after the commit read the file's time and in the same
-/// timestamp tick, at the same size, is staged by the next commit: the commit recorded no time
-/// it could not tell apart from a later write. The tick is forced, as a coarse clock makes it.
-/// A file changed before the commit's clock has its time recorded, so the clock was read.
+/// timestamp tick, at the same size, is staged by the next commit: a virtual clone compares files
+/// by content. The tick is forced, as a coarse clock makes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
     use std::sync::atomic::AtomicBool;
@@ -13467,8 +15282,6 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
                 "b.txt",
                 std::time::SystemTime::now() - Duration::from_secs(3600),
             );
-            // Past the change's tick, so the commit's clock reads later than it.
-            tokio::time::sleep(Duration::from_millis(20)).await;
             // Written in the tick the commit reads its clock in: a time no older than the clock.
             let host = instance.write_dir().join("a.txt");
             let tick = std::time::SystemTime::now() + Duration::from_secs(3600);
@@ -13513,7 +15326,7 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
             assert_ne!(
                 recorded_time(&instance, &fs, "b.txt").await,
                 0,
-                "the commit recorded a time for b.txt: its clock read"
+                "the commit recorded a time for b.txt"
             );
             let revision = commit_through(&instance, &fs, false)
                 .await
@@ -13531,7 +15344,7 @@ async fn a_save_in_the_commits_timestamp_tick_is_staged_by_the_next_commit() {
 
 /// A save's temporary written in the millisecond of the file it saves over, before a commit, and
 /// renamed over the file after the commit recorded the file's time, is staged by the next commit:
-/// the file renamed onto the name never matches the time recorded for the one it replaced.
+/// a virtual clone compares files by content, whatever their times.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_temporary_from_the_files_millisecond_renamed_over_it_after_a_commit_is_staged() {
     let instance = Arc::new(Instance::new(&[("a.txt", b"alpha")]).await);
@@ -13545,7 +15358,6 @@ async fn a_temporary_from_the_files_millisecond_renamed_over_it_after_a_commit_i
             fs.forget(ino, 1);
             let millisecond = std::time::SystemTime::now() - Duration::from_secs(3600);
             set_host_time(&instance, "a.txt", millisecond);
-            wait_past_host_time(&instance, &fs, "a.txt").await;
             stage_through(&instance, &fs).await.expect("stage a.txt");
             let temporary = create_with(&fs, ROOT_INO, "a.txt.tmp", b"TWO..").await;
             set_host_time(&instance, "a.txt.tmp", millisecond);
@@ -13590,14 +15402,19 @@ async fn a_file_created_after_an_unlink_with_the_recorded_time_is_staged() {
             fs.forget(ino, 1);
             let millisecond = std::time::SystemTime::now() - Duration::from_secs(3600);
             set_host_time(&instance, "a.txt", millisecond);
-            wait_past_host_time(&instance, &fs, "a.txt").await;
-            stage_through(&instance, &fs).await.expect("stage a.txt");
-            commit_staged(&instance, &fs).await.expect("commit a.txt");
-            assert_ne!(
-                recorded_time(&instance, &fs, "a.txt").await,
-                0,
-                "the commit recorded a time for a.txt"
+            let shown = lore_revision::util::fs::file_mtime(
+                &std::fs::metadata(instance.write_dir().join("a.txt")).expect("a.txt"),
             );
+            commit_locked_through(&instance, &fs)
+                .await
+                .expect("commit a.txt");
+            let served = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
+            assert_eq!(
+                reported_time(&fs, served).await,
+                shown,
+                "the commit recorded a.txt's time"
+            );
+            fs.forget(served, 1);
             fs.unlink(&request(), ROOT_INO, b"a.txt")
                 .await
                 .expect("unlink a.txt");
@@ -13605,7 +15422,7 @@ async fn a_file_created_after_an_unlink_with_the_recorded_time_is_staged() {
             set_host_time(&instance, "a.txt", millisecond);
             fs.forget(created, 1);
 
-            let revision = commit_through(&instance, &fs, false)
+            let revision = commit_locked_through(&instance, &fs)
                 .await
                 .expect("the next commit stages the new file");
             assert_eq!(
@@ -14108,13 +15925,11 @@ async fn settled_requests(spawned: &Spawned) {
 /// The names in the staging directory beside `write/`.
 fn names_in_staging(instance: &Instance) -> Vec<String> {
     let staging = instance.write_dir().with_file_name("write-staging");
-    std::fs::read_dir(staging)
-        .map(|dir| {
-            dir.flatten()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect()
-        })
-        .unwrap_or_default()
+    std::fs::read_dir(staging).map_or_default(|dir| {
+        dir.flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect()
+    })
 }
 
 /// Forgets every lookup the kernel holds on each of `inos`.
@@ -15750,162 +17565,6 @@ async fn writes_renames_and_unlinks_racing_commits_are_never_lost() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn status_stage_and_diff_see_a_write_at_once() {
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreFileAction;
-    use lore_revision::interface::LoreString;
-    use lore_revision::repository::RepositoryWriteToken;
-
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"alpha\n"), ("b.txt", b"bee\n")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    blocking(move || std::fs::write(root.join("a.txt"), b"ALPHA\n").expect("rewrite")).await;
-    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(&m.fs, Some(token.share()));
-
-    assert_eq!(
-        staged_state::status_files(context.clone(), false).await,
-        std::collections::BTreeMap::from([("a.txt".to_string(), (LoreFileAction::Keep, true))]),
-        "status without --scan sees the write at once"
-    );
-
-    LORE_CONTEXT
-        .scope(
-            fuse_fixture::setup_test_execution(),
-            lore_revision::file::stage::stage(
-                context.clone(),
-                &token,
-                LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path.join("a.txt"))]),
-                lore_revision::stage::StageOptions::default(),
-            ),
-        )
-        .await
-        .expect("the write stages");
-    let staged = staged_state::status_files(context.clone(), false).await;
-    assert_eq!(
-        staged.keys().map(String::as_str).collect::<Vec<_>>(),
-        vec!["a.txt"],
-        "the staged write is reported once"
-    );
-
-    let diffs = working_diffs(context).await;
-    assert_eq!(diffs.len(), 1, "{diffs:?}");
-    let (path, action, patch) = &diffs[0];
-    assert_eq!((path.as_str(), *action), ("a.txt", LoreFileAction::Keep));
-    assert!(
-        patch.contains("-alpha") && patch.contains("+ALPHA"),
-        "{patch}"
-    );
-    drop(token);
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn diff_of_a_created_and_a_deleted_file_through_the_mount() {
-    use lore_revision::interface::LoreFileAction;
-
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"alpha\n"), ("b.txt", b"bee\n")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::write(root.join("new.txt"), b"new\n").expect("create");
-        std::fs::remove_file(root.join("b.txt")).expect("unlink");
-    })
-    .await;
-
-    let diffs = working_diffs(instance.command_context(&m.fs, None)).await;
-    assert_eq!(
-        diffs
-            .iter()
-            .map(|(path, action, _)| (path.as_str(), *action))
-            .collect::<Vec<_>>(),
-        vec![
-            ("b.txt", LoreFileAction::Delete),
-            ("new.txt", LoreFileAction::Add)
-        ],
-        "{diffs:?}"
-    );
-    assert!(diffs[0].2.contains("-bee"), "{}", diffs[0].2);
-    assert!(diffs[1].2.contains("+new"), "{}", diffs[1].2);
-    m.unmount().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn stage_of_a_directory_right_after_a_write_stages_it() {
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreString;
-    use lore_revision::repository::RepositoryWriteToken;
-
-    skip_without_fuse!();
-    let instance = Instance::new(&[
-        ("a.txt", b"alpha\n"),
-        ("b.txt", b"bee\n"),
-        ("dir/c.txt", b"sea\n"),
-    ])
-    .await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::write(root.join("a.txt"), b"ALPHA\n").expect("rewrite");
-        std::fs::write(root.join("dir/new.txt"), b"new\n").expect("create");
-        std::fs::remove_file(root.join("b.txt")).expect("unlink");
-    })
-    .await;
-
-    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(&m.fs, Some(token.share()));
-    LORE_CONTEXT
-        .scope(
-            fuse_fixture::setup_test_execution(),
-            lore_revision::file::stage::stage(
-                context.clone(),
-                &token,
-                LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
-                lore_revision::stage::StageOptions::default(),
-            ),
-        )
-        .await
-        .expect("the stage succeeds");
-    drop(token);
-
-    let staged = instance.staged().await;
-    let repository = &instance.fixture.repository;
-    let mut actions = Vec::new();
-    for path in ["a.txt", "b.txt", "dir/c.txt", "dir/new.txt"] {
-        let link = staged
-            .find_node_link(repository.clone(), path)
-            .await
-            .unwrap_or_else(|_| panic!("{path} is in the staged State"));
-        let node = staged
-            .node(repository.clone(), link.node)
-            .await
-            .expect("a staged node");
-        let action = if node.is_staged_delete() {
-            "delete"
-        } else if node.is_staged_add() {
-            "add"
-        } else if node.is_staged_modify() {
-            "modify"
-        } else {
-            "none"
-        };
-        actions.push((path, action));
-    }
-    assert_eq!(
-        actions,
-        vec![
-            ("a.txt", "modify"),
-            ("b.txt", "delete"),
-            ("dir/c.txt", "none"),
-            ("dir/new.txt", "add")
-        ]
-    );
-    m.unmount().await;
-}
-
 /// Files the timing benches track, rewrite and create.
 const BENCH_TRACKED: usize = 2000;
 const BENCH_REWRITTEN: usize = 100;
@@ -15945,182 +17604,6 @@ async fn written_bench_mount() -> (Instance, Mounted) {
     })
     .await;
     (instance, m)
-}
-
-/// `lore status` without `--scan` over a mount holding a few hundred written files: the
-/// provider's diff and the marks it records, the first run storing them and each later one
-/// finding them in place. Run pinned on a quiet machine: `cargo test -p lore-revision --release
-/// --test unit -- --ignored --nocapture bench_status_without_scan_over_written_files`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_status_without_scan_over_written_files() {
-    use lore_revision::repository::RepositoryWriteToken;
-
-    const RUNS: usize = 7;
-    skip_without_fuse!();
-    let (instance, m) = written_bench_mount().await;
-    let mut times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-        let context = instance.command_context(&m.fs, Some(token));
-        let start = std::time::Instant::now();
-        let reported = staged_state::status_files(context, false).await;
-        times.push(start.elapsed());
-        assert_eq!(
-            reported.len(),
-            BENCH_REWRITTEN + BENCH_CREATED + 1,
-            "every write reported"
-        );
-    }
-    let first = times[0];
-    times.sort();
-    println!(
-        "status without --scan, {} written files over {BENCH_TRACKED} tracked: first {first:?}, min {:?}, median {:?}, max {:?}",
-        BENCH_REWRITTEN + BENCH_CREATED,
-        times[0],
-        times[RUNS / 2],
-        times[RUNS - 1]
-    );
-    m.unmount().await;
-}
-
-/// `lore stage .` right after a few hundred writes to a mount, with no status before it: the
-/// provider's diff marking them, then the stage of each. Each run stages a fresh mount. Run pinned
-/// on a quiet machine: `cargo test -p lore-revision --release --test unit -- --ignored
-/// --nocapture bench_stage_of_the_root_over_written_files`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_stage_of_the_root_over_written_files() {
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreString;
-    use lore_revision::repository::RepositoryWriteToken;
-
-    const RUNS: usize = 5;
-    skip_without_fuse!();
-    let mut times = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        let (instance, m) = written_bench_mount().await;
-        let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-        let context = instance.command_context(&m.fs, Some(token.share()));
-        let start = std::time::Instant::now();
-        LORE_CONTEXT
-            .scope(
-                fuse_fixture::setup_test_execution(),
-                lore_revision::file::stage::stage(
-                    context,
-                    &token,
-                    LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
-                    lore_revision::stage::StageOptions::default(),
-                ),
-            )
-            .await
-            .expect("the stage succeeds");
-        times.push(start.elapsed());
-        drop(token);
-        let staged = instance.staged().await;
-        let last = format!("out/o{}.o", BENCH_CREATED - 1);
-        let link = staged
-            .find_node_link(instance.fixture.repository.clone(), &last)
-            .await
-            .expect("the last created file is staged");
-        assert!(
-            staged
-                .node(instance.fixture.repository.clone(), link.node)
-                .await
-                .expect("a staged node")
-                .is_staged_add()
-        );
-        m.unmount().await;
-    }
-    times.sort();
-    println!(
-        "stage of the root, {} written files over {BENCH_TRACKED} tracked: min {:?}, median {:?}, max {:?}",
-        BENCH_REWRITTEN + BENCH_CREATED,
-        times[0],
-        times[RUNS / 2],
-        times[RUNS - 1]
-    );
-}
-
-/// `lore commit` of a few hundred writes to a mount, staged first: the commit storing them and
-/// flipping each to the stored revision, the flips timed from the start of the reconciliation to
-/// the end of the commit. Each run commits a fresh mount. Run pinned on a quiet
-/// machine: `cargo test -p lore-revision --release --test unit -- --ignored
-/// --nocapture bench_commit_of_written_files`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_commit_of_written_files() {
-    use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreString;
-    use lore_revision::repository::RepositoryWriteToken;
-
-    const RUNS: usize = 5;
-    skip_without_fuse!();
-    let mut times = Vec::with_capacity(RUNS);
-    let mut reconciled = Vec::with_capacity(RUNS);
-    for _ in 0..RUNS {
-        let (instance, m) = written_bench_mount().await;
-        let flips = Arc::new(std::sync::Mutex::new(None));
-        let started = flips.clone();
-        m.fs.set_commit_hook(Arc::new(move || {
-            *started.lock().expect("the start") = Some(std::time::Instant::now());
-            Box::pin(async {})
-        }));
-        let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-        let context = instance.command_context(&m.fs, Some(token.share()));
-        LORE_CONTEXT
-            .scope(
-                fuse_fixture::setup_test_execution(),
-                lore_revision::file::stage::stage(
-                    context.clone(),
-                    &token,
-                    LoreArray::from_vec(vec![LoreString::from(&instance.fixture.path)]),
-                    lore_revision::stage::StageOptions::default(),
-                ),
-            )
-            .await
-            .expect("the stage succeeds");
-        let start = std::time::Instant::now();
-        LORE_CONTEXT
-            .scope(
-                fuse_fixture::setup_test_execution(),
-                lore_revision::commit::commit_boxed(
-                    context,
-                    &token,
-                    lore_revision::commit::CommitOptions::new("bench".to_string()),
-                ),
-            )
-            .await
-            .expect("the commit succeeds");
-        times.push(start.elapsed());
-        reconciled.push(
-            flips
-                .lock()
-                .expect("the start")
-                .expect("a reconciliation")
-                .elapsed(),
-        );
-        assert_eq!(
-            m.fs.commit_outcomes(),
-            ((BENCH_REWRITTEN + BENCH_CREATED) as u64, 0),
-            "every written file flipped"
-        );
-        assert_eq!(names(&instance.write_dir()), Vec::<String>::new());
-        drop(token);
-        m.unmount().await;
-    }
-    times.sort();
-    reconciled.sort();
-    println!(
-        "commit, {} written files over {BENCH_TRACKED} tracked: min {:?}, median {:?}, max {:?}; from the reconciliation on: min {:?}, median {:?}, max {:?}",
-        BENCH_REWRITTEN + BENCH_CREATED,
-        times[0],
-        times[RUNS / 2],
-        times[RUNS - 1],
-        reconciled[0],
-        reconciled[RUNS / 2],
-        reconciled[RUNS - 1]
-    );
 }
 
 /// `lore commit` of the directories `make` creates under a fresh mount's root, staged first,
@@ -16194,57 +17677,6 @@ async fn bench_commit_of_directories(label: &str, make: fn(&std::path::Path)) {
         sums[RUNS / 2],
         sums[RUNS - 1],
     );
-}
-
-/// [`bench_commit_of_directories`] of 1000 new empty sibling directories. Run pinned on a quiet
-/// machine: `cargo test -p lore-revision --release --test unit -- --ignored --nocapture
-/// bench_commit_of_empty_sibling_directories`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_commit_of_empty_sibling_directories() {
-    skip_without_fuse!();
-    bench_commit_of_directories("1000 empty sibling directories", |root| {
-        for i in 0..1000 {
-            std::fs::create_dir_all(root.join(format!("new/d{i}"))).expect("mkdir");
-        }
-    })
-    .await;
-}
-
-/// [`bench_commit_of_directories`] of a local tree of 1000 empty directories, 100 holding 9 each,
-/// moved by a rename of its root before the stage. Run pinned on a quiet machine: `cargo test -p
-/// lore-revision --release --test unit -- --ignored --nocapture
-/// bench_commit_of_a_moved_tree_of_empty_directories`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_commit_of_a_moved_tree_of_empty_directories() {
-    skip_without_fuse!();
-    bench_commit_of_directories("a moved tree of 1000 empty directories", |root| {
-        for i in 0..100 {
-            for j in 0..9 {
-                std::fs::create_dir_all(root.join(format!("tree/d{i}/e{j}"))).expect("mkdir");
-            }
-        }
-        std::fs::rename(root.join("tree"), root.join("moved")).expect("rename");
-    })
-    .await;
-}
-
-/// [`bench_commit_of_directories`] of 1000 new directories each holding a file, which the commit
-/// reads and flips. Run pinned on a quiet machine: `cargo test -p lore-revision --release --test
-/// unit -- --ignored --nocapture bench_commit_of_directories_holding_files`.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn bench_commit_of_directories_holding_files() {
-    skip_without_fuse!();
-    bench_commit_of_directories("1000 directories holding a file each", |root| {
-        for i in 0..1000 {
-            let dir = root.join(format!("files/d{i}"));
-            std::fs::create_dir_all(&dir).expect("mkdir");
-            std::fs::write(dir.join("f.txt"), pattern(64, i as u8)).expect("create");
-        }
-    })
-    .await;
 }
 
 /// The first revision a sync goes back to: the file `dir/f.txt` and `dir/g.txt` differ from the
@@ -16365,21 +17797,40 @@ async fn switch_through(
     fs: &Arc<FuseFilesystem>,
     name: &str,
 ) -> Result<Hash, String> {
+    switch_with(
+        instance,
+        fs,
+        name,
+        lore_revision::repository::BranchSwitchOptions {
+            local: true,
+            ..Default::default()
+        },
+        Default::default(),
+    )
+    .await
+}
+
+/// Runs `lore branch switch <name>` with `options` through `fs`, as relayed to the service,
+/// under `globals`.
+async fn switch_with(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    name: &str,
+    options: lore_revision::repository::BranchSwitchOptions,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> Result<Hash, String> {
     use lore_revision::repository::RepositoryWriteToken;
 
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
     let context = instance.command_context(fs, Some(token.share()));
     LORE_CONTEXT
         .scope(
-            fuse_fixture::setup_test_execution(),
+            fuse_fixture::test_execution_with(globals),
             Box::pin(lore_revision::repository::branch_switch(
                 context,
                 &token,
                 name.to_string(),
-                lore_revision::repository::BranchSwitchOptions {
-                    local: true,
-                    ..Default::default()
-                },
+                options,
             )),
         )
         .await
@@ -16769,37 +18220,6 @@ async fn a_sync_reports_each_change_it_applies() {
         .await;
 }
 
-/// A sync that changes a file the kernel holds keeps its inode number and drops its cached
-/// pages: a read through the mount after the sync returns the target's bytes.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_sync_that_changes_a_file_keeps_its_inode_and_invalidates_its_pages() {
-    use std::os::unix::fs::MetadataExt as _;
-
-    skip_without_fuse!();
-    let instance = sync_instance().await;
-    let first = instance.fixture.state.parent_self();
-    let m = instance.mount().await;
-    let path = m.root.join("dir/f.txt");
-    let read_through = move || {
-        let path = path.clone();
-        blocking(move || {
-            let read = std::fs::read(&path).expect("read through the mount");
-            (read, std::fs::metadata(&path).expect("stat").ino())
-        })
-    };
-    let (before, ino) = read_through().await;
-    assert_eq!(before, b"two");
-
-    sync_through(&instance, &m.fs, first, Default::default())
-        .await
-        .expect("the sync");
-
-    let (after, synced_ino) = read_through().await;
-    assert_eq!(after, b"one", "the kernel served its cached pages");
-    assert_eq!(synced_ino, ino);
-    m.unmount().await;
-}
-
 /// A sync whose target adds a directory tree lists and serves it, while a directory it leaves
 /// as it is keeps its cached listing.
 #[tokio::test(flavor = "multi_thread")]
@@ -16947,56 +18367,6 @@ async fn a_sync_removing_a_directory_removes_its_host_directory() {
         .await;
 }
 
-/// `lore sync` back and forth between two revisions 1,000 files apart on a mounted virtual clone:
-/// the verify, the in-place apply, the directory settle and the deletion-list rewrite.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark; run on a quiet machine"]
-async fn sync_of_a_thousand_changes_bench() {
-    skip_without_fuse!();
-    const FILES: usize = 1000;
-    const RUNS: usize = 7;
-    let names: Vec<String> = (0..FILES)
-        .map(|i| format!("d{:02}/f{i:04}.txt", i % 20))
-        .collect();
-    let contents = |tag: &str| -> Vec<Vec<u8>> {
-        (0..FILES)
-            .map(|i| format!("{tag} {i}").into_bytes())
-            .collect()
-    };
-    let (first, second) = (contents("first"), contents("second"));
-    let side = |contents: &[Vec<u8>]| -> Vec<(String, Vec<u8>)> {
-        names
-            .iter()
-            .cloned()
-            .zip(contents.iter().cloned())
-            .collect()
-    };
-    let (first, second) = (side(&first), side(&second));
-    let (first, second) = (as_files(&first), as_files(&second));
-    let instance = Instance::with_revisions(&[&first, &second]).await;
-    let revisions = [
-        instance.fixture.state.parent_self(),
-        instance.fixture.state.revision(),
-    ];
-    let m = instance.mount().await;
-    let mut times = Vec::with_capacity(RUNS);
-    for run in 0..RUNS {
-        let started = std::time::Instant::now();
-        sync_through(&instance, &m.fs, revisions[run % 2], Default::default())
-            .await
-            .expect("the sync");
-        times.push(started.elapsed());
-    }
-    m.unmount().await;
-    times.sort();
-    println!(
-        "sync of {FILES} changes: min {:?}, median {:?}, max {:?}",
-        times[0],
-        times[RUNS / 2],
-        times[RUNS - 1]
-    );
-}
-
 /// `side` as the fixture's file list.
 fn as_files(side: &[(String, Vec<u8>)]) -> Vec<(&str, &[u8])> {
     side.iter()
@@ -17122,6 +18492,725 @@ async fn a_forced_sync_keeps_untracked_files_below_a_removed_directory() {
                     && !changed.contains(&"gone/x.txt".to_string()),
                 "{changed:?}"
             );
+        })
+        .await;
+}
+
+/// Runs `lore sync <revision> --reset` through `fs` under `globals`, answering the files it
+/// reports ([`sync_reporting`]).
+async fn reset_sync_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    revision: Hash,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> (
+    Result<(), lore_revision::revision::sync::SyncError>,
+    Vec<String>,
+) {
+    let options = lore_revision::revision::sync::SyncOptions {
+        revision: Some(revision.to_string()),
+        reset: true,
+        ..Default::default()
+    };
+    sync_reporting(instance, fs, options, globals).await
+}
+
+/// A sync resetting local changes gives each tracked path the target's content, where the target
+/// changes the path and where it leaves it, and keeps a file added locally: `write/` holds the
+/// added file alone, and status reports it alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_each_tracked_path_the_target_and_keeps_added_files() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            fs.write(&request(), f, 0, 0, b"TWO!", 0)
+                .await
+                .expect("write");
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [
+                ("dir/f.txt", &b"one"[..]),
+                ("keep/k.txt", b"kept"),
+                ("keep/new.txt", b"added"),
+            ] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert!(!instance.write_dir().join("dir/f.txt").exists());
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            assert!(instance.write_dir().join("keep/new.txt").exists());
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked file deleted locally that the target
+/// leaves, and a remount serves it too: the deletion list holds it no more.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_file_deleted_locally_and_a_remount_serves_it() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt is back");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            let remounted = provider_at(&instance, first).await;
+            let k = lookup_path(&remounted, "keep/k.txt")
+                .await
+                .expect("the remount serves k.txt");
+            assert_eq!(read(&remounted, k, 64).await, b"kept");
+        })
+        .await;
+}
+
+/// A sync resetting local changes to the revision the mount serves discards them: an edit takes
+/// the revision's content again, a deleted file comes back, and status reports nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_to_the_served_revision_discards_local_changes() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            let dir = lookup_path(&fs, "dir").await.expect("dir");
+            lookup(&fs, dir, "g.txt").await.expect("g.txt");
+            fs.unlink(&request(), dir, b"g.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("dir/g.txt", b"g-two")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(fs.served().revision(), second);
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A dry run of a sync resetting local changes reports the paths it would reset and changes
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dry_run_reset_sync_reports_the_paths_and_changes_nothing() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+
+            let (dry, reported) = reset_sync_through(
+                &instance,
+                &fs,
+                second,
+                lore_revision::interface::LoreGlobalArgs {
+                    dry_run: 1,
+                    ..Default::default()
+                },
+            )
+            .await;
+            dry.expect("the dry run");
+
+            assert!(
+                reported.iter().any(|line| line.ends_with(" keep/k.txt")),
+                "{reported:?}"
+            );
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"KEPT!");
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/k.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked file a local rename moved away and keeps
+/// the file at its new name, edited since: the revision holds nothing there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_the_file_a_rename_moved_a_tracked_file_to() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"m.txt", 0)
+                .await
+                .expect("rename");
+            let m = lookup(&fs, keep, "m.txt").await.expect("m.txt");
+            fs.write(&request(), m, 0, 0, b"MOVED!", 0)
+                .await
+                .expect("write");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/m.txt", b"MOVED!")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/m.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a file renamed in case alone the revision's spelling
+/// back, and a remount serves it under that spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_file_renamed_in_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"K.txt", 0)
+                .await
+                .expect("rename");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+            let remounted = provider_at(&instance, first).await;
+            let keep = lookup_path(&remounted, "keep").await.expect("keep");
+            lookup(&remounted, keep, "k.txt")
+                .await
+                .expect("the remount serves k.txt");
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a tracked path a directory made locally stands at its
+/// file back, removing the directory with the file added in it, as an ordinary clone's does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_directory_made_at_a_tracked_file_with_the_file() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            let made = fs
+                .mkdir(&request(), keep, b"k.txt", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "inner.txt", b"inner").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert!(!instance.write_dir().join("keep/k.txt").exists());
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a symlink made at a tracked file's path and writes
+/// nothing through it, as a forced sync does; status still lists the path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_symlink_made_at_a_tracked_file() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.symlink(&request(), keep, b"k.txt", b"../dir/f.txt")
+                .await
+                .expect("symlink");
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let link = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(link_target(&fs, link).await, b"../dir/f.txt");
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            assert_eq!(read(&fs, f, 64).await, b"one");
+            assert!(
+                changed_paths(&instance, &fs)
+                    .await
+                    .contains(&"keep/k.txt".to_string())
+            );
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked directory deleted whole, with its files.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_directory_deleted_whole() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let dir = lookup_path(&fs, "dir").await.expect("dir");
+            lookup(&fs, dir, "f.txt").await.expect("f.txt");
+            lookup(&fs, dir, "g.txt").await.expect("g.txt");
+            fs.unlink(&request(), dir, b"f.txt").await.expect("unlink");
+            fs.unlink(&request(), dir, b"g.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"dir").await.expect("rmdir");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("dir/f.txt", &b"two"[..]), ("dir/g.txt", b"g-two")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back the files of a tracked directory deleted and made
+/// again, and keeps the file added in it since.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_file_added_in_a_directory_deleted_and_made_again() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"keep")
+                .await
+                .expect("rmdir");
+            let made = fs
+                .mkdir(&request(), ROOT_INO, b"keep", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A branch switch resetting local changes discards them, as a sync resetting them does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_branch_switch_discards_local_changes() {
+    let instance = sync_instance().await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_branch_through(&instance, &fs, "other").await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+
+            switch_with(
+                &instance,
+                &fs,
+                "other",
+                lore_revision::repository::BranchSwitchOptions {
+                    local: true,
+                    reset: true,
+                    ..Default::default()
+                },
+                Default::default(),
+            )
+            .await
+            .expect("the reset switch");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a directory renamed in case alone the revision's
+/// spelling back, keeping the file added in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_directory_renamed_in_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.rename(&request(), ROOT_INO, b"keep", ROOT_INO, b"Keep", 0)
+                .await
+                .expect("rename");
+            let keep = lookup(&fs, ROOT_INO, "Keep").await.expect("Keep");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup(&fs, ROOT_INO, "Keep").await, Err(Errno::ENOENT));
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a file renamed in case and then deleted under the
+/// revision's spelling.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_restores_a_file_renamed_in_case_then_deleted_as_the_revision_spells_it() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.rename(&request(), keep, b"k.txt", keep, b"K.txt", 0)
+                .await
+                .expect("rename");
+            lookup(&fs, keep, "K.txt").await.expect("K.txt");
+            fs.unlink(&request(), keep, b"K.txt").await.expect("unlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives back a tracked file deleted and made again in another
+/// case, under the revision's spelling and with its content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_tracked_file_made_again_in_another_case() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            create_with(&fs, keep, "K.txt", b"NEW").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(lookup(&fs, keep, "K.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes brings back a tracked directory an instance removal took whole,
+/// made again since with a directory standing at its file: the directory there goes, with the
+/// file added in it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_replaces_a_directory_at_a_tracked_file_in_a_directory_made_again() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            use lore_revision::fs::filesystem_provider::InstanceOperation as _;
+            let keep = lore_revision::util::path::RelativePath::new_from_initial_path("keep")
+                .expect("path");
+            lore_revision::fs::fuse::operation::FuseOperation::new(fs.clone())
+                .remove_recursive(&keep)
+                .await
+                .expect("the instance removal");
+            let mut dir = ROOT_INO;
+            for name in ["keep", "k.txt"] {
+                dir = fs
+                    .mkdir(
+                        &request(),
+                        dir,
+                        name.as_bytes(),
+                        libc::S_IFDIR | 0o755,
+                        0o022,
+                    )
+                    .await
+                    .expect("mkdir")
+                    .ino;
+            }
+            create_with(&fs, dir, "inner.txt", b"inner").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let k = lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            assert_eq!(read(&fs, k, 64).await, b"kept");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes to a revision that deletes a file deleted locally reports the
+/// deletion once and leaves nothing of the directory the target removes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_deleting_a_file_deleted_locally_reports_the_deletion_once() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let gone = lookup_path(&fs, "gone").await.expect("gone");
+            lookup(&fs, gone, "x.txt").await.expect("x.txt");
+            fs.unlink(&request(), gone, b"x.txt").await.expect("unlink");
+
+            let (synced, reported) =
+                reset_sync_through(&instance, &fs, first, Default::default()).await;
+            synced.expect("the reset sync");
+
+            let deleted: Vec<&String> = reported
+                .iter()
+                .filter(|line| line.ends_with(" gone/x.txt"))
+                .collect();
+            assert_eq!(deleted.len(), 1, "{reported:?}");
+            assert_eq!(lookup_path(&fs, "gone").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes gives a tracked directory deleted and made again in another
+/// case the revision's spelling, keeping the file added in it, and a remount serves it so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_gives_a_directory_made_again_in_another_case_the_revision_spelling() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.rmdir(&request(), ROOT_INO, b"keep")
+                .await
+                .expect("rmdir");
+            let made = fs
+                .mkdir(&request(), ROOT_INO, b"Keep", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, made, "new.txt", b"added").await;
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup(&fs, ROOT_INO, "Keep").await, Err(Errno::ENOENT));
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
+            let remounted = provider_at(&instance, second).await;
+            lookup_path(&remounted, "keep/k.txt")
+                .await
+                .expect("the remount serves keep/k.txt");
+        })
+        .await;
+}
+
+/// A sync resetting local changes to a revision that deletes a tracked file removes it where it
+/// was deleted and made again under the same name, as it removes an edit of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_removes_a_file_made_again_where_the_target_deletes_it() {
+    let instance = sync_instance().await;
+    let first = instance.fixture.state.parent_self();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let gone = lookup_path(&fs, "gone").await.expect("gone");
+            lookup(&fs, gone, "x.txt").await.expect("x.txt");
+            fs.unlink(&request(), gone, b"x.txt").await.expect("unlink");
+            create_with(&fs, gone, "x.txt", b"NEW").await;
+
+            reset_sync_through(&instance, &fs, first, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            assert_eq!(lookup_path(&fs, "gone/x.txt").await, Err(Errno::ENOENT));
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a symlink made in another case at a tracked file's
+/// path, as it leaves one under the file's own spelling, and writes nothing through it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_keeps_a_symlink_made_in_another_case_at_a_tracked_file() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.unlink(&request(), keep, b"k.txt").await.expect("unlink");
+            fs.symlink(&request(), keep, b"K.txt", b"../dir/f.txt")
+                .await
+                .expect("symlink");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let link = lookup(&fs, keep, "K.txt").await.expect("K.txt");
+            assert_eq!(link_target(&fs, link).await, b"../dir/f.txt");
+            let f = lookup_path(&fs, "dir/f.txt").await.expect("f.txt");
+            assert_eq!(read(&fs, f, 64).await, b"two");
+        })
+        .await;
+}
+
+/// A sync resetting local changes leaves a directory it gave the revision's spelling back clean,
+/// where nothing in it changed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_sync_settles_a_directory_it_respells() {
+    let instance = sync_instance().await;
+    let second = instance.fixture.state.revision();
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            lookup_path(&fs, "keep/k.txt").await.expect("k.txt");
+            fs.rename(&request(), ROOT_INO, b"keep", ROOT_INO, b"Keep", 0)
+                .await
+                .expect("rename");
+
+            reset_sync_through(&instance, &fs, second, Default::default())
+                .await
+                .0
+                .expect("the reset sync");
+
+            let keep = fs_node(&instance, &fs, "keep").await;
+            assert!(!keep.is_dirty(), "{keep:?}");
+            assert_eq!(changed_paths(&instance, &fs).await, Vec::<String>::new());
+        })
+        .await;
+}
+
+/// A forced branch switch resetting local changes, which also keeps local changes the target
+/// leaves, discards the edits and keeps the files added locally.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forced_reset_branch_switch_discards_edits_and_keeps_added_files() {
+    let instance = sync_instance().await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            create_branch_through(&instance, &fs, "other").await;
+            let keep = lookup_path(&fs, "keep").await.expect("keep");
+            let k = lookup(&fs, keep, "k.txt").await.expect("k.txt");
+            fs.write(&request(), k, 0, 0, b"KEPT!", 0)
+                .await
+                .expect("write");
+            create_with(&fs, keep, "new.txt", b"added").await;
+
+            switch_with(
+                &instance,
+                &fs,
+                "other",
+                lore_revision::repository::BranchSwitchOptions {
+                    local: true,
+                    reset: true,
+                    ..Default::default()
+                },
+                lore_revision::interface::LoreGlobalArgs {
+                    force: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the forced reset switch");
+
+            for (path, content) in [("keep/k.txt", &b"kept"[..]), ("keep/new.txt", b"added")] {
+                let ino = lookup_path(&fs, path).await.expect(path);
+                assert_eq!(read(&fs, ino, 64).await, content, "{path}");
+            }
+            assert_eq!(changed_paths(&instance, &fs).await, vec!["keep/new.txt"]);
         })
         .await;
 }
@@ -17790,11 +19879,13 @@ async fn cherry_pick_through(
         .await
 }
 
-/// Runs `lore reset <paths>` through `fs`, purging untracked files where `purge`.
+/// Runs `lore reset <paths>` through `fs` to `revision`, the served one where `None`, purging
+/// untracked files where `purge`, under the instance's repository lock.
 async fn reset_through(
     instance: &Instance,
     fs: &Arc<FuseFilesystem>,
     paths: &[&str],
+    revision: Option<Hash>,
     purge: bool,
 ) -> Result<(), String> {
     use lore_revision::interface::LoreArray;
@@ -17802,7 +19893,7 @@ async fn reset_through(
     use lore_revision::repository::RepositoryWriteToken;
 
     let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
-    let context = instance.command_context(fs, Some(token.share()));
+    let context = instance.locked_command_context(fs, token.share()).await;
     let paths = LoreArray::from_vec(
         paths
             .iter()
@@ -17816,7 +19907,11 @@ async fn reset_through(
                 context,
                 &token,
                 paths,
-                lore_revision::interface::LoreString::default(),
+                LoreString::from(
+                    revision
+                        .map_or_else(String::new, |revision| revision.to_string())
+                        .as_str(),
+                ),
                 lore_revision::file::reset::ResetOptions {
                     purge,
                     single_node: false,
@@ -17857,7 +19952,7 @@ async fn reset_of_an_edited_file_serves_the_revision_to_an_open_reader_and_statu
                 .expect("write");
             assert_eq!(read(&fs, a, 64).await, b"ALPHA!");
 
-            reset_through(&instance, &fs, &["a.txt"], false)
+            reset_through(&instance, &fs, &["a.txt"], None, false)
                 .await
                 .expect("the reset");
 
@@ -17880,7 +19975,7 @@ async fn reset_of_an_edited_file_leaves_nothing_under_write() {
                 .await
                 .expect("write");
 
-            reset_through(&instance, &fs, &["a.txt"], false)
+            reset_through(&instance, &fs, &["a.txt"], None, false)
                 .await
                 .expect("the reset");
 
@@ -17956,7 +20051,7 @@ async fn reset_of_a_file_made_again_over_its_deletion_survives_a_remount() {
                 }
                 let held = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt again");
 
-                reset_through(&instance, &fs, &["a.txt"], false)
+                reset_through(&instance, &fs, &["a.txt"], None, false)
                     .await
                     .expect("the reset");
 
@@ -18018,7 +20113,7 @@ async fn reset_of_a_tracked_file_a_symlink_replaced_serves_the_revisions_file() 
                 };
                 assert_eq!(kind("a.txt").await, libc::S_IFLNK, "{how:?}");
 
-                reset_through(&instance, &fs, &["a.txt"], false)
+                reset_through(&instance, &fs, &["a.txt"], None, false)
                     .await
                     .expect("the reset");
 
@@ -18041,44 +20136,6 @@ async fn reset_of_a_tracked_file_a_symlink_replaced_serves_the_revisions_file() 
             })
             .await;
     }
-}
-
-/// A tracked file replaced through the mount by a symlink to another tracked file reads, after a
-/// reset, as the revision's regular file through the mount, and the other file is unchanged.
-#[tokio::test(flavor = "multi_thread")]
-async fn reset_of_a_tracked_file_a_symlink_replaced_through_the_mount_reads_the_revisions_file() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::remove_file(root.join("a.txt")).expect("rm a.txt");
-        std::os::unix::fs::symlink("b.txt", root.join("a.txt")).expect("ln -s b.txt a.txt");
-        assert_eq!(std::fs::read(root.join("a.txt")).expect("a.txt"), b"bee");
-    })
-    .await;
-
-    reset_through(&instance, &m.fs, &["a.txt"], false)
-        .await
-        .expect("the reset");
-
-    let root = m.root.clone();
-    let (regular, a, b) = blocking(move || {
-        let a = root.join("a.txt");
-        (
-            std::fs::symlink_metadata(&a)
-                .expect("a.txt")
-                .file_type()
-                .is_file(),
-            std::fs::read(&a).expect("a.txt"),
-            std::fs::read(root.join("b.txt")).expect("b.txt"),
-        )
-    })
-    .await;
-    assert!(regular, "a.txt is a regular file again");
-    assert_eq!((a, b), (b"alpha".to_vec(), b"bee".to_vec()));
-    assert_eq!(changed_paths(&instance, &m.fs).await, Vec::<String>::new());
-    m.unmount().await;
 }
 
 /// An instance operation reads the deletion list again once a write has appended to it since
@@ -18197,7 +20254,7 @@ async fn reset_purge_removes_added_files_and_restores_deleted_ones() {
             lookup(&fs, dir, "b.txt").await.expect("b.txt");
             fs.unlink(&request(), dir, b"b.txt").await.expect("unlink");
 
-            reset_through(&instance, &fs, &[""], true)
+            reset_through(&instance, &fs, &[""], None, true)
                 .await
                 .expect("the reset");
 
@@ -18243,6 +20300,37 @@ async fn feature_branch_and_revision(
         .await
         .expect("switch back");
     (feature, revision)
+}
+
+/// A branch `feature` off `instance`'s revision whose commit rewrites `a.txt` as the line
+/// `theirs`, and a commit on the default branch that rewrites it as the line `mine`, with the
+/// mount back on the default branch; answers the branch.
+async fn conflicting_feature_branch(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> lore_revision::lore::BranchId {
+    let feature = create_branch_id_through(instance, fs, "feature").await;
+    switch_through(instance, fs, "feature")
+        .await
+        .expect("switch to feature");
+    let a = lookup(fs, ROOT_INO, "a.txt").await.expect("a.txt");
+    fs.write(&request(), a, 0, 0, b"theirs\n", 0)
+        .await
+        .expect("write");
+    commit_through(instance, fs, false)
+        .await
+        .expect("commit on feature");
+    switch_through(instance, fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+        .await
+        .expect("switch back");
+    let a = lookup(fs, ROOT_INO, "a.txt").await.expect("a.txt");
+    fs.write(&request(), a, 0, 0, b"mine\n", 0)
+        .await
+        .expect("write");
+    commit_through(instance, fs, false)
+        .await
+        .expect("commit on main");
+    feature
 }
 
 /// A merge serves the incoming changes through the mount, and status shows them staged with no
@@ -18307,193 +20395,6 @@ fn expected_listings(names: &[&str]) -> [Vec<String>; 3] {
     [names.clone(), names.clone(), names]
 }
 
-/// A merge whose only change in the root adds a name the kernel never looked up shows it in a
-/// listing through the mount whose root the kernel listed before, as the provider lists it.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_merge_adding_only_a_new_name_lists_it_through_the_mount() {
-    skip_without_fuse!();
-    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
-    let m = instance.mount().await;
-    let feature = LORE_CONTEXT
-        .scope(fuse_fixture::setup_test_execution(), async {
-            let feature = create_branch_id_through(&instance, &m.fs, "feature").await;
-            switch_through(&instance, &m.fs, "feature")
-                .await
-                .expect("switch to feature");
-            create_with(&m.fs, ROOT_INO, "theirs.txt", b"theirs").await;
-            commit_through(&instance, &m.fs, false)
-                .await
-                .expect("commit on feature");
-            switch_through(
-                &instance,
-                &m.fs,
-                lore_revision::branch::DEFAULT_DEFAULT_NAME,
-            )
-            .await
-            .expect("switch back");
-            feature
-        })
-        .await;
-    for _ in 0..2 {
-        assert_eq!(root_listings(&m).await, expected_listings(&["a.txt"]));
-    }
-
-    merge_through(&instance, &m.fs, feature)
-        .await
-        .expect("the merge");
-    let merged = root_listings(&m).await;
-    commit_through(&instance, &m.fs, false)
-        .await
-        .expect("the merge commit");
-    let committed = root_listings(&m).await;
-
-    let after = expected_listings(&["a.txt", "theirs.txt"]);
-    assert_eq!(
-        (merged, committed),
-        (after.clone(), after),
-        "[through the mount, the provider's READDIR, the operation] after the merge, then after \
-         its commit"
-    );
-    m.unmount().await;
-}
-
-/// Every namespace change an instance operation makes in a directory whose listing the kernel
-/// cached shows in the next listing through the mount, as the provider lists it, a new name the
-/// kernel never looked up too.
-#[tokio::test(flavor = "multi_thread")]
-async fn instance_namespace_changes_show_in_a_listing_the_kernel_cached() {
-    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
-    use lore_revision::fs::fuse::operation::FuseOperation;
-    use lore_revision::util::path::RelativePath;
-
-    skip_without_fuse!();
-    let path = |at: &str| RelativePath::new_from_initial_path(at).expect("path");
-    let mut stale = Vec::new();
-    for (change, after) in [
-        ("write", &["a.txt", "d", "new.txt"][..]),
-        ("create_dir_all", &["a.txt", "d", "e"][..]),
-        ("remove", &["d"][..]),
-        ("rename", &["b.txt", "d"][..]),
-        ("remove_recursive", &["a.txt"][..]),
-    ] {
-        let instance = Instance::new(&[("a.txt", b"alpha"), ("d/x.txt", b"x")]).await;
-        let m = instance.mount().await;
-        for _ in 0..2 {
-            assert_eq!(root_listings(&m).await, expected_listings(&["a.txt", "d"]));
-        }
-        let operation = FuseOperation::new(m.fs.clone());
-        LORE_CONTEXT
-            .scope(fuse_fixture::setup_test_execution(), async {
-                match change {
-                    "write" => {
-                        operation
-                            .write_file(&path("new.txt"), bytes::Bytes::from_static(b"new"))
-                            .await
-                    }
-                    "create_dir_all" => operation.create_dir_all(&path("e/f")).await,
-                    "remove" => operation.remove(&path("a.txt")).await,
-                    "rename" => operation.rename(&path("a.txt"), &path("b.txt")).await,
-                    _ => operation.remove_recursive(&path("d")).await,
-                }
-                .unwrap_or_else(|error| panic!("{change}: {error}"));
-            })
-            .await;
-        let [through_mount, provider, _] = root_listings(&m).await;
-        assert_eq!(provider, after, "{change}: the provider lists the change");
-        if through_mount != provider {
-            stale.push((change, through_mount, provider));
-        }
-        m.unmount().await;
-    }
-    assert_eq!(
-        stale,
-        Vec::new(),
-        "(change, listed through the mount, listed by the provider)"
-    );
-}
-
-/// An instance write that changes a file the kernel holds drops what it cached of the file: a
-/// descriptor held across the change reads the new content, and a stat shows the new mode. Each
-/// change keeps the length, so only the inode's invalidation shows: content written, the file
-/// made executable, and an edit restored to the revision.
-#[tokio::test(flavor = "multi_thread")]
-async fn instance_content_changes_reach_what_the_kernel_cached_of_the_file() {
-    use std::os::unix::fs::FileExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
-    use lore_revision::fs::filesystem_provider::InstanceOperation as _;
-    use lore_revision::fs::fuse::operation::FuseOperation;
-    use lore_revision::util::path::RelativePath;
-
-    skip_without_fuse!();
-    let path = |at: &str| RelativePath::new_from_initial_path(at).expect("path");
-    for change in ["write", "make_executable", "restore"] {
-        let instance = Instance::new(&[("a.txt", b"alpha"), ("b.txt", b"bee")]).await;
-        let m = instance.mount().await;
-        let revision_node = fs_node(&instance, &m.fs, "a.txt").await;
-        let file = m.root.join("a.txt");
-        let edited = change == "restore";
-        let (held, mode) = blocking({
-            let file = file.clone();
-            move || {
-                if edited {
-                    std::fs::write(&file, b"ALPHA").expect("edit a.txt");
-                }
-                let held = std::fs::File::open(&file).expect("open a.txt");
-                let mut cached = [0u8; 5];
-                held.read_exact_at(&mut cached, 0).expect("read a.txt");
-                let mode = std::fs::metadata(&file).expect("stat a.txt").permissions();
-                (held, (cached, mode.mode()))
-            }
-        })
-        .await;
-        assert_eq!(
-            &mode.0,
-            if edited { b"ALPHA" } else { b"alpha" },
-            "{change}"
-        );
-        assert_eq!(mode.1 & 0o111, 0, "{change}: a.txt is not executable");
-
-        let operation = FuseOperation::new(m.fs.clone());
-        LORE_CONTEXT
-            .scope(fuse_fixture::setup_test_execution(), async {
-                match change {
-                    "write" => {
-                        operation
-                            .write_file(&path("a.txt"), bytes::Bytes::from_static(b"OMEGA"))
-                            .await
-                    }
-                    "make_executable" => operation.make_executable(&path("a.txt"), true).await,
-                    _ => operation
-                        .write_node(
-                            instance.fixture.repository.clone(),
-                            &revision_node,
-                            &path("a.txt"),
-                        )
-                        .await
-                        .map(|_| ()),
-                }
-                .unwrap_or_else(|error| panic!("{change}: {error}"));
-            })
-            .await;
-        drop(operation);
-
-        let (read, mode) = blocking(move || {
-            let mut read = [0u8; 5];
-            held.read_exact_at(&mut read, 0).expect("read a.txt again");
-            let mode = std::fs::metadata(&file).expect("stat a.txt").permissions();
-            (read, mode.mode())
-        })
-        .await;
-        match change {
-            "write" => assert_eq!(&read, b"OMEGA", "{change}"),
-            "make_executable" => assert_ne!(mode & 0o111, 0, "{change}: the new mode shows"),
-            _ => assert_eq!(&read, b"alpha", "{change}"),
-        }
-        m.unmount().await;
-    }
-}
-
 /// A remount while a merge is in progress keeps what the merge wrote: the incoming files from
 /// `write/`, the deletion from the deletion list.
 #[tokio::test(flavor = "multi_thread")]
@@ -18524,27 +20425,7 @@ async fn a_conflicting_merge_serves_the_file_with_markers_and_its_side_files() {
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
             let fs = provider(&instance).await;
-            let feature = create_branch_id_through(&instance, &fs, "feature").await;
-            switch_through(&instance, &fs, "feature")
-                .await
-                .expect("switch to feature");
-            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
-            fs.write(&request(), a, 0, 0, b"theirs\n", 0)
-                .await
-                .expect("write");
-            commit_through(&instance, &fs, false)
-                .await
-                .expect("commit on feature");
-            switch_through(&instance, &fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
-                .await
-                .expect("switch back");
-            let a = lookup(&fs, ROOT_INO, "a.txt").await.expect("a.txt");
-            fs.write(&request(), a, 0, 0, b"mine\n", 0)
-                .await
-                .expect("write");
-            commit_through(&instance, &fs, false)
-                .await
-                .expect("commit on main");
+            let feature = conflicting_feature_branch(&instance, &fs).await;
 
             let _ = merge_through(&instance, &fs, feature).await;
 
@@ -18758,108 +20639,6 @@ async fn disagreements(
         ));
     }
     found
-}
-
-/// Status, stage, commit, sync and reset agree with what the mount serves: after a write, its
-/// commit, an edit and a save through a temporary, a sync and a reset, run back to back, a walk
-/// of the mount holds what the steps wrote and status reports exactly what the walk changes over
-/// the current revision, and a remount over that revision agrees again.
-#[tokio::test(flavor = "multi_thread")]
-async fn status_after_write_commit_edit_sync_and_reset_matches_what_the_mount_serves() {
-    skip_without_fuse!();
-    let first: &[(&str, &[u8])] = &[
-        ("a.txt", b"a-one"),
-        ("dir/b.txt", b"bee"),
-        ("dir/c.txt", b"c-one"),
-        ("gone.txt", b"gone"),
-        ("keep.txt", b"kept"),
-    ];
-    let second: &[(&str, &[u8])] = &[("dir/c.txt", b"c-two"), ("r2.txt", b"two")];
-    let instance = Instance::with_revisions(&[first, second]).await;
-    let first_revision = instance.fixture.state.parent_self();
-    let mut working = revision_tree(&instance, current_revision(&instance).await).await;
-    let mut found = Vec::new();
-    let mut m = instance.mount().await;
-    found.extend(disagreements(&instance, &m, &working, "mounted").await);
-
-    let remount = async |m: Mounted, working: &Tree, step: &str, found: &mut Vec<String>| {
-        m.unmount().await;
-        let m = instance
-            .mount_at(state_at(&instance, current_revision(&instance).await).await)
-            .await;
-        found.extend(disagreements(&instance, &m, working, &format!("{step}, remounted")).await);
-        m
-    };
-
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::write(root.join("a.txt"), b"A-local").expect("rewrite a.txt");
-        std::fs::write(root.join("dir/new.txt"), b"new").expect("create dir/new.txt");
-        std::fs::create_dir(root.join("sub")).expect("mkdir sub");
-        std::fs::write(root.join("sub/deep.txt"), b"deep").expect("create sub/deep.txt");
-        std::fs::remove_file(root.join("gone.txt")).expect("unlink gone.txt");
-    })
-    .await;
-    working.insert("a.txt".into(), Some(b"A-local".to_vec()));
-    working.insert("dir/new.txt".into(), Some(b"new".to_vec()));
-    working.insert("sub".into(), None);
-    working.insert("sub/deep.txt".into(), Some(b"deep".to_vec()));
-    working.remove("gone.txt");
-    found.extend(disagreements(&instance, &m, &working, "write").await);
-    m = remount(m, &working, "write", &mut found).await;
-
-    commit_through(&instance, &m.fs, false)
-        .await
-        .expect("the commit");
-    found.extend(disagreements(&instance, &m, &working, "commit").await);
-    // Status agrees with whatever revision is current, so only this shows the commit stored
-    // everything the mount serves.
-    let committed = revision_tree(&instance, current_revision(&instance).await).await;
-    let walk = walked(&m.root).await;
-    if committed != walk {
-        found.push(format!(
-            "commit: the committed revision holds {committed:?}, the mount serves {walk:?}"
-        ));
-    }
-
-    let root = m.root.clone();
-    blocking(move || {
-        std::fs::write(root.join("dir/b.txt"), b"B-edit").expect("edit dir/b.txt");
-        std::fs::write(root.join("keep.txt.tmp"), b"saved").expect("write the temporary");
-        std::fs::rename(root.join("keep.txt.tmp"), root.join("keep.txt"))
-            .expect("save keep.txt over its temporary");
-    })
-    .await;
-    working.insert("dir/b.txt".into(), Some(b"B-edit".to_vec()));
-    working.insert("keep.txt".into(), Some(b"saved".to_vec()));
-    found.extend(disagreements(&instance, &m, &working, "edit after the commit").await);
-    m = remount(m, &working, "edit after the commit", &mut found).await;
-
-    sync_through(&instance, &m.fs, first_revision, Default::default())
-        .await
-        .expect("the sync");
-    let synced = current_revision(&instance).await;
-    if synced != first_revision {
-        found.push(format!(
-            "sync: the anchor stands on {synced}, not the target {first_revision}"
-        ));
-    }
-    working = revision_tree(&instance, first_revision).await;
-    working.insert("dir/b.txt".into(), Some(b"B-edit".to_vec()));
-    working.insert("keep.txt".into(), Some(b"saved".to_vec()));
-    found.extend(disagreements(&instance, &m, &working, "sync").await);
-    m = remount(m, &working, "sync", &mut found).await;
-
-    reset_through(&instance, &m.fs, &["dir/b.txt", "keep.txt"], false)
-        .await
-        .expect("the reset");
-    working.insert("dir/b.txt".into(), Some(b"bee".to_vec()));
-    working.insert("keep.txt".into(), Some(b"kept".to_vec()));
-    found.extend(disagreements(&instance, &m, &working, "reset").await);
-    m = remount(m, &working, "reset", &mut found).await;
-
-    m.unmount().await;
-    assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
 /// A file the kernel held when a commit read it, forgotten and looked up again before the flip,
@@ -20049,11 +21828,11 @@ async fn empty_directories_a_commit_adds_are_settled_and_their_removals_recorded
 }
 
 /// H20: an empty directory added and staged, then removed before the commit, when no commit
-/// reads content: the RMDIR of an added directory records nothing, and the commit stores the
-/// directory. The commit hands it to its settle, whose pre-record finds no directory at its path
-/// and records the deletion, so status reports it and a remount keeps it deleted.
+/// reads content: the RMDIR of an added directory records nothing, and the commit leaves the
+/// directory out, as the working tree no longer holds it, handing its settle nothing of it: no
+/// deletion is recorded, nothing is changed past the commit, and a remount holds no `e`.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_added_directory_removed_between_the_stage_and_the_commit_is_recorded_deleted() {
+async fn an_added_directory_removed_between_the_stage_and_the_commit_is_left_out() {
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -20061,36 +21840,32 @@ async fn an_added_directory_removed_between_the_stage_and_the_commit_is_recorded
             fs.mkdir(&request(), ROOT_INO, b"e", libc::S_IFDIR | 0o755, 0o022)
                 .await
                 .expect("mkdir");
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
             stage_through(&instance, &fs).await.expect("stage");
             fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir");
             assert!(deleted(&instance).is_empty(), "{:?}", deleted(&instance));
 
             let revision = commit_staged(&instance, &fs).await.expect("commit");
 
+            assert!(committed_node(&instance, revision, "n.txt").await.is_file());
             assert!(
-                committed_node(&instance, revision, "e")
-                    .await
-                    .is_directory()
-            );
-            assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the deletion list misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the deletion list holds e: {:?}",
                 deleted(&instance)
             );
-            assert_eq!(changed_paths(&instance, &fs).await, vec!["e"]);
+            assert!(changed_paths(&instance, &fs).await.is_empty());
             let again = provider_at(&instance, revision).await;
             assert!(lookup(&again, ROOT_INO, "e").await.is_err(), "e is back");
         })
         .await;
 }
 
-/// H20: [`an_added_directory_removed_between_the_stage_and_the_commit_is_recorded_deleted`] with
-/// the commit's reconcile refused, as a commit dropped before its settle: its pre-record alone
-/// records the directory's deletion. The settle stays owed, so the UNLINK of a file the commit
-/// stored, still marked added as no settle reached it, records its deletion too, and a remount
-/// keeps both deleted.
+/// H20: [`an_added_directory_removed_between_the_stage_and_the_commit_is_left_out`] with the
+/// commit's reconcile refused, as a commit dropped before its settle: the directory left out is
+/// recorded nowhere. The settle stays owed, so the UNLINK of a file the commit stored, still
+/// marked added as no settle reached it, records its deletion, and a remount holds neither.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
+async fn a_commit_dropped_before_its_settle_keeps_recording() {
     use lore_revision::fs::fuse::filesystem::WriteStep;
 
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
@@ -20112,8 +21887,8 @@ async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
                 Some(b"eff".to_vec())
             );
             assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the pre-record misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the pre-record holds e: {:?}",
                 deleted(&instance)
             );
             assert!(fs_node(&instance, &fs, "f.txt").await.is_dirty_add());
@@ -20132,6 +21907,39 @@ async fn a_commit_dropped_before_its_settle_has_recorded_and_keeps_recording() {
                     "{name} is back"
                 );
             }
+        })
+        .await;
+}
+
+/// The settle a commit owes records the deletion of each handed path the served State holds no
+/// directory at, as no settle reaches it, and leaves a handed directory it holds to the settle.
+#[tokio::test(flavor = "multi_thread")]
+async fn owing_a_settle_records_the_deletion_of_a_handed_path_holding_no_directory() {
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("keep.txt", b"k")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            fs.mkdir(&request(), ROOT_INO, b"d", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir");
+            let handed = ["d", "e", "keep.txt"]
+                .map(|path| RelativePath::new_from_initial_path(path).expect("a path"));
+
+            let owed = fs.owe_settle(handed.to_vec()).await;
+
+            let recorded = deleted(&instance);
+            assert!(
+                recorded.iter().any(|line| line == "e")
+                    && recorded.iter().any(|line| line == "keep.txt"),
+                "the pre-record: {recorded:?}"
+            );
+            assert!(
+                !recorded.iter().any(|line| line == "d"),
+                "the pre-record holds d: {recorded:?}"
+            );
+            drop(owed);
         })
         .await;
 }
@@ -20202,7 +22010,7 @@ async fn a_commit_failing_to_store_its_branch_latest_owes_no_settle() {
             assert!(moved.load(Ordering::SeqCst), "the branch did not move on");
             let error = failed.expect_err("the commit stored over a moved branch");
             assert!(
-                error.contains("advanced by another instance"),
+                error.contains("latest revision has moved on"),
                 "the commit failed otherwise: {error}"
             );
             create_with(&fs, ROOT_INO, "g.txt", b"gee").await;
@@ -20426,11 +22234,11 @@ async fn a_directory_its_settle_kept_dirty_records_its_removal() {
 }
 
 /// H20: an added empty directory staged, then replaced by a file of its name before the commit:
-/// the commit stores the directory and hands it to its settle, whose pre-record finds a file at
-/// the path and records the directory's deletion. The file is left as it stands, added, which a
-/// forced sync must not delete; a remount serves it.
+/// the commit leaves the directory out, as the working tree holds a file at its path, and hands
+/// its settle nothing of it, so no deletion is recorded. The file is left as it stands, added,
+/// which a forced sync must not delete; a remount serves it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kept() {
+async fn a_staged_directory_path_now_holding_a_file_leaves_the_directory_out_and_the_file_kept() {
     let instance = Instance::new(&[("keep.txt", b"k")]).await;
     LORE_CONTEXT
         .scope(fuse_fixture::setup_test_execution(), async {
@@ -20438,16 +22246,25 @@ async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kep
             fs.mkdir(&request(), ROOT_INO, b"e", libc::S_IFDIR | 0o755, 0o022)
                 .await
                 .expect("mkdir");
+            create_with(&fs, ROOT_INO, "n.txt", b"new").await;
             stage_through(&instance, &fs).await.expect("stage");
             fs.rmdir(&request(), ROOT_INO, b"e").await.expect("rmdir");
             create_with(&fs, ROOT_INO, "e", b"a file").await;
 
             let revision = commit_staged(&instance, &fs).await.expect("commit");
 
+            assert!(committed_node(&instance, revision, "n.txt").await.is_file());
             assert!(
-                committed_node(&instance, revision, "e")
+                state_at(&instance, revision)
                     .await
-                    .is_directory()
+                    .find_subnode(
+                        instance.fixture.repository.clone(),
+                        ROOT_NODE,
+                        hash_string("e")
+                    )
+                    .await
+                    .is_err_and(|error| error.is_node_not_found()),
+                "the revision holds a node at e"
             );
             let node = fs_node(&instance, &fs, "e").await;
             assert!(
@@ -20455,8 +22272,8 @@ async fn a_handed_directory_path_now_holding_a_file_is_recorded_and_the_file_kep
                 "the file at e lost its add"
             );
             assert!(
-                deleted(&instance).iter().any(|line| line == "e"),
-                "the deletion list misses e: {:?}",
+                !deleted(&instance).iter().any(|line| line == "e"),
+                "the deletion list holds e: {:?}",
                 deleted(&instance)
             );
             let again = provider_at(&instance, revision).await;
@@ -21231,127 +23048,6 @@ async fn a_copy_up_racing_a_rename_of_its_directory_lands_below_the_new_name() {
         .await;
 }
 
-/// A forced sync that overwrites a file edited through the mount, and removes another, has the
-/// kernel drop what it cached of both: a descriptor held across the sync reads the target's
-/// content, and the removed file is gone.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_forced_sync_over_files_edited_through_the_mount_drops_what_the_kernel_cached() {
-    use std::os::unix::fs::FileExt;
-
-    skip_without_fuse!();
-    let instance = sync_instance().await;
-    let first = instance.fixture.state.parent_self();
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    // The edit is as long as the target's content, so only an inode invalidation shows.
-    let held = blocking({
-        let root = root.clone();
-        move || {
-            std::fs::write(root.join("dir/f.txt"), b"TWO").expect("edit f.txt");
-            std::fs::write(root.join("gone/x.txt"), b"X-EDIT").expect("edit x.txt");
-            assert_eq!(
-                std::fs::read(root.join("gone/x.txt")).expect("read x.txt"),
-                b"X-EDIT"
-            );
-            let held = std::fs::File::open(root.join("dir/f.txt")).expect("open f.txt");
-            let mut cached = [0u8; 3];
-            held.read_exact_at(&mut cached, 0).expect("read f.txt");
-            assert_eq!(&cached, b"TWO");
-            held
-        }
-    })
-    .await;
-
-    LORE_CONTEXT
-        .scope(
-            fuse_fixture::setup_test_execution(),
-            sync_through(
-                &instance,
-                &m.fs,
-                first,
-                lore_revision::interface::LoreGlobalArgs {
-                    force: 1,
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("the forced sync");
-
-    blocking(move || {
-        let mut read = [0u8; 3];
-        held.read_exact_at(&mut read, 0).expect("read f.txt again");
-        assert_eq!(
-            &read, b"one",
-            "the held descriptor served the overwritten edit"
-        );
-        assert!(
-            std::fs::metadata(root.join("gone/x.txt")).is_err(),
-            "the removed file is still there"
-        );
-    })
-    .await;
-    m.unmount().await;
-}
-
-/// A forced sync whose target adds a file where one made through the mount stands, a change the
-/// plan does not count as a rewrite, has the kernel drop what it cached of the local file: a
-/// descriptor held across the sync reads the target's content.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_forced_sync_adding_a_file_over_a_local_one_drops_what_the_kernel_cached() {
-    use std::os::unix::fs::FileExt;
-
-    skip_without_fuse!();
-    let instance = sync_instance().await;
-    let first = instance.fixture.state.parent_self();
-    let m = instance.mount().await;
-    let root = m.root.clone();
-    let held = blocking({
-        let root = root.clone();
-        move || {
-            std::fs::create_dir_all(root.join("new/a")).expect("mkdir new/a");
-            std::fs::write(root.join("new/a/b.txt"), b"BEE").expect("make b.txt");
-            let held = std::fs::File::open(root.join("new/a/b.txt")).expect("open b.txt");
-            let mut cached = [0u8; 3];
-            held.read_exact_at(&mut cached, 0).expect("read b.txt");
-            assert_eq!(&cached, b"BEE");
-            held
-        }
-    })
-    .await;
-
-    LORE_CONTEXT
-        .scope(
-            fuse_fixture::setup_test_execution(),
-            sync_through(
-                &instance,
-                &m.fs,
-                first,
-                lore_revision::interface::LoreGlobalArgs {
-                    force: 1,
-                    ..Default::default()
-                },
-            ),
-        )
-        .await
-        .expect("the forced sync");
-
-    blocking(move || {
-        let mut read = [0u8; 3];
-        held.read_exact_at(&mut read, 0).expect("read b.txt again");
-        assert_eq!(
-            &read, b"bee",
-            "the held descriptor served the overwritten local file"
-        );
-        assert_eq!(
-            std::fs::read(root.join("new/a/b.txt")).expect("read b.txt by name"),
-            b"bee"
-        );
-    })
-    .await;
-    m.unmount().await;
-}
-
 /// Instance writes into a directory none of them finds, as a merge writes the side files of its
 /// conflicts below a directory the local side deleted, all land: a write whose create of the
 /// directory finds the host directory another has just made waits for that create's inode before
@@ -21487,6 +23183,645 @@ async fn instance_writes_racing_to_make_their_directory(writes: usize) {
                     "after a remount"
                 );
             }
+        })
+        .await;
+}
+
+/// Attaches a link named `name` below `parent` in the provider's filesystem State, as a sync
+/// bringing a revision that holds one leaves it.
+async fn attach_link(fs: &FuseFilesystem, instance: &Instance, parent: NodeID, name: &str) {
+    let link = Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        address: address(0x5a),
+        ..Node::default()
+    };
+    fs.state()
+        .node_attach(instance.fixture.repository.clone(), parent, link, name)
+        .await
+        .expect("attach the link");
+}
+
+/// A link is served as a directory without a write bit, and every write at or below it answers
+/// `EROFS`: a create, mknod, mkdir or symlink in it, its unlink or rmdir, a rename of it, into
+/// it, out of it or over it, and a setattr of it. The link stays, and `write/` holds nothing for
+/// it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_write_at_or_below_a_link_answers_read_only() {
+    use lore_fuse::abi::SetattrIn;
+    use lore_fuse::abi::entry::setattr_valid;
+
+    let instance = Instance::new(&[("keep.txt", b"k"), ("dir/a.txt", b"a")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, "vendor").await;
+            let vendor = lookup(&fs, ROOT_INO, "vendor").await.expect("vendor");
+            let attr = fs.getattr(&request(), vendor).await.expect("getattr").attr;
+            assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+            assert_eq!(attr.mode & 0o222, 0, "a link has no write bit");
+            fs.mkdir(&request(), ROOT_INO, b"empty", libc::S_IFDIR | 0o755, 0o022)
+                .await
+                .expect("mkdir");
+            let erofs = Some(Errno::EROFS);
+            let create_flags = (libc::O_CREAT | libc::O_RDWR) as u32;
+
+            let created = fs
+                .create(
+                    &request(),
+                    vendor,
+                    b"new.txt",
+                    libc::S_IFREG | 0o644,
+                    0o022,
+                    create_flags,
+                )
+                .await;
+            assert_eq!(created.err(), erofs, "create in the link");
+            let made = fs
+                .mknod(&request(), vendor, b"node", libc::S_IFREG | 0o644, 0, 0o022)
+                .await;
+            assert_eq!(made.err(), erofs, "mknod in the link");
+            let made = fs
+                .mkdir(&request(), vendor, b"sub", libc::S_IFDIR | 0o755, 0o022)
+                .await;
+            assert_eq!(made.err(), erofs, "mkdir in the link");
+            let made = fs.symlink(&request(), vendor, b"ln", b"x").await;
+            assert_eq!(made.err(), erofs, "symlink in the link");
+            assert_eq!(
+                fs.unlink(&request(), ROOT_INO, b"vendor").await.err(),
+                erofs,
+                "unlink of the link"
+            );
+            assert_eq!(
+                fs.rmdir(&request(), ROOT_INO, b"vendor").await.err(),
+                erofs,
+                "rmdir of the link"
+            );
+            for (parent, name, new_parent, new_name, what) in [
+                (
+                    ROOT_INO,
+                    "vendor",
+                    ROOT_INO,
+                    "moved",
+                    "a rename of the link",
+                ),
+                (
+                    ROOT_INO,
+                    "keep.txt",
+                    vendor,
+                    "keep.txt",
+                    "a rename into the link",
+                ),
+                (
+                    vendor,
+                    "l.txt",
+                    ROOT_INO,
+                    "out.txt",
+                    "a rename out of the link",
+                ),
+                (
+                    ROOT_INO,
+                    "empty",
+                    ROOT_INO,
+                    "vendor",
+                    "a rename over the link",
+                ),
+            ] {
+                let renamed = fs
+                    .rename(
+                        &request(),
+                        parent,
+                        name.as_bytes(),
+                        new_parent,
+                        new_name.as_bytes(),
+                        0,
+                    )
+                    .await;
+                assert_eq!(renamed.err(), erofs, "{what}");
+            }
+            for valid in [setattr_valid::MTIME_NOW, setattr_valid::MODE] {
+                let attr = SetattrIn {
+                    valid,
+                    mode: libc::S_IFDIR | 0o700,
+                    ..SetattrIn::default()
+                };
+                let set = fs.setattr(&request(), vendor, &attr).await;
+                assert_eq!(set.err(), erofs, "a setattr of the link");
+            }
+
+            assert_eq!(lookup(&fs, ROOT_INO, "vendor").await, Ok(vendor));
+            lookup(&fs, ROOT_INO, "keep.txt")
+                .await
+                .expect("keep.txt stays");
+            assert!(!instance.write_dir().join("vendor").exists());
+            let node = node_at(&instance, &fs, "vendor").await;
+            let node = fs
+                .state()
+                .node(instance.fixture.repository.clone(), node)
+                .await
+                .expect("the link's node");
+            assert!(node.is_link(), "the link stays a link");
+        })
+        .await;
+}
+
+/// The messages that name [`WARNED_LINK`], collected by the log callback.
+static WARNED_LINK_LOGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A link name no other test's messages carry.
+const WARNED_LINK: &str = "linked-6ib-warned";
+
+/// Collects each warning naming [`WARNED_LINK`] in [`WARNED_LINK_LOGS`].
+fn collect_warned_link_logs(level: lore_base::log::LoreLogLevel, _location: &str, message: &str) {
+    if level == lore_base::log::LoreLogLevel::Warn && message.contains(WARNED_LINK) {
+        WARNED_LINK_LOGS
+            .lock()
+            .expect("the log collector lock is not poisoned")
+            .push(message.to_string());
+    }
+}
+
+/// A mount warns once for each link it serves, however often the link's inode is made, and a
+/// new mount warns again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mount_warns_once_for_each_link() {
+    let instance = Instance::new(&[("keep.txt", b"k")]).await;
+    let capture = crate::helper::LOG_CAPTURE.lock().await;
+    WARNED_LINK_LOGS
+        .lock()
+        .expect("the log collector lock is not poisoned")
+        .clear();
+    let level = lore_base::log::log_level();
+    lore_base::log::set_log_level(lore_base::log::LoreLogLevel::Info);
+    lore_base::log::set_log_callback(Some(collect_warned_link_logs));
+    let warned = || {
+        WARNED_LINK_LOGS
+            .lock()
+            .expect("the log collector lock is not poisoned")
+            .len()
+    };
+    let counted = LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, WARNED_LINK).await;
+            let link = lookup(&fs, ROOT_INO, WARNED_LINK).await.expect("the link");
+            let first = warned();
+            fs.forget(link, 1);
+            assert!(
+                fs.inodes().get(link).is_none(),
+                "the forget drops the inode"
+            );
+            lookup(&fs, ROOT_INO, WARNED_LINK)
+                .await
+                .expect("the link again");
+            let again = warned();
+            drop(fs);
+            let fs = provider(&instance).await;
+            attach_link(&fs, &instance, ROOT_NODE, WARNED_LINK).await;
+            lookup(&fs, ROOT_INO, WARNED_LINK)
+                .await
+                .expect("the link remounted");
+            (first, again, warned())
+        })
+        .await;
+    lore_base::log::set_log_callback(None);
+    lore_base::log::set_log_level(level);
+    drop(capture);
+    assert_eq!(counted, (1, 1, 2), "one warning per mount and link");
+}
+
+/// The repository's context over the instance's stores, which commits in memory.
+fn in_memory_writer(instance: &Instance) -> Arc<lore_revision::repository::RepositoryContext> {
+    crate::helper::in_memory::repository_in(
+        instance.fixture.immutable.clone(),
+        instance.fixture.mutable.clone(),
+        instance.fixture.repository.id,
+    )
+}
+
+/// Merges through `fs` a branch whose revision adds a link at `vendor` to a revision of another
+/// repository holding `l.txt`, leaving the link staged; answers the repository and the revision.
+async fn merge_a_link(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+) -> (lore_revision::lore::RepositoryId, Hash) {
+    use crate::helper::in_memory;
+
+    let feature = create_branch_id_through(instance, fs, "feature").await;
+    let writer = in_memory_writer(instance);
+    let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+    let pin = in_memory::linked_revision(&writer, linked).await;
+    let base = instance.fixture.state.revision();
+    let state = in_memory::revision_state(&writer, base).await;
+    let link = in_memory::link_node("vendor", linked, pin);
+    in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+    in_memory::commit(&writer, &state, base, feature).await;
+    switch_through(instance, fs, lore_revision::branch::DEFAULT_DEFAULT_NAME)
+        .await
+        .expect("switch back");
+    merge_through(instance, fs, feature)
+        .await
+        .expect("the merge");
+    (linked, pin)
+}
+
+/// Runs `lore link remove <link_path>` through `fs`.
+async fn link_remove_through(
+    instance: &Instance,
+    fs: &Arc<FuseFilesystem>,
+    link_path: &str,
+) -> Result<(), String> {
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::util::path::RelativePath;
+
+    let token = RepositoryWriteToken::acquire(&instance.fixture.path).await;
+    let context = instance.command_context(fs, Some(token.share()));
+    let link_path = RelativePath::new_from_initial_path(link_path).expect("a link path");
+    LORE_CONTEXT
+        .scope(
+            fuse_fixture::setup_test_execution(),
+            lore_revision::link::remove::remove_boxed(context, &token, link_path),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))
+}
+
+/// A merge bringing a link writes none of the link through the mount: nothing lands in `write/`
+/// for it, status shows the link staged and nothing dirty, and the merge commits with nothing
+/// left in status. A remount serves the link as a read-only directory.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_merge_bringing_a_link_writes_none_of_it_and_commits() {
+    use lore_revision::interface::LoreFileAction;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing of the link"
+            );
+            let status = status_of(&instance, &fs).await;
+            assert_eq!(
+                status.into_iter().collect::<Vec<_>>(),
+                [("vendor".to_string(), (LoreFileAction::Add, false))],
+                "the link is staged and nothing is dirty"
+            );
+
+            let merged = commit_through(&instance, &fs, false)
+                .await
+                .expect("the commit of the merge");
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+            drop(fs);
+
+            let fs = provider_at(&instance, merged).await;
+            let vendor = lookup(&fs, ROOT_INO, "vendor").await.expect("vendor");
+            let attr = fs.getattr(&request(), vendor).await.expect("getattr").attr;
+            assert_eq!(attr.mode & libc::S_IFMT, libc::S_IFDIR);
+            assert_eq!(attr.mode & 0o222, 0, "the link is served read-only");
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing of the link"
+            );
+        })
+        .await;
+}
+
+/// Each stage after a sync brings a link stages nothing of the link: a scan of the whole tree, a
+/// stage of the directory holding it, of the link itself, and of a path below it. Status reports
+/// nothing, and the staged link keeps its pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_after_a_sync_brings_a_link_stages_nothing_of_it() {
+    use crate::helper::in_memory;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let writer = in_memory::repository_in(
+                instance.fixture.immutable.clone(),
+                instance.fixture.mutable.clone(),
+                instance.fixture.repository.id,
+            );
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let pin =
+                in_memory::linked_revision_holding(&writer, linked, &["l.txt", "m.txt"]).await;
+            let base = instance.fixture.state.revision();
+            let (_, branch) =
+                lore_revision::instance::load_current_anchor_boxed(&instance.fixture.repository)
+                    .await
+                    .expect("the current anchor reads");
+            let state = in_memory::revision_state(&writer, base).await;
+            // As a stage of the working tree records them, with no mode.
+            let vendor = Node {
+                mode: 0,
+                ..in_memory::directory("vendor")
+            };
+            let dir = in_memory::add(&state, writer.clone(), ROOT_NODE, vendor, "vendor").await;
+            let link = Node {
+                mode: 0,
+                ..in_memory::link_node("lib", linked, pin)
+            };
+            let link = in_memory::add(&state, writer.clone(), dir, link, "lib").await;
+            state
+                .link_add(
+                    writer.clone(),
+                    linked,
+                    in_memory::branch_id(),
+                    pin,
+                    link,
+                    lore_revision::link::LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the link");
+            let linking = in_memory::commit(&writer, &state, base, branch).await;
+            sync_through(&instance, &fs, linking, Default::default())
+                .await
+                .expect("the sync bringing the link");
+
+            let scan = lore_revision::stage::StageOptions {
+                scan: true,
+                ..Default::default()
+            };
+            let root = vec![instance.fixture.path.clone()];
+            for (what, staged) in [
+                (
+                    "a scan",
+                    stage_hosts_through(&instance, &fs, root, Default::default(), scan).await,
+                ),
+                (
+                    "the directory",
+                    stage_paths_through(&instance, &fs, &["vendor"]).await,
+                ),
+                (
+                    "the link",
+                    stage_paths_through(&instance, &fs, &["vendor/lib"]).await,
+                ),
+                (
+                    "below it",
+                    stage_paths_through(&instance, &fs, &["vendor/lib/l.txt"]).await,
+                ),
+            ] {
+                let staged = staged.unwrap_or_else(|error| panic!("{what}: {error}"));
+                assert_eq!(
+                    status_of(&instance, &fs).await,
+                    Default::default(),
+                    "{what}"
+                );
+                if staged.is_zero() {
+                    continue;
+                }
+                let staged = lore_revision::state::State::deserialize(
+                    instance.fixture.repository.clone(),
+                    staged,
+                )
+                .await
+                .expect("the staged State loads");
+                let held = staged
+                    .find_node_link(instance.fixture.repository.clone(), "vendor/lib")
+                    .await
+                    .expect("vendor/lib");
+                let held = staged
+                    .node(instance.fixture.repository.clone(), held.node)
+                    .await
+                    .expect("vendor/lib");
+                assert!(held.is_link(), "{what}: vendor/lib stays a link");
+                assert_eq!(held.address.hash, pin, "{what}: the link keeps its pin");
+            }
+        })
+        .await;
+}
+
+/// Removing a link a merge staged through the mount leaves nothing at its path: the mount holds
+/// none of the link to take back.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_link_a_merge_staged_leaves_nothing_at_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+
+            link_remove_through(&instance, &fs, "vendor")
+                .await
+                .expect("the link removal");
+
+            assert!(
+                !instance.write_dir().join("vendor").exists(),
+                "write/ holds nothing at the link's path"
+            );
+            assert_eq!(lookup(&fs, ROOT_INO, "vendor").await, Err(Errno::ENOENT));
+            let status = status_of(&instance, &fs).await;
+            assert!(
+                !status.contains_key("vendor"),
+                "nothing is staged at the link's path: {status:?}"
+            );
+        })
+        .await;
+}
+
+/// Removing a link a merge staged through the mount reads nothing of the link and nothing at or
+/// below its path, as the removal takes nothing there: a local file at its path does not refuse
+/// the removal of a link whose revision the store no longer holds, and stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_link_a_merge_staged_reads_nothing_below_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let (linked, pin) = merge_a_link(&instance, &fs).await;
+            instance
+                .fixture
+                .immutable
+                .clone()
+                .obliterate(linked, Address::zero_context_hash(pin), Arc::default())
+                .await
+                .expect("dropping the linked revision");
+            let vendor = fs
+                .mkdir(
+                    &request(),
+                    ROOT_INO,
+                    b"vendor",
+                    libc::S_IFDIR | 0o755,
+                    0o022,
+                )
+                .await
+                .expect("mkdir")
+                .ino;
+            create_with(&fs, vendor, "l.txt", b"local").await;
+
+            link_remove_through(&instance, &fs, "vendor")
+                .await
+                .expect("the link removal");
+
+            assert_eq!(
+                std::fs::read(instance.write_dir().join("vendor/l.txt")).expect("the local file"),
+                b"local"
+            );
+        })
+        .await;
+}
+
+/// A link pin change realizes nothing through a provider holding its state, so neither of its
+/// entry points reads the linked revisions: one between revisions the store does not hold
+/// succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_pin_change_on_the_mount_reads_neither_revision() {
+    use lore_revision::link::LinkMountSource;
+    use lore_revision::link::LinkPinRealizeTarget;
+    use lore_revision::util::path::RelativePath;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let repository = instance.command_context(&fs, None);
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let link_context = repository.to_link_context(linked).await;
+            let target = LinkPinRealizeTarget {
+                link_path: RelativePath::new_from_initial_path("vendor").expect("a link path"),
+                old_signature: Hash::from_u64(0x6a),
+                new_signature: Hash::from_u64(0x6b),
+                current_node: ROOT_NODE,
+                mount_source: LinkMountSource::SamePath,
+            };
+
+            lore_revision::link::realize_link_pin_change(
+                repository.clone(),
+                link_context.clone(),
+                target.clone(),
+            )
+            .await
+            .expect("the realize opening its operation");
+            lore_revision::fs::filesystem_provider::with_operation(
+                repository.file_system(),
+                async |operation| {
+                    lore_revision::link::realize_link_pin_change_in_operation(
+                        &operation,
+                        repository.clone(),
+                        link_context.clone(),
+                        target,
+                        false,
+                    )
+                    .await
+                },
+            )
+            .await
+            .expect("the realize in the caller's operation");
+        })
+        .await;
+}
+
+/// A stage naming a path below a link through the mount stages nothing, and reads nothing of the
+/// link: a link whose revision the store does not hold answers the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_below_a_link_whose_revision_is_not_held_stages_nothing() {
+    use crate::helper::in_memory;
+
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            let writer = in_memory_writer(&instance);
+            let linked = lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7());
+            let base = instance.fixture.state.revision();
+            let (_, branch) =
+                lore_revision::instance::load_current_anchor_boxed(&instance.fixture.repository)
+                    .await
+                    .expect("the current anchor reads");
+            let state = in_memory::revision_state(&writer, base).await;
+            let link = in_memory::link_node("vendor", linked, Hash::from_u64(0x6c));
+            in_memory::add(&state, writer.clone(), ROOT_NODE, link, "vendor").await;
+            let linking = in_memory::commit(&writer, &state, base, branch).await;
+            sync_through(&instance, &fs, linking, Default::default())
+                .await
+                .expect("the sync bringing the link");
+
+            stage_paths_through(&instance, &fs, &["vendor/l.txt"])
+                .await
+                .expect("the stage below the link");
+            assert_eq!(status_of(&instance, &fs).await, Default::default());
+        })
+        .await;
+}
+
+/// A reset of a link's staged removal through the mount restores the link and writes nothing of
+/// it, whether or not the mount serves the link yet: nothing lands in `write/`, the link stands in
+/// the State the mount serves as it did, and status is clean.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_a_link_removal_writes_nothing_of_the_link() {
+    for remounted in [false, true] {
+        let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+        LORE_CONTEXT
+            .scope(fuse_fixture::setup_test_execution(), async {
+                let fs = provider(&instance).await;
+                merge_a_link(&instance, &fs).await;
+                let merged = commit_through(&instance, &fs, false)
+                    .await
+                    .expect("the commit of the merge");
+                let fs = if remounted {
+                    drop(fs);
+                    provider_at(&instance, merged).await
+                } else {
+                    fs
+                };
+                let served = lookup(&fs, ROOT_INO, "vendor").await;
+                link_remove_through(&instance, &fs, "vendor")
+                    .await
+                    .expect("the link removal");
+
+                reset_through(&instance, &fs, &["vendor"], None, false)
+                    .await
+                    .unwrap_or_else(|error| panic!("remounted {remounted}: the reset: {error}"));
+
+                assert!(
+                    !instance.write_dir().join("vendor").exists(),
+                    "remounted {remounted}: write/ holds nothing at the link's path"
+                );
+                assert_eq!(
+                    lookup(&fs, ROOT_INO, "vendor").await,
+                    served,
+                    "remounted {remounted}: the mount serves the link's path as before"
+                );
+                assert_eq!(
+                    status_of(&instance, &fs).await,
+                    Default::default(),
+                    "remounted {remounted}: nothing changed"
+                );
+            })
+            .await;
+    }
+}
+
+/// A reset of a link a merge staged through the mount removes nothing at its path, which holds
+/// none of the link: a directory made there stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_of_a_link_a_merge_staged_keeps_the_directory_at_its_path() {
+    let instance = Instance::new(&[("a.txt", b"alpha")]).await;
+    LORE_CONTEXT
+        .scope(fuse_fixture::setup_test_execution(), async {
+            let fs = provider(&instance).await;
+            merge_a_link(&instance, &fs).await;
+            fs.mkdir(
+                &request(),
+                ROOT_INO,
+                b"vendor",
+                libc::S_IFDIR | 0o755,
+                0o022,
+            )
+            .await
+            .expect("mkdir");
+
+            reset_through(&instance, &fs, &["vendor"], None, false)
+                .await
+                .expect("the reset");
+
+            assert!(
+                instance.write_dir().join("vendor").is_dir(),
+                "the directory at the link's path stays"
+            );
         })
         .await;
 }

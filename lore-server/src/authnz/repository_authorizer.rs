@@ -13,8 +13,10 @@ use lore_proto::auth::CheckUserPermissionResponse;
 use tonic::Code;
 use tonic::Status;
 use tracing::info;
+use tracing::warn;
 
 use super::auth::AuthChannel;
+use super::auth::is_auth_dial_failure;
 use super::auth::is_auth_unavailable;
 use super::auth::with_auth_budget;
 use super::common::create_request_with_authorization;
@@ -22,7 +24,7 @@ use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourceMatcher;
-use crate::grpc::ServerResultExt;
+use crate::grpc::rpc_code_to_str;
 use crate::settings::AuthSettings;
 
 /// An action a caller may be asked to hold on a partition. Grants name
@@ -37,6 +39,7 @@ pub enum Action {
     Admin,
     Migrate,
     PushProtected,
+    SetProtected,
     Obliterate,
     Presign,
 }
@@ -50,6 +53,7 @@ impl Action {
             Self::Admin => "admin",
             Self::Migrate => "migrate",
             Self::PushProtected => "push-protected",
+            Self::SetProtected => "set-protected",
             Self::Obliterate => "obliterate",
             Self::Presign => "presign",
         }
@@ -142,6 +146,13 @@ pub struct PartitionGrants {
     pub grants: Grants,
 }
 
+/// Answers whether a caller may act on a partition.
+///
+/// An implementation denies with `PERMISSION_DENIED`, or `UNAUTHENTICATED`
+/// for a token it refuses. Any other status means the check could not be
+/// made, and callers return it as an error: `RESOURCE_EXHAUSTED` for a
+/// failure the client should retry. See [`AuthorizationOutcome`]. An
+/// implementation logs a check it fails to make.
 #[async_trait]
 pub trait RepositoryAuthorizer: Send + Sync {
     /// Whether `token` may perform `action` on `repository_id`: [`Action::Read`],
@@ -211,7 +222,8 @@ impl dyn RepositoryAuthorizer {
     /// answered by asking [`Action::Read`] of an authorizer that cannot enumerate;
     /// later action checks then ask it too. Denials are flattened to
     /// [`no_repository_access_status`] so an unauthorized caller learns
-    /// nothing from the reason.
+    /// nothing from the reason. A check that failed, rather than denied,
+    /// keeps its own status.
     ///
     /// The one call every partition-scoped entry point makes — the gRPC
     /// partition-access layer, the QUIC session start / connect, and the
@@ -225,12 +237,12 @@ impl dyn RepositoryAuthorizer {
     ) -> Result<Option<Grants>, Status> {
         match self.granted_actions(token, repository_id).await {
             Ok(Some(grants)) if grants.reachable() => Ok(Some(grants)),
+            Ok(Some(_unreachable)) => Err(crate::grpc::no_repository_access_status()),
             Ok(None) => self
                 .check_repository_access(token, repository_id, Action::Read)
                 .await
                 .map(|()| None)
                 .map_err(flatten_denial),
-            Ok(Some(_denied)) => Err(crate::grpc::no_repository_access_status()),
             Err(status) => Err(flatten_denial(status)),
         }
     }
@@ -244,12 +256,13 @@ impl dyn RepositoryAuthorizer {
     /// that can only answer per-action policy questions (and for call sites
     /// that are not behind the Tower middleware). A request with no verified
     /// token is asked too: the authorizer decides what such a caller holds.
+    /// `Err` when the check failed rather than denied.
     pub async fn permits(
         &self,
         extensions: &tonic::Extensions,
         repository_id: RepositoryId,
         action: Action,
-    ) -> bool {
+    ) -> Result<bool, Status> {
         let grants = extensions
             .get::<PartitionGrants>()
             .filter(|grants| grants.repository_id == repository_id);
@@ -291,8 +304,10 @@ impl dyn RepositoryAuthorizer {
                     .await
                 {
                     Ok(()) => true,
-                    Err(status) if is_auth_unavailable(&status) => return Err(status),
-                    Err(_denied) => false,
+                    Err(status) if is_denial(&status) => false,
+                    // A check that failed (the fork's auth timeout included)
+                    // is the failure, not a denial.
+                    Err(status) => return Err(status),
                 },
             };
             if permitted {
@@ -305,39 +320,75 @@ impl dyn RepositoryAuthorizer {
     }
 }
 
-/// FORK-LOCAL (Tideshift): the status an authorization check reports for a
-/// failed question. A denial, or any error, is flattened to
-/// [`no_repository_access_status`] so an unauthorized caller learns nothing
-/// from the reason. An auth service that did not answer in time
-/// ([`is_auth_unavailable`]) is passed on: it is the server's condition, says
-/// nothing about the repository, and must not read as "not authorized".
-///
-/// [`no_repository_access_status`]: crate::grpc::no_repository_access_status
-pub fn flatten_denial(status: Status) -> Status {
-    if is_auth_unavailable(&status) {
-        status
-    } else {
-        crate::grpc::no_repository_access_status()
-    }
-}
-
 /// Whether `action` on `repository_id` is permitted. `grants`, the caller's
 /// enumerated grants on it, answer when present; otherwise `authorizer` is
 /// asked with `token`, which is `None` when no verifier is configured.
+/// `Err` when the check failed rather than denied.
 pub async fn permits_with(
     authorizer: &dyn RepositoryAuthorizer,
     grants: Option<&Grants>,
     token: Option<&VerifiedToken<'_>>,
     repository_id: RepositoryId,
     action: Action,
-) -> bool {
+) -> Result<bool, Status> {
     if let Some(grants) = grants {
-        return grants.permits(action);
+        return Ok(grants.permits(action));
     }
-    authorizer
+    match authorizer
         .check_repository_access(token, repository_id, action)
         .await
-        .is_ok()
+    {
+        Ok(()) => Ok(true),
+        Err(status) if is_denial(&status) => Ok(false),
+        Err(status) => Err(status),
+    }
+}
+
+/// Whether `status`, an error from a [`RepositoryAuthorizer`], is its answer
+/// that the caller may not act, rather than a failure to answer. Authorizers
+/// deny with `PERMISSION_DENIED`, or with `UNAUTHENTICATED` for a token they
+/// refuse. Any other code means the check could not be made.
+pub fn is_denial(status: &Status) -> bool {
+    matches!(
+        status.code(),
+        Code::PermissionDenied | Code::Unauthenticated
+    )
+}
+
+/// What an error from a [`RepositoryAuthorizer`] means for its caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthorizationOutcome {
+    /// The caller may not act: see [`is_denial`].
+    Denied,
+    /// The check could not be made, and the client should retry:
+    /// `RESOURCE_EXHAUSTED`.
+    Retryable,
+    /// The check could not be made, and a retry would not help.
+    Failed,
+}
+
+impl AuthorizationOutcome {
+    pub fn of(status: &Status) -> Self {
+        if is_denial(status) {
+            Self::Denied
+        } else if status.code() == Code::ResourceExhausted {
+            Self::Retryable
+        } else {
+            Self::Failed
+        }
+    }
+}
+
+/// `status` from a [`RepositoryAuthorizer`], with a denial flattened to
+/// [`no_repository_access_status`](crate::grpc::no_repository_access_status)
+/// so an unauthorized caller learns nothing from the reason. A failed check
+/// keeps its own status.
+pub fn flatten_denial(status: Status) -> Status {
+    if is_denial(&status) {
+        crate::grpc::no_repository_access_status()
+    } else {
+        status
+    }
 }
 
 /// Selected when no `[server.auth]` is configured: nothing verifies tokens,
@@ -418,22 +469,64 @@ impl AuthClientAuthorizer {
     ) -> Result<CheckUserPermissionResponse, Status> {
         let request = check_user_permission_request(resource_id.to_string(), authorization)?;
 
-        let mut client = self.auth.client().await?;
-        let permissions = client
-            .check_user_permission(request)
+        // FORK-LOCAL (Tideshift): the shared AuthChannel replaces upstream's
+        // per-call `grpc_get_permission_client`. A dial that failed fast is
+        // upstream's `UNAVAILABLE` dial failure (retryable); a dial that ran
+        // out of time keeps the fork's auth-unavailable status.
+        let mut client = self
+            .auth
+            .client()
             .await
-            .warn_map_err(|err| {
-                if is_auth_unavailable(err) {
-                    return err.clone();
-                } else if err.code() == Code::PermissionDenied {
-                    return Status::permission_denied("Query resource denied");
-                } else if err.code() == Code::Unauthenticated {
-                    return Status::unauthenticated("Query resource failed - unauthenticated");
-                }
-                Status::internal(format!("Failed to call auth check_user_permission: {err}"))
-            })?;
+            .map_err(|err| permission_check_failure(&err))?;
+        let permissions = client.check_user_permission(request).await.map_err(|err| {
+            let status = permission_check_failure(&err);
+            if !is_denial(&status) {
+                warn!(
+                    ?err,
+                    response = ?status,
+                    rpc_status_code = rpc_code_to_str(&status.code()),
+                    "CheckUserPermission failed"
+                );
+            }
+            status
+        })?;
 
         Ok(permissions.into_inner())
+    }
+}
+
+/// FORK-LOCAL (Tideshift): [`auth_service_failure`] for the shared
+/// [`AuthChannel`]. A status the fork's auth budget or outage hold produced
+/// ([`is_auth_unavailable`]) passes on unchanged: an `INTERNAL` failed check,
+/// never a denial. A dial that failed fast maps as upstream's `UNAVAILABLE`
+/// dial failure does: `RESOURCE_EXHAUSTED`.
+fn permission_check_failure(err: &Status) -> Status {
+    if is_auth_unavailable(err) {
+        err.clone()
+    } else if is_auth_dial_failure(err) {
+        auth_service_failure(&Status::unavailable(err.message()))
+    } else {
+        auth_service_failure(err)
+    }
+}
+
+/// The status a `CheckUserPermission` call that ended in `err` answers. The
+/// auth service's denials stay denials. `NOT_FOUND` is one: auth API can
+/// answer it for a caller or repo missing from its store. A failure that can clear, such as an
+/// unreachable or rate-limiting auth service, is `RESOURCE_EXHAUSTED`, which
+/// clients retry with backoff. Any other failure is `INTERNAL`. The auth
+/// service's own message is not passed on.
+#[lore_macro::test_pub]
+fn auth_service_failure(err: &Status) -> Status {
+    match err.code() {
+        Code::PermissionDenied | Code::NotFound => {
+            Status::permission_denied("Query resource denied")
+        }
+        Code::Unauthenticated => Status::unauthenticated("Query resource failed - unauthenticated"),
+        Code::Unavailable | Code::ResourceExhausted | Code::DeadlineExceeded | Code::Aborted => {
+            Status::resource_exhausted("The auth service could not answer the permission check")
+        }
+        _ => Status::internal("The auth service failed the permission check"),
     }
 }
 

@@ -18,6 +18,7 @@ use lore_revision::metadata::branch::ARCHIVE_KEYS;
 use lore_revision::metadata::branch::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -38,8 +39,8 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::require_action;
+use crate::grpc::require_branch_protection_administration;
 use crate::grpc::require_permission;
-use crate::grpc::require_repository_administration;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -81,8 +82,7 @@ pub(crate) fn validate_read_only_fields(
 /// `current`. Such a change is repository administration rather than an
 /// ordinary write.
 pub(crate) fn changes_protection(current: &Metadata, proposed: &Metadata) -> bool {
-    current.get_bool(branch::PROTECT).unwrap_or_default()
-        != proposed.get_bool(branch::PROTECT).unwrap_or_default()
+    branch::protected(current) != branch::protected(proposed)
 }
 
 /// Validate that all Address-typed values in the proposed metadata blob reference existing
@@ -157,40 +157,16 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing branch ID"));
     }
 
-    // Recomputed from the exact validated wire values, never taken from the
-    // body. v0 and v1 of this CAS share one frozen intent family, so identical
-    // values must produce identical bytes on both entry points.
-    //
-    // After the empty/default check, per INTENT-02-LORE; see the v0 repository
-    // handler for the full reasoning.
-    let governed = match admitted {
-        Some(admitted) => {
-            let digest = canonical_intent_digest(&CanonicalIntent::BranchMetadataCas {
-                repository_id: repository_id.data(),
-                branch_id: branch_id.as_ref(),
-                expected_hash: &req.expected_hash,
-                new_hash: &req.new_hash,
-            })
-            .map_err(|error| Status::invalid_argument(error.to_string()))?;
-            GovernedMetadataCas::prepare(
-                domain_context,
-                Some(admitted),
-                MetadataCasFamily::Branch,
-                digest,
-            )
-            .await?
-        }
-        None => None,
-    };
-
-    let expected_hash: Hash = req.expected_hash.into();
-    let new_hash: Hash = req.new_hash.into();
+    // Cloned: the governed prepare below hashes the raw wire bytes too.
+    let expected_hash: Hash = req.expected_hash.clone().into();
+    let new_hash: Hash = req.new_hash.clone().into();
 
     let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
@@ -238,7 +214,7 @@ pub async fn handler(
             // Validate read-only fields are unchanged
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
             if protect_changed {
-                require_repository_administration(
+                require_branch_protection_administration(
                     authorizer,
                     &extensions,
                     repository.clone(),
@@ -246,6 +222,36 @@ pub async fn handler(
                 )
                 .await?;
             }
+
+            // The governed prepare writes the receipt, so it runs only after every
+            // authorization check above (admission -> write/admin -> protection
+            // administration -> prepare). The checks read the two metadata blobs and
+            // the repository record; none of them writes.
+            // Recomputed from the exact validated wire values, never taken from the
+            // body. v0 and v1 of this CAS share one frozen intent family, so identical
+            // values must produce identical bytes on both entry points.
+            //
+            // After the empty/default check, per INTENT-02-LORE; see the v0 repository
+            // handler for the full reasoning.
+            let governed = match admitted {
+                Some(admitted) => {
+                    let digest = canonical_intent_digest(&CanonicalIntent::BranchMetadataCas {
+                        repository_id: repository_id.data(),
+                        branch_id: branch_id.as_ref(),
+                        expected_hash: &req.expected_hash,
+                        new_hash: &req.new_hash,
+                    })
+                    .map_err(|error| Status::invalid_argument(error.to_string()))?;
+                    GovernedMetadataCas::prepare(
+                        domain_context,
+                        Some(admitted),
+                        MetadataCasFamily::Branch,
+                        digest,
+                    )
+                    .await?
+                }
+                None => None,
+            };
 
             // Validate binary blob references exist
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;

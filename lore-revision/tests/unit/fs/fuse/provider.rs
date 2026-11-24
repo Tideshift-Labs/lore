@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::test_util::TempDir;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -48,6 +49,7 @@ use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::Mark;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
@@ -694,6 +696,27 @@ fn marked_address(marker: u64) -> Address {
     }
 }
 
+/// A provider over a context without a Lore directory is refused before it takes the State, so
+/// the caller's own State, which it would serve for the zero revision, stays unserved.
+#[tokio::test]
+async fn a_provider_over_a_context_without_a_lore_directory_is_refused_and_serves_nothing() {
+    let (immutable_store, mutable_store, execution) =
+        fuse_fixture::test_store_create().await.expect("stores");
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async {
+            let repository = Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            ));
+            let state = lore_revision::state::State::new();
+            let built = FuseFilesystem::new(repository, state.clone(), attr_context()).await;
+            assert!(matches!(built, Err(error) if error.is_internal()));
+            assert!(!state.is_served(), "the State is left unserved");
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn same_content_directories_under_a_path_specific_view_keep_their_own_masks() {
     let (immutable_store, mutable_store, execution) =
@@ -703,9 +726,11 @@ async fn same_content_directories_under_a_path_specific_view_keep_their_own_mask
         .view
         .add_exclusion("a/x/secret.txt")
         .expect("exclusion");
+    let instance = TempDir::new("fuse-provider-view-masks-");
     let repository = Arc::new(
         RepositoryContext::new(
             fuse_fixture::default_repository_creation_args(immutable_store, mutable_store)
+                .with_path(instance.path())
                 .with_filter(Arc::new(filter)),
         )
         .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
@@ -1655,28 +1680,18 @@ async fn a_directory_attached_since_the_listing_keeps_its_view_state() {
     );
 }
 
-/// Names attached since their directory's listing that no listing serves answer absent, with
-/// no inode made: a link, and one the view excludes. A name no FUSE entry carries never comes
-/// this way: the State refuses `/`, NUL, `.` and `..`, and LOOKUP answers a name over 255 bytes
-/// itself. The caller runs in no execution context: the event the exclusion reports goes out
-/// under the one the provider captured.
+/// A name attached since its directory's listing that the view excludes answers absent, with no
+/// inode made. A name no FUSE entry carries never comes this way: the State refuses `/`, NUL, `.`
+/// and `..`, and LOOKUP answers a name over 255 bytes itself. The caller runs in no execution
+/// context: the event the exclusion reports goes out under the one the provider captured.
 #[tokio::test]
-async fn names_attached_since_the_listing_that_listings_leave_out_answer_absent() {
+async fn a_name_attached_since_the_listing_that_the_view_excludes_answers_absent() {
     let fixture = fuse_fixture::committed(&[("keep.txt", b"k")]).await;
     let repository = view_repository(&fixture, &["drop.txt"]);
     let fs = provider(repository.clone(), fixture.state.clone()).await;
     fs.lookup(&req(), ROOT_INO, b"keep.txt")
         .await
         .expect("keep.txt");
-    let link = Node {
-        flags: NodeFlags::Link.bits(),
-        mode: 0o755,
-        ..Node::default()
-    };
-    fs.state()
-        .node_attach(repository.clone(), ROOT_NODE, link, "vendor")
-        .await
-        .expect("attach the link");
     attach_named(&fs, &repository, ROOT_NODE, "drop.txt", true).await;
     let added = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = added.clone();
@@ -1691,19 +1706,75 @@ async fn names_attached_since_the_listing_that_listings_leave_out_answer_absent(
     }));
     let inodes = fs.inodes().len();
 
-    for name in ["vendor", "drop.txt"] {
-        let found = fs.lookup(&req(), ROOT_INO, name.as_bytes()).await;
-        assert!(
-            found.is_err() || found.is_ok_and(|entry| entry.ino == 0),
-            "{name} is absent"
-        );
-    }
+    let found = fs.lookup(&req(), ROOT_INO, b"drop.txt").await;
+    assert!(
+        found.is_err() || found.is_ok_and(|entry| entry.ino == 0),
+        "drop.txt is absent"
+    );
     assert_eq!(
         added.load(Ordering::SeqCst),
-        2,
-        "each lookup read a node attached since the listing"
+        1,
+        "the lookup read a node attached since the listing"
     );
     assert_eq!(fs.inodes().len(), inodes, "no inode was made");
+}
+
+/// Attaches a link named `name` under `parent`, as a sync bringing a revision that holds one
+/// leaves it.
+async fn attach_link(
+    fs: &FuseFilesystem,
+    repository: &Arc<RepositoryContext>,
+    parent: NodeID,
+    name: &str,
+) {
+    let link = Node {
+        flags: NodeFlags::Link.bits(),
+        mode: 0o755,
+        address: marked_address(0x5a),
+        ..Node::default()
+    };
+    fs.state()
+        .node_attach(repository.clone(), parent, link, name)
+        .await
+        .expect("attach the link");
+}
+
+/// A link is served as an empty directory with no write bit, whether its directory's listing
+/// holds it or it was attached since: the mount does not serve a link's content.
+#[tokio::test]
+async fn a_link_is_served_as_an_empty_read_only_directory() {
+    let (fixture, fs) = mounted(&[("keep.txt", b"k")]).await;
+    attach_link(&fs, &fixture.repository, ROOT_NODE, "listed").await;
+    let (records, _) = readdirplus(&fs, ROOT_INO, 0, 64 * 1024).await;
+    let listed = records
+        .iter()
+        .find(|record| record.name == b"listed")
+        .expect("the root lists the link");
+    assert_eq!(listed.kind, lore_fuse::abi::DirentType::Dir as u32);
+    attach_link(&fs, &fixture.repository, ROOT_NODE, "added").await;
+
+    for name in ["listed", "added"] {
+        let built = fs.listings_built();
+        let entry = fs
+            .lookup(&req(), ROOT_INO, name.as_bytes())
+            .await
+            .expect(name);
+        assert_ne!(entry.ino, 0, "{name} is served");
+        assert_eq!(entry.attr.mode, libc::S_IFDIR | 0o555, "{name}");
+        assert_eq!(fs.listings_built(), built, "{name} is found with no build");
+        let records = readdir(&fs, entry.ino, 0, 4096).await;
+        let names: Vec<&[u8]> = records.iter().map(|r| r.name.as_slice()).collect();
+        assert_eq!(
+            names,
+            [b".".as_slice(), b"..".as_slice()],
+            "{name} lists nothing"
+        );
+        let inner = fs.lookup(&req(), entry.ino, b"keep.txt").await;
+        assert!(
+            inner.is_err() || inner.is_ok_and(|entry| entry.ino == 0),
+            "nothing is found below {name}"
+        );
+    }
 }
 
 /// The node blocks cached listings hold count against the cache's budget once each, however many
@@ -1789,5 +1860,25 @@ async fn a_pinned_block_gives_back_exactly_its_charge_after_attaches() {
         served.listings.pinned_bytes(),
         0,
         "exactly the charge comes back"
+    );
+}
+
+/// A future run under an execution context holds its work once: the scope takes the work rather
+/// than standing beside it.
+#[test]
+fn a_scoped_future_holds_its_work_once() {
+    let context: Arc<dyn std::any::Any + Send + Sync> = Arc::new(());
+    let work = || async {
+        let held = [0_u8; 1024];
+        tokio::task::yield_now().await;
+        held.len()
+    };
+    let scoped = lore_revision::fs::fuse::filesystem::scoped_in(Some(&context), work());
+
+    assert!(
+        size_of_val(&scoped) < 2 * size_of_val(&work()),
+        "the scoped future holds {} bytes for work of {}",
+        size_of_val(&scoped),
+        size_of_val(&work())
     );
 }

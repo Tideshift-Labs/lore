@@ -301,6 +301,8 @@ the Rust equivalent of the smoke tests' `--keep-test-data`. The prefix is all
 there is to identify one afterwards, so give it the test's name wherever several
 tests in a module would otherwise share it.
 
+A test that moves the external root needs its global directory and its targets on one volume Lore verifies as local and durable, and outside any Lore working tree. It makes them in the base `lore_io::test_util::verified_scratch_base` finds, through `verified_temp_dir` in `lore-revision/tests/helper.rs`, or with the `verified_volume` marker in the smoke tests: the system temp directory where it qualifies, else the build's temp directory, else `lore-test-scratch` beside the outermost working tree that holds the build. The last lies outside pytest's base temp directory, so the session sweep doesn't reach it: the process that chose it removes it once empty as it exits, a Rust test binary only on Unix. Where no candidate qualifies, the test fails, naming each.
+
 `tempfile` is the implementation and a dependency of `lore-base` only. Do not add
 it to another crate: a second guard type is a second set of rules, and it does not
 honour `LORE_KEEP_TEST_DATA`.
@@ -340,7 +342,7 @@ Fixed sleeps are acceptable only for time-based behavior such as TTL expiry, or 
 
 - `new_lore_repo` — Creates a new test repository.
 - `scratch_dir` — Hands out a path beside the repositories for the test to create
-  something at: a shared store, a clone target, a moved instance.
+  something at: a shared store, a path to clone into, a moved instance.
 - `lore_executable_path` — Path to the Lore client binary.
 - `auto_lore_local_server` — Auto starts the server for the session.
 
@@ -439,6 +441,38 @@ service process, so the client relaying to it blocks until the per-test timeout
 kills the worker. A machine without the driver should deselect the tests with
 `-m "smoke and not swfs"`.
 
+The Rust tests that mount SWFS, such as `lore-revision/tests/swfs_freeze.rs`,
+compile for Windows x86-64 only and have the same two preconditions. A machine
+without the driver sets `LORE_TEST_NO_SWFS=1`, and they return at once, passing
+without testing anything. A new Rust test that mounts SWFS must check
+that variable first.
+
+### Running the FUSE tests
+
+The tests that mount FUSE run on Linux, with `/dev/fuse` open to the user running
+them and `fusermount3` on `PATH`. Without either, the smoke tests in
+`test_fuse.py` skip, and the Rust tests return at once, passing without testing
+anything, as they do when `LORE_TEST_SKIP_FUSE` is set.
+
+A Rust test that mounts FUSE is declared in a module named `needs_fuse`, in one of
+the packages `lore_fuse::test_support::FUSE_TEST_PACKAGES` names, and starts with
+`lore_fuse::skip_without_fuse!()`, which panics in a test declared anywhere else.
+The filter `needs_fuse::` then selects every test that mounts, so CI runs them
+alone in a container that has `/dev/fuse`:
+
+```bash
+cargo test --release -p lore-fuse -p lore-revision -- needs_fuse::
+```
+
+The FUSE tests of `lore-integration-tests` also need its `integration_tests`
+feature and the services its integration tests use.
+
+A test that writes through a shared mapping of a mount its own process serves
+writes from a child process. In the test's process, the page fault waits for a
+WRITE the process's own session serves while it holds the mapping's lock, and a
+`fork` elsewhere in the process meanwhile keeps the session's threads from taking
+a page fault, so the WRITE is never served.
+
 ### Running the machine server's container tests
 
 The tests in `test_uds_containers.py` run a machine server with a container on
@@ -479,8 +513,8 @@ that service, except in the tests that manage a service of their own through
 `runs_in_process(reason)`, whose commands stay in their own process. The
 executable the relayed commands name for starting a service doesn't exist, so a
 service that stops partway fails the tests that follow instead of being replaced,
-the commands of a virtual clone included. Naming none would not do that: a
-virtual clone's commands start a service from the `lore` that ran them.
+the commands of a virtual instance included. Naming none would not do that: a
+virtual instance's commands start a service from the `lore` that ran them.
 
 ```bash
 LORE_TEST_SHARED_SERVICE=1 uv run pytest scripts/test/ -m smoke -n 4
@@ -517,33 +551,33 @@ process. Outside a call the service reads its own paths, so start it as the
 harness starts its shared service: with a directory of its own for both paths
 and `LORE_AUTH_STORE=fallback`.
 
-### Running every test over virtual clones
+### Running every test over virtual instances
 
 `LORE_TEST_VFS` names a VFS that every repository a test creates or clones
 through the harness takes where the test names none, so the suite runs over
-virtual clones. The service mounts a virtual clone, so the run needs one:
+virtual instances. The service mounts a virtual instance, so the run needs one:
 
 ```bash
 LORE_TEST_SHARED_SERVICE=1 LORE_TEST_VFS=fuse uv run pytest scripts/test/ -m smoke -n 4
 ```
 
-A bare, untracked or dry-run clone stays as the test asks, since a virtual
-clone has no such form. A virtual clone stays mounted past the test that made
-it, so the harness detaches every Lore mount below a test's directories before
-removing them.
+A test that clones bare, untracked or as a dry run keeps that form, since a
+virtual instance has no such form. A virtual instance stays mounted past the test
+that made it, so the harness detaches every Lore mount below a test's directories
+before removing them.
 
-A virtual clone always uses a shared store. A repository the run makes virtual,
+A virtual instance always uses a shared store. A repository the run makes virtual,
 where the test asks for no shared store, gets a store of its own beside it
 (`--shared-store-path <path>.store`). That keeps it apart from the test's other
 repositories, as the store in its own `.lore` did: a branch it commits to
 doesn't advance in theirs.
 
-A test that cannot run over a virtual clone keeps the VFS it names, or none,
+A test that cannot run over a virtual instance keeps the VFS it names, or none,
 with `@pytest.mark.own_vfs("<why>")`. The reason names what the test does that a
-virtual clone does not: it links or layers a repository, deletes or moves an
+virtual instance does not: it links or layers a repository, deletes or moves an
 instance's directory, reads the store in a repository's own `.lore`, or asserts
 what a plain status reports of an ordinary working tree, where a status on a
-virtual clone always scans.
+virtual instance always scans.
 
 ### Per-test timeout
 
@@ -570,12 +604,13 @@ is legitimately slower.
 | `@pytest.mark.swfs` | Tests that need the EpicVFS driver, which is available only on Windows machines where it is installed. Deselect with `-m "smoke and not swfs"` if you don't have the driver. |
 | `@pytest.mark.slow` | Slow running tests |
 | `@pytest.mark.disable_auto_server` | Tests requiring the `--disable-auto-server` flag |
+| `@pytest.mark.verified_volume` | Tests that move the external root: their global directory and scratch paths go on a volume Lore verifies, outside any Lore working tree, as [Scratch space on disk](#scratch-space-on-disk) describes |
 
 ---
 
 ## 5. Load tests
 
-Lore has a load-testing suite that exercises concurrent clone, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
+Lore has a load-testing suite that exercises concurrent cloning, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
 
 ---
 

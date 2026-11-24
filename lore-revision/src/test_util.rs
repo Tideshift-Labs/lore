@@ -3,17 +3,35 @@
 //! Probes a test reads and arms inside the library, points where it stops a branch write, and
 //! fixtures tests build on, built with the `test-util` feature.
 
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use bytes::Bytes;
+use lore_base::error::NoRemote;
+use lore_base::types::Context;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
+use lore_storage::WriteOptions;
+use lore_transport::ProtocolError;
 use tokio::sync::Notify;
 
-use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FsError;
+use crate::instance;
+use crate::instance::InstanceId;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
+use crate::repository::DOT_LORE;
+use crate::repository::INSTANCE;
 use crate::repository::RemoteState;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryContextCreationArgs;
+use crate::repository::RepositoryWriteToken;
+use crate::state::State;
+use crate::state::StateData;
 
 /// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
 /// the remote is valid.
@@ -39,6 +57,89 @@ pub async fn context_built(
         Arc::default(),
         None,
     )))
+}
+
+/// Registers a new instance of `repository` in the stores `immutable` and `mutable` at `dir`, with
+/// `branch` and `revision` as its current branch and revision, and writes `<dir>/.lore/instance`
+/// holding its id, so the registration reads as live. Returns the instance's id. The writes run
+/// in the caller's execution context.
+pub async fn register_live_instance(
+    immutable: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    repository: RepositoryId,
+    branch: BranchId,
+    revision: Hash,
+    dir: &Path,
+) -> InstanceId {
+    let instance_id = InstanceId::generate();
+    let context = Arc::new(
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            paths: None,
+            immutable_store: immutable,
+            mutable_store: mutable,
+            id: repository,
+            instance_id,
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            filesystem_provider: None,
+        })
+        .with_write_token(RepositoryWriteToken::acquire(dir).await),
+    );
+    instance::register_instance(&context, instance_id, &dir.display().to_string())
+        .await
+        .expect("registers the instance");
+    instance::store_current_anchor_branch(&context, branch)
+        .await
+        .expect("stores the current branch");
+    instance::store_current_anchor(&context, revision)
+        .await
+        .expect("stores the current revision");
+    let dot_lore = dir.join(DOT_LORE);
+    lore_io::IoDriver::global()
+        .create_dir_all(&dot_lore)
+        .await
+        .expect("creates the Lore directory");
+    instance_id
+        .write_to_file(dot_lore.join(INSTANCE))
+        .await
+        .expect("writes the instance file");
+    instance_id
+}
+
+/// Writes through `repository` a revision numbered `number` whose self parent is `parent` and whose
+/// metadata hash is `metadata`, and returns its hash.
+pub async fn write_state_revision(
+    repository: &Arc<RepositoryContext>,
+    parent: Hash,
+    number: u64,
+    metadata: Hash,
+) -> Hash {
+    let token = repository
+        .try_write_token()
+        .expect("the context carries a write token");
+    let state = State::new();
+    state.set_parent_self(parent);
+    state.set_revision_number(number);
+    state.set_metadata_hash(metadata);
+    state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("writes the revision state")
+}
+
+/// Writes through `repository` a blob of a revision state's size that is not a revision state:
+/// zeroed, so its header lacks the state magic. Read as a state, it is a revision numbered 0
+/// without parents. Returns its hash.
+pub async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
+    crate::immutable::write(
+        repository.clone(),
+        Context::default(),
+        Bytes::from(vec![0u8; size_of::<StateData>()]),
+        WriteOptions::default(),
+    )
+    .await
+    .expect("writes the blob")
+    .hash
 }
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one
@@ -99,10 +200,7 @@ impl TaskProbe {
 
     /// `entry`, or the failure [`Self::fail_entry_after`] armed in its place, which it answers
     /// once.
-    pub(crate) fn entry(
-        &self,
-        entry: Result<DirectoryEntry, FsError>,
-    ) -> Result<DirectoryEntry, FsError> {
+    pub(crate) fn entry<T>(&self, entry: Result<T, FsError>) -> Result<T, FsError> {
         let armed = self.fail_after.load(Ordering::Acquire);
         if self.spawned.load(Ordering::Acquire) >= armed
             && self
@@ -207,15 +305,26 @@ pub enum BranchStep {
     ProtectMetadataRead,
 }
 
-/// Where a stepped task reports each step it reaches, and what it waits for to go on.
+/// Where a held task reports each point it reaches, and what it waits for to go on.
 #[derive(Clone)]
-struct Stepped {
-    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+struct Hold<T> {
+    reached: tokio::sync::mpsc::UnboundedSender<T>,
     resume: Arc<Notify>,
 }
 
+/// Stops this task at `point`, where it runs held by `hold`: `point` is sent on the hold's
+/// `reached`, and the task waits for a notification of its `resume` before it goes on.
+async fn stop_where_held<T: Clone>(hold: &'static tokio::task::LocalKey<Hold<T>>, point: T) {
+    let Ok(hold) = hold.try_with(Hold::clone) else {
+        return;
+    };
+    if hold.reached.send(point).is_ok() {
+        hold.resume.notified().await;
+    }
+}
+
 tokio::task_local! {
-    static STEPPED: Stepped;
+    static STEPPED: Hold<BranchStep>;
 }
 
 /// Runs `future`, stopping at each [`BranchStep`] it reaches: the step is sent on `reached`, and
@@ -226,31 +335,174 @@ pub fn step_branch_writes<F: Future>(
     resume: Arc<Notify>,
     future: F,
 ) -> impl Future<Output = F::Output> {
-    STEPPED.scope(Stepped { reached, resume }, future)
+    STEPPED.scope(Hold { reached, resume }, future)
 }
 
 /// Stops this task at `step`, where it runs under [`step_branch_writes`].
 pub(crate) async fn branch_step(step: BranchStep) {
-    let Ok(stepped) = STEPPED.try_with(Stepped::clone) else {
-        return;
+    stop_where_held(&STEPPED, step).await;
+}
+
+/// A point of a move of the external root where a task run under [`step_moves`] stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveStep {
+    /// The move has recorded this phase and not yet run its step.
+    Phase(crate::global::external_dir::record::MovePhase),
+    /// An undo has not yet run this step.
+    Undo(crate::global::external_dir::recovery::UndoStep),
+    /// A leftover's removal has deleted its marker and not yet removed its contents.
+    LeftoverUnmarked,
+    /// A takeover has listed what it gives up and not yet replaced the move record.
+    TakeoverListed,
+    /// A move's final switch has failed and let go of the store locks, and its recovery has not
+    /// yet begun.
+    SwitchFailed,
+}
+
+/// Where a task run under [`step_moves`] reports each step it reaches, with the sender a test
+/// answers on: `true` to go on, `false` to fail the step. A dropped sender goes on.
+pub type MoveStepped =
+    tokio::sync::mpsc::UnboundedSender<(MoveStep, tokio::sync::oneshot::Sender<bool>)>;
+
+tokio::task_local! {
+    static MOVE_STEPPED: MoveStepped;
+}
+
+/// Runs `future`, stopping at each [`MoveStep`] it reaches until the test answers it on the
+/// sender sent with the step on `reached`. Tasks `future` spawns don't stop.
+pub fn step_moves<F: Future>(reached: MoveStepped, future: F) -> impl Future<Output = F::Output> {
+    MOVE_STEPPED.scope(reached, future)
+}
+
+/// Stops this task at `step`, where it runs under [`step_moves`], and answers whether the step
+/// goes on.
+pub(crate) async fn move_step(step: MoveStep) -> bool {
+    let Ok(reached) = MOVE_STEPPED.try_with(MoveStepped::clone) else {
+        return true;
     };
-    if stepped.reached.send(step).is_ok() {
-        stepped.resume.notified().await;
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    if reached.send((step, answer)).is_err() {
+        return true;
+    }
+    answered.await.unwrap_or(true)
+}
+
+/// What a test makes the moves of the external root of one global data directory read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveOverride {
+    /// Every move copies, as a move between two volumes does, whatever the volumes are.
+    Copy,
+    /// Every move copies, and the target's volume reads as having no free space.
+    CopyToFullVolume,
+    /// Every move copies, and the copy, once it has copied an entry, waits until it is stopped.
+    CopyHeld,
+}
+
+/// The global data directories whose moves tests override, with how.
+static MOVE_OVERRIDES: std::sync::Mutex<Vec<(std::path::PathBuf, MoveOverride)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Makes the moves of the external root of `global` read as `how` says until the guard drops.
+/// Keyed by the global data directory, so tests with directories of their own don't see each
+/// other's.
+#[must_use]
+pub fn override_moves(global: &Path, how: MoveOverride) -> MoveOverridden {
+    let global = global.to_path_buf();
+    MOVE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((global.clone(), how));
+    MoveOverridden(global)
+}
+
+/// Ends an [`override_moves`] when dropped.
+pub struct MoveOverridden(std::path::PathBuf);
+
+impl Drop for MoveOverridden {
+    fn drop(&mut self) {
+        MOVE_OVERRIDES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(global, _)| *global != self.0);
     }
 }
 
-/// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
-/// inode table counting no lookups, and what it waits for to go on.
-#[cfg(target_os = "linux")]
-#[derive(Clone)]
-struct DrainHold {
-    reached: tokio::sync::mpsc::UnboundedSender<()>,
-    resume: Arc<Notify>,
+/// How a test overrides the moves of the external root of `global`, if it does.
+pub(crate) fn move_override(global: &Path) -> Option<MoveOverride> {
+    MOVE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(overridden, _)| overridden == global)
+        .map(|&(_, how)| how)
 }
 
-#[cfg(target_os = "linux")]
+/// A pause a test arms: once armed, the next [`pass`](Self::pass) stops, whichever task makes it,
+/// until it is resumed.
+#[derive(Default)]
+pub struct ArmedPause {
+    armed: AtomicBool,
+    paused: AtomicBool,
+    reached: Notify,
+    resume: Notify,
+}
+
+impl ArmedPause {
+    /// Stops the next pass.
+    pub fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// Waits until the armed pass stops.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Lets the stopped pass go on.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.resume.notify_waiters();
+    }
+
+    /// Arms the pause until the guard it answers drops, which disarms it and lets a stopped pass go
+    /// on, so that a test that fails leaves no pass stopped and none armed for the next test.
+    pub fn arm_while_held(&self) -> ArmedPauseGuard<'_> {
+        self.arm();
+        ArmedPauseGuard(self)
+    }
+
+    /// Stops here where the pause is armed.
+    pub async fn pass(&self) {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        self.paused.store(true, Ordering::SeqCst);
+        self.reached.notify_one();
+        loop {
+            let mut resumed = std::pin::pin!(self.resume.notified());
+            resumed.as_mut().enable();
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            resumed.await;
+        }
+    }
+}
+
+/// The hold [`ArmedPause::arm_while_held`] answers.
+pub struct ArmedPauseGuard<'a>(&'a ArmedPause);
+
+impl Drop for ArmedPauseGuard<'_> {
+    fn drop(&mut self) {
+        self.0.armed.store(false, Ordering::SeqCst);
+        self.0.resume();
+    }
+}
+
 tokio::task_local! {
-    static DRAIN_HOLD: DrainHold;
+    #[cfg(target_os = "linux")]
+    static DRAIN_HOLD: Hold<()>;
+    static IN_MEMORY_STORES_HOLD: Hold<()>;
 }
 
 /// Runs `future`, stopping each FUSE unmount's drain it runs wherever the drain finds the inode
@@ -263,17 +515,30 @@ pub fn hold_unmount_drains<F: Future>(
     resume: Arc<Notify>,
     future: F,
 ) -> impl Future<Output = F::Output> {
-    DRAIN_HOLD.scope(DrainHold { reached, resume }, future)
+    DRAIN_HOLD.scope(Hold { reached, resume }, future)
 }
 
 /// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
 /// where it runs under [`hold_unmount_drains`].
 #[cfg(target_os = "linux")]
 pub(crate) async fn unmount_drain_emptied() {
-    let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
-        return;
-    };
-    if hold.reached.send(()).is_ok() {
-        hold.resume.notified().await;
-    }
+    stop_where_held(&DRAIN_HOLD, ()).await;
+}
+
+/// Runs `future`, stopping each open of an instance with in-memory stores it makes that finds none
+/// of the instance's stores cached, before it looks for them again and creates them where none are
+/// cached: a `()` is sent on `reached`, and the open waits for a notification of `resume` before it
+/// goes on. Tasks `future` spawns don't stop.
+pub fn hold_in_memory_store_misses<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    IN_MEMORY_STORES_HOLD.scope(Hold { reached, resume }, future)
+}
+
+/// Stops this task where an open of an instance with in-memory stores has found none of its stores
+/// cached, where it runs under [`hold_in_memory_store_misses`].
+pub(crate) async fn in_memory_stores_missed() {
+    stop_where_held(&IN_MEMORY_STORES_HOLD, ()).await;
 }

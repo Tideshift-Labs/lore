@@ -173,6 +173,7 @@ mod replicated_store_tests {
             partition,
             &credentials,
             None,
+            lore_transport::quic::client::CongestionAlgorithm::default(),
         )
         .await
         .expect("storage client connection");

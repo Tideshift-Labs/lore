@@ -28,6 +28,7 @@ use lore_base::env::CallEnvironment;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::Partition;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
@@ -213,6 +214,7 @@ fn a_put_carries_its_bytes_to_the_service() {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         })
         .collect();
@@ -510,7 +512,10 @@ async fn revision_tree_commit_survives_the_wire() {
     let args = LoreRevisionTreeCommitArgs {
         id: 4242,
         handle: LoreRevisionTree { handle_id: 9 },
-        options: LoreRevisionTreeCommitOptions { remote_write: 1 },
+        options: LoreRevisionTreeCommitOptions {
+            remote_write: 1,
+            parent_other: Hash::from_u64(0x2a),
+        },
     };
 
     match relayed(LoreCommand::RevisionTreeCommit(args)) {
@@ -700,4 +705,423 @@ async fn shared_store_list_args_survive_the_wire() {
         }
         other => panic!("Unexpected command: {other:?}"),
     }
+}
+
+/// A branch list relayed to the service carries its creator filter byte for byte, since the filter
+/// matches exactly and case-sensitively, and an empty filter, which keeps every creator.
+#[test]
+fn revision_graph_branch_list_survives_the_wire() {
+    use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
+    use lore::storage::handle::LoreStore;
+
+    let filtered = LoreRevisionGraphBranchListArgs {
+        id: 31,
+        store: LoreStore { handle_id: 6 },
+        repository: Partition::from([0x5au8; 16]),
+        include_archived: 1,
+        creator: LoreString::from_str("Åsa.Builder"),
+    };
+    let unfiltered = LoreRevisionGraphBranchListArgs {
+        creator: LoreString::default(),
+        include_archived: 0,
+        ..filtered.clone()
+    };
+
+    for args in [filtered, unfiltered] {
+        match relayed(LoreCommand::RevisionGraphBranchList(args.clone())) {
+            LoreCommand::RevisionGraphBranchList(read_back) => {
+                assert_eq!(read_back, args, "must carry every field unchanged");
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// A branch metadata set relayed to the service carries a value of every type, each under the tag
+/// it was sent with, and the keys to remove.
+#[test]
+fn revision_graph_branch_metadata_set_survives_the_wire() {
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataEntry;
+    use lore::revision_graph::branch_metadata_set::LoreRevisionGraphBranchMetadataSetArgs;
+    use lore::storage::handle::LoreStore;
+    use lore_revision::interface::LoreBinary;
+    use lore_revision::interface::LoreMetadata;
+
+    let entry = |key: &str, value| LoreRevisionGraphBranchMetadataEntry {
+        key: LoreString::from_str(key),
+        value,
+    };
+    let args = LoreRevisionGraphBranchMetadataSetArgs {
+        id: 14,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+        entries: LoreArray::from_vec(vec![
+            entry(
+                "asset",
+                LoreMetadata::Address(Address {
+                    hash: Hash::from([0x37u8; 32]),
+                    context: Context::from([0x73u8; 16]),
+                }),
+            ),
+            entry("protect", LoreMetadata::Boolean(1)),
+            entry(
+                "thumbnail",
+                LoreMetadata::Binary(LoreBinary::from_bytes(b"raw\x00bytes")),
+            ),
+            entry("owner", LoreMetadata::Context(Context::from([0x19u8; 16]))),
+            entry("build", LoreMetadata::Hash(Hash::from([0x91u8; 32]))),
+            entry("changelist", LoreMetadata::Numeric(4207)),
+            entry(
+                "pipeline",
+                LoreMetadata::String(LoreString::from_str("nightly")),
+            ),
+        ]),
+        remove: LoreArray::from_vec(vec![LoreString::from_str("reviewer")]),
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchMetadataSet(args.clone())) {
+        LoreCommand::RevisionGraphBranchMetadataSet(read_back) => {
+            assert_eq!(
+                (
+                    read_back.id,
+                    read_back.store,
+                    read_back.repository,
+                    read_back.branch
+                ),
+                (args.id, args.store, args.repository, args.branch)
+            );
+            assert_eq!(
+                read_back.entries.as_slice(),
+                args.entries.as_slice(),
+                "must carry every entry's key and typed value unchanged"
+            );
+            assert_eq!(
+                read_back.remove.as_slice(),
+                args.remove.as_slice(),
+                "must carry the keys to remove unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// A branch create relayed to the service carries its name, its category and the revision
+/// identifier it starts from, a number on a branch and a hash alike.
+#[test]
+fn revision_graph_branch_create_survives_the_wire() {
+    use lore::revision_graph::LoreRevisionIdentifier;
+    use lore::revision_graph::branch_create::LoreRevisionGraphBranchCreateArgs;
+    use lore::storage::handle::LoreStore;
+
+    let numbered = LoreRevisionGraphBranchCreateArgs {
+        id: 16,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        name: LoreString::from_str("feature/Åsa"),
+        category: LoreString::from_str("tools"),
+        from: LoreRevisionIdentifier {
+            hash: Hash::default(),
+            branch: Context::from([0x42u8; 16]),
+            revision_number: 25,
+        },
+    };
+    let by_hash = LoreRevisionGraphBranchCreateArgs {
+        category: LoreString::default(),
+        from: LoreRevisionIdentifier {
+            hash: Hash::from([0x37u8; 32]),
+            ..Default::default()
+        },
+        ..numbered.clone()
+    };
+
+    for args in [numbered, by_hash] {
+        match relayed(LoreCommand::RevisionGraphBranchCreate(args.clone())) {
+            LoreCommand::RevisionGraphBranchCreate(read_back) => {
+                assert_eq!(read_back, args, "must carry every field unchanged");
+            }
+            other => panic!("Unexpected command: {other:?}"),
+        }
+    }
+}
+
+/// A branch archive relayed to the service carries its branch id.
+#[test]
+fn revision_graph_branch_archive_survives_the_wire() {
+    use lore::revision_graph::branch_archive::LoreRevisionGraphBranchArchiveArgs;
+    use lore::storage::handle::LoreStore;
+
+    let args = LoreRevisionGraphBranchArchiveArgs {
+        id: 17,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchArchive(args.clone())) {
+        LoreCommand::RevisionGraphBranchArchive(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// A branch sync relayed to the service carries its target and options.
+#[test]
+fn revision_graph_branch_sync_survives_the_wire() {
+    use lore::revision_graph::LoreRevisionIdentifier;
+    use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncArgs;
+    use lore::revision_graph::branch_sync::LoreRevisionGraphBranchSyncOptions;
+    use lore::storage::handle::LoreStore;
+
+    let args = LoreRevisionGraphBranchSyncArgs {
+        id: 18,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+        target: LoreRevisionIdentifier {
+            hash: Hash::default(),
+            branch: Context::from([0x42u8; 16]),
+            revision_number: 25,
+        },
+        options: LoreRevisionGraphBranchSyncOptions {
+            force: 1,
+            expected_local_latest: Hash::from([0x63u8; 32]),
+        },
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchSync(args.clone())) {
+        LoreCommand::RevisionGraphBranchSync(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// A branch push relayed to the service carries its options.
+#[test]
+fn revision_graph_branch_push_survives_the_wire() {
+    use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushArgs;
+    use lore::revision_graph::branch_push::LoreRevisionGraphBranchPushOptions;
+    use lore::storage::handle::LoreStore;
+
+    let args = LoreRevisionGraphBranchPushArgs {
+        id: 19,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+        options: LoreRevisionGraphBranchPushOptions {
+            force: 1,
+            fast_forward_merge: 1,
+        },
+    };
+
+    match relayed(LoreCommand::RevisionGraphBranchPush(args.clone())) {
+        LoreCommand::RevisionGraphBranchPush(read_back) => {
+            assert_eq!(read_back, args, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// The revision graph commands follow the commands that preceded them. Bitcode names a variant by
+/// its position, in the first byte of the encoding, so a command added ahead of another shifts the
+/// variant the other decodes as: the last of the earlier commands keeps the bytes it encodes as
+/// without the revision graph commands, the revision graph commands take the positions after it in
+/// the order they landed, and each reads back as itself, the branch metadata set with a value of
+/// every type in `revision_graph_branch_metadata_set_survives_the_wire`.
+#[test]
+fn revision_graph_commands_follow_the_last_existing_command() {
+    use lore::repository::LoreRepositoryInstanceCloneArgs;
+    use lore::revision_graph::LoreRevisionIdentifier;
+    use lore::revision_graph::branch_list::LoreRevisionGraphBranchListArgs;
+    use lore::revision_graph::branch_metadata_get::LoreRevisionGraphBranchMetadataGetArgs;
+    use lore::revision_graph::branch_resolve::LoreRevisionGraphBranchResolveArgs;
+    use lore::revision_graph::revision_resolve::LoreRevisionGraphRevisionResolveArgs;
+    use lore::storage::handle::LoreStore;
+
+    const LAST_EXISTING_COMMAND: [u8; 10] = [161, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        bitcode::encode(&LoreCommand::RepositoryInstanceClone(
+            LoreRepositoryInstanceCloneArgs {
+                target_path: LoreString::default(),
+                allow_copy: 0,
+            }
+        )),
+        LAST_EXISTING_COMMAND,
+        "the last command before the revision graph commands must keep its encoding"
+    );
+    for (offset, command) in [
+        (1, LoreCommand::RevisionGraphBranchList(Default::default())),
+        (
+            2,
+            LoreCommand::RevisionGraphRevisionResolve(Default::default()),
+        ),
+        (
+            3,
+            LoreCommand::RevisionGraphBranchResolve(Default::default()),
+        ),
+        (
+            4,
+            LoreCommand::RevisionGraphBranchMetadataGet(Default::default()),
+        ),
+        (
+            5,
+            LoreCommand::RevisionGraphBranchMetadataSet(Default::default()),
+        ),
+        (
+            6,
+            LoreCommand::RevisionGraphBranchCreate(Default::default()),
+        ),
+        (
+            7,
+            LoreCommand::RevisionGraphBranchArchive(Default::default()),
+        ),
+        (8, LoreCommand::RevisionGraphBranchSync(Default::default())),
+        (11, LoreCommand::RevisionGraphBranchPush(Default::default())),
+    ] {
+        assert_eq!(
+            bitcode::encode(&command)[0],
+            LAST_EXISTING_COMMAND[0] + offset,
+            "{command:?} must take position {offset} after the last earlier command"
+        );
+    }
+
+    let revision_resolve = LoreRevisionGraphRevisionResolveArgs {
+        id: 11,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        revision: LoreRevisionIdentifier {
+            hash: Hash::default(),
+            branch: Context::from([0x42u8; 16]),
+            revision_number: 25,
+        },
+    };
+    match relayed(LoreCommand::RevisionGraphRevisionResolve(
+        revision_resolve.clone(),
+    )) {
+        LoreCommand::RevisionGraphRevisionResolve(read_back) => {
+            assert_eq!(
+                read_back, revision_resolve,
+                "must carry every field unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+
+    let branch_resolve = LoreRevisionGraphBranchResolveArgs {
+        id: 12,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        name: LoreString::from_str("release/5.4"),
+    };
+    match relayed(LoreCommand::RevisionGraphBranchResolve(
+        branch_resolve.clone(),
+    )) {
+        LoreCommand::RevisionGraphBranchResolve(read_back) => {
+            assert_eq!(
+                read_back, branch_resolve,
+                "must carry every field unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+
+    let branch_list = LoreRevisionGraphBranchListArgs {
+        id: 13,
+        ..Default::default()
+    };
+    match relayed(LoreCommand::RevisionGraphBranchList(branch_list.clone())) {
+        LoreCommand::RevisionGraphBranchList(read_back) => {
+            assert_eq!(read_back, branch_list, "must carry every field unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+
+    let branch_metadata_get = LoreRevisionGraphBranchMetadataGetArgs {
+        id: 15,
+        store: LoreStore { handle_id: 4 },
+        repository: Partition::from([0x21u8; 16]),
+        branch: Context::from([0x42u8; 16]),
+        key: LoreString::from_str("protect"),
+    };
+    match relayed(LoreCommand::RevisionGraphBranchMetadataGet(
+        branch_metadata_get.clone(),
+    )) {
+        LoreCommand::RevisionGraphBranchMetadataGet(read_back) => {
+            assert_eq!(
+                read_back, branch_metadata_get,
+                "must carry every field unchanged"
+            );
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// The command that moves the external root follows the last command before it, so no earlier
+/// command's encoding moves.
+#[test]
+fn set_external_directory_follows_the_last_existing_command() {
+    let last = bitcode::encode(&LoreCommand::BranchMergeConflictsList(
+        lore::branch::LoreBranchMergeConflictsListArgs {},
+    ))[0];
+    let command = LoreCommand::ServiceSetExternalDirectory(
+        lore::service::LoreServiceSetExternalDirectoryArgs {
+            path: LoreString::from_str("/roots/next"),
+            adopt: 1,
+            abandon: 0,
+        },
+    );
+    assert_eq!(bitcode::encode(&command)[0], last + 1);
+    match relayed(command) {
+        LoreCommand::ServiceSetExternalDirectory(read_back) => {
+            assert_eq!(read_back.path.as_str(), "/roots/next");
+            assert_eq!((read_back.adopt, read_back.abandon), (1, 0));
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// The move reply is the variant after `ApiResult`. A client's decoder from before it read the
+/// existing variants from the same bytes, and refuses the move reply rather than reading it as
+/// another message.
+#[test]
+fn the_move_reply_follows_the_api_result() {
+    /// `MessageToClient` before the move reply.
+    #[derive(bitcode::Encode, bitcode::Decode)]
+    #[allow(clippy::large_enum_variant)]
+    enum OlderMessageToClient {
+        Event(LoreEvent),
+        ApiResult(i32),
+    }
+
+    let event = LoreEvent::Log(lore_revision::relay::EventDispatcher::make_log(
+        lore_base::log::LoreLogLevel::Info,
+        "an event".to_string(),
+    ));
+    assert_eq!(
+        encode_message(&MessageToClient::Event(&event)),
+        encode_message(&OlderMessageToClient::Event(event.clone())),
+        "an event keeps its encoding"
+    );
+    assert_eq!(
+        encode_message(&MessageToClient::<LoreEvent>::ApiResult(-7)),
+        encode_message(&OlderMessageToClient::ApiResult(-7)),
+        "a result keeps its encoding"
+    );
+
+    let reply = encode_message(&MessageToClient::<LoreEvent>::ExternalRootMove);
+    assert_eq!(
+        reply,
+        [2],
+        "the move reply takes the position after the result"
+    );
+    assert!(matches!(
+        bitcode::decode::<MessageToClient>(&reply),
+        Ok(MessageToClient::ExternalRootMove)
+    ));
+    assert!(
+        bitcode::decode::<OlderMessageToClient>(&reply).is_err(),
+        "a decoder from before the move reply refuses it"
+    );
 }

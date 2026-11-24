@@ -12,9 +12,11 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
+use lore_transport::grpc::branch_advanced_status;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -60,7 +62,9 @@ use crate::util::setup_execution;
 /// Soft rejection (non-fast-forward without `force`/`fast_forward_merge`,
 /// or fast-forward merge with conflicts) is conveyed via
 /// `FailedPrecondition` with a detail message that distinguishes the
-/// two cases and embeds the current branch latest. Pushing to a branch
+/// two cases and embeds the current branch latest, and with the branch
+/// latest in the status details, which mark the rejection apart from a
+/// hook's `FailedPrecondition` ([`branch_advanced_status`]). Pushing to a branch
 /// id whose metadata is missing returns `NotFound`. Pushing to a
 /// deleted branch returns `NotFound` too, so the client restores it
 /// with a create, or `AlreadyExists` if its name is claimed by a
@@ -77,6 +81,7 @@ pub async fn handler(
     request: Request<BranchPushRequest>,
     authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    local_tier: Option<Arc<dyn lore_storage::ImmutableStore>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
@@ -151,10 +156,13 @@ pub async fn handler(
                 "Handling branch push request",
             );
 
+            // The fast-forward merge must build the same revision whoever pushes; narrowing its
+            // diff to the pusher's reads would change it.
             let repository = Arc::new(RepositoryContext::new_server_context(
                 immutable_store,
                 mutable_store,
                 repository_id,
+                allow_all_repositories(),
             ));
             let repository_id: RepositoryId = repository.id;
 
@@ -231,6 +239,7 @@ pub async fn handler(
                         async {
                             let pushed = push_loaded(
                                 repository.clone(),
+                                local_tier.as_ref(),
                                 branch_id,
                                 revision,
                                 access,
@@ -288,7 +297,7 @@ pub async fn handler(
                     fast_forward_merge,
                     "Branch push rejected",
                 );
-                return Err(Status::failed_precondition(detail));
+                return Err(branch_advanced_status(resulting_revision, detail));
             }
 
             if advanced && let Some(mut hook_ctx) = hook_ctx {

@@ -11,6 +11,7 @@ use lore_revision::branch::{self};
 use lore_revision::lore::BranchId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -33,6 +34,7 @@ async fn test_handle() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         // Create the main branch (without parent)
@@ -61,6 +63,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             first_hash,
             crate::util::test_support::PUSH_ANY,
@@ -84,6 +87,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             second_hash,
             crate::util::test_support::PUSH_ANY,
@@ -107,6 +111,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             third_hash,
             crate::util::test_support::PUSH_ANY,
@@ -130,6 +135,7 @@ async fn test_handle() {
             .expect("Failed to serialize state");
         let head = branch_push::push(
             repository.clone(),
+            None,
             main,
             fourth_hash,
             crate::util::test_support::PUSH_ANY,
@@ -304,6 +310,7 @@ async fn test_handle_optional_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository.into(),
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         // No branch and no source should fail with invalid_argument
@@ -368,6 +375,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             first_hash,
             crate::util::test_support::PUSH_ANY,
@@ -390,6 +398,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             second_hash,
             crate::util::test_support::PUSH_ANY,
@@ -412,6 +421,7 @@ async fn test_handle_optional_branch() {
             .expect("Failed to serialize state");
         branch_push::push(
             repository.clone(),
+            None,
             main,
             third_hash,
             crate::util::test_support::PUSH_ANY,
@@ -477,6 +487,7 @@ async fn test_handle_not_exist() {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository.into(),
+                allow_all_repositories(),
             ));
             // Try getting branch revision list unbounded
             let mut request = Request::new(BranchRevisionListRequest {

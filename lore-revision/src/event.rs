@@ -5,6 +5,7 @@
 #![allow(unused_parens)]
 
 pub mod metadata;
+pub mod revision_graph;
 pub mod revision_tree;
 
 use lore_macro::VariantTypeSize;
@@ -82,6 +83,13 @@ use crate::dependency::LoreFileDependencyListFileEventData;
 use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchMetadataEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchPushedEventData;
+use crate::event::revision_graph::LoreRevisionGraphBranchSyncedEventData;
+use crate::event::revision_graph::LoreRevisionGraphInstanceEventData;
+use crate::event::revision_graph::LoreRevisionGraphLocationCompleteEventData;
+use crate::event::revision_graph::LoreRevisionGraphRevisionEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
@@ -251,6 +259,7 @@ use crate::store::event::LoreStorageMutableStoreItemCompleteEventData;
 use crate::store::event::LoreStorageObliterateItemCompleteEventData;
 use crate::store::event::LoreStorageOpenedEventData;
 use crate::store::event::LoreStoragePutItemCompleteEventData;
+use crate::store::event::LoreStoragePutStatsEventData;
 use crate::store::event::LoreStorageUploadItemCompleteEventData;
 
 pub fn convert_event_callback(callback: LoreEventCallbackConfig) -> LoreEventCallback {
@@ -469,7 +478,7 @@ impl core::fmt::Debug for LoreBytesMut {
 /// Small discriminator enum for the per-item terminal events of the revision-tree API.
 ///
 /// Narrower than the general library error code: an event embeds this so a caller can branch on
-/// the common cases cheaply, without reading a message. The cost is that it names only five
+/// the common cases cheaply, without reading a message. The cost is that it names only six
 /// outcomes, so errors outside them arrive as `Internal`. The storage API carries a full
 /// [`LoreErrorDetail`] on its per-item events instead, and no longer uses this enum.
 ///
@@ -496,6 +505,8 @@ pub enum LoreErrorCode {
     Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// A size bound refused the operation, such as a name over its length bound.
+    Oversized = 118,
     /// A dispatched mutable item whose outcome is not known (WP-120).
     ///
     /// Last in declaration order because the order is the serialized wire format, so a
@@ -517,6 +528,7 @@ const _: () =
 const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
+const _: () = assert!(LoreErrorCode::Oversized as i32 == lore_base::error::Oversized::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::OutcomeUnknown as i32 == lore_base::error::OutcomeUnknown::FFI_CODE);
 
@@ -579,6 +591,12 @@ impl LoreMetadataEventData {
         };
 
         Ok(LoreMetadataEventData { key, value })
+    }
+
+    /// The entry stored with `key` and `value` under `value_type`, as an event carries it. `None`
+    /// where `key` isn't UTF-8 or `value` doesn't decode as `value_type`.
+    pub fn from_stored(key: &[u8], value: &[u8], value_type: MetadataType) -> Option<Self> {
+        Self::new(std::str::from_utf8(key).ok()?, value, value_type).ok()
     }
 }
 
@@ -784,15 +802,16 @@ impl LoreErrorDetail {
         }
     }
 
-    /// Builds the detail for a command result: the empty success detail on
-    /// `Ok`, the populated detail (read from the error's own trace) on `Err`.
-    pub fn from_result<T, E>(result: Result<T, E>) -> Self
+    /// Builds the detail for `result`: the empty success detail on `Ok`, the
+    /// populated detail (read from the error's own trace) on `Err`. The success
+    /// detail allocates nothing.
+    pub fn from_result<T, E>(result: &Result<T, E>) -> Self
     where
         E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
     {
         match result {
             Ok(_) => Self::default(),
-            Err(err) => Self::from_error(&err),
+            Err(err) => Self::from_error(err),
         }
     }
 }
@@ -867,6 +886,53 @@ pub struct LoreServiceStatusEventData {
     pub connection_count: u32,
     /// Number of SWFS mounts currently active.
     pub swfs_mount_count: u32,
+    /// The path of the caller's external root, empty where its setting can't be read or there is
+    /// no global data directory. Reported whether or not the service is running.
+    pub external_root: LoreString,
+    /// Whether the external root can be used. Reported whether or not the service is running.
+    pub external_root_state: LoreExternalRootState,
+    /// The number of old external directory roots listed to be removed, 0 where the list can't be
+    /// read. Reported whether or not the service is running.
+    pub external_leftovers: u32,
+    /// Whether the service runs inside a program that doesn't serve from its own executable, as the
+    /// Lore CLI does: 1 if so, else 0.
+    pub embedded: u8,
+    /// The canonical path of each global data directory the service mounts virtual instances
+    /// for.
+    pub mounted_global_data_directories: LoreArray<LoreString>,
+    /// The path of each virtual instance the service mounts.
+    pub mounted_paths: LoreArray<LoreString>,
+    /// The service's process ID.
+    pub process_id: u32,
+}
+
+/// Whether the external root of a global data directory can be used.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, bitcode::Encode, bitcode::Decode,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreExternalRootState {
+    /// The root can be used.
+    #[default]
+    Available = 0,
+    /// The root can't be used.
+    Unavailable = 1,
+    /// A move of the root is under way, or was interrupted.
+    Interrupted = 2,
+}
+
+impl From<&crate::global::external_dir::resolve::Availability> for LoreExternalRootState {
+    fn from(availability: &crate::global::external_dir::resolve::Availability) -> Self {
+        use crate::global::external_dir::resolve::Availability;
+        match availability {
+            Availability::Available(_) => LoreExternalRootState::Available,
+            Availability::Unavailable(_) => LoreExternalRootState::Unavailable,
+            Availability::Interrupted => LoreExternalRootState::Interrupted,
+        }
+    }
 }
 
 /// Data for a service log message captured outside command execution.
@@ -1389,6 +1455,26 @@ pub enum LoreEvent {
     RepositoryInstanceCloneProgress(LoreRepositoryInstanceCloneProgressEventData),
     /// The completion of an instance clone operation.
     RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData),
+    /// One branch, as one location holds it.
+    RevisionGraphBranch(LoreRevisionGraphBranchEventData),
+    /// One repository instance on a branch, as the local store records it.
+    RevisionGraphInstance(LoreRevisionGraphInstanceEventData),
+    /// One revision, as one location resolves it.
+    RevisionGraphRevision(LoreRevisionGraphRevisionEventData),
+    /// A revision graph call's outcome at one location.
+    RevisionGraphLocationComplete(LoreRevisionGraphLocationCompleteEventData),
+    /// One metadata entry of a branch, as one location holds it.
+    RevisionGraphBranchMetadata(LoreRevisionGraphBranchMetadataEventData),
+    /// A branch sync's outcome.
+    RevisionGraphBranchSynced(LoreRevisionGraphBranchSyncedEventData),
+    /// A link row both branches changed, which the merge holds open.
+    BranchMergeLinkPinConflict(crate::branch::merge::LoreBranchMergeLinkPinConflictEventData),
+    /// A divergent link row was settled to one side.
+    BranchMergeLinkPinResolved(crate::branch::merge::LoreBranchMergeLinkPinResolvedEventData),
+    /// What one storage put or upload call cost.
+    StoragePutStats(LoreStoragePutStatsEventData),
+    /// A branch push's outcome.
+    RevisionGraphBranchPushed(LoreRevisionGraphBranchPushedEventData),
 }
 
 /// Encodes as the event it refers to, so that a sender can encode an event it only borrows.

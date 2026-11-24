@@ -1744,7 +1744,8 @@ mod tests {
 
     /// Run `body` against a fresh in-memory state, inside the execution scope the
     /// state edits read their globals from. Nothing here serializes, so the
-    /// repository needs no path and no write token.
+    /// repository needs no write token; its path is a scratch directory, as a
+    /// provider over it reads its Lore directory.
     async fn with_state<F, Fut>(body: F)
     where
         F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut + Send + 'static,
@@ -1762,8 +1763,10 @@ mod tests {
                 )
                 .await
                 .expect("Failed to create store");
+                let tempdir = generate_tempdir();
                 let repository = Arc::new(RepositoryContext::new(
-                    default_repository_creation_args(immutable_store, mutable_store),
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(tempdir.path()),
                 ));
                 body(repository, State::new()).await;
             }))
@@ -2342,7 +2345,7 @@ mod tests {
                 lore_revision::state::node_discard_free(
                     &state,
                     &repository,
-                    &[node],
+                    &[(node, 0)],
                     Vec::new(),
                     |_, _| {},
                 )
@@ -4301,6 +4304,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 
@@ -4332,6 +4336,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let options = immutable::read_options_from_repository(&repository);
@@ -4379,6 +4384,7 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
                 let mut tree_walk = lore_revision::state::TreeWalk::default();
@@ -4391,7 +4397,6 @@ mod block_single_flight {
                     0,
                     0,
                     0,
-                    lore_revision::state::allow_all_repositories(),
                     &mut tree_walk,
                     true,
                 );
@@ -4408,7 +4413,7 @@ mod block_single_flight {
     }
 
     /// A node block read holds its read of the current format, and the fallback to the older
-    /// formats, which holds a read as large and the conversion, stays in a box of its own.
+    /// formats, which holds a read as large and the first read's error, stays in a box of its own.
     #[tokio::test]
     async fn a_node_block_read_keeps_the_older_formats_out_of_its_future() {
         LORE_CONTEXT
@@ -4418,12 +4423,16 @@ mod block_single_flight {
                 let repository = Arc::new(RepositoryContext::new_null_context(
                     immutable_store,
                     mutable_store,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let state = State::new();
 
                 let read = NodeBlock::deserialize(repository.clone(), &state, Address::default());
-                let fallback =
-                    NodeBlock::deserialize_other_version(repository, &state, Address::default());
+                let fallback = lore_revision::node::read_older_node_block(
+                    repository,
+                    Address::default(),
+                    lore_revision::immutable::ImmutableError::internal("the current format's read"),
+                );
 
                 assert!(
                     size_of_val(&read) < size_of_val(&fallback),

@@ -599,6 +599,29 @@ def test_repository_list_is_the_auth_services_answer(auth_env, make_actor):
 
 
 @pytest.mark.smoke
+def test_an_access_token_alone_clones_and_pushes(auth_env, make_actor, scratch_dir):
+    """A caller with no login and only an access token for a repository
+    resolves the repository's name, clones it and pushes to it."""
+    owner = provision_owner(auth_env, make_actor, "owner", USER1)
+    commit_file(owner.repo, "owner.txt", "owner content")
+
+    agent = make_actor("agent").make_repo(remote_path=owner.repo.remote_path)
+    clone_path = scratch_dir("access-token-clone")
+    agent.clone(path=str(clone_path), access_token=owner.authz_token)
+    assert (clone_path / "owner.txt").read_text() == "owner content"
+
+    (clone_path / "agent.txt").write_text("agent content")
+    for command in (
+        ["file", "stage", "agent.txt"],
+        ["revision", "commit", "add agent.txt"],
+        ["push"],
+    ):
+        agent.run(command, path=str(clone_path), access_token=owner.authz_token)
+    owner.repo.sync()
+    assert (Path(owner.repo.path) / "agent.txt").read_text() == "agent content"
+
+
+@pytest.mark.smoke
 def test_each_user_owns_their_created_repositories(auth_env, make_actor):
     """USER2 creates repository C with an API-key login: the rebac
     registration carries USER2's credential, not USER1's."""
@@ -895,8 +918,8 @@ RPC_ACTIONS = {
     "/urc.rpc.RevisionService/BranchGet": ("read",),
     "/urc.rpc.RevisionService/BranchList": ("read",),
     "/urc.rpc.RevisionService/BranchPush": ("write", "push-protected"),
-    "/urc.rpc.RevisionService/BranchProtect": ("owner", "admin"),
-    "/urc.rpc.RevisionService/BranchUnprotect": ("owner", "admin"),
+    "/urc.rpc.RevisionService/BranchProtect": ("owner", "admin", "set-protected"),
+    "/urc.rpc.RevisionService/BranchUnprotect": ("owner", "admin", "set-protected"),
     "/urc.rpc.RevisionService/BranchDiff": ("read",),
     "/urc.rpc.RevisionService/BranchRevisionList": ("read",),
     "/urc.rpc.RevisionService/BranchMetadataGet": ("read",),
@@ -979,7 +1002,15 @@ def test_every_partition_scoped_rpc_asks_its_action(auth_env, make_actor):
 
     tokens = {
         action: holding(action)
-        for action in ("read", "write", "owner", "admin", "migrate", "push-protected")
+        for action in (
+            "read",
+            "write",
+            "owner",
+            "admin",
+            "migrate",
+            "push-protected",
+            "set-protected",
+        )
     }
     failures = []
     for method, accepted in RPC_ACTIONS.items():

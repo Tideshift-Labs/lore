@@ -29,6 +29,7 @@ use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
 use crate::grpc::caller_capabilities::admit_quic;
 use crate::grpc::caller_capabilities::parse_capability_list;
@@ -298,7 +299,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(Some(&verified), repository)
                         .await
-                        .map_err(|status| MessageHandleError::from_authorization_status(&status))?;
+                        .map_err(MessageHandleError::from_authorization)?;
                     token = Some(Arc::new(verified.owned()));
 
                     permissions =
@@ -322,9 +323,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(None, repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(MessageHandleError::from_authorization)?;
                 }
 
                 let session_map = self.session_map.clone();
@@ -478,10 +477,15 @@ impl QuicService for StorageServiceV4 {
                 let permitted = match (action, enumerated) {
                     (Some(action), Some(None)) => {
                         let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
-                        self.repository_authorizer
-                            .check_repository_access(verified.as_ref(), repository, action)
-                            .await
-                            .is_ok()
+                        permits_with(
+                            self.repository_authorizer.as_ref(),
+                            None,
+                            verified.as_ref(),
+                            repository,
+                            action,
+                        )
+                        .await
+                        .map_err(MessageHandleError::from_authorization)?
                     }
                     (_, Some(Some(permitted))) => permitted,
                     _ => true,
@@ -567,9 +571,7 @@ impl QuicService for StorageServiceV4 {
                                     Action::Read,
                                 )
                                 .await
-                                .map_err(|status| {
-                                    MessageHandleError::from_authorization_status(&status)
-                                })?;
+                                .map_err(MessageHandleError::from_authorization)?;
                             authorized_sources.insert(copy.source_repository);
                         }
                         handle_copy(

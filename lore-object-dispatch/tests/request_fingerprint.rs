@@ -68,7 +68,9 @@ const GOLDEN_PREIMAGE_HEX: &str = concat!(
 fn decode_hex(value: &str) -> Vec<u8> {
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| {
             let text = std::str::from_utf8(pair).expect("golden hex must be ASCII");
             u8::from_str_radix(text, 16).expect("golden preimage must be valid hex")

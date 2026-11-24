@@ -18,12 +18,11 @@ use lore_revision::store::composite::ReplicationTarget;
 use lore_revision::store::composite::replica_factory::ReplicaFactory;
 use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
-use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
-use lore_transport::user_agent_product;
+use lore_transport::user_agent_with_component;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
-use smallvec::smallvec;
+use smallvec::SmallVec;
 use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 
@@ -31,8 +30,10 @@ use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
 use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
 use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::initial_cwnd::default_peer_initial_cwnd_bytes;
+use crate::quic::replication_store_service::client::CommandPermitWait;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
+use crate::quic::replication_store_service::peer_responses::PeerResponseObserver;
 use crate::store::grpc_replica::GrpcReplica;
 use crate::store::grpc_replica::ReplicationClient;
 use crate::store::replica::Replica;
@@ -42,6 +43,48 @@ use crate::tls::CertificateSettings;
 /// peers in other regions. This value covers the most distant region. The windows only limit how
 /// much data may be in flight, so connections to nearer regions can leave some capacity unused.
 const OTHER_REGION_EXPECTED_RTT_MS: u64 = 220;
+
+/// How long a read peer client waits for a free command permit before it refuses a request.
+#[lore_macro::test_pub]
+const READ_PEER_COMMAND_PERMIT_WAIT: Duration = Duration::from_millis(10);
+
+/// The command permit wait of a peer client of `replica_type`. A read waits, since a burst of
+/// reads can take every permit for a few milliseconds and a refused read goes to another read
+/// replica or the durable store. A write refuses at once, since write replication runs as detached
+/// tasks that hold their payloads while they wait.
+#[lore_macro::test_pub]
+fn peer_command_permit_wait(replica_type: ReplicaType) -> CommandPermitWait {
+    match replica_type {
+        ReplicaType::Read => CommandPermitWait::UpTo(READ_PEER_COMMAND_PERMIT_WAIT),
+        ReplicaType::Write => CommandPermitWait::Refuse,
+    }
+}
+
+/// The threshold above which a response from a peer of `locality` is logged as slow, if any.
+/// Another region's round trip alone exceeds `threshold`, so only same-region peers are logged.
+#[lore_macro::test_pub]
+fn peer_slow_response_threshold(
+    locality: Locality,
+    threshold: Option<Duration>,
+) -> Option<Duration> {
+    match locality {
+        Locality::SameRegion => threshold,
+        Locality::OtherRegion => None,
+    }
+}
+
+/// The component a peer client of `locality` and `replica_type` appends to its user agent. The
+/// receiving server labels its per-connection statistics by user agent, so this is what keeps a
+/// peer's read and write connections apart there.
+#[lore_macro::test_pub]
+fn peer_user_agent_component(locality: Locality, replica_type: ReplicaType) -> &'static str {
+    match (locality, replica_type) {
+        (Locality::SameRegion, ReplicaType::Read) => "replication-same-region-read",
+        (Locality::SameRegion, ReplicaType::Write) => "replication-same-region-write",
+        (Locality::OtherRegion, ReplicaType::Read) => "replication-other-region-read",
+        (Locality::OtherRegion, ReplicaType::Write) => "replication-other-region-write",
+    }
+}
 
 pub static METRICS_PEER_ID_LABEL: &str = "peer_id";
 pub static METRICS_PEER_LOCALITY_LABEL: &str = "peer_locality";
@@ -73,6 +116,12 @@ pub struct ReplicaFactorySettings {
     /// the window a periodically refreshed connection carries over.
     #[serde(default = "default_peer_initial_cwnd_bytes")]
     pub initial_cwnd_bytes: InitialCwndBytes,
+    /// How long a QUIC peer's response may take to start arriving after its request, which
+    /// includes the peer's handling and the round trip, or to arrive once started, before the
+    /// response is logged as slow. Same-region peers only, since another region's round trip
+    /// alone exceeds any useful threshold. Unset, no response is logged. The log is rate limited;
+    /// the response metrics record every response either way.
+    pub slow_response_threshold_ms: Option<u64>,
 }
 
 fn default_read_replicas_enabled() -> bool {
@@ -98,6 +147,7 @@ pub struct ReplicationStoreTargetFactory {
     pub quic_monitor_interval: Duration,
     pub enable_same_region_write: bool,
     pub initial_cwnd_bytes: InitialCwndBytes,
+    pub slow_response_threshold: Option<Duration>,
 }
 
 impl ReplicationStoreTargetFactory {
@@ -119,6 +169,7 @@ impl ReplicationStoreTargetFactory {
             quic_monitor_interval: Duration::from_secs(default_quic_client_monitor_interval_secs()),
             enable_same_region_write: true,
             initial_cwnd_bytes: DEFAULT_PEER_INITIAL_CWND_BYTES,
+            slow_response_threshold: None,
         }
     }
 
@@ -174,23 +225,32 @@ impl ReplicationStoreTargetFactory {
             None
         };
 
-        let (rtt_ms, user_agent_component) = match peer_info.locality {
-            Locality::SameRegion => (10, "replication-same-region"),
-            Locality::OtherRegion => (OTHER_REGION_EXPECTED_RTT_MS, "replication-other-region"),
+        let rtt_ms = match peer_info.locality {
+            Locality::SameRegion => 10,
+            Locality::OtherRegion => OTHER_REGION_EXPECTED_RTT_MS,
         };
+        let user_agent_component = peer_user_agent_component(peer_info.locality, replica_type);
 
         let mut factory =
             client_container::QuicClientFactory::new(remote_url, self.quic_certs.clone());
         factory.command_behavior.message_limit = self.client_message_buffer;
-        factory.command_behavior.should_await_command_permit = false;
+        factory.command_behavior.permit_wait = peer_command_permit_wait(replica_type);
         factory.quic_max_reconnects = Some(5);
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
         factory.transport_config.initial_cwnd = Some(self.initial_cwnd_bytes.get());
-        factory.user_agent = Some(make_user_agent_with_component(
-            user_agent_product(),
-            user_agent_component,
-        ));
+        factory.user_agent = Some(user_agent_with_component(user_agent_component));
+        let peer_labels = [
+            KeyValue::new(METRICS_PEER_ID_LABEL, peer_info.metric_id.clone()),
+            KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str()),
+            // A peer serving both roles is two targets holding a connection each. Without
+            // this they record under one series and the two connections' statistics merge.
+            KeyValue::new(METRICS_REPLICA_TYPE_LABEL, replica_type.as_str()),
+        ];
+        factory.response_observer = Some(Arc::new(PeerResponseObserver::new(
+            peer_labels.clone(),
+            peer_slow_response_threshold(peer_info.locality, self.slow_response_threshold),
+        )));
 
         let container_config = ClientContainerConfig {
             regenerate_retry_policy: RetryPolicy::builder()
@@ -204,13 +264,7 @@ impl ReplicationStoreTargetFactory {
         let replica = Replica::new(
             Arc::new(factory),
             container_config,
-            smallvec![
-                KeyValue::new(METRICS_PEER_ID_LABEL, peer_info.metric_id.clone()),
-                KeyValue::new(METRICS_PEER_LOCALITY_LABEL, peer_info.locality.as_str()),
-                // A peer serving both roles is two targets holding a connection each. Without
-                // this they record under one series and the two connections' statistics merge.
-                KeyValue::new(METRICS_REPLICA_TYPE_LABEL, replica_type.as_str()),
-            ],
+            SmallVec::from_iter(peer_labels),
         )
         .await?;
         let replica = Arc::new(replica);

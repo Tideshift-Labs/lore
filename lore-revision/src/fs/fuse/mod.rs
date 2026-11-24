@@ -15,6 +15,10 @@ pub mod attr;
 mod clock;
 #[cfg(feature = "test-util")]
 pub mod clock;
+#[cfg(not(feature = "test-util"))]
+mod clone;
+#[cfg(feature = "test-util")]
+pub mod clone;
 pub mod deletions;
 pub mod discover;
 pub mod filesystem;
@@ -38,7 +42,7 @@ pub mod spelling;
 pub mod swap;
 pub mod view;
 #[cfg(not(feature = "test-util"))]
-mod write;
+pub(crate) mod write;
 #[cfg(feature = "test-util")]
 pub mod write;
 

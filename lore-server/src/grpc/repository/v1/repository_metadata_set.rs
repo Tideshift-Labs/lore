@@ -16,6 +16,7 @@ use lore_revision::metadata::MetadataType;
 use lore_revision::metadata::repository::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash;
 use tonic::Request;
 use tonic::Response;
@@ -83,6 +84,20 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository id"));
     }
 
+    // FORK-LOCAL (Tideshift): admin, not any grant; `write` without a verified
+    // token (no-auth server). See the v0 handler. After admission and before
+    // the governed prepare write: a refused or failed check leaves no receipt.
+    {
+        let token = get_verified_token(&extensions);
+        let action = if token.is_some() {
+            Action::Admin
+        } else {
+            Action::Write
+        };
+        authorizer
+            .require_action(token.as_ref(), repository_id.into(), action)
+            .await?;
+    }
     // Same family and same digest as v0: CR-029 freezes one canonical intent
     // per semantic operation, not one per wire shape, so v0 and v1 of the same
     // CAS must produce identical 32 bytes for identical values.
@@ -115,22 +130,11 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id.into(),
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // FORK-LOCAL (Tideshift): admin, not any grant; `write` without a
-            // verified token (no-auth server). See the v0 handler.
-            let token = get_verified_token(&extensions);
-            let action = if token.is_some() {
-                Action::Admin
-            } else {
-                Action::Write
-            };
-            authorizer
-                .require_action(token.as_ref(), repository_id.into(), action)
-                .await?;
-
             let current_metadata = if !expected.is_zero() {
                 Metadata::deserialize(repository.clone(), expected)
                     .await

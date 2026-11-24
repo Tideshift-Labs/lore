@@ -398,6 +398,7 @@ mod quic_token_expiry_tests {
                             inflight_limit: 800,
                             handler_timeout: None,
                             permit_timeout: None,
+                            slow_send_threshold: None,
                         },
                     )) as Box<dyn StreamDataHandler>
                 }),
@@ -479,7 +480,7 @@ mod quic_token_expiry_tests {
                 GrpcServerBuilder::new()
                     .with_environment(environment)
                     .with_feature(FeatureSettings::default())
-                    .with_immutable_store(immutable.clone(), immutable)
+                    .with_immutable_store(immutable.clone(), immutable, None)
                     .with_mutable_store(mutable)
                     .with_lock_store(None)
                     .with_domain_context(None)
@@ -614,6 +615,7 @@ mod quic_token_expiry_tests {
             "",
             access_token,
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await?;
         Ok((connection, identity))
@@ -682,7 +684,8 @@ mod quic_token_expiry_tests {
                     "",
                     &token(partition, now_secs() + 3600),
                     lore_transport::auth::AuthMode::Auto,
-                )
+None,
+)
                 .await?;
                 assert!(Arc::ptr_eq(&renewed, &connection));
 

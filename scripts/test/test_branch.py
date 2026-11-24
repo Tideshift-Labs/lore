@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import os
+import re
 import uuid
 
 import pytest
@@ -25,7 +26,6 @@ def generate_branch_id() -> str:
     return uuid.uuid4().hex
 
 
-@pytest.mark.own_vfs("switches branches with --reset, which a virtual clone refuses")
 @pytest.mark.smoke
 def test_branch(new_lore_repo):
     repo: Lore = new_lore_repo(repository_admin=True)
@@ -143,8 +143,9 @@ def test_branch(new_lore_repo):
     urc_divergent.stage(scan=True)
     urc_divergent.commit("Test commit 3 (divergent)")
 
-    with pytest.raises(BranchDivergedError):
+    with pytest.raises(BranchDivergedError) as diverged:
         urc_divergent.push()
+    assert diverged.value.returncode == 41, "a diverged push exits with BranchAdvanced"
 
     urc_divergent.push(force=True)
 
@@ -478,16 +479,18 @@ def test_branch_list_fresh_clone_lists_default_branch(new_lore_repo):
 
     fresh_clone = repo.clone()
 
-    output = fresh_clone.branch_list(json=True)
-    branch_list = parse_branch_list_json(output)
+    branch_list = parse_branch_list_json(fresh_clone.branch_list(json=True))
+    remote_list = parse_branch_list_json(
+        fresh_clone.branch_list(remote=True, json=True)
+    )
 
     assert branch_list.has_local_branch("main"), (
         f"Default branch 'main' should appear in local branches on a fresh clone, "
         f"got local={branch_list.local_branches}"
     )
-    assert branch_list.has_remote_branch("main"), (
+    assert remote_list.has_remote_branch("main"), (
         f"Default branch 'main' should appear in remote branches on a fresh clone, "
-        f"got remote={branch_list.remote_branches}"
+        f"got remote={remote_list.remote_branches}"
     )
     assert branch_list.current_branch == "main", (
         f"Current branch should be 'main' on a fresh clone, "
@@ -506,12 +509,12 @@ def test_branch_list_archived(new_lore_repo):
 
     def local_branch_sets() -> tuple[set[str], set[str]]:
         """Active-local and archived-local branch names from branch list --archived."""
-        output = repo.branch_list(archived=True, json=True)
-        local = [
-            e
-            for e in parse_jsonl(output, "branchListEntry")
-            if e["location"] == "local"
-        ]
+        local = parse_jsonl(
+            repo.branch_list(archived=True, json=True), "branchListEntry"
+        )
+        assert all(e["location"] == "local" for e in local), (
+            "branch list --archived must not list the remote branches"
+        )
         active = {e["name"] for e in local if not e["archived"]}
         archived = {e["name"] for e in local if e["archived"]}
         return active, archived
@@ -591,7 +594,7 @@ def test_branch_list_archived(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_branch_list_remote_only(new_lore_repo):
+def test_branch_list_local_unless_remote(new_lore_repo):
     repo: Lore = new_lore_repo()
 
     repo.write_commit_push(
@@ -599,13 +602,13 @@ def test_branch_list_remote_only(new_lore_repo):
         {"file.txt": ["content\n"]},
     )
 
-    # The default listing covers both the local and the remote.
+    # The default listing covers the local branches only.
     default = parse_jsonl(repo.branch_list(json=True), "branchListEntry")
-    assert any(e["location"] == "local" for e in default), (
+    assert any(e["location"] == "local" and e["name"] == "main" for e in default), (
         "Default branch list should include local entries"
     )
-    assert any(e["location"] == "remote" and e["name"] == "main" for e in default), (
-        "Default branch list should include remote entries"
+    assert all(e["location"] == "local" for e in default), (
+        "Default branch list must not list the remote branches"
     )
 
     # --remote lists the remote only: every entry is remote, with no local section.
@@ -967,6 +970,7 @@ def test_switch_between_file_and_folder(
 # | 3 | No        | Yes!=self | mapped ID has no metadata         | Create               | (stale mapping, not testable via smoke)          |
 # | 4 | No        | Yes!=self | mapped ID has metadata            | AlreadyExist (name)  | test_name_conflict_from_two_clones               |
 # | 5 | Yes       | No        | metadata.name == given name       | Restore (same name)  | test_push_restores_deleted_branch*               |
+# |   |           |           |                                   |                      | test_create_restoring_deleted_branch_switches_to_it |
 # | 6 | Yes       | No        | name differs, old name mapped     | AlreadyExist (id)    | test_duplicate_id_different_name                 |
 # | 7 | Yes       | No        | name differs, old name gone       | Restore+rename       | test_delete_and_create_different_name_same_id    |
 # | 8 | Yes       | Yes       | -                                 | AlreadyExist (id)    | test_branch, test_local_delete_and_switch*       |
@@ -1004,7 +1008,7 @@ def test_push_restores_deleted_branch(new_lore_repo):
     clone = repo.clone(branch="feature")
 
     # Verify both clients see the branch remotely
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert branch_list.has_remote_branch("feature"), (
         "feature branch should exist remotely before delete"
     )
@@ -1013,7 +1017,7 @@ def test_push_restores_deleted_branch(new_lore_repo):
     repo.branch_switch("main")
     repo.branch_archive("feature")
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("feature"), (
         "feature branch should not exist remotely after delete"
     )
@@ -1028,14 +1032,14 @@ def test_push_restores_deleted_branch(new_lore_repo):
     clone.push()
 
     # Verify the branch is back in the remote branch list
-    branch_list = clone.branch_list()
+    branch_list = clone.branch_list(remote=True)
     assert branch_list.has_remote_branch("feature"), (
         "feature branch should be restored remotely after push from clone"
     )
 
     # Verify from a fresh clone that the branch is visible
     verify_clone = repo.clone()
-    branch_list = verify_clone.branch_list()
+    branch_list = verify_clone.branch_list(remote=True)
     assert branch_list.has_remote_branch("feature"), (
         "feature branch should be visible from a fresh clone"
     )
@@ -1047,7 +1051,7 @@ def test_push_restores_deleted_branch(new_lore_repo):
     repo.sync()
     repo.branch_archive("feature")
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("feature"), (
         "feature branch should not exist remotely after second delete"
     )
@@ -1056,7 +1060,7 @@ def test_push_restores_deleted_branch(new_lore_repo):
     repo.branch_create("feature")
     repo.write_commit_push("New feature commit", {text_file: ["Reused name\n"]})
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert branch_list.has_remote_branch("feature"), (
         "reused feature branch should exist remotely"
     )
@@ -1091,7 +1095,7 @@ def test_push_restores_deleted_branch_no_new_commits(new_lore_repo):
     repo.branch_switch("main")
     repo.branch_archive("restore-branch")
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("restore-branch"), (
         "restore-branch should not exist remotely after delete"
     )
@@ -1100,14 +1104,14 @@ def test_push_restores_deleted_branch_no_new_commits(new_lore_repo):
     clone.push()
 
     # Verify the branch is back
-    branch_list = clone.branch_list()
+    branch_list = clone.branch_list(remote=True)
     assert branch_list.has_remote_branch("restore-branch"), (
         "restore-branch should be restored remotely after push with no new commits"
     )
 
     # Verify from a fresh clone
     verify_clone = repo.clone()
-    branch_list = verify_clone.branch_list()
+    branch_list = verify_clone.branch_list(remote=True)
     assert branch_list.has_remote_branch("restore-branch"), (
         "restore-branch should be visible from a fresh clone"
     )
@@ -1219,11 +1223,10 @@ def test_local_delete_and_switch_restores_from_remote(new_lore_repo):
 
     # Delete local only
     repo.branch_archive("restore-switch", local=True)
-    branch_list = repo.branch_list()
-    assert not branch_list.has_local_branch("restore-switch"), (
+    assert not repo.branch_list().has_local_branch("restore-switch"), (
         "restore-switch should not exist locally after local delete"
     )
-    assert branch_list.has_remote_branch("restore-switch"), (
+    assert repo.branch_list(remote=True).has_remote_branch("restore-switch"), (
         "restore-switch should still exist on remote"
     )
 
@@ -1256,7 +1259,7 @@ def test_delete_and_create_different_name_same_client(new_lore_repo):
     repo.branch_switch("main")
     repo.branch_archive("old-name")
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("old-name"), (
         "old-name should not exist after delete"
     )
@@ -1265,7 +1268,7 @@ def test_delete_and_create_different_name_same_client(new_lore_repo):
     repo.branch_create("new-name")
     repo.write_commit_push("New branch commit", {text_file: ["Line one\nNew branch\n"]})
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert branch_list.has_remote_branch("new-name"), "new-name should exist after push"
 
 
@@ -1304,7 +1307,7 @@ def test_query_deleted_branch_by_name_not_found(new_lore_repo):
 
     # Fresh clone should not see the branch by name
     clone = repo.clone()
-    branch_list = clone.branch_list()
+    branch_list = clone.branch_list(remote=True)
     assert not branch_list.has_remote_branch("query-del"), (
         "Deleted branch should not appear in remote branch list"
     )
@@ -1350,7 +1353,7 @@ def test_delete_and_create_different_name_same_id(new_lore_repo):
     repo.branch_switch("main")
     repo.branch_archive("old-name")
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("old-name"), (
         "old-name should not exist after delete"
     )
@@ -1363,13 +1366,46 @@ def test_delete_and_create_different_name_same_id(new_lore_repo):
     # Push should succeed (latest already on server, just restores the name mapping)
     repo.push()
 
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert branch_list.has_remote_branch("new-name"), (
         "new-name should exist remotely after push"
     )
     assert not branch_list.has_remote_branch("old-name"), (
         "old-name should still not exist"
     )
+
+
+@pytest.mark.smoke
+def test_create_restoring_deleted_branch_switches_to_it(new_lore_repo):
+    """Restoring a deleted branch with `branch create --id`, from a clone that
+    never held it, puts the working tree on the revision the branch left off at.
+    A dry run of the restore leaves the clone on its branch."""
+    repo: Lore = new_lore_repo()
+
+    text_file = "file.txt"
+    repo.write_commit_push("Initial commit", {text_file: ["Line one\n"]})
+
+    branch_id = generate_branch_id()
+    repo.branch_create("restored", id=branch_id)
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch\n"]})
+    branch_head = repo.branch_info().local_latest
+    repo.branch_switch("main")
+    repo.branch_archive("restored")
+    clone = repo.clone()
+
+    clone.branch_create("restored", id=branch_id, dry_run=True)
+    assert get_status_branch(clone) == "main", "a dry run must stay on the branch"
+
+    clone.branch_create("restored", id=branch_id)
+
+    assert get_status_branch(clone) == "restored", (
+        "the restore must switch to the branch"
+    )
+    assert re.search(rf"revision \d+ -> {branch_head}", clone.status()), (
+        "the working tree must stand on the revision the branch left off at"
+    )
+    with clone.open_file(text_file, "r") as input_file:
+        assert input_file.read() == "Line one\nBranch\n"
 
 
 @pytest.mark.smoke
@@ -1386,7 +1422,7 @@ def test_query_deleted_branch_by_id(new_lore_repo):
     repo.branch_archive("del-query-id")
 
     # Branch should not appear in remote list
-    branch_list = repo.branch_list()
+    branch_list = repo.branch_list(remote=True)
     assert not branch_list.has_remote_branch("del-query-id"), (
         "Deleted branch should not appear in remote branch list"
     )

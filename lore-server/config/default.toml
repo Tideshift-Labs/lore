@@ -61,6 +61,9 @@ transport_rtt = 100  # 100 ms
 # Window each connection starts sending responses with. Unset, the congestion controller's own
 # default applies.
 # initial_cwnd_bytes = 262_144
+# Congestion controller pacing what the server sends on each connection: "bbr" or "cubic".
+# Unset: "bbr".
+# congestion_algorithm = "bbr"
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.
@@ -88,6 +91,9 @@ transport_bits_per_second = 10_737_418_240  # 10 gbit/s
 transport_rtt = 220  # 220 ms
 # Window each connection starts sending responses with. Defaults to 1 MiB.
 # initial_cwnd_bytes = 1_048_576
+# Congestion controller pacing what the server sends on each connection: "bbr" or "cubic".
+# Unset: "cubic".
+# congestion_algorithm = "cubic"
 handler_timeout_seconds = 50
 # Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
 # read loop, so it delays requests queued behind it on that stream.
@@ -185,7 +191,9 @@ history_step_size = 100
 # Max source-side change count for v1 thin-client RevisionDiff 3-way before aborting (resource_exhausted).
 # revision_diff_source_cap = 100000
 
-# Parallel history-walk permits used by revision::diff3 to bound conflict resolution.
+# Parallel history-walk permits used by revision::diff3 to bound conflict resolution, shared with
+# the revision comparisons of its walks of the history lines for deleted paths. Each comparison
+# keeps up to 64 path lookups in flight, so the comparisons keep up to 64 times this many.
 # revision_diff_history_walk_concurrency = 24
 
 # Branches a v1 BranchList request loads from the store at once. Must be at least 1.

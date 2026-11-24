@@ -573,6 +573,5 @@ pub async fn held_tokens(
 pub fn now_unix_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+        .map_or_default(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
 }

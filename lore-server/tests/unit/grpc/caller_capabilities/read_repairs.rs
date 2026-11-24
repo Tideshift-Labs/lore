@@ -36,6 +36,7 @@ async fn both_repository_handlers_refuse_stale_names_without_deleting_in_require
                     immutable.clone(),
                     mutable.clone(),
                     id,
+                    lore_revision::state::allow_all_repositories(),
                 ),
             );
             lore_revision::repository::store_name_to_id(context, "stale", id)

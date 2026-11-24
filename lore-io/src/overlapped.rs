@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Positional reads and writes on Windows, issued through an `OVERLAPPED` this crate owns.
+//! Positional reads and writes, and file system controls, on Windows, issued through an
+//! `OVERLAPPED` this crate owns.
 //!
 //! Handles opened through this crate are overlapped, because a *synchronous* Windows handle
 //! serializes every operation issued on it inside the I/O manager, however many threads are
@@ -18,13 +19,14 @@
 //!
 //! So each operation owns its completion: its own `OVERLAPPED`, a per-thread event, and a wait
 //! that a pending operation cannot return past. The wait blocks, which is right rather than a
-//! concession — these run on the syscall pool, whose purpose is to hold a thread across a blocking
-//! syscall, and the pool never abandons a job it has started.
+//! concession — these run as syscall pool jobs, on a pool thread, whose purpose is to hold a thread
+//! across a blocking syscall, or on a thread that blocks for the job anyway
+//! ([`crate::run_file_operations_on_this_thread`]), and a job that has started is never abandoned.
 //!
 //! **The wait is the common path.** A buffered read on an overlapped handle reports
 //! `ERROR_IO_PENDING` rather than transferring, so every positional operation on a handle this
-//! crate opened parks its pool thread until the kernel is done — which makes the pool size a
-//! ceiling on how many can be in flight, and is why [`crate::iocp`] exists.
+//! crate opened parks the thread running it until the kernel is done — which makes the pool size
+//! a ceiling on how many the pool can have in flight, and is why [`crate::iocp`] exists.
 //!
 //! The inline branch below is not dead for that: the whole-file composites open their own
 //! *synchronous* handles through `File::open`, and those complete inside the call.
@@ -39,6 +41,7 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem::ReadFile;
 use windows_sys::Win32::Storage::FileSystem::WriteFile;
 use windows_sys::Win32::System::IO::CancelIoEx;
+use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::IO::GetOverlappedResult;
 use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::Threading::CreateEventW;
@@ -48,8 +51,9 @@ use windows_sys::Win32::System::Threading::CreateEventW;
 /// Supplying an event is not optional. With a null `hEvent` the I/O manager signals the *file
 /// handle* instead, and two concurrent operations on one shared handle cannot both wait on that —
 /// which is precisely the sharing this backend exists to allow. One event per thread rather than
-/// per operation is enough because a thread runs one operation at a time: the pool hands a thread
-/// a job and the job returns before the next begins.
+/// per operation is enough because a thread runs one operation at a time: a job returns before
+/// the thread running it begins the next, on a pool thread and on a thread that runs its own jobs
+/// alike, and no job submits a job.
 struct CompletionEvent(HANDLE);
 
 impl Drop for CompletionEvent {
@@ -78,9 +82,13 @@ fn create_completion_event() -> Option<CompletionEvent> {
 /// report `ERROR_IO_PENDING`, which is not a failure: the kernel has accepted the request and owns
 /// the buffer until it completes, so waiting here is what keeps the buffer alive for exactly as
 /// long as the kernel can touch it.
+///
+/// Where `unported`, the event carries its low-order bit, so no completion reaches a completion
+/// port `file` is bound to.
 fn run(
     file: &File,
     offset: u64,
+    unported: bool,
     issue: impl FnOnce(HANDLE, *mut u32, *mut OVERLAPPED) -> i32,
 ) -> std::io::Result<usize> {
     COMPLETION_EVENT.with(|event| {
@@ -94,7 +102,7 @@ fn run(
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
         overlapped.Anonymous.Anonymous.Offset = offset as u32;
         overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-        overlapped.hEvent = event.0;
+        overlapped.hEvent = event.0.map_addr(|address| address | usize::from(unported));
 
         let mut transferred: u32 = 0;
         if issue(handle, &mut transferred, &mut overlapped) != 0 {
@@ -135,10 +143,39 @@ fn wait(
     Err(error)
 }
 
+/// Issues the file system control `code` on `file` with the `input` and `output` buffers, and does
+/// not return until the kernel is finished with both: the bytes written to `output`. No completion
+/// reaches a completion port `file` is bound to.
+pub(crate) fn control(
+    file: &File,
+    code: u32,
+    input: *const std::ffi::c_void,
+    input_size: u32,
+    output: *mut std::ffi::c_void,
+    output_size: u32,
+) -> std::io::Result<usize> {
+    run(file, 0, true, |handle, transferred, overlapped| {
+        // SAFETY: Calling OS functions. The buffers are valid for the sizes given, and they
+        // outlive the operation because `run` does not return while it is in flight.
+        unsafe {
+            DeviceIoControl(
+                handle,
+                code,
+                input,
+                input_size,
+                output,
+                output_size,
+                transferred,
+                overlapped,
+            )
+        }
+    })
+}
+
 pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
     let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     let pointer: *mut u8 = buffer.as_mut_ptr();
-    let result = run(file, offset, |handle, transferred, overlapped| {
+    let result = run(file, offset, false, |handle, transferred, overlapped| {
         // SAFETY: Calling OS functions. `pointer` and `len` describe `buffer`, which outlives the
         // operation because `run` does not return while it is in flight.
         unsafe { ReadFile(handle, pointer, len, transferred, overlapped) }
@@ -155,7 +192,7 @@ pub(crate) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::R
 pub(crate) fn write_at(file: &File, buffer: &[u8], offset: u64) -> std::io::Result<usize> {
     let len = u32::try_from(buffer.len()).unwrap_or(u32::MAX);
     let pointer: *const u8 = buffer.as_ptr();
-    run(file, offset, |handle, transferred, overlapped| {
+    run(file, offset, false, |handle, transferred, overlapped| {
         // SAFETY: Calling OS functions. `pointer` and `len` describe `buffer`, which outlives the
         // operation because `run` does not return while it is in flight.
         unsafe { WriteFile(handle, pointer, len, transferred, overlapped) }

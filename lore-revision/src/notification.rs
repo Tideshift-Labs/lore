@@ -339,9 +339,7 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
     // point the subscription elsewhere; when none is installed the derived value
     // stands, which is the stock behaviour.
     let derived = remote.environment.notification_url(&remote_url).to_string();
-    let route = notification_router()
-        .map(|router| router.route(repository.id))
-        .unwrap_or_default();
+    let route = notification_router().map_or_default(|router| router.route(repository.id));
     let endpoint = route.endpoint.clone().unwrap_or(derived);
 
     lore_debug!("Creating notification client");

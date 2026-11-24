@@ -90,6 +90,7 @@ impl Fixture {
             immutable.clone(),
             mutable.clone(),
             repository.into(),
+            lore_revision::state::allow_all_repositories(),
         ));
         let revision = LORE_CONTEXT
             .scope(execution, async {
@@ -182,6 +183,7 @@ impl Fixture {
                 request,
                 crate::grpc::push_protected::allow_all(),
                 self.immutable.clone(),
+                None,
                 self.mutable.clone(),
                 notifications,
                 &hooks,
@@ -197,6 +199,7 @@ impl Fixture {
                 request,
                 crate::grpc::push_protected::allow_all(),
                 self.immutable.clone(),
+                None,
                 self.mutable.clone(),
                 notifications,
                 &hooks,
@@ -237,6 +240,7 @@ impl Fixture {
             self.immutable.clone(),
             self.mutable.clone(),
             self.repository.into(),
+            lore_revision::state::allow_all_repositories(),
         ));
         let projected = branch::load_latest(context, self.branch.into())
             .await
@@ -872,6 +876,7 @@ async fn sustained_upload(cross_repository: bool) {
         fixture.immutable.clone(),
         fixture.mutable.clone(),
         fixture.repository.into(),
+        lore_revision::state::allow_all_repositories(),
     ));
     let mut uploaders = Vec::new();
     for _ in 0..3 {
@@ -1033,6 +1038,7 @@ async fn rewritten_publication_retains_original_witness(merge: bool) {
             fixture.immutable.clone(),
             fixture.mutable.clone(),
             fixture.repository.into(),
+            lore_revision::state::allow_all_repositories(),
         ));
         let (_, _, execution) = crate::store::test_support::test_store_create()
             .await

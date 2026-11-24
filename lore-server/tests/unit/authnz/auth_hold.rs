@@ -643,23 +643,30 @@ fn unavailable() -> Status {
 }
 
 #[test]
-fn flatten_denial_passes_a_timeout_on_and_flattens_everything_else() {
+fn flatten_denial_passes_a_timeout_and_failures_on_and_flattens_denials() {
     let timeout = unavailable();
     let passed = flatten_denial(timeout.clone());
     assert!(is_auth_unavailable(&passed));
     assert_eq!(passed.code(), Code::Internal);
     assert_eq!(passed.message(), timeout.message());
 
-    for other in [
+    for denial in [
         Status::permission_denied("Query resource denied"),
         Status::unauthenticated("who"),
-        Status::internal("Failed to connect to lore auth service"),
-        Status::unavailable("down"),
     ] {
-        let flat = flatten_denial(other);
+        let flat = flatten_denial(denial);
         assert_eq!(flat.code(), Code::PermissionDenied);
         assert_eq!(flat.message(), no_repository_access_status().message());
         assert!(!is_auth_unavailable(&flat));
+    }
+    // f2013946: a failed check keeps its own status.
+    for failure in [
+        Status::internal("Failed to connect to lore auth service"),
+        Status::unavailable("down"),
+    ] {
+        let kept = flatten_denial(failure.clone());
+        assert_eq!(kept.code(), failure.code());
+        assert_eq!(kept.message(), failure.message());
     }
 }
 
@@ -672,24 +679,28 @@ fn only_this_modules_marker_makes_an_auth_unavailable_status() {
 }
 
 #[test]
-fn from_authorization_status_tells_a_timeout_from_a_denial() {
-    let timeout = MessageHandleError::from_authorization_status(&unavailable());
+fn from_authorization_tells_a_timeout_from_a_denial_and_a_failure() {
+    let timeout = MessageHandleError::from_authorization(unavailable());
     assert!(
         matches!(&timeout, MessageHandleError::AuthUnavailable(message)
             if message == unavailable().message()),
         "{timeout:?}"
     );
-    for denial in [
-        Status::permission_denied("Query resource denied"),
-        Status::internal("Failed to connect to lore auth service"),
-    ] {
-        let mapped = MessageHandleError::from_authorization_status(&denial);
-        assert!(
-            matches!(&mapped, MessageHandleError::AuthorizationFailure(message)
-                if message == denial.message()),
-            "{mapped:?}"
-        );
-    }
+    let denial = Status::permission_denied("Query resource denied");
+    let mapped = MessageHandleError::from_authorization(denial.clone());
+    assert!(
+        matches!(&mapped, MessageHandleError::AuthorizationFailure(message)
+            if message == denial.message()),
+        "{mapped:?}"
+    );
+    // f2013946: a failed check that is not a denial is not "unauthorized".
+    let failure = MessageHandleError::from_authorization(Status::internal(
+        "Failed to connect to lore auth service",
+    ));
+    assert!(
+        matches!(failure, MessageHandleError::InternalError),
+        "{failure:?}"
+    );
 }
 
 #[tokio::test]

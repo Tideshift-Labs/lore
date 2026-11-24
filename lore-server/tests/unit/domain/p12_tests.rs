@@ -2118,6 +2118,7 @@ async fn governed_repository_create_refuses_a_claim_witness_with_no_configured_a
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let domain = Arc::new(context(true));
             let admitted = mediated_admitted_operation(Some(claim_witness_fixture()));
@@ -2298,6 +2299,7 @@ async fn repository_delete_preflight_checks_snapshot_and_loads_branch_metadata()
                     immutable,
                     mutable,
                     RepositoryId::from(bytes.repository_id),
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let captured = Arc::new(Mutex::new(None));
                 let snapshot = if case == 0 {
@@ -2592,6 +2594,7 @@ async fn branch_delete_preflight_loads_metadata_and_returns_only_the_committed_r
                     immutable,
                     mutable,
                     RepositoryId::from([0x61; 16]),
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let id = Context::from([0x62; 16]);
                 let mut metadata = lore_revision::metadata::Metadata::new();
@@ -2688,6 +2691,7 @@ async fn run_non_creator_delete(
                 immutable.clone(),
                 mutable.clone(),
                 id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let metadata_hash = repository::metadata_store(
                 repository.clone(),
@@ -3003,6 +3007,7 @@ async fn a_dropped_governed_branch_delete_still_notifies_and_spawns_its_post_hoo
                     immutable.clone(),
                     mutable.clone(),
                     RepositoryId::from([0x61; 16]),
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 let id = Context::from([0x62; 16]);
                 let mut metadata = lore_revision::metadata::Metadata::new();
@@ -3144,6 +3149,7 @@ async fn governed_create_fixture(
         immutable.clone(),
         mutable.clone(),
         repository_id,
+        lore_revision::state::allow_all_repositories(),
     ));
     let repository_metadata_hash = LORE_CONTEXT
         .scope(

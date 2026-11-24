@@ -23,6 +23,7 @@ mod grpc;
 mod hooks;
 mod http;
 mod lock;
+mod log_capture;
 mod notification;
 mod plugins;
 mod protocol;

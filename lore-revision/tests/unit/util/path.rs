@@ -4,24 +4,13 @@ use std::str::FromStr;
 
 use lore_revision::util::path::*;
 
+use super::allocations_during;
+
 /// A walk holds a path per change, millions for a large tree, so a path stays 24 bytes: the shared
 /// data and four 32-bit offsets.
 #[test]
 fn a_path_is_24_bytes() {
     assert_eq!(std::mem::size_of::<RelativePath>(), 24);
-}
-
-/// What `f` returns and the allocations the calling thread made running it.
-///
-/// Counting stays on, since switching it off would undercount a test measuring on another thread.
-fn allocations_during<T>(f: impl FnOnce() -> T) -> (T, u64) {
-    lore_base::allocator::set_allocation_counting(true);
-    let before = lore_base::allocator::thread_allocation_count();
-    let value = std::hint::black_box(f());
-    (
-        value,
-        lore_base::allocator::thread_allocation_count() - before,
-    )
 }
 
 /// A path built from a string makes its two strings and the shared data once each, never
@@ -255,6 +244,90 @@ fn shared_component_depth_counts_whole_components() {
     assert_eq!(shared_component_depth("a/b", "a/b/c"), 2);
     assert_eq!(shared_component_depth("", "a"), 0);
     assert_eq!(shared_component_depth("a", "a"), 1);
+}
+
+/// The paths a search of a sorted set is checked against. They hold the cases a search can get
+/// wrong: names that sort between `a` and `a/` (`a-x`, `a.x`), names that share a prefix but not a
+/// component (`ab`), the empty path, paths that are not clean (`a/`, `a//b`), and names past ASCII.
+const SEARCHED_PATHS: [&str; 14] = [
+    "", "a", "a/b", "a/b/c", "a-x", "a.x", "a/b-x", "a/b.x", "ab", "a/", "a//b", "b", "é", "é/b",
+];
+
+/// Each set of [`SEARCHED_PATHS`], in byte order.
+fn sorted_sets() -> impl Iterator<Item = Vec<&'static str>> {
+    (0u32..1 << SEARCHED_PATHS.len()).map(|set| {
+        let mut sorted: Vec<&str> = (0..SEARCHED_PATHS.len())
+            .filter(|at| set & (1 << at) != 0)
+            .map(|at| SEARCHED_PATHS[at])
+            .collect();
+        sorted.sort_unstable();
+        sorted
+    })
+}
+
+/// The search of a sorted set for a path or a path below it answers as a scan for the path and for
+/// the paths starting with it and a `/`, for each set of [`SEARCHED_PATHS`], and allocates nothing.
+#[test]
+fn covers_any_answers_as_a_scan_for_the_path_and_the_paths_below_it() {
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let below = format!("{path}/");
+            let scanned = sorted
+                .iter()
+                .any(|held| *held == path || held.starts_with(&below));
+            let (covered, allocated) = allocations_during(|| covers_any(&sorted, path));
+            assert_eq!(covered, scanned, "{path:?} against {sorted:?}");
+            assert_eq!(allocated, 0, "{path:?} against {sorted:?} allocated");
+        }
+    }
+}
+
+/// The search of a sorted set for a path covering one answers as a scan comparing
+/// `RelativePath::covers` against every path of it, for each set of [`SEARCHED_PATHS`], and
+/// allocates nothing.
+#[test]
+fn covered_by_any_answers_as_a_scan_of_covers() {
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let relative = RelativePath::from_str(path).expect("path");
+            let scanned = sorted.iter().any(|held| {
+                RelativePath::from_str(held)
+                    .expect("path")
+                    .covers(&relative)
+            });
+            let (covered, allocated) = allocations_during(|| covered_by_any(&sorted, path));
+            assert_eq!(covered, scanned, "{path:?} against {sorted:?}");
+            assert_eq!(allocated, 0, "{path:?} against {sorted:?} allocated");
+        }
+    }
+}
+
+/// The search of a sorted set answers as a scan comparing `RelativePath::overlaps` against every
+/// path of it, for each set of [`SEARCHED_PATHS`].
+#[test]
+fn overlaps_any_answers_as_a_scan_of_overlaps() {
+    let relative: Vec<RelativePath> = SEARCHED_PATHS
+        .iter()
+        .map(|path| RelativePath::from_str(path).expect("path"))
+        .collect();
+    let relative_of = |path: &str| {
+        &relative[SEARCHED_PATHS
+            .iter()
+            .position(|searched| *searched == path)
+            .expect("a searched path")]
+    };
+    for sorted in sorted_sets() {
+        for path in SEARCHED_PATHS {
+            let scanned = sorted
+                .iter()
+                .any(|held| relative_of(held).overlaps(relative_of(path)));
+            assert_eq!(
+                overlaps_any(&sorted, path),
+                scanned,
+                "{path:?} against {sorted:?}"
+            );
+        }
+    }
 }
 
 /// The steps a path takes to reach canonical form, each of which leaves a

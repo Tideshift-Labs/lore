@@ -175,6 +175,51 @@ pub(in crate::state) fn holds_base_marks(flags: u16) -> bool {
     flags & marked == marked
 }
 
+/// The action bits of a dirty move, add or copy: the dirty changes of a directory that a staged
+/// change below it stages with it.
+const STAGED_WITH_CONTENT: u16 =
+    (NodeFlags::DirtyMove.bits() | NodeFlags::DirtyAdd.bits() | NodeFlags::DirtyCopy.bits())
+        & NodeFlags::ActionBits.bits();
+
+/// The action bits a bare `Staged` bit takes on a node holding `node`: the dirty move, add or copy
+/// of a node not staged, which a staged change below a directory stages with it. None for a dirty
+/// deletion, which such a change leaves out of the directory, its children keeping theirs.
+#[inline]
+fn staged_with_content(node: u16) -> u16 {
+    let base = (NodeFlags::Staged | NodeFlags::Dirty).bits();
+    let action = node & NodeFlags::ActionBits.bits();
+    if node & base == NodeFlags::Dirty.bits()
+        && action & NodeFlags::DirtyDelete.bits() == 0
+        && action & STAGED_WITH_CONTENT != 0
+    {
+        action
+    } else {
+        0
+    }
+}
+
+/// The flags a dirty mark of `flags` leaves on a node holding `node`: the latest dirty action in
+/// place of the previous one, the staged and merge bits kept. The action bits under a `Staged` bit
+/// are the node's staged action, so on a staged node the mark sets the `Dirty` bit alone: a staged
+/// action stands, and under a bare `Staged` bit, which a staged change below carries, as does the
+/// rehash of a directory a child's staged move left, the dirty action is not recorded. A caller
+/// that stages it with that change marks it staged; a commit that finds such a directory gone
+/// deletes it with what it holds, but keeps it where it holds a child not staged and no gone
+/// directory above it carries a staged change of its own.
+///
+/// FORK-LOCAL (Tideshift, 89f4202c): a node that is not staged holds no staged action, so any
+/// action bits it holds are stale and the mark clears them, the base `Dirty` bit alone included
+/// (upstream keeps them where a bare `Dirty` reaches a clean node). Pinned by
+/// `dirty_propagation_clears_unstaged_ancestor_action`.
+#[inline]
+fn dirty_marked(node: u16, flags: u16) -> u16 {
+    let dirty = NodeFlags::Dirty.bits();
+    if node & NodeFlags::Staged.bits() != 0 {
+        return node | dirty;
+    }
+    (node & !NodeFlags::DirtyBits.bits()) | flags
+}
+
 /// How an unserved mark's target takes extension flags ([`Mark::dirty`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ext {
@@ -218,6 +263,14 @@ impl Mark {
             dirty: Some((flags, ext, force)),
         }
     }
+
+    /// The deletion `lore file dirty` marks on a node the working tree lacks, in place of its dirty
+    /// action, its extension flags cleared.
+    pub const DIRTY_DELETE: Self = Self::dirty(
+        NodeFlags::DirtyDelete,
+        Ext::Set(NodeExtFlags::NoFlags),
+        true,
+    );
 
     /// A staged change and the matching dirty change, both forced, as the working-tree staging
     /// path records them: a staged change recorded without its dirty counterpart leaves the two
@@ -300,6 +353,20 @@ impl Halves {
         self.staged.is_some() || self.dirty.is_some()
     }
 
+    /// Whether the staged half, climbing with no action of its own, stages the dirty move of
+    /// `node`, a directory: the move of a node not staged, which [`staged_with_content`] stages
+    /// with the change below it.
+    #[inline]
+    fn promotes_move(&self, node: &Node) -> bool {
+        self.staged
+            .is_some_and(|half| half.flags & NodeFlags::ActionBits.bits() == 0)
+            && node.is_directory()
+            && staged_with_content(node.flags)
+                & NodeFlags::DirtyMove.bits()
+                & NodeFlags::ActionBits.bits()
+                != 0
+    }
+
     /// One level of the mark on `node`, under its block's write lock: the staged half, then the
     /// dirty half, each where still climbing, each stopping where `node` holds it already.
     /// Answers whether either wrote; a half that wrote climbs on with the base bit alone, and the
@@ -320,6 +387,9 @@ impl Halves {
                 } else {
                     flags |= node.flags & merge & NodeFlags::StagedMergeConflict.bits();
                 }
+                if flags & NodeFlags::ActionBits.bits() == 0 {
+                    flags |= staged_with_content(node.flags);
+                }
                 node.flags &= !NodeFlags::StagedBits.bits();
                 node.flags |= (NodeFlags::Staged.bits() | flags) & NodeFlags::StagedBits.bits();
                 self.staged = Some(Half {
@@ -339,14 +409,7 @@ impl Halves {
             {
                 self.dirty = None;
             } else {
-                // The latest action replaces the previous one; staged and merge bits stay. The
-                // base bit alone on a clean node keeps the action bits its staged action holds,
-                // which the two halves share. A clean node that is not staged holds no such
-                // action, so its stale action bits are cleared (fork 89f4202c).
-                if flags != NodeFlags::Dirty.bits() || node.is_dirty() || !node.is_staged() {
-                    node.flags &= !NodeFlags::DirtyBits.bits();
-                }
-                node.flags |= flags;
+                node.flags = dirty_marked(node.flags, flags);
                 if self.set_ext {
                     node.ext_flags = self.ext;
                     self.set_ext = false;
@@ -363,14 +426,16 @@ impl Halves {
 }
 
 impl State {
-    /// The staged and dirty flags an edit to `node` should record.
-    ///
-    /// A node staged for addition stays staged for addition however it is edited
-    /// afterwards: it is in no revision yet, so there is nothing for a commit to
-    /// record a modification against.
+    /// The staged and dirty flags an edit to `node` records, for the working-tree staging path
+    /// staging a node again and for the C API's modify: a node staged for addition stays an
+    /// addition, as it is in no revision yet for a commit to record a modification against; one
+    /// staged as moved stays a move, which carries the new content; and any other, one staged as
+    /// copied among them, is staged as modified.
     pub fn staged_edit_flags(node: &Node) -> (NodeFlags, NodeFlags) {
         if node.is_staged_add() {
             (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+        } else if node.is_staged_move() {
+            (NodeFlags::StagedMove, NodeFlags::DirtyMove)
         } else {
             (NodeFlags::StagedModify, NodeFlags::DirtyModify)
         }
@@ -385,7 +450,11 @@ impl State {
     ///
     /// A staged half replaces the target's staged action and keeps its merge flags, a conflict's
     /// resolution and side with them, where the mark sets no merge bit; a mark that sets one, as
-    /// a merge's and a resolve's do, keeps a merge and a conflict and sets the rest.
+    /// a merge's and a resolve's do, keeps a merge and a conflict and sets the rest. A staged half
+    /// setting no action stages a dirty move, add or copy of a node not staged with it; a
+    /// directory's move staged so is noted for the caller to stage whole
+    /// ([`State::take_promoted_moves`]). A dirty half on a staged node sets the `Dirty` bit alone
+    /// ([`dirty_marked`]).
     ///
     /// The unserved tiers' mark: a dirty node is marked before its parent, so a concurrent reader
     /// may see a dirty node under a clean directory until the walk reaches it. An unserved clear
@@ -426,8 +495,12 @@ impl State {
                     let mut wrote = false;
                     let parent = loop {
                         let node = writer.node(Node::index(at));
+                        let promoted = halves.promotes_move(node);
                         if !halves.apply(node) {
                             break None;
+                        }
+                        if promoted {
+                            self.note_promoted_move(at);
                         }
                         wrote = true;
                         lore_trace!("Node {at} marked, now flags {:x}", node.flags);

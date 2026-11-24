@@ -32,6 +32,7 @@ mod storage_remote_tests {
     use lore_storage::immutable_store::CopyBehavior;
 
     use crate::common::net_common::Partitions;
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::bind_matched_pair;
     use crate::common::net_common::close_handle;
     use crate::common::net_common::make_backends;
@@ -66,37 +67,21 @@ mod storage_remote_tests {
         url: String,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-        /// Signals the gRPC server to stop serving. Dropping it starts the shutdown.
-        grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        /// Fires when the gRPC serve task returns, which is when its listener is closed.
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<String>>,
-        /// The QUIC endpoint, on a `lore://` server.
-        quic: Option<QuinnServer>,
+        /// Stops the server. Dropping it starts the shutdown.
+        stop: TestServerStop,
     }
 
     impl TestServer {
-        /// Stop serving and wait until this server is unreachable.
+        /// Stop serving and wait until this server accepts and answers nothing.
         ///
         /// Dropping a `TestServer` only *signals* the stop: the gRPC listener closes when its
         /// serve task returns, and QUIC keeps accepting until its endpoint does. A test that
         /// needs the peer gone rather than going has to wait for both, or the request it expects
         /// to fail can still be answered.
         async fn shutdown(mut self) {
-            if let Some(quic) = self.quic.take() {
-                quic.close().await;
-            }
-            drop(self.grpc_shutdown.take());
-            if let Some(stopped) = self.grpc_stopped.take()
-                && tokio::time::timeout(SHUTDOWN_WAIT, stopped).await.is_err()
-            {
-                panic!("test server at {} did not stop serving", self.url);
-            }
+            self.stop.stop().await;
         }
     }
-
-    /// Bound on a test server's shutdown. Long enough that a loaded runner is not mistaken for a
-    /// server that will not stop.
-    const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
 
     /// A server-side store that refuses to store exactly one leaf fragment.
     ///
@@ -306,8 +291,19 @@ mod storage_remote_tests {
     /// Start a server speaking `transport`, backed by fresh in-memory stores.
     async fn start_server(transport: Transport) -> TestServer {
         match transport {
-            Transport::Grpc => start_test_server().await,
-            Transport::Quic => start_quic_test_server().await,
+            Transport::Grpc => {
+                start_server_on(
+                    std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port to serve on"),
+                    None,
+                )
+                .await
+            }
+            Transport::Quic => {
+                // Both legs serve on one number: gRPC on its TCP half, QUIC on its UDP half. Both
+                // are bound before either server starts, so neither has a port to lose.
+                let (listener, udp) = bind_matched_pair();
+                start_server_on(listener, Some(udp)).await
+            }
         }
     }
 
@@ -324,15 +320,13 @@ mod storage_remote_tests {
     ) -> TestServer {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-        let (url, shutdown_tx, stopped_rx) = start_grpc_server(backend_immutable, backend_mutable);
+        let (url, stop) = start_grpc_server(backend_immutable, backend_mutable);
 
         TestServer {
             url,
             backend_immutable: backend_for_test,
             backend_mutable: backend_mutable_for_test,
-            grpc_shutdown: Some(shutdown_tx),
-            grpc_stopped: Some(stopped_rx),
-            quic: None,
+            stop,
         }
     }
 
@@ -362,62 +356,59 @@ mod storage_remote_tests {
         let intercept_for_test = intercept.clone();
         let backend_immutable: Arc<dyn lore_storage::ImmutableStore> = intercept;
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-        let (url, shutdown_tx, stopped_rx) = start_grpc_server(backend_immutable, backend_mutable);
+        let (url, stop) = start_grpc_server(backend_immutable, backend_mutable);
 
         (
             TestServer {
                 url,
                 backend_immutable: backend_for_test,
                 backend_mutable: backend_mutable_for_test,
-                grpc_shutdown: Some(shutdown_tx),
-                grpc_stopped: Some(stopped_rx),
-                quic: None,
+                stop,
             },
             intercept_for_test,
         )
     }
 
-    /// A `lore://` server: QUIC for storage, gRPC for everything else.
+    /// A server on `listener`, backed by fresh in-memory stores: gRPC only, or with `udp`, bound
+    /// to the listener's port, a `lore://` server, QUIC for storage and gRPC for everything else.
     ///
     /// `LoreProtocol` routes storage over QUIC but revision, repository, admin and environment
     /// over gRPC, and `Connection::connect` fetches the environment config before anything else —
     /// so a `lore://` peer must serve both. QUIC is UDP and gRPC is TCP, so they share one port
     /// number. Both are backed by the same stores, as a real deployment has them.
-    async fn start_quic_test_server() -> TestServer {
+    async fn start_server_on(
+        listener: std::net::TcpListener,
+        udp: Option<std::net::UdpSocket>,
+    ) -> TestServer {
         let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
-        let backend_for_test = backend_immutable.clone();
-        let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
-
-        // Both legs serve on one number: gRPC on its TCP half, QUIC on its UDP half. Both are bound
-        // before either server starts, so neither has a port to lose.
-        let (listener, udp) = bind_matched_pair();
         let addr: SocketAddr = listener.local_addr().expect("tcp local addr");
-
-        let (cert_path, key_path, _ca) = server_certs().expect("test certs");
-        let quic = QuinnServer::start(
-            QuinnConfigBuilder::new()
-                .socket(udp)
-                .cert_file(cert_path)
-                .pkey_file(key_path)
-                .stream_handler_factory(Box::new(TestHandlerFactory::new(
-                    backend_immutable.clone(),
-                    backend_mutable.clone(),
-                )))
-                .build()
-                .expect("quinn config"),
-        )
-        .expect("quinn server start");
-
-        let (shutdown_tx, stopped_rx) =
-            spawn_grpc_server(listener, backend_immutable, backend_mutable);
+        let quic = udp.map(|udp| {
+            let (cert_path, key_path, _ca) = server_certs().expect("test certs");
+            QuinnServer::start(
+                QuinnConfigBuilder::new()
+                    .socket(udp)
+                    .cert_file(cert_path)
+                    .pkey_file(key_path)
+                    .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                        backend_immutable.clone(),
+                        backend_mutable.clone(),
+                    )))
+                    .build()
+                    .expect("quinn config"),
+            )
+            .expect("quinn server start")
+        });
+        let scheme = if quic.is_some() { "lore" } else { "grpc" };
+        let stop = spawn_grpc_server(listener, backend_immutable.clone(), backend_mutable.clone());
 
         TestServer {
-            url: format!("lore://127.0.0.1:{}", addr.port()),
-            backend_immutable: backend_for_test,
-            backend_mutable: backend_mutable_for_test,
-            grpc_shutdown: Some(shutdown_tx),
-            grpc_stopped: Some(stopped_rx),
-            quic: Some(quic),
+            url: format!("{scheme}://{addr}"),
+            backend_immutable,
+            backend_mutable,
+            stop: match quic {
+                Some(quic) => stop.with_quic(quic),
+                None => stop,
+            },
         }
     }
 
@@ -426,31 +417,68 @@ mod storage_remote_tests {
     /// asynchronously, so a dropped server keeps accepting. Measured before this barrier
     /// existed, a dropped server was still accepting on every attempt.
     ///
+    /// Once the server is stopped, as [`TestServer::shutdown`] stops it, its gRPC serve task must
+    /// have returned, which it does only after dropping its listener. On Linux the server's own
+    /// fd must no longer refer to the socket either. The test holds a copy of the listener, so a
+    /// connection made after the stop waits in the socket's accept queue, which the copy keeps
+    /// open, and the copy must accept it. A probe for a refused connect fails whenever another
+    /// copy keeps the socket listening, as a child process that another test spawns holds a copy
+    /// of every fd until it execs.
+    ///
     /// TCP covers the gRPC leg on both server kinds, `lore://` included, since both serve gRPC
     /// on the port's TCP half. The QUIC half has no equivalent probe and rests on
     /// `Endpoint::close` plus `wait_idle`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_awaited_shutdown_leaves_the_port_closed() {
+    async fn an_awaited_shutdown_leaves_the_server_accepting_nothing() {
         let execution = setup_execution("storage-remote-shutdown-barrier".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
                 for transport in TRANSPORTS {
-                    let server = start_server(transport).await;
-                    let addr: SocketAddr = server
-                        .url
-                        .rsplit_once('/')
-                        .expect("url carries a scheme")
-                        .1
-                        .parse()
-                        .expect("url carries a socket address");
+                    let (listener, udp) = bind_matched_pair();
+                    let addr = listener.local_addr().expect("tcp local addr");
+                    #[cfg(target_os = "linux")]
+                    let server_fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
+                    let held = listener.try_clone().expect("the listener copies");
+                    held.set_nonblocking(true)
+                        .expect("the copy is made non-blocking");
+                    let mut server =
+                        start_server_on(listener, (transport == Transport::Quic).then_some(udp))
+                            .await;
 
-                    server.shutdown().await;
+                    server.stop.stop().await;
 
                     assert!(
-                        tokio::net::TcpStream::connect(addr).await.is_err(),
-                        "{transport:?}: the port must refuse a connection once the server has \
-                         stopped, or a test that needs an unreachable peer does not have one"
+                        server.stop.serve_ended(),
+                        "{transport:?}: the stop returned before the gRPC serve task did"
                     );
+                    #[cfg(target_os = "linux")]
+                    {
+                        let socket_of = |fd: i32| std::fs::read_link(format!("/proc/self/fd/{fd}"));
+                        let held_fd = std::os::fd::AsRawFd::as_raw_fd(&held);
+                        assert_ne!(
+                            socket_of(server_fd).ok(),
+                            Some(socket_of(held_fd).expect("the held copy is open")),
+                            "{transport:?}: the server still holds its listener after its stop"
+                        );
+                    }
+                    let _client = tokio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("the held copy queues a connection");
+                    // The handshake can reach the accept queue after the connect returns.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        match held.accept() {
+                            Ok(_) => break,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "{transport:?}: the connection never reached the held copy"
+                                );
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                            Err(error) => panic!("{transport:?}: the held copy accepts: {error}"),
+                        }
+                    }
                 }
             })
             .await;
@@ -571,6 +599,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -654,6 +683,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 0,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -788,13 +818,166 @@ mod storage_remote_tests {
                     .await
                     .expect("local exist call");
                     assert_eq!(
-                        local_match.match_made,
-                        lore_storage::store_types::StoreMatch::MatchNone,
-                        "unflagged remote-fetched payload must NOT be cached locally",
+                        (
+                            local_match.match_made,
+                            local_match.stored_local,
+                            local_match.stored_durable
+                        ),
+                        (
+                            lore_storage::store_types::StoreMatch::MatchFull,
+                            false,
+                            true
+                        ),
+                        "an unflagged remote-fetched payload is recorded as durable, not cached",
                     );
 
                     close_handle(handle).await;
                 }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The Overmind image store's repro, `get_teaches_store`, against a real server: node B pulls
+    /// the content node A published in fixed-size chunks, with `local_cache` 0, and its put of
+    /// the same content sends the server nothing, neither a payload nor a copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_after_a_get_caching_nothing_sends_the_server_nothing() -> TestResult {
+        use lore::storage::get;
+        use lore::storage::get::LoreStorageGetArgs;
+        use lore::storage::get::LoreStorageGetItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use rand::Rng;
+
+        use crate::common::net_common::CountingStore;
+        use crate::common::net_common::Traffic;
+
+        const CHUNK: u64 = 256 * 1024;
+
+        let execution = setup_execution("storage-remote-get-teaches-store".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
+                let counted = CountingStore::new(backend_immutable);
+                let server = start_test_server_with(counted.clone(), backend_mutable);
+                let partition = Partition::from([0xb7u8; 16]);
+                let context = Context::from([0xb7u8; 16]);
+                let mut content = vec![0u8; 8 * CHUNK as usize];
+                rand::rng().fill(&mut content[..]);
+
+                let node_a = open_handle(Some(&server.url)).await;
+                let address = put_content(node_a, partition, context, &content, 1, CHUNK).await;
+                close_handle(node_a).await;
+
+                let node_b = open_handle(Some(&server.url)).await;
+                let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_for_cb = received.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetData(data) = event {
+                        // SAFETY: the event's bytes are valid for the callback.
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                        };
+                        received_for_cb.lock().unwrap().extend_from_slice(slice);
+                    }
+                }));
+                let status = get::get(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetArgs {
+                        handle: node_b,
+                        items: LoreArray::from_vec(vec![LoreStorageGetItem {
+                            id: 1,
+                            partition,
+                            address,
+                            local_cache: 0,
+                            ..Default::default()
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "node B's get");
+                assert!(*received.lock().unwrap() == content, "node B's get");
+
+                counted.reset();
+                let put = put_content(node_b, partition, context, &content, 1, CHUNK).await;
+                assert_eq!(put, address);
+                assert_eq!(
+                    counted.traffic(),
+                    Traffic::default(),
+                    "the put after the pull sent the server something"
+                );
+                close_handle(node_b).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A `get_metadata` the server answers records the fragment in node B's store, so node B's
+    /// put of the same content sends the server nothing, neither a payload nor a copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_put_after_a_remote_get_metadata_sends_the_server_nothing() -> TestResult {
+        use lore::storage::get_metadata;
+        use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
+        use lore::storage::get_metadata::LoreStorageGetMetadataItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use rand::Rng;
+
+        use crate::common::net_common::CountingStore;
+        use crate::common::net_common::Traffic;
+
+        let execution = setup_execution("storage-remote-get-metadata-teaches-store".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (backend_immutable, backend_mutable) = make_backends(Partitions::Shared).await;
+                let counted = CountingStore::new(backend_immutable);
+                let server = start_test_server_with(counted.clone(), backend_mutable);
+                let partition = Partition::from([0xb8u8; 16]);
+                let context = Context::from([0xb8u8; 16]);
+                let mut content = vec![0u8; 64 * 1024];
+                rand::rng().fill(&mut content[..]);
+
+                let node_a = open_handle(Some(&server.url)).await;
+                let address = put_content(node_a, partition, context, &content, 1, 0).await;
+                close_handle(node_a).await;
+
+                let node_b = open_handle(Some(&server.url)).await;
+                let codes: Arc<Mutex<Vec<i32>>> = Arc::new(Mutex::new(Vec::new()));
+                let codes_for_cb = codes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        codes_for_cb.lock().unwrap().push(data.error.error_code);
+                    }
+                }));
+                let status = get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetMetadataArgs {
+                        handle: node_b,
+                        items: LoreArray::from_vec(vec![LoreStorageGetMetadataItem {
+                            id: 1,
+                            partition,
+                            address,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "node B's get_metadata");
+                assert_eq!(*codes.lock().unwrap(), [0], "node B's get_metadata");
+
+                counted.reset();
+                let put = put_content(node_b, partition, context, &content, 1, 0).await;
+                assert_eq!(put, address);
+                assert_eq!(
+                    counted.traffic(),
+                    Traffic::default(),
+                    "the put after the metadata read sent the server something"
+                );
+                close_handle(node_b).await;
                 Ok(())
             })
             .await
@@ -1183,6 +1366,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -1634,6 +1818,7 @@ mod storage_remote_tests {
                 "",
                 "",
                 lore_transport::auth::AuthMode::Auto,
+                None,
             )
             .await?;
             let client_repository =
@@ -2401,6 +2586,7 @@ mod storage_remote_tests {
             "",
             "",
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await?;
         let client_repository =
@@ -2474,6 +2660,126 @@ mod storage_remote_tests {
             .await
     }
 
+    /// The diagnostic immutable query walks a remote list past its hole, which names no fragment:
+    /// it queries the list and each leaf, and never a hole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_immutable_query_walks_past_the_hole_of_a_list() -> TestResult {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::FragmentReference;
+        use lore_base::types::Hash;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreEndEventData;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::relay::EventDispatcher;
+
+        let queried: Arc<Mutex<Vec<(Address, u8)>>> = Arc::default();
+        let ended = Arc::new(tokio::sync::Notify::new());
+        let (events, end) = (queried.clone(), ended.clone());
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::RepositoryStoreImmutableQuery(data) => {
+                events
+                    .lock()
+                    .unwrap()
+                    .push((data.address, data.subfragment));
+            }
+            LoreEvent::End(_) => end.notify_one(),
+            _ => {}
+        }));
+        let execution = Arc::new(ExecutionContext::new_server(
+            LoreGlobalArgs::default(),
+            EventDispatcher::new(callback),
+            "storage-remote-immutable-query-hole".to_string(),
+        ));
+        let leaves = LORE_CONTEXT
+            .scope(execution, async move {
+                let repository_id = RepositoryId::from([0xd9; 16]);
+                let test = CacheTest::start(Transport::Grpc, repository_id).await?;
+                let context = Context::from([0xd9; 16]);
+                let mut leaves = Vec::new();
+                let mut references = Vec::new();
+                let before: &[u8] = b"the leaf before the hole";
+                for (leaf, offset) in [(before, 0u64), (&b"after"[..], 4096)] {
+                    let address = Address {
+                        hash: lore_storage::hash::hash_slice(leaf),
+                        context,
+                    };
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: leaf.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            repository_id,
+                            address,
+                            plain,
+                            Some(bytes::Bytes::copy_from_slice(leaf)),
+                            false,
+                        )
+                        .await?;
+                    leaves.push(address);
+                    references.push(FragmentReference {
+                        hash: address.hash,
+                        offset_content: offset,
+                    });
+                }
+                references.insert(
+                    1,
+                    FragmentReference {
+                        hash: Hash::default(),
+                        offset_content: before.len() as u64,
+                    },
+                );
+                let list = bytes::Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(
+                    references.as_slice(),
+                ));
+                let list_address = Address {
+                    hash: lore_storage::hash::hash_slice(&list),
+                    context,
+                };
+                let fragmented = Fragment {
+                    flags: FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: list.len() as u32,
+                    size_content: 4096 + 5,
+                };
+                test.server
+                    .backend_immutable
+                    .clone()
+                    .put(repository_id, list_address, fragmented, Some(list), false)
+                    .await?;
+
+                lore_revision::repository::store::immutable_query(
+                    test.client_repository.clone(),
+                    list_address.to_string(),
+                    false,
+                    true,
+                )
+                .await?;
+                LoreEvent::End(LoreEndEventData::default()).send();
+                Ok::<_, Box<dyn Error>>(leaves)
+            })
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(10), ended.notified()).await?;
+        let queried = queried.lock().unwrap().clone();
+        assert!(
+            queried.iter().all(|(address, _)| !address.hash.is_zero()),
+            "a hole is queried: {queried:?}"
+        );
+        for leaf in leaves {
+            assert!(
+                queried.contains(&(leaf, 1)),
+                "the leaf {leaf} is queried as a subfragment"
+            );
+        }
+        Ok(())
+    }
+
     /// `local_cache=1` on a put item tags the resulting fragment with
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's
@@ -2521,6 +2827,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 0,
                         local_cache: 1,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -3079,6 +3386,79 @@ mod storage_remote_tests {
             .await
     }
 
+    /// An upload at statistics level one reports its items, the one that failed among them, and
+    /// the payload it uploaded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn upload_reports_what_it_cost() -> TestResult {
+        use lore::storage::upload::LoreStorageUploadArgs;
+        use lore::storage::upload::LoreStorageUploadItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+        use lore_revision::store::event::LoreStoragePutStatsEventData;
+
+        let execution = setup_execution("storage-remote-upload-stats".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xaau8; 16]);
+                    let handle = open_handle(Some(&server.url)).await;
+                    let payload = b"upload payload a stats event reports".to_vec();
+                    let stored = put_local_via_handle(handle, partition, payload.as_slice()).await;
+                    let absent = Address {
+                        hash: Hash::from([0xfcu8; 32]),
+                        context: Context::default(),
+                    };
+
+                    let reported: Arc<Mutex<Vec<LoreStoragePutStatsEventData>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let sink = reported.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutStats(data) = event {
+                            sink.lock().unwrap().push(*data);
+                        }
+                    }));
+                    let status = lore::storage::upload::upload(
+                        LoreGlobalArgs {
+                            stats: 1,
+                            ..LoreGlobalArgs::default()
+                        },
+                        LoreStorageUploadArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![
+                                LoreStorageUploadItem {
+                                    id: 1,
+                                    partition,
+                                    address: stored,
+                                },
+                                LoreStorageUploadItem {
+                                    id: 2,
+                                    partition,
+                                    address: absent,
+                                },
+                            ]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_ne!(status, 0, "the absent address fails the call");
+
+                    let reported = std::mem::take(&mut *reported.lock().unwrap());
+                    assert_eq!(reported.len(), 1, "the call reports once");
+                    assert_eq!((reported[0].items, reported[0].items_failed), (2, 1));
+                    assert_eq!(reported[0].fragments.remote_put_writes, 1);
+                    assert!(reported[0].fragments.remote_put_bytes > 0);
+
+                    close_handle(handle).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;
@@ -3481,6 +3861,8 @@ mod storage_remote_tests {
                         path: LoreString::from(path.as_str()),
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
+                        skip_holes: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put_file::put_file(
@@ -3621,6 +4003,280 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A file of 8 MiB in `dir` with data at two ranges and a hole everywhere else, made sparse
+    /// on the file system the test runs on, and the content it reads as.
+    #[cfg(unix)]
+    fn sparse_source(dir: &lore_base::test_util::TempDir) -> (std::path::PathBuf, Vec<u8>) {
+        use std::os::unix::fs::FileExt;
+
+        let path = dir.path().join("image.img");
+        let size = 8usize << 20;
+        let file = std::fs::File::create(&path).expect("create the source");
+        file.set_len(size as u64).expect("size the source");
+        let mut content = vec![0u8; size];
+        for (offset, length) in [(1usize << 20, (1usize << 20) + 4096), (5 << 20, 300 << 10)] {
+            let data: Vec<u8> = incompressible(length as u64 + offset as u64).split_off(offset);
+            file.write_all_at(&data, offset as u64).expect("write data");
+            content[offset..offset + length].copy_from_slice(&data);
+        }
+        file.sync_all().expect("sync the source");
+        (path, content)
+    }
+
+    /// The ranges of the file at `path` that hold data, as a put skipping holes finds them.
+    #[cfg(unix)]
+    async fn data_ranges(path: &std::path::Path) -> Vec<std::ops::Range<u64>> {
+        let (handle, size) = lore_storage::ContentSource::file(path)
+            .open()
+            .await
+            .expect("open the file");
+        let mut ranges = Vec::new();
+        let mut offset = 0;
+        let mut cursor = lore_storage::DataCursor::default();
+        while offset < size {
+            let (found, walked) = handle.next_data(offset, cursor).await;
+            cursor = walked;
+            let Some(range) = found.expect("find data") else {
+                break;
+            };
+            offset = range.end;
+            ranges.push(range.start..range.end.min(size));
+        }
+        ranges
+    }
+
+    /// Whether the list the server stores at `address` holds a hole.
+    #[cfg(unix)]
+    async fn server_list_holds_a_hole(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> bool {
+        use lore_base::types::TypedBytes;
+
+        let stored = server
+            .backend_immutable
+            .clone()
+            .get(partition, address)
+            .await
+            .expect("the server stores the list");
+        let (_, list) = lore_storage::expand_payload(
+            stored.fragment,
+            stored.payload.expect("the list payload"),
+        )
+        .expect("the list expands");
+        list.to_aligned::<lore_base::types::FragmentReference>()
+            .as_type_slice::<lore_base::types::FragmentReference>()
+            .iter()
+            .any(lore_base::types::FragmentReference::is_hole)
+    }
+
+    /// A file put with `skip_holes` and `remote_write` reaches the server as lists holding holes,
+    /// which the server checks and stores, and a get through another handle, whose store is empty,
+    /// writes the file back with the same holes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_put_skipping_holes_round_trips_through_the_server() -> TestResult {
+        use lore::storage::get_file;
+        use lore::storage::get_file::LoreStorageGetFileArgs;
+        use lore::storage::get_file::LoreStorageGetFileItem;
+        use lore::storage::put_file;
+        use lore::storage::put_file::LoreStoragePutFileArgs;
+        use lore::storage::put_file::LoreStoragePutFileItem;
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-file-holes".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let dir = lore_base::test_util::TempDir::new("lore-put-file-holes-");
+                    let (source, content) = sparse_source(&dir);
+                    let source_data = data_ranges(&source).await;
+                    if source_data.len() != 2 {
+                        eprintln!("the file system the test runs on reports no hole");
+                        return Ok(());
+                    }
+                    let partition = Partition::from([0xb7u8; 16]);
+
+                    let handle = open_handle(Some(&server.url)).await;
+                    let outcomes: PutOutcomes = Arc::new(Mutex::new(Vec::new()));
+                    let sink = outcomes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            sink.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error.error_code,
+                                data.stored_local,
+                                data.stored_remote,
+                            ));
+                        }
+                    }));
+                    let status = put_file::put_file(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileItem {
+                                id: 1,
+                                partition,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 1,
+                                fixed_size_chunk: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    let outcomes = outcomes.lock().unwrap().clone();
+                    let (_, address, code, _, stored_remote) = outcomes[0];
+                    assert_eq!((code, stored_remote), (0, 1), "{transport:?}");
+                    assert!(
+                        server_list_holds_a_hole(&server, partition, address).await,
+                        "the server stores a list holding a hole, {transport:?}"
+                    );
+                    close_handle(handle).await;
+
+                    let reader = open_handle(Some(&server.url)).await;
+                    let target = dir.path().join("target.img");
+                    let status = get_file::get_file(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileArgs {
+                            handle: reader,
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileItem {
+                                id: 2,
+                                partition,
+                                address,
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                ..Default::default()
+                            }]),
+                        },
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(std::fs::read(&target)?, content, "{transport:?}");
+                    assert_eq!(data_ranges(&target).await, source_data, "{transport:?}");
+                    close_handle(reader).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// `skip_holes` on a `put_file_resolved` item stores the file with its holes skipped and
+    /// publishes the key to it, and `get_file_resolved` through another handle writes the file
+    /// back with the same holes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_put_resolved_skipping_holes_round_trips_through_the_server() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-file-resolved-holes".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let dir = lore_base::test_util::TempDir::new("lore-put-file-resolved-holes-");
+                    let (source, content) = sparse_source(&dir);
+                    let source_data = data_ranges(&source).await;
+                    if source_data.len() != 2 {
+                        eprintln!("the file system the test runs on reports no hole");
+                        return Ok(());
+                    }
+                    let partition = Partition::from([0xb8u8; 16]);
+                    let key = Hash::hash_buffer(b"file-with-holes-key");
+
+                    let handle = open_handle(Some(&server.url)).await;
+                    let outcomes: PutOutcomes = Arc::new(Mutex::new(Vec::new()));
+                    let sink = outcomes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            sink.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error.error_code,
+                                data.stored_local,
+                                data.stored_remote,
+                            ));
+                        }
+                    }));
+                    let status = put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle,
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 1,
+                                fixed_size_chunk: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    let outcomes = outcomes.lock().unwrap().clone();
+                    let (_, address, code, _, stored_remote) = outcomes[0];
+                    assert_eq!((code, stored_remote), (0, 1), "{transport:?}");
+                    assert!(
+                        server_list_holds_a_hole(&server, partition, address).await,
+                        "the server stores a list holding a hole, {transport:?}"
+                    );
+                    close_handle(handle).await;
+
+                    let reader = open_handle(Some(&server.url)).await;
+                    let target = dir.path().join("target.img");
+                    let status = get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: reader,
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: 0,
+                                length: 0,
+                                local_cache: 0,
+                            }]),
+                        },
+                        None,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}");
+                    assert_eq!(std::fs::read(&target)?, content, "{transport:?}");
+                    assert_eq!(data_ranges(&target).await, source_data, "{transport:?}");
+                    close_handle(reader).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// Open a remote-configured handle with `globals.offline=1`, then put with
     /// `remote_write=1`. The bound `offline` flag must silently suppress the upload — the
     /// server backend stays empty even though the API call returns success.
@@ -3674,6 +4330,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let status = put::put(
@@ -3831,6 +4488,7 @@ mod storage_remote_tests {
                         },
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
                     let bad = LoreGlobalArgs {
@@ -5262,6 +5920,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5398,6 +6057,7 @@ mod storage_remote_tests {
                         data,
                         remote_write: 1,
                         local_cache: 0,
+                        remote_query: 0,
                         fixed_size_chunk: 0,
                     };
 
@@ -5542,6 +6202,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 0,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5744,6 +6405,7 @@ mod storage_remote_tests {
                                     },
                                     remote_write: 1,
                                     local_cache: 0,
+                                    remote_query: 0,
                                     fixed_size_chunk: 0,
                                 }]),
                             },
@@ -5864,6 +6526,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -5963,6 +6626,7 @@ mod storage_remote_tests {
                             },
                             remote_write: 1,
                             local_cache: 0,
+                            remote_query: 0,
                             fixed_size_chunk: CHUNK,
                         }]),
                     },
@@ -6052,6 +6716,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6178,6 +6843,7 @@ mod storage_remote_tests {
                                 },
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6310,6 +6976,7 @@ mod storage_remote_tests {
                     },
                     remote_write: 1,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 64 * 1024,
                 }]),
             },
@@ -6538,6 +7205,8 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 0,
                             }]),
                         },
@@ -6688,6 +7357,8 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6801,6 +7472,8 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: 64 * 1024,
                             }]),
                         },
@@ -6902,6 +7575,8 @@ mod storage_remote_tests {
                                     path: LoreString::from(path.display().to_string().as_str()),
                                     remote_write: 1,
                                     local_cache: 0,
+                                    remote_query: 0,
+                                    skip_holes: 0,
                                     fixed_size_chunk: 0,
                                 }]),
                             },
@@ -7112,6 +7787,7 @@ mod storage_remote_tests {
                 },
                 remote_write: 1,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -7309,6 +7985,8 @@ mod storage_remote_tests {
                                 path: LoreString::from(source.display().to_string().as_str()),
                                 remote_write: 1,
                                 local_cache: 0,
+                                remote_query: 0,
+                                skip_holes: 0,
                                 fixed_size_chunk: CHUNK,
                             }]),
                         },
@@ -7386,6 +8064,8 @@ mod storage_remote_tests {
                             path: LoreString::from(source.display().to_string().as_str()),
                             remote_write: 1,
                             local_cache: 0,
+                            remote_query: 0,
+                            skip_holes: 0,
                             fixed_size_chunk: CHUNK,
                         }]),
                     },
@@ -9264,6 +9944,7 @@ mod storage_remote_tests {
             "",
             "",
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("connect to the test server")
@@ -9295,7 +9976,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connections".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let partition = lore_base::types::Partition::from([0xc1u8; 16]);
                 let seeded = seed_payloads(&server, partition, "lost-connections", 16).await;
                 let addresses: Vec<_> = seeded.iter().map(|(address, _)| *address).collect();
@@ -9347,7 +10028,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connection-partitions".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let connection = connect_quic(&server, 1).await;
                 let first = lore_base::types::Partition::from([0xc3u8; 16]);
                 let second = lore_base::types::Partition::from([0xc4u8; 16]);
@@ -9401,7 +10082,7 @@ mod storage_remote_tests {
         let execution = setup_execution("storage-remote-lost-connections-in-flight".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let server = start_quic_test_server().await;
+                let server = start_server(Transport::Quic).await;
                 let partition = lore_base::types::Partition::from([0xc5u8; 16]);
                 let seeded = seed_payloads(&server, partition, "in-flight", 64).await;
                 let connection = connect_quic(&server, 4).await;

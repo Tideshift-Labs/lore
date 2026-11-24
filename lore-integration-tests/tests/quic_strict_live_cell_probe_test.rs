@@ -231,6 +231,7 @@ mod quic_strict_live_cell_probe_tests {
             identity_token,
             access_token,
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await?;
         connection.session(partition, "g8-live-probe").await

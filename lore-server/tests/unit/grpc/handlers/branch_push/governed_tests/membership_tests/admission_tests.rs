@@ -86,6 +86,7 @@ async fn missing_carriage(v1: bool) {
                 request,
                 crate::grpc::push_protected::allow_all(),
                 fixture.immutable.clone(),
+                None,
                 fixture.mutable.clone(),
                 notifications,
                 &hooks,
@@ -102,6 +103,7 @@ async fn missing_carriage(v1: bool) {
                 request,
                 crate::grpc::push_protected::allow_all(),
                 fixture.immutable.clone(),
+                None,
                 fixture.mutable.clone(),
                 notifications,
                 &hooks,
@@ -136,6 +138,7 @@ async fn missing_carriage(v1: bool) {
         fixture.immutable.clone(),
         fixture.mutable.clone(),
         fixture.repository.into(),
+        lore_revision::state::allow_all_repositories(),
     ));
     assert_eq!(
         branch::load_latest(context, fixture.branch.into())

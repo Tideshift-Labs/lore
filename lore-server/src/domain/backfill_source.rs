@@ -172,7 +172,11 @@ impl CellBackfillSource {
     ) -> Self {
         Self {
             pool,
-            base: Arc::new(RepositoryContext::new_null_context(immutable, mutable)),
+            base: Arc::new(RepositoryContext::new_null_context(
+                immutable,
+                mutable,
+                lore_revision::state::no_link_traversal(),
+            )),
             facts: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }

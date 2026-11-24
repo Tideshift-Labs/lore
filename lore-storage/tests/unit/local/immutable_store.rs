@@ -1260,6 +1260,11 @@ async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
 /// asked for it through a renamed temporary file, with and without `sync_data`. Either way it leaves
 /// no temporary file, and the store reopens with every entry. The second flush is the one observed:
 /// the first commits the groups' level, which renames `.new` files whatever the options.
+///
+/// The fragments are durable and the store does not flush in the background, so it schedules no
+/// delayed flush and the test's flushes are the only writes. A delayed flush writes through a
+/// renamed temporary file, and one that wakes before the second flush would replace the files that
+/// flush is to write.
 #[tokio::test]
 async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
     use lore_storage::immutable_store::ImmutableStore;
@@ -1270,10 +1275,15 @@ async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
             let root = dir.path().join("immutable").join("index");
             let mut addresses = Vec::new();
             {
-                let store =
-                    LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
-                        .await
-                        .expect("store opens");
+                let store = LocalImmutableStore::new(
+                    Some(dir.path().to_path_buf()),
+                    ImmutableStoreSettings {
+                        flush_background: false,
+                        ..client_settings()
+                    },
+                )
+                .await
+                .expect("store opens");
                 let dyn_store: Arc<dyn ImmutableStore> = store.clone();
                 let mut before = None;
                 // Enough fragments per batch that the second lands in groups the first wrote.
@@ -1281,7 +1291,7 @@ async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
                     for seed in seeds {
                         let (address, payload) = payload_off_bucket_zero(seed);
                         let fragment = Fragment {
-                            flags: 0,
+                            flags: FragmentFlags::PayloadStoredDurable.bits(),
                             size_payload: payload.len() as u32,
                             size_content: payload.len() as u64,
                         };
@@ -6466,6 +6476,208 @@ async fn an_entry_stored_without_its_payload_is_not_reported_local() {
     .await
     .expect("query the entry");
     assert!(!resolved.stored_local);
+}
+
+/// A put without its payload over an entry holding the payload keeps the payload, and a put with
+/// the payload over an entry without one stores it, each keeping the entry durable: a read that
+/// records a fragment it fetched and a write that stores the same content land in either order.
+#[tokio::test]
+async fn a_put_without_its_payload_keeps_a_payload_stored_before_or_after_it() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let partition = Partition::from([0x73u8; 16]);
+    let payload = Bytes::from_static(b"content one read leaves an entry of and one write stores");
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x73u8; 16]),
+    };
+    for payload_first in [true, false] {
+        let dir = lore_base::test_util::TempDir::new("is_header_only_beside_store_");
+        let store: Arc<dyn ImmutableStore> =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+        let stored = store.clone().put(
+            partition,
+            address,
+            stored_fragment(&payload, FragmentFlags::PayloadStoredLocal),
+            Some(payload.clone()),
+            false,
+        );
+        let recorded = store.clone().put(
+            partition,
+            address,
+            stored_fragment(&payload, FragmentFlags::PayloadStoredDurable),
+            None,
+            false,
+        );
+        if payload_first {
+            stored.await.expect("the payload is stored");
+            recorded.await.expect("the fragment is recorded");
+        } else {
+            recorded.await.expect("the fragment is recorded");
+            stored.await.expect("the payload is stored");
+        }
+
+        let held = store
+            .clone()
+            .get(partition, address)
+            .await
+            .unwrap_or_else(|err| panic!("payload first: {payload_first}: {err}"));
+        let resolved = lore_storage::immutable_store::query_one(&store, partition, address)
+            .await
+            .expect("query the entry");
+        assert_eq!(
+            held.payload,
+            Some(payload.clone()),
+            "payload first: {payload_first}"
+        );
+        assert!(
+            resolved.stored_local && resolved.stored_durable,
+            "payload first: {payload_first}: {resolved:?}"
+        );
+    }
+}
+
+/// A header-only entry that lands while a put of the payload, which found no entry, writes the
+/// payload stays durable: the payload fills the entry in and keeps its durable mark.
+#[tokio::test]
+async fn a_header_only_entry_landing_during_a_payload_write_stays_durable() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_header_only_during_write_");
+    let store: Arc<dyn ImmutableStore> =
+        LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+            .await
+            .expect("store opens");
+    let partition = Partition::from([0x74u8; 16]);
+    let payload = Bytes::from_static(b"content one write stores as a read leaves its entry");
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x74u8; 16]),
+    };
+
+    let written = pause_at(PausePoint::Written);
+    let stored = {
+        let store = store.clone();
+        let payload = payload.clone();
+        lore_base::lore_spawn!(async move {
+            let fragment = stored_fragment(&payload, FragmentFlags::PayloadStoredLocal);
+            store
+                .put(partition, address, fragment, Some(payload), false)
+                .await
+        })
+    };
+    written.reached.notified().await;
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            stored_fragment(&payload, FragmentFlags::PayloadStoredDurable),
+            None,
+            false,
+        )
+        .await
+        .expect("the header-only entry");
+    written.resume.notify_one();
+    stored
+        .await
+        .expect("store task")
+        .expect("the payload is stored");
+
+    let held = store
+        .clone()
+        .get(partition, address)
+        .await
+        .expect("the payload is held");
+    let resolved = lore_storage::immutable_store::query_one(&store, partition, address)
+        .await
+        .expect("query the entry");
+    assert_eq!(held.payload, Some(payload));
+    assert!(
+        resolved.stored_local && resolved.stored_durable,
+        "{resolved:?}"
+    );
+}
+
+/// A put the store already holds as it would write it, as a read's write of content it holds,
+/// takes no write claim: the epoch stays where it was, inside a span and outside one, while a put
+/// that writes advances it.
+#[tokio::test]
+async fn a_put_that_changes_nothing_leaves_the_epoch_as_it_was() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_put_nothing_epoch_");
+    let store = LocalImmutableStore::new(Some(dir.to_path_buf()), quiet_settings())
+        .await
+        .unwrap();
+    let partition = Partition::from([0x75u8; 16]);
+    let payload = Bytes::from_static(b"content a read writes again");
+    let address = Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([0x75u8; 16]),
+    };
+    let held = stored_fragment(
+        &payload,
+        FragmentFlags::PayloadStoredLocal | FragmentFlags::PayloadStoredDurable,
+    );
+    let header_only = stored_fragment(&payload, FragmentFlags::PayloadStoredDurable);
+    store
+        .clone()
+        .put(partition, address, held, Some(payload.clone()), false)
+        .await
+        .expect("the payload is stored");
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
+
+    let epoch = dir.to_path_buf().join("immutable").join("epoch");
+    let before = std::fs::read(&epoch).ok();
+    {
+        let _span = store.clone().hold_for_command().await.unwrap();
+        store
+            .clone()
+            .put(partition, address, header_only, None, false)
+            .await
+            .expect("a put inside a span");
+    }
+    store
+        .clone()
+        .put(partition, address, header_only, None, false)
+        .await
+        .expect("a put outside a span");
+    store
+        .clone()
+        .put(partition, address, held, Some(payload.clone()), false)
+        .await
+        .expect("a put with the payload");
+    assert!(before.is_some(), "the first put advanced the epoch");
+    assert_eq!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "a put that changes nothing advanced the epoch"
+    );
+
+    let other = Bytes::from_static(b"content a write stores");
+    let other_address = Address {
+        hash: hash::hash_slice(&other),
+        ..address
+    };
+    store
+        .clone()
+        .put(
+            partition,
+            other_address,
+            stored_fragment(&other, FragmentFlags::PayloadStoredLocal),
+            Some(other),
+            false,
+        )
+        .await
+        .expect("a put of new content");
+    assert_ne!(
+        std::fs::read(&epoch).ok(),
+        before,
+        "a put that writes left the epoch"
+    );
 }
 
 /// The source forms `copy` accepts: an exact association, and any association a partition

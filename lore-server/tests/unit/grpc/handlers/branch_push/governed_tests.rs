@@ -383,6 +383,7 @@ async fn push_revision(
 ) -> Hash {
     lore_server::grpc::handlers::branch_push::push(
         repository.clone(),
+        None,
         branch,
         revision,
         crate::util::test_support::PUSH_ANY,
@@ -420,6 +421,7 @@ async fn local_repository_with_root(
         immutable_store,
         mutable_store,
         repository,
+        lore_revision::state::allow_all_repositories(),
     ));
     let root = Box::pin(LORE_CONTEXT.scope(execution.clone(), {
         let repository_ctx = repository_ctx.clone();
@@ -578,6 +580,7 @@ async fn enforce_fenced_locks_blocks_a_push_touching_the_locked_old_path_of_a_re
         immutable_store,
         mutable_store,
         repository,
+        lore_revision::state::allow_all_repositories(),
     ));
 
     // Same non-zero node context at both paths is what folds an add+delete
@@ -949,7 +952,12 @@ async fn local_repository_context() -> RepositoryContext {
         crate::store::test_support::test_store_create()
             .await
             .expect("create local test stores");
-    RepositoryContext::new_server_context(immutable_store, mutable_store, random::<RepositoryId>())
+    RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        random::<RepositoryId>(),
+        lore_revision::state::allow_all_repositories(),
+    )
 }
 
 #[tokio::test]
@@ -1235,6 +1243,7 @@ async fn idempotent_no_op_branch_surfaces_a_lost_cas_as_aborted_with_no_retry() 
             // which calls `publish(current_head, current_head)`.
             lore_server::grpc::handlers::branch_push::push_with_governance(
                 repository_ctx,
+                None,
                 branch_id,
                 tip,
                 crate::util::test_support::PUSH_ANY,
@@ -1290,6 +1299,7 @@ async fn advancing_branch_surfaces_a_lost_cas_as_aborted_with_no_retry() {
             // loop, which calls `publish` at the publication boundary.
             lore_server::grpc::handlers::branch_push::push_with_governance(
                 repository_ctx,
+                None,
                 branch_id,
                 next,
                 crate::util::test_support::PUSH_ANY,
@@ -1329,6 +1339,7 @@ async fn ungoverned_push_is_unchanged_by_governance() {
         async move {
             let no_op = lore_server::grpc::handlers::branch_push::push_with_governance(
                 repository_ctx.clone(),
+                None,
                 branch_id,
                 tip,
                 crate::util::test_support::PUSH_ANY,
@@ -1347,6 +1358,7 @@ async fn ungoverned_push_is_unchanged_by_governance() {
             let next = serialize_file_revision(&repository_ctx, tip, 2, "hero.uasset").await;
             let advancing = lore_server::grpc::handlers::branch_push::push_with_governance(
                 repository_ctx,
+                None,
                 branch_id,
                 next,
                 crate::util::test_support::PUSH_ANY,
@@ -1528,6 +1540,7 @@ async fn local_repository_with_zero_head(
         immutable_store.clone(),
         mutable_store.clone(),
         repository,
+        lore_revision::state::allow_all_repositories(),
     ));
     Box::pin(LORE_CONTEXT.scope(execution.clone(), {
         let repository_ctx = repository_ctx.clone();
@@ -1748,6 +1761,7 @@ async fn committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_
         request,
         crate::grpc::push_protected::allow_all(),
         immutable_store.clone(),
+        None,
         mutable_store.clone(),
         notification_sender.clone(),
         &hooks,
@@ -1814,6 +1828,7 @@ async fn committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_
         repeat_request,
         crate::grpc::push_protected::allow_all(),
         immutable_store,
+        None,
         mutable_store,
         notification_sender,
         &hooks,
@@ -1917,6 +1932,7 @@ async fn hint_sender_queue_exhaustion_does_not_change_a_committed_governed_pushs
         request,
         crate::grpc::push_protected::allow_all(),
         immutable_store,
+        None,
         mutable_store,
         notification,
         &HookDispatcher::empty(),

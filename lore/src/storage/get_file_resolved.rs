@@ -17,7 +17,8 @@
 //! - `offset` past the end of the content → `INVALID_ARGUMENTS`, with `path` left untouched.
 //! - a file write failure reports its own error, `INTERNAL` where the filesystem gave no code.
 //!
-//! Ranges and temp-file staging behave as in `lore_storage_get_file`. Only the terminal
+//! Ranges, temporary files and the resume from one behave as in `lore_storage_get_file`, matched
+//! on the resolved address, and a path takes one get at a time, as there. Only the terminal
 //! `GET_ITEM_COMPLETE` is emitted, and its `address` is the *resolved* address, so a caller still
 //! learns the key-to-hash mapping.
 //!
@@ -33,6 +34,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreString;
@@ -47,7 +49,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::offset_past_end;
 use crate::storage::store::StoreInternal;
 
@@ -67,8 +68,8 @@ pub struct LoreStorageGetFileResolvedItem {
     /// Paired with the resolved hash to address the immutable read; the mutable store yields only
     /// a hash
     pub context: Context,
-    /// Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes stage via
-    /// `<path>.loretmp` then atomically rename
+    /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+    /// Multi-fragment writes go through `<path>.loretmp`, renamed into place atomically
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content. Past the
     /// end of the content rejects with `INVALID_ARGUMENTS`
@@ -76,8 +77,11 @@ pub struct LoreStorageGetFileResolvedItem {
     /// Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
     /// requested range starting at its own first byte, and is sized to it
     pub length: u64,
-    /// Cache fetched fragments and the mapping back to the local store, not just write the content
-    /// to `path`
+    /// Cache fetched fragments and the mapping in the local store, not just write the content to
+    /// `path`, as fragments written with `PayloadLocalCachePriority`, and those of revision state,
+    /// always are. A fetched fragment that is not cached is still written to the local store as an
+    /// entry without its payload, so a put of the same content uploads nothing. Either is marked
+    /// stored durable
     pub local_cache: u8,
 }
 
@@ -106,12 +110,12 @@ pub struct LoreStorageGetFileResolvedArgs {
 }
 
 /// Resolve one or more mutable keys and write the content they name to filesystem paths.
-pub async fn get_file_resolved(
+pub fn get_file_resolved(
     globals: LoreGlobalArgs,
     args: LoreStorageGetFileResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_file_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_file_resolved_local)
 }
 
 async fn get_file_resolved_local(
@@ -155,7 +159,7 @@ async fn get_file_resolved_item(
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result
@@ -194,7 +198,10 @@ async fn resolve_get_file_resolved_item(
         );
     }
 
-    let mut read_options = effective.read_options(remote_session.is_some());
+    let mut read_options = effective
+        .read_options(remote_session.is_some())
+        .resuming_write()
+        .sparse_writing();
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }

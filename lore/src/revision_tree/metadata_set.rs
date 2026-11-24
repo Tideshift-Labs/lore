@@ -171,7 +171,7 @@ fn plan_entries(
 
         let (value, value_type) = entry.value.to_stored();
 
-        if !Metadata::can_hold(entry.key.as_str(), &value) {
+        if !Metadata::can_hold([(entry.key.as_str(), value.as_ref())]) {
             return Err(reject(
                 entry_id,
                 index,
@@ -206,7 +206,7 @@ fn apply_plan(
     for item in planned {
         let key = entries[item.entry_index].key.as_str();
         match pending.set_typed(key, &item.value, item.value_type) {
-            Ok(()) => emit_set_complete(item.entry_id, LoreErrorCode::None),
+            Ok(_) => emit_set_complete(item.entry_id, LoreErrorCode::None),
             Err(error) => {
                 emit_set_complete(item.entry_id, LoreErrorCode::Internal);
                 return Err(MetadataSetError::internal_with_context(
@@ -282,12 +282,12 @@ fn apply_plan(
 /// The handle is claimed even though this edits no tree: that pending buffer is
 /// what a commit clones and then empties, so an edit landing inside a commit would
 /// be recorded and dropped without ever reaching a revision.
-pub async fn metadata_set(
+pub fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, metadata_set_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, metadata_set_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

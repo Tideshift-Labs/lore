@@ -91,10 +91,9 @@ fn hex_to_array<const N: usize>(hex: &str, field: &str) -> [u8; N] {
 }
 
 fn parse_system_time(s: &str) -> SystemTime {
-    let dt = chrono::DateTime::parse_from_rfc3339(s)
+    let millis = lore_base::timestamp::parse_rfc3339_millis(s)
         .unwrap_or_else(|e| panic!("fixture timestamp {s:?} must be RFC 3339: {e}"));
-    UNIX_EPOCH
-        + Duration::from_millis(u64::try_from(dt.timestamp_millis()).expect("positive epoch"))
+    UNIX_EPOCH + Duration::from_millis(u64::try_from(millis).expect("positive epoch"))
 }
 
 fn repository_from_hex(hex: &str) -> RepositoryId {

@@ -330,6 +330,7 @@ impl ProbeFactory {
                         inflight_limit: 800,
                         handler_timeout: None,
                         permit_timeout: None,
+                        slow_send_threshold: None,
                     },
                 )) as Box<dyn StreamDataHandler>
             }),
@@ -413,7 +414,7 @@ pub(crate) async fn start_grpc_backend(
             GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(immutable.clone(), immutable)
+                .with_immutable_store(immutable.clone(), immutable, None)
                 .with_mutable_store(mutable)
                 .with_lock_store(None)
                 .with_domain_context(None)

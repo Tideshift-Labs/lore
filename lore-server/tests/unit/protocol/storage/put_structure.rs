@@ -141,6 +141,7 @@ impl Fixture {
             self.store.clone(),
             self.mutable_store.clone(),
             self.repository,
+            lore_revision::state::allow_all_repositories(),
         ))
     }
 }
@@ -195,6 +196,7 @@ async fn verify_push(
         let state = state_with_files(&repository, files).await;
         verify_fragments(
             repository,
+            None,
             parent,
             None,
             state,
@@ -571,6 +573,7 @@ mod push_verification {
             .await;
             verify_fragments(
                 repository,
+                None,
                 parent,
                 None,
                 state,

@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 mod established_decisions;
 mod managed_uploads;
+mod remote_query;
 mod unmanaged_gate;
 
 use std::path::PathBuf;
@@ -2657,7 +2658,7 @@ mod copy_association {
     use lore_storage::write_stats::FragmentWriteCounts;
     use lore_storage::write_stats::FragmentWriteStats;
     use lore_transport::ProtocolError;
-    use lore_transport::test_util::CopyingPeer;
+    use lore_transport::test_util::StubPeer;
 
     use super::*;
 
@@ -2680,7 +2681,7 @@ mod copy_association {
         refusal: Option<ProtocolError>,
     ) -> Written {
         let (_dir, store) = make_test_store().await;
-        let peer = CopyingPeer::new(slow_downs, refusal);
+        let peer = Arc::new(StubPeer::default().with_copy_answers(slow_downs, refusal));
         let session = Arc::new(peer.session(partition));
         let (partition, held, fragment, buffer) = make_input_in(partition, seed);
         store_fragment(
@@ -2808,7 +2809,7 @@ mod remote_copy_retry {
     use lore_storage::CopyOutcome;
     use lore_storage::remote_copy_retry;
     use lore_transport::ProtocolError;
-    use lore_transport::test_util::CopyingPeer;
+    use lore_transport::test_util::StubPeer;
 
     use super::*;
 
@@ -2833,7 +2834,7 @@ mod remote_copy_retry {
         slow_downs: usize,
         refusal: Option<ProtocolError>,
     ) -> (Result<CopyOutcome, ProtocolError>, usize) {
-        let peer = CopyingPeer::new(slow_downs, refusal);
+        let peer = Arc::new(StubPeer::default().with_copy_answers(slow_downs, refusal));
         let session = peer.session(own());
         let outcome =
             remote_copy_retry(&session, partition, source(), Context::from([0xE4; 16])).await;

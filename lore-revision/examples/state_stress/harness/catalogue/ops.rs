@@ -60,6 +60,7 @@ use lore_storage::hash::hash_string;
 
 use super::Kind;
 use super::call::Answer;
+use super::call::Failed;
 use super::call::Filter;
 use super::call::Leaves;
 use super::call::Lookup;
@@ -149,25 +150,16 @@ fn naming(dir: NodeID, name: &str) -> On {
 }
 
 /// The outcome of `error`, one a run can provoke: self-reported where the State asked its caller
-/// to slow down or a name table had no room, otherwise a failure, which only a failed read makes
-/// legal.
+/// to slow down, or refused a name as `Oversized`, a name table with no room for it or a name over
+/// `MAX_NODE_NAME_LEN`; otherwise a failure, which only a failed read makes legal.
 pub(crate) fn failed(error: &StateError) -> Outcome {
     if error.is_slow_down() {
-        return Outcome::SelfReported(SelfReported::SlowDown);
-    }
-    let text = error.to_string();
-    if names_full(&text) {
-        Outcome::SelfReported(SelfReported::NameTableFull)
+        Outcome::SelfReported(SelfReported::SlowDown)
+    } else if error.is_oversized() {
+        Outcome::SelfReported(SelfReported::Oversized)
     } else {
-        Outcome::Failed(text)
+        Outcome::Failed(Failed::of(error))
     }
-}
-
-/// Whether an error's `text` says a name table had no room: as the name store answers a table it
-/// cannot grow (state/block.rs, `node_name_store`), or the staged move one it found full before its
-/// marks (relocate.rs, `node_move_staged`).
-fn names_full(text: &str) -> bool {
-    text.contains("node name store would grow") || text.contains("name table has no room")
 }
 
 /// The outcome of a change answering done or `error`.
@@ -247,7 +239,10 @@ fn attach_answered(
         // Only a resident attach answers `None`.
         Ok(None) => (
             None,
-            Outcome::Failed("a fetching attach answered no node".into()),
+            Outcome::Failed(Failed {
+                text: "a fetching attach answered no node".into(),
+                read: None,
+            }),
         ),
         Err(error) => (None, gone_or_failed(&error)),
     }
@@ -1144,6 +1139,20 @@ pub async fn reattached_since(tree: &Tree, marked: &Marked) -> bool {
         async {
             let reattached = marked.mark.reattached();
             (reattached, Outcome::Answer(Answer::Reattached(reattached)))
+        },
+    )
+    .await
+}
+
+/// Whether `marked` found its directory's chain changed since only by the prepends its holder
+/// counted in it, as the stage asks before it searches since a mark (`claim_from_listing`).
+pub async fn unchanged_since(tree: &Tree, marked: &Marked) -> bool {
+    call_on(
+        &tree.state,
+        (&super::UNCHANGED_SINCE, marked.on(None)),
+        async {
+            let unchanged = marked.mark.unchanged(&tree.state);
+            (unchanged, Outcome::Answer(Answer::Unchanged(unchanged)))
         },
     )
     .await
@@ -2272,10 +2281,10 @@ pub async fn dirty_add(
 }
 
 /// The most entries a stage's claims in a directory take, within the 31 claims past its answer's
-/// the model watches: two its listing's, three an entry's at most, a stale search, its find through
-/// the chain and a reattach read, or two, a search answering none and its mark's head kept, and one
-/// node taken where the claims stop.
-const MOST_ENTRIES: usize = 9;
+/// the model watches: two its listing's, four an entry's at most, its mark's unchanged read, a
+/// stale search, its find through the chain and a reattach read, or three, its unchanged read, a
+/// search answering none and its mark's head kept, and one node taken where the claims stop.
+const MOST_ENTRIES: usize = 7;
 
 /// What the stage's claims in a directory came to ([`stage_claim`]): what its listing held, in
 /// sibling order; each entry's node, in order, claimed from its listing, found since its mark or
@@ -2290,18 +2299,19 @@ pub struct Claimed {
 
 /// The stage's listing of directory `dir` and its claims of `entries`, each a name and whether it
 /// names a file, as `stage_directory` (stage.rs) makes them for the directory's entries on disk:
-/// the listing marked; each entry claimed from it or searched for since its mark (`claim_child`),
-/// each read noted; an entry the directory holds none of added clean and marked staged and dirty
-/// added, forced, with its ancestors (`stage_node_from_metadata`), counted in the mark once marked.
-/// One call, beside nothing that frees a published slot while its mark lives (the mark's
-/// precondition), which nothing drops, as `lore stage` runs under `block_on_command`. Scheduling
-/// points follow the listing, as the stage reads the directory on disk there, and each entry
-/// claimed, as the stage reads an existing node's block there (`Point::StageWindow`). The entries
-/// are the scenarios' own: distinct names, none reserved, [`MOST_ENTRIES`] at most. Names sharing
-/// a hash reach the claims, as the stage's default case mode leaves them; beyond the product, the
-/// claims go on past a second claim of a hash answering a node spelled otherwise, where that mode
-/// stops with an error. What it claimed; `None` where a step failed, the directory was gone, or a
-/// node it added was taken.
+/// the listing marked; each entry claimed from it, answered from it where its mark found the chain
+/// unchanged but for the claims' own adds, or searched for since its mark (`claim_from_listing`,
+/// `claim_child`), each read noted; an entry the directory holds none of added clean and marked
+/// staged and dirty added, forced, with its ancestors (`stage_node_from_metadata`), counted in the
+/// mark once marked. One call, beside nothing that frees a published slot while its mark lives
+/// (the mark's precondition), which nothing drops, as `lore stage` runs under `block_on_command`.
+/// Scheduling points follow the listing, as the stage reads the directory on disk there, and each
+/// entry claimed, as the stage reads an existing node's block there (`Point::StageWindow`). The
+/// entries are the scenarios' own: distinct names, none reserved, [`MOST_ENTRIES`] at most. Names
+/// sharing a hash reach the claims, as the stage's default case mode leaves them; beyond the
+/// product, the claims go on past a second claim of a hash answering a node spelled otherwise,
+/// where that mode stops with an error. What it claimed; `None` where a step failed, the
+/// directory was gone, or a node it added was taken.
 pub async fn stage_claim(tree: &Tree, dir: NodeID, entries: &[(&str, bool)]) -> Option<Claimed> {
     stage_claim_windowed(tree, dir, entries, async {}, |_, _| async {}).await
 }
@@ -2365,7 +2375,8 @@ pub async fn stage_claim_windowed<F: Future<Output = ()>>(
 /// entries: what it claimed, or the outcome of the step that stopped it, as the stage stops at an
 /// entry's error. Its directory gone, or a node it added taken
 /// before its mark, once an add of its own landed, the add stands: the directory or the node
-/// noted taken, the call done.
+/// noted taken, the call done; as it does where an entry's name is refused as `Oversized`
+/// ([`after_adds`]).
 async fn claims_in<F: Future<Output = ()>>(
     tree: &Tree,
     dir: NodeID,
@@ -2401,10 +2412,12 @@ async fn claims_in<F: Future<Output = ()>>(
         prepends: 0,
     };
     let mut children = DirectoryChildren::new(listed, None);
+    let distinct = distinct_names(entries);
     window(state, between).await;
     let (mut nodes, mut landed) = (Vec::with_capacity(entries.len()), false);
     for (index, &(name, is_file)) in entries.iter().enumerate() {
-        let claimed = claim_child(tree, &mut children, &marked, hash_string(name)).await;
+        let claimed =
+            claim_child(tree, &mut children, (&marked, distinct), hash_string(name)).await;
         if let Some(claimed) = after_adds(claimed, landed)? {
             hooks::reached(Point::StageWindow).await;
             nodes.push(claimed);
@@ -2443,36 +2456,64 @@ async fn claims_in<F: Future<Output = ()>>(
     })
 }
 
-/// `step`'s answer in a stage's claims, passed on; panics where it self-reported once an add of the
+/// `step`'s answer in a stage's claims, passed on but where it self-reported once an add of the
 /// claims' own `landed`, as the model takes a call's self-report for one that changed nothing, the
-/// add another step's. No run reaches one: a `SlowDown` needs the chain to change at every attempt
-/// the product's retry bound allows, and no scenario fills a name table beside the kind.
+/// add another step's. A name refused as `Oversized` there stops the claims done, the adds
+/// standing, as a directory gone does; any other self-report there panics. No run reaches one: a
+/// `SlowDown` needs the chain to change at every attempt the product's retry bound allows.
 fn after_adds<T>(step: Result<T, Outcome>, landed: bool) -> Result<T, Outcome> {
-    if landed && let Err(Outcome::SelfReported(reported)) = &step {
-        panic!(
+    match step {
+        Err(Outcome::SelfReported(SelfReported::Oversized)) if landed => {
+            Err(Outcome::Done(Answer::None))
+        }
+        Err(Outcome::SelfReported(reported)) if landed => panic!(
             "a stage's claims self-reported {reported:?} after an add of their own landed, which \
              the model would take for a change of the self-reporting step's"
-        );
+        ),
+        step => step,
     }
-    step
 }
 
-/// The child of `marked`'s directory `name_hash` belongs to, as `claim_child` (stage.rs) answers,
-/// each read by the mark noted with the prepends counted in it: the listed child carrying it that
-/// nothing claimed yet; else a search since the mark, a stale one followed by a find through the
-/// whole chain, then, for a node either found, the mark's reattach read, a reattach claiming the
-/// node in the listing too; else the listed child carrying it, claimed or not. None where the
-/// directory holds none; the outcome of a read that failed.
+/// Whether no two of `entries` carry one name hash, as the stage asks of a directory's entries
+/// once its own adds changed the chain (`DirectoryChildren::entries_distinct`).
+fn distinct_names(entries: &[(&str, bool)]) -> bool {
+    let mut hashes: Vec<u64> = entries.iter().map(|&(name, _)| hash_string(name)).collect();
+    hashes.sort_unstable();
+    hashes.windows(2).all(|pair| pair[0] != pair[1])
+}
+
+/// The child of `marked`'s directory `name_hash` belongs to, as `claim_from_listing` and
+/// `claim_child` (stage.rs) answer, each read by the mark noted with the prepends counted in it:
+/// the listed child carrying it that nothing claimed yet; else the mark's unchanged read, and,
+/// where it found the chain changed only by the claims' own prepends, of which there were none
+/// or the entries carry distinct name hashes (`distinct`), the listed child carrying it, claimed
+/// or not; else a search since the mark, a stale one followed by a find through the whole chain,
+/// then, for a node either found, the mark's reattach read, a reattach claiming the node in the
+/// listing too; else the listed child carrying it, claimed or not. None where the directory holds
+/// none; the outcome of a read that failed.
 async fn claim_child(
     tree: &Tree,
     children: &mut DirectoryChildren,
-    marked: &Marked,
+    (marked, distinct): (&Marked, bool),
     name_hash: u64,
 ) -> Result<Option<NodeID>, Outcome> {
-    if let Some(node) = children.claim(name_hash) {
+    if let Some((node, _)) = children.claim(name_hash) {
         return Ok(Some(node));
     }
     let (state, dir, prepends) = (&tree.state, marked.dir, marked.prepends);
+    let from = state.hooks().seq_now();
+    let unchanged = marked.mark.unchanged(state);
+    let read = Lookup::Unchanged {
+        dir,
+        unchanged,
+        prepends,
+        from,
+        to: state.hooks().seq_now(),
+    };
+    looked_up(state, read);
+    if unchanged && (prepends == 0 || distinct) {
+        return Ok(children.holds(name_hash));
+    }
     let from = state.hooks().seq_now();
     let searched = (state
         .find_subnode_added_since(tree.repository.clone(), &marked.mark, name_hash)
@@ -2931,10 +2972,7 @@ pub async fn staged_move_planned(
                 )
                 .await;
             let outcome = match moved {
-                // But a name table with no room, self-reported.
-                Err(error) if error.is_invalid_arguments() && !names_full(&error.to_string()) => {
-                    Outcome::Refused(Refusal::Move)
-                }
+                Err(error) if error.is_invalid_arguments() => Outcome::Refused(Refusal::Move),
                 moved => done_or_failed(moved),
             };
             ((), outcome)

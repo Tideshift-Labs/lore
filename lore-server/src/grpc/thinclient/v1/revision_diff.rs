@@ -19,6 +19,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::DiffItem;
+use lore_revision::revision::LinkSettlement;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
@@ -77,7 +78,9 @@ pub struct RevisionDiffConfig {
     /// `BranchError::Oversized` before target's walk runs.
     pub source_cap: usize,
     /// Permit count for the parallel history-walk semaphore inside
-    /// `revision::diff3_with_source_cap`. `None` falls back to
+    /// `revision::diff3_with_source_cap`, and for the revision
+    /// comparisons of its walks of the history lines for deleted paths.
+    /// `None` falls back to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`.
     pub history_walk_concurrency: Option<usize>,
 }
@@ -138,10 +141,12 @@ pub async fn handler(
     let autoresolve = req.autoresolve;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-    let repository = Arc::new(
-        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(can_read),
-    );
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        repository_id,
+        can_read,
+    ));
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -530,6 +535,7 @@ async fn run_three_way(
             config.history_walk_concurrency,
             // The display diff reports every changed path individually.
             None,
+            LinkSettlement::Tree,
             producer_tx,
         ))
         .await

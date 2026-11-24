@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::fs::File;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -155,6 +156,120 @@ impl std::fmt::Debug for IoFile {
     }
 }
 
+/// What an attempt at the exclusive lock of a file came to ([`IoFile::try_lock`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockAttempt {
+    /// The handle holds the lock.
+    Acquired,
+    /// Another handle holds the lock.
+    Busy,
+    /// The file system refuses advisory locks.
+    Unsupported,
+}
+
+/// Whether an attempt at a lock failed because the file system refuses advisory locks, as one
+/// without lock support or a network mount without a lock service answers: `ENOLCK`, `ENOTSUP`,
+/// `EOPNOTSUPP` or `ENOSYS` on Unix, `ERROR_NOT_SUPPORTED` or `ERROR_INVALID_FUNCTION` on Windows,
+/// or [`std::io::ErrorKind::Unsupported`]. Another holder having the lock is not one.
+pub fn lock_refused(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(target_family = "windows")]
+    let refusals = [
+        windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED as i32,
+        windows_sys::Win32::Foundation::ERROR_INVALID_FUNCTION as i32,
+    ];
+    #[cfg(not(target_family = "windows"))]
+    let refusals = [libc::ENOLCK, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS];
+    err.raw_os_error()
+        .is_some_and(|code| refusals.contains(&code))
+}
+
+/// One attempt at the exclusive lock of `file`: `true` where it took the lock, `false` where
+/// another handle holds it.
+#[cfg(not(target_family = "windows"))]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(err)) => Err(err),
+    }
+}
+
+/// One attempt at the exclusive lock of `file`, an overlapped handle: `true` where it took the
+/// lock, `false` where another handle holds it. See [`IoFile::try_lock`].
+#[cfg(target_family = "windows")]
+fn try_lock_file(file: &File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::LOCKFILE_EXCLUSIVE_LOCK;
+    use windows_sys::Win32::Storage::FileSystem::LOCKFILE_FAIL_IMMEDIATELY;
+    use windows_sys::Win32::Storage::FileSystem::LockFileEx;
+    use windows_sys::Win32::System::IO::GetOverlappedResult;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    /// The event an attempt waits on, closed once the attempt is done with it.
+    struct Event(HANDLE);
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            // SAFETY: the handle is the event this attempt created, and nothing uses it after.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    let refused = |err: std::io::Error| {
+        if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Ok(false)
+        } else {
+            Err(err)
+        }
+    };
+
+    // SAFETY: creates an unnamed, manual-reset event, not signalled, with default security.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    let event = Event(event);
+    let handle = file.as_raw_handle();
+    // SAFETY: an all-zero `OVERLAPPED` is valid, and its zero offset starts the lock at the file's
+    // first byte.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    overlapped.hEvent = event.0.map_addr(|address| address | 1);
+    // SAFETY: the handle is open, and `overlapped` and the event outlive the call, which the wait
+    // below ends before either goes for a call left pending.
+    let locked = unsafe {
+        LockFileEx(
+            handle,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+        return refused(err);
+    }
+    let mut transferred = 0u32;
+    // SAFETY: waits for the call pending on `overlapped`, which lives until it returns.
+    if unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, 1) } != 0 {
+        return Ok(true);
+    }
+    refused(std::io::Error::last_os_error())
+}
+
 impl IoFile {
     pub(crate) fn new(driver: IoDriver, file: Arc<File>) -> IoFile {
         IoFile { driver, file }
@@ -295,13 +410,128 @@ impl IoFile {
         self.driver.file_metadata_raw(Arc::clone(&self.file)).await
     }
 
+    /// Whether `path` names the file this handle has open, as
+    /// [`IoDriver::names_one_entry`](crate::IoDriver::names_one_entry) tells one entry: `false`
+    /// where it names another file, the file having been renamed or replaced, or nothing.
+    pub async fn is_at(&self, path: impl Into<PathBuf>) -> std::io::Result<bool> {
+        self.driver
+            .is_at_raw(Arc::clone(&self.file), path.into())
+            .await
+    }
+
+    /// Takes the exclusive lock of the file this handle has open where no other handle holds it,
+    /// without waiting: [`LockAttempt::Busy`] while another handle does, and
+    /// [`LockAttempt::Unsupported`] where the file system refuses advisory locks ([`lock_refused`]).
+    /// The lock is held until the last clone of this handle is dropped and every operation issued
+    /// through one has ended. It is advisory on Unix, and on Windows covers the whole file, so
+    /// other handles can neither read nor write it. The attempt runs on the calling thread, so on a
+    /// network file system it may block that thread for as long as the server takes to answer.
+    ///
+    /// On Windows the attempt is a `LockFileEx` of its own rather than `std`'s, which hands an
+    /// overlapped handle a stack `OVERLAPPED` it may return before the kernel is done with: it
+    /// waits on an event of its own whose low-order bit is set, so that no completion of it reaches
+    /// an `iocp` port, and waits for an attempt left pending.
+    pub fn try_lock(&self) -> std::io::Result<LockAttempt> {
+        match try_lock_file(&self.file) {
+            Ok(true) => Ok(LockAttempt::Acquired),
+            Ok(false) => Ok(LockAttempt::Busy),
+            Err(err) if lock_refused(&err) => Ok(LockAttempt::Unsupported),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Sets the file length, extending it with a hole that reads as zeros or truncating it.
     ///
     /// `completion` is dropped once the length is set, whether or not the call is still awaited,
     /// as [`crate::IoDriver::write_file_segments_atomic`] drops its own.
     pub async fn set_len<C: Send + 'static>(&self, len: u64, completion: C) -> std::io::Result<()> {
         self.driver
-            .set_len_raw(Arc::clone(&self.file), len, completion)
+            .set_len_raw(Arc::clone(&self.file), len, false, completion)
             .await
+    }
+
+    /// Sets the file length as [`Self::set_len`] does, with the file made sparse first, so a range
+    /// of it never written holds no storage: on Windows `FSCTL_SET_SPARSE`. Where the marking
+    /// fails, as on a file system without sparse files, the file is sized all the same and is not
+    /// sparse, its unwritten ranges held as zeros, which read the same. Elsewhere a range never
+    /// written holds no storage already. Both run in one job on the syscall pool.
+    pub async fn set_len_sparse(&self, len: u64) -> std::io::Result<()> {
+        self.driver
+            .set_len_raw(Arc::clone(&self.file), len, true, ())
+            .await
+    }
+
+    /// Empties the file and sizes it to `len`, made sparse as [`Self::set_len_sparse`] makes it, so
+    /// every range of it is a hole that reads as zeros, whatever it held. On Windows the file is
+    /// deallocated whole first, as NTFS is observed, not documented, to keep a file's allocation
+    /// through a truncation while a handle to it is open, and version 3.14 of the Resilient File
+    /// System to record the ranges a sparse file held past a truncation as allocated again once it
+    /// grows, through any handle, unless its data was written out first. All of it runs in one job
+    /// on the syscall pool, which starts when this is called, as for [`Self::next_data`].
+    pub fn empty(&self, len: u64) -> impl Future<Output = std::io::Result<()>> + use<> {
+        IoDriver::empty_raw(Arc::clone(&self.file), len)
+    }
+
+    /// The first range at or after `offset` the file system holds data for, ending where the next
+    /// hole begins: `None` when only holes follow `offset`, or `offset` is at or past the end. A
+    /// hole is a range holding no written data: mapped to no storage, or allocated and never
+    /// written (an unwritten extent). It reads as zeros, but zeros written to the file are data
+    /// where the file system holds them as written.
+    /// On Linux the map comes from `FIEMAP`, with the file synced first, and a range is widened to
+    /// whole blocks of the file system, so it may end past the end of the file. On the other
+    /// platforms but Windows, and on a Linux file system without `FIEMAP`, it comes from
+    /// `SEEK_DATA`, which takes an unwritten extent the page cache holds pages for as data. On
+    /// Apple platforms, where the file system holds holes, the walk writes the file's data out
+    /// before its first lookup, as APFS allocates the small holes beside data it writes out. On
+    /// Windows, on NTFS, everything at or past the file's valid data length, from
+    /// `FSCTL_QUERY_FILE_REGIONS` with the file's data flushed first, was never written and is a
+    /// hole; on any other file system the allocation alone decides. Below it a range is an
+    /// allocated range of a sparse file, from `FSCTL_QUERY_ALLOCATED_RANGES`, and a file that is
+    /// not sparse is data whole. Where the valid data length cannot be read, the allocation alone
+    /// decides. Where the file cannot be flushed, or its data may be held elsewhere until it is
+    /// read, as for a cloud placeholder or an offline file, it is data whole. Where the platform
+    /// reports no holes, everything from `offset` to the end is one range of data.
+    ///
+    /// `cursor` is what one walk of the file keeps between calls ([`crate::DataCursor`]): a new one
+    /// for the first call of a walk, then the one each call hands back with its answer.
+    ///
+    /// The lookup starts when this is called, and is not an `async fn`, so a future awaiting it
+    /// holds the pool's task alone.
+    pub fn next_data(
+        &self,
+        offset: u64,
+        cursor: crate::DataCursor,
+    ) -> impl Future<
+        Output = (
+            std::io::Result<Option<std::ops::Range<u64>>>,
+            crate::DataCursor,
+        ),
+    > + use<> {
+        IoDriver::next_data_raw(Arc::clone(&self.file), offset, cursor)
+    }
+
+    /// Writes the file's data out, then deallocates the whole blocks of the file system in each of
+    /// `holes`, so that each holds no storage and reads as zeros; APFS keeps a small hole beside
+    /// data only where it is deallocated after the data is written out. A part of a hole in a block
+    /// it shares with data stays as it is, and a hole that ends the file takes its last block
+    /// whole. Does nothing where the file system holds no holes ([`Self::holds_holes`]), and fails
+    /// where it holds them and refuses to deallocate one.
+    ///
+    /// The call starts when this is called, as [`Self::next_data`] does.
+    #[cfg(target_vendor = "apple")]
+    pub fn punch_holes(
+        &self,
+        holes: Vec<std::ops::Range<u64>>,
+    ) -> impl Future<Output = std::io::Result<()>> + use<> {
+        IoDriver::punch_holes_raw(Arc::clone(&self.file), holes)
+    }
+
+    /// Whether the file system of this file holds holes: its smallest hole, `_PC_MIN_HOLE_SIZE`, is
+    /// above zero. [`Self::punch_holes`] deallocates nothing where it is not.
+    ///
+    /// The call starts when this is called, as [`Self::next_data`] does.
+    #[cfg(target_vendor = "apple")]
+    pub fn holds_holes(&self) -> impl Future<Output = bool> + use<> {
+        IoDriver::holds_holes_raw(Arc::clone(&self.file))
     }
 }

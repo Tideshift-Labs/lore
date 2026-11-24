@@ -51,6 +51,7 @@ async fn client_with_session(peer: &Peer) -> (Arc<StorageClient>, u32) {
         partition(),
         &Arc::new(SuppliedCredentials::default()),
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect to the scripted peer");

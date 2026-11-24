@@ -373,33 +373,25 @@ impl From<&str> for LoreString {
 
 impl From<Option<String>> for LoreString {
     fn from(value: Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&String>> for LoreString {
     fn from(value: Option<&String>) -> Self {
-        value
-            .map(|value| LoreString::from_str(value.as_str()))
-            .unwrap_or_default()
+        value.map_or_default(|value| LoreString::from_str(value.as_str()))
     }
 }
 
 impl From<&Option<String>> for LoreString {
     fn from(value: &Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map_or_default(LoreString::from_str)
     }
 }
 
 impl From<Option<&str>> for LoreString {
     fn from(value: Option<&str>) -> Self {
-        value.map(LoreString::from_str).unwrap_or_default()
+        value.map_or_default(LoreString::from_str)
     }
 }
 
@@ -730,11 +722,14 @@ pub struct LoreGlobalArgs {
     /// How much an operation reports about what it cost.
     ///
     /// - `0` — no statistics event, and no per-fragment counters kept for one.
-    /// - `1` — one statistics event when the operation finishes: per-action file
-    ///   counts, and the fragment, local-store and remote-store totals.
+    /// - `1` — one statistics event when the operation finishes: a commit reports
+    ///   per-action file counts and the fragment, local-store and remote-store
+    ///   totals, a storage put or upload call its item counts and the same totals,
+    ///   and a push the fragments it deduplicated, copied and put.
     /// - `2` — also a `FragmentWrite` event per stored fragment, which describes
     ///   the shape of what was written rather than its sums. One event per
-    ///   fragment is the cost of this level.
+    ///   fragment is the cost of this level. A storage put or upload call sends
+    ///   none, so this level reports for it what level `1` does.
     ///
     /// A level above the highest known behaves as the highest known.
     pub stats: u32,
@@ -1158,35 +1153,33 @@ impl ExecutionContext {
     }
 
     /// This context for a holder that serves past the call that made it, a mounted filesystem,
-    /// for a caller with `environment`: these globals and this mode, and a dispatcher that sends
+    /// for a caller with `environment` under `globals`: this mode, and a dispatcher that sends
     /// nowhere, as no call awaits what the holder logs.
-    #[cfg(target_os = "linux")]
     #[lore_macro::test_pub]
-    pub(crate) fn serving(&self, environment: CallEnvironment) -> Self {
+    pub(crate) fn serving(
+        &self,
+        globals: LoreGlobalArgs,
+        environment: Option<CallEnvironment>,
+    ) -> Self {
         let mut dispatcher = EventDispatcher::new(None);
         dispatcher
             .correlation_id
             .clone_from(&self.dispatcher.correlation_id);
-        let user_id = self
-            .user_id
-            .try_lock()
-            .map(|id| id.clone())
-            .unwrap_or_default();
+        let user_id = self.user_id.try_lock().map_or_default(|id| id.clone());
         Self {
-            globals: self.globals.clone(),
+            globals,
             dispatcher,
             log_level: self.log_level,
             user_id: Mutex::new(user_id),
             mode: self.mode,
             caller_state: self.caller_state.clone(),
-            environment: Some(environment),
+            environment,
             ..Default::default()
         }
     }
 
     /// The environment of the process that relayed this call, `None` for a call made in this
     /// process.
-    #[cfg(target_os = "linux")]
     pub(crate) fn environment(&self) -> Option<&CallEnvironment> {
         self.environment.as_ref()
     }

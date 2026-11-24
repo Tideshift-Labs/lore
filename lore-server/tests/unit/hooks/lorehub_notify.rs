@@ -5,8 +5,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use chrono::TimeZone;
-use chrono::Utc;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
@@ -18,10 +16,17 @@ use lore_server::hooks::HookFactory;
 use lore_server::hooks::HookPoint;
 use lore_server::hooks::lorehub_notify::*;
 use ring::hmac;
+use time::Date;
+use time::Month;
+use time::UtcDateTime;
 
 /// A fixed time so payload + `event_id` are deterministic in tests.
-fn fixed_time() -> chrono::DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 6, 24, 12, 34, 56).unwrap()
+fn fixed_time() -> UtcDateTime {
+    Date::from_calendar_date(2026, Month::June, 24)
+        .unwrap()
+        .with_hms(12, 34, 56)
+        .unwrap()
+        .as_utc()
 }
 
 /// Builds a branch-push context with all fields populated.
@@ -125,10 +130,8 @@ fn event_id_is_deterministic_and_distinct() {
     assert_ne!(a.event_id(), other.event_id());
 
     // A different occurred_at -> a different id.
-    let later = EventFields::from_context(
-        &push_context(),
-        Utc.with_ymd_and_hms(2026, 6, 24, 12, 34, 57).unwrap(),
-    );
+    let later =
+        EventFields::from_context(&push_context(), fixed_time() + time::Duration::seconds(1));
     assert_ne!(a.event_id(), later.event_id());
 }
 
@@ -240,7 +243,7 @@ fn signed_bytes_are_the_bytes_posted() {
     // POST sends — recompute end-to-end and confirm they line up.
     let fields = EventFields::from_context(&push_context(), fixed_time());
     let raw_body = serde_json::to_vec(&fields.to_payload()).unwrap();
-    let timestamp = fixed_time().timestamp();
+    let timestamp = fixed_time().unix_timestamp();
     let sig = sign_event("sekret", timestamp, &raw_body);
 
     let key = hmac::Key::new(hmac::HMAC_SHA256, b"sekret");
@@ -740,4 +743,23 @@ fn factory_rejects_zero_timeout() {
     ));
     // A positive timeout still builds fine — already covered by
     // `factory_builds_hook_from_valid_config` (`timeout = 5`).
+}
+
+/// `occurred_at` keeps chrono's `SecondsFormat::Secs` + `Z` text after the move to `time`
+/// (062069c6): whole seconds, the fraction dropped rather than rounded, and `Z`, not `+00:00`.
+#[test]
+fn occurred_at_is_whole_seconds_with_z() {
+    assert_eq!(occurred_at_text(fixed_time()), "2026-06-24T12:34:56Z");
+    let late = Date::from_calendar_date(2026, Month::June, 24)
+        .unwrap()
+        .with_hms_nano(12, 34, 56, 999_999_999)
+        .unwrap()
+        .as_utc();
+    assert_eq!(occurred_at_text(late), "2026-06-24T12:34:56Z");
+    let early = Date::from_calendar_date(987, Month::January, 2)
+        .unwrap()
+        .with_hms(3, 4, 5)
+        .unwrap()
+        .as_utc();
+    assert_eq!(occurred_at_text(early), "0987-01-02T03:04:05Z");
 }

@@ -11,23 +11,26 @@ use axum::http::Extensions;
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
 use axum::middleware::Next;
+use axum::response::IntoResponse;
 use axum::response::Response;
 use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_telemetry::tracing::fields::USER_ID;
 use serde::Deserialize;
+use tonic::Status;
 use tracing::Span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt::decode_unsigned_identity;
-use crate::authnz::auth::is_auth_unavailable;
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::is_denial;
 use crate::authnz::repository_authorizer::permits_with;
+use crate::http::failed_authorization_status;
 use crate::http::server::ServerState;
 
 #[derive(Deserialize)]
@@ -74,33 +77,32 @@ pub async fn jwt_axum_verify_authorization(
                 raw: &accesstoken,
                 claims: &user_info,
             };
-            let access = state
+            // A failed check (the fork's auth timeout included, an
+            // `INTERNAL` status) answers 500 or 503, never a refusal.
+            match state
                 .repository_authorizer
                 .granted_access(Some(&token), repository)
-                .await;
-            // FORK-LOCAL (Tideshift): an auth service that did not answer
-            // in time is a server error, not a refusal.
-            if let Err(status) = &access
-                && is_auth_unavailable(status)
+                .await
             {
-                return Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Body::from(status.message().to_string()))
-                    .unwrap();
-            }
-            if let Ok(grants) = access {
-                Span::current().record(USER_ID, user_info.identity());
-                if let Some(grants) = grants {
-                    request.extensions_mut().insert(PartitionGrants {
-                        repository_id: repository,
-                        grants,
-                    });
-                }
-                // Set `user_info` as a request extension so it can be used down the stack
-                request.extensions_mut().insert(RawToken(accesstoken));
-                request.extensions_mut().insert(Some(user_info));
+                Ok(grants) => {
+                    Span::current().record(USER_ID, user_info.identity());
+                    if let Some(grants) = grants {
+                        request.extensions_mut().insert(PartitionGrants {
+                            repository_id: repository,
+                            grants,
+                        });
+                    }
+                    // Set `user_info` as a request extension so it can be used down the stack
+                    request.extensions_mut().insert(RawToken(accesstoken));
+                    request.extensions_mut().insert(Some(user_info));
 
-                return next.run(request).await;
+                    return next.run(request).await;
+                }
+                Err(status) => {
+                    if !is_denial(&status) {
+                        return failed_authorization_status(&status).into_response();
+                    }
+                }
             }
         }
         Response::builder()
@@ -135,12 +137,13 @@ fn extract_bearer_token(request: &Request) -> Option<String> {
 
 /// [`permits_with`] over what [`jwt_axum_verify_authorization`] inserts into
 /// the request extensions, where the claims sit as `Option<AuthorizationToken>`.
+/// `Err` when the check failed rather than denied.
 pub async fn http_permits(
     authorizer: &dyn RepositoryAuthorizer,
     extensions: &Extensions,
     repository: RepositoryId,
     action: Action,
-) -> bool {
+) -> Result<bool, Status> {
     let grants = extensions
         .get::<PartitionGrants>()
         .filter(|grants| grants.repository_id == repository);

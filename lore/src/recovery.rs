@@ -30,6 +30,8 @@ pub async fn receipt_get(
             // A receipt read has no caller globals; follow the server's preference, as a call
             // that leaves `auth_mode` zeroed does.
             lore_transport::auth::AuthMode::Auto,
+            // No caller globals either: the transport's default congestion control.
+            None,
         )
         .await?;
         connection

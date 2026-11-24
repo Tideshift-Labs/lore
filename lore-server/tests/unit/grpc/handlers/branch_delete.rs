@@ -13,6 +13,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_delete::*;
 use lore_server::grpc::handlers::branch_push;
@@ -127,6 +128,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
 
     let head = branch_push::push(
         repository_context.clone(),
+        None,
         main,
         state_hash,
         crate::util::test_support::PUSH_ANY,
@@ -180,6 +182,7 @@ async fn sends_delete_notification_for_deleted_branch() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
 
         create_test_branch(repository_context.clone(), branch).await;
@@ -263,6 +266,7 @@ async fn no_delete_notification_for_branch_delete_errors() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
 
         create_test_branch(repository_context.clone(), branch).await;
@@ -327,6 +331,7 @@ async fn a_dropped_delete_settles_a_stopped_restore() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         create_test_branch(repository_context.clone(), branch).await;
         branch::delete(repository_context.clone(), branch)

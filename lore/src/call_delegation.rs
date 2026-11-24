@@ -4,6 +4,8 @@
 use std::pin::Pin;
 use std::pin::pin;
 
+use futures::FutureExt;
+use futures::future::Either;
 use lore_base::error::InvalidArguments;
 use lore_base::error::ShutDown;
 use lore_base::text::TextNotUtf8;
@@ -19,6 +21,9 @@ use lore_revision::interface::LoreGlobalArgs;
 use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
+use crate::remote::call::EXTERNAL_ROOT_MOVING;
+use crate::remote::call::HandedBack;
+use crate::remote::call::Relayed;
 use crate::remote::call::ServiceCallError;
 use crate::remote::call::run_service_call;
 use crate::remote::command::LoreCommand;
@@ -354,22 +359,26 @@ fn command_requires_service_given(
 /// Never runs the call here. Where no service can be reached or started, it reports
 /// [`lore_base::error::ServiceUnavailable`], saying why the call needs one and why none could be
 /// had.
-async fn forced_service_call(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments: the closure holds them while
+/// the connect runs, and then the call on the service or the boxed fallback does.
+#[inline]
+fn forced_service_call(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> i32 {
-    let unreached = match connect_to_running_service().await {
-        Ok(Some(connection)) => {
-            return run_service_call(Some(connection), globals, command, callback).await;
-        }
-        Ok(None) => None,
-        Err(error) => Some(error),
-    };
-    Box::pin(unanswered_forced_service_call(
-        globals, command, callback, unreached,
-    ))
-    .await
+) -> impl Future<Output = i32> {
+    connect_to_running_service().then(move |connected| match connected {
+        Ok(Some(connection)) => Either::Left(
+            run_service_call(Some(connection), globals, command, callback).then(forced_status),
+        ),
+        unanswered => Either::Right(Box::pin(unanswered_forced_service_call(
+            globals,
+            command,
+            callback,
+            unanswered.err(),
+        ))),
+    })
 }
 
 /// [`forced_service_call`] where no service answered its connect, failing with `unreached` or,
@@ -391,18 +400,13 @@ async fn unanswered_forced_service_call(
     if unreached.is_none() && starts_a_service(&globals, makes_instance).await {
         match connect_or_spawn_service(ServiceStart::NamedOrThisProgram).await {
             Ok(connection) => {
-                return run_service_call(Some(connection), globals, command, callback).await;
+                let relayed = run_service_call(Some(connection), globals, command, callback).await;
+                return forced_status(relayed).await;
             }
             Err(error) => unreached = Some(error),
         }
     }
-    let needs = match &command {
-        LoreCommand::RepositoryClone(_) => "A FUSE clone is mounted by the Lore service",
-        LoreCommand::RepositoryCreate(_) => {
-            "A FUSE instance is created and mounted by the Lore service"
-        }
-        _ => "This instance is served through a FUSE mount only the Lore service may use",
-    };
+    let needs = forced_need(&command);
     let reason = match unreached {
         None if makes_instance || !cfg!(target_os = "linux") => {
             format!("{needs}, and no service is running")
@@ -421,18 +425,79 @@ async fn unanswered_forced_service_call(
             format!("{needs}, and no service could be reached or started: {error}")
         }
     };
-    crate::call::no_repository_call(
+    forced_unavailable(globals, callback, "fuse_forced_relay", reason).await
+}
+
+/// Why a forced call of `command` needs the Lore service.
+fn forced_need(command: &LoreCommand) -> &'static str {
+    match command {
+        LoreCommand::RepositoryClone(_) => "A FUSE instance is mounted by the Lore service",
+        LoreCommand::RepositoryCreate(_) => {
+            "A FUSE instance is created and mounted by the Lore service"
+        }
+        _ => "This instance is served through a FUSE mount only the Lore service may use",
+    }
+}
+
+/// Fails the call `caller`, which never runs in this process, with `ServiceUnavailable` for
+/// `reason`.
+fn forced_unavailable(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    caller: &'static str,
+    reason: String,
+) -> impl Future<Output = i32> {
+    crate::call::no_repository_call(globals, callback, (), caller, |()| async move {
+        Err::<(), ServiceCallError>(ServiceCallError::from(
+            lore_base::error::ServiceUnavailable { reason },
+        ))
+    })
+}
+
+/// The status of the forced call `relayed`, which fails with the move's `ServiceUnavailable`
+/// where a move of the external root held the service socket.
+async fn forced_status(relayed: Relayed) -> i32 {
+    match relayed {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => {
+            let need = forced_need(&call.command);
+            refuse_handed_back(call, "fuse_forced_relay", need).await
+        }
+    }
+}
+
+/// Fails the handed-back call `caller`, which `need` says needs the service, with the move's
+/// `ServiceUnavailable`. The failure is boxed: a cold path.
+pub(crate) async fn refuse_handed_back(
+    call: Box<HandedBack>,
+    caller: &'static str,
+    need: &str,
+) -> i32 {
+    let reason = format!("{need}, and {EXTERNAL_ROOT_MOVING}");
+    let HandedBack {
+        globals, callback, ..
+    } = *call;
+    Box::pin(forced_unavailable(globals, callback, caller, reason)).await
+}
+
+/// The status of the relayed call `relayed`, run in this process where a move of the external
+/// root held the service socket. That run is boxed: a cold path.
+pub(crate) async fn relayed_status(relayed: Relayed) -> i32 {
+    match relayed {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => Box::pin(handed_back_locally(*call)).await,
+    }
+}
+
+/// Runs `call`, which the service socket handed back during a move of the external root, in this
+/// process, with the move recorded for it.
+fn handed_back_locally(call: HandedBack) -> impl Future<Output = i32> {
+    let HandedBack {
         globals,
+        command,
         callback,
-        (),
-        "fuse_forced_relay",
-        |()| async move {
-            Err::<(), ServiceCallError>(ServiceCallError::from(
-                lore_base::error::ServiceUnavailable { reason },
-            ))
-        },
-    )
-    .await
+    } = call;
+    crate::call::during_external_root_move(command.invoke_local(globals, callback))
 }
 
 /// FORK-LOCAL (Tideshift, WP-120): the refusal a managed caller gets instead of a relay. A
@@ -480,7 +545,12 @@ fn run_forced(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEvent
 /// future is in a frame of its own rather than under every command run in this process.
 #[inline(never)]
 fn run_relayed(globals: LoreGlobalArgs, command: LoreCommand, callback: LoreEventCallback) -> i32 {
-    block_on_command(pin!(run_service_call(None, globals, command, callback)))
+    match crate::runtime().block_on(pin!(run_service_call(None, globals, command, callback))) {
+        Relayed::Ran(status) => status,
+        Relayed::HandedBack(call) => {
+            block_on_command(Box::pin(handed_back_locally(*call)).as_mut())
+        }
+    }
 }
 
 /// Runs `command` to completion in this process, for the commands that act on the Lore service
@@ -504,28 +574,37 @@ pub(crate) fn block_on_command(running: Pin<&mut dyn Future<Output = i32>>) -> i
 /// Runs `command` in the Lore service when the command requires one or one is in use, and in this
 /// process otherwise.
 ///
-/// Pins each future it awaits, for the reason `LoreCommand::invoke_local` gives.
+/// Pins each branch's future, for the reason `LoreCommand::invoke_local` gives. The block's
+/// captures stay reserved while the branch's future holds the arguments moved out of them.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-pub(crate) async fn dispatch_command(
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn dispatch_command(
     globals: LoreGlobalArgs,
     command: LoreCommand,
     callback: LoreEventCallback,
-) -> i32 {
-    if command_requires_service(&globals, &command) {
-        if lore_transport::has_managed_caller() {
-            return reject_managed_relay(globals, callback).await;
+) -> impl Future<Output = i32> {
+    async move {
+        if command_requires_service(&globals, &command) {
+            if lore_transport::has_managed_caller() {
+                return reject_managed_relay(globals, callback).await;
+            }
+            let relay = pin!(forced_service_call(globals, command, callback));
+            relay.await
+        } else if service_in_use().await {
+            if lore_transport::has_managed_caller() {
+                return reject_managed_relay(globals, callback).await;
+            }
+            let relayed = {
+                let relay = pin!(run_service_call(None, globals, command, callback));
+                relay.await
+            };
+            relayed_status(relayed).await
+        } else {
+            let handler = pin!(command.invoke_local(globals, callback));
+            handler.await
         }
-        let relay = pin!(forced_service_call(globals, command, callback));
-        relay.await
-    } else if service_in_use().await {
-        if lore_transport::has_managed_caller() {
-            return reject_managed_relay(globals, callback).await;
-        }
-        let relay = pin!(run_service_call(None, globals, command, callback));
-        relay.await
-    } else {
-        let handler = pin!(command.invoke_local(globals, callback));
-        handler.await
     }
 }
 
@@ -539,8 +618,16 @@ pub(crate) fn invoke_locally(
     command.invoke_local(globals, callback)
 }
 
+/// Runs the call of `args` in the Lore service when it requires one or one is in use, and with
+/// `handler` in this process otherwise.
+///
+/// Pins each branch's future, for the reason `LoreCommand::invoke_local` gives. The block's
+/// captures stay reserved while the branch's future holds the arguments moved out of them.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
-pub(crate) async fn dispatch_call<
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn dispatch_call<
     ArgsType: LoreArgs,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
     Fut: Future<Output = i32> + Send + 'static,
@@ -549,19 +636,26 @@ pub(crate) async fn dispatch_call<
     args: ArgsType,
     callback: LoreEventCallback,
     handler: Handler,
-) -> i32 {
-    if args_require_service(&globals, &args, running_as_service()) {
-        if lore_transport::has_managed_caller() {
-            return reject_managed_relay(globals, callback).await;
+) -> impl Future<Output = i32> {
+    async move {
+        if args_require_service(&globals, &args, running_as_service()) {
+            if lore_transport::has_managed_caller() {
+                return reject_managed_relay(globals, callback).await;
+            }
+            let relay = pin!(forced_service_call(globals, args.to_command(), callback));
+            relay.await
+        } else if service_in_use().await {
+            if lore_transport::has_managed_caller() {
+                return reject_managed_relay(globals, callback).await;
+            }
+            let relayed = {
+                let relay = pin!(run_service_call(None, globals, args.to_command(), callback));
+                relay.await
+            };
+            relayed_status(relayed).await
+        } else {
+            let handler = pin!(handler(globals, args, callback));
+            handler.await
         }
-        return forced_service_call(globals, args.to_command(), callback).await;
-    }
-    if service_in_use().await {
-        if lore_transport::has_managed_caller() {
-            return reject_managed_relay(globals, callback).await;
-        }
-        run_service_call(None, globals, args.to_command(), callback).await
-    } else {
-        handler(globals, args, callback).await
     }
 }

@@ -65,10 +65,38 @@ pub struct LoreStoragePutFileResolvedItem {
     /// Tag the fragments with `PayloadLocalCachePriority` so future remote reads always cache them
     /// locally
     pub local_cache: u8,
+    /// Ask the remote whether it already holds each fragment at its exact address before
+    /// compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+    /// remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+    /// round trip per fragment the local store does not know as stored remotely. A fragment it
+    /// knows under another context the remote holds is copied from there first, and asked about
+    /// only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+    /// sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+    /// before setting its fields: a non-zero padding byte from a caller built against an older
+    /// header turns the query on
+    pub remote_query: u8,
+    /// Store each hole of the file as a hole in the fragment list rather than reading it, as
+    /// `lore_storage_put_file` does. The field sits in what was padding, after `remote_query`, so
+    /// zero the whole item before setting its fields, as for `remote_query`
+    pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
     /// `FRAGMENT_SIZE_THRESHOLD`
     pub fixed_size_chunk: u64,
 }
+
+// Lock the C ABI layout of `LoreStoragePutFileResolvedItem` on a 64-bit target. `remote_query` and
+// `skip_holes` sit in the padding after `local_cache`, so a caller built against a header without
+// them passes an item of the same size, with `fixed_size_chunk` at the same offset.
+const _: () = assert!(std::mem::size_of::<LoreStoragePutFileResolvedItem>() == 104);
+const _: () = assert!(std::mem::offset_of!(LoreStoragePutFileResolvedItem, fixed_size_chunk) == 96);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileResolvedItem, remote_query)
+        == std::mem::offset_of!(LoreStoragePutFileResolvedItem, local_cache) + 1
+);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileResolvedItem, skip_holes)
+        == std::mem::offset_of!(LoreStoragePutFileResolvedItem, remote_query) + 1
+);
 
 impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -76,7 +104,9 @@ impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
             .field("id", &self.id)
             .field("path", &self.path.as_str())
             .field("remote_write", &self.remote_write)
+            .field("remote_query", &self.remote_query)
             .field("local_cache", &self.local_cache)
+            .field("skip_holes", &self.skip_holes)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
@@ -94,12 +124,12 @@ pub struct LoreStoragePutFileResolvedArgs {
 }
 
 /// Store one or more files and publish a mutable key naming each.
-pub async fn put_file_resolved(
+pub fn put_file_resolved(
     globals: LoreGlobalArgs,
     args: LoreStoragePutFileResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_file_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_file_resolved_local)
 }
 
 async fn put_file_resolved_local(
@@ -109,6 +139,7 @@ async fn put_file_resolved_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -123,7 +154,7 @@ async fn put_file_resolved_local(
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "put_file_resolved", |item| {
+            crate::storage::fan_out_items!(items, "put_file_resolved", stats = stats, |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
@@ -177,6 +208,12 @@ async fn resolve_put_file_resolved_item(
     }
     if item.local_cache != 0 {
         write_options = write_options.with_local_cache_priority();
+    }
+    if item.remote_query != 0 {
+        write_options = write_options.with_remote_query();
+    }
+    if item.skip_holes != 0 {
+        write_options = write_options.with_skip_holes();
     }
 
     write_resolved_from_file(

@@ -314,6 +314,10 @@ async fn usable_authentication_token(
 /// Refresh an authentication token when its JWT expiry enters the lead window. The auth URL is
 /// resolved through the scheme registry; see [`refresh_authentication_if_due`]. Empty when no
 /// usable token remains.
+///
+/// Test-only since upstream 822fa4a3 moved every caller to [`refresh_authentication_if_due`];
+/// the fork's refresh tests still drive the String form.
+#[cfg(feature = "test-util")]
 #[lore_macro::test_pub]
 async fn refresh_authentication_if_needed(
     auth_url: &str,
@@ -331,6 +335,7 @@ async fn refresh_authentication_if_needed(
     .await
 }
 
+#[cfg(feature = "test-util")]
 #[lore_macro::test_pub]
 async fn refresh_authentication_if_needed_with_timeouts(
     auth_url: &str,
@@ -994,8 +999,9 @@ async fn auth_exchange_for_identity(
     {
         Ok(token) => token,
         // A supplied access token authorizes on its own, so carry on without an
-        // authentication token: the services that need one fail where they use it,
-        // and the ones that only need authorization still work.
+        // authentication token: the repository service is sent the access token
+        // instead, any other service that needs an authentication token fails
+        // where it uses it, and the ones that only need authorization still work.
         Err(_) if !access_token.is_empty() => String::new(),
         Err(err) if err.is_token_not_found() => {
             lore_debug!(
@@ -1047,9 +1053,10 @@ async fn auth_exchange_for_identity(
     }
 
     // This will return the cached authz token if it is still valid,
-    // or perform an authz exchange if needed
+    // or perform an authz exchange if needed. A supplied access token is the
+    // authorization token with or without a repository.
     let mut failure = None;
-    let authorization_token = if !repository.is_zero() {
+    let authorization_token = if !repository.is_zero() || !access_token.is_empty() {
         exchange(
             auth_endpoint,
             identity,
@@ -1073,7 +1080,7 @@ async fn auth_exchange_for_identity(
     // and just spams the log. Re-emit only when the inputs change. The lock
     // is dropped before we log so the dispatch (file write, event channel)
     // cannot block other callers.
-    if !authorization_token.is_empty() {
+    if !authorization_token.is_empty() && !repository.is_zero() {
         static LAST_AUTHORIZED: parking_lot::Mutex<Option<(String, RepositoryId, String)>> =
             parking_lot::Mutex::new(None);
         let key = (identity.to_string(), repository, remote_domain.to_string());

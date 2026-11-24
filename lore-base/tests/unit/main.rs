@@ -9,9 +9,14 @@
 mod allocator;
 mod error;
 mod fs;
+mod log;
 mod retry;
 mod runtime;
 mod test_util;
 mod text;
+/// Shared with the runtime binaries in `tests/`.
+#[path = "../support/timer.rs"]
+mod timer;
+mod timestamp;
 mod types;
 mod units;

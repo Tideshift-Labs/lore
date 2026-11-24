@@ -256,12 +256,10 @@ impl MutableStore for PostgresMutableStore {
             .await
             .map_err(db_err)?;
         let row_present = current.is_some();
-        let current = current
-            .map(|row| {
-                let current: Vec<u8> = row.get("value");
-                Hash::from(current.as_slice())
-            })
-            .unwrap_or_default();
+        let current = current.map_or_default(|row| {
+            let current: Vec<u8> = row.get("value");
+            Hash::from(current.as_slice())
+        });
 
         // A mismatch writes nothing. A swap to the value held writes nothing too,
         // except that a zero row an older build left (it reads as absent) is

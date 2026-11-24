@@ -9,6 +9,7 @@ use lore_base::types::KeyType;
 use lore_proto::lore::repository::v1::RepositoryMetadataSetRequest;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use tonic::Request;
@@ -242,6 +243,7 @@ mod auth_guard {
             immutable,
             mutable,
             Context::from(REPOSITORY_ID).into(),
+            allow_all_repositories(),
         ));
         lore_revision::repository::metadata_store(
             repo_ctx,
@@ -558,6 +560,7 @@ mod authorization {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         repository::metadata_store(
             repository,
@@ -611,6 +614,7 @@ mod authorization {
             immutable,
             mutable,
             target_repo,
+            lore_revision::state::allow_all_repositories(),
         ));
         let current = repository::metadata_hash(repository)
             .await
@@ -754,6 +758,7 @@ mod authorization {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let current = repository::metadata_hash(repository)
             .await
@@ -856,6 +861,7 @@ mod authorization {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let current = repository::metadata_hash(repository)
             .await
@@ -899,6 +905,7 @@ mod authorization {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let current = repository::metadata_hash(repository)
             .await
@@ -950,6 +957,7 @@ mod authorization {
             immutable,
             mutable,
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let current = repository::metadata_hash(repository)
             .await

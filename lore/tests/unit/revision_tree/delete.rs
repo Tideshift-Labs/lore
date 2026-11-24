@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -13,17 +11,12 @@ use lore::revision_tree::delete::*;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::handle::RevisionTreeInternal;
-use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
-use lore::revision_tree::list_children::list_children;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
 use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
 use lore::revision_tree::modify::modify;
 use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
 use lore::revision_tree::node_info::node_info;
 use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -40,88 +33,34 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 
+use crate::call::test_support::Recorded;
+use crate::call::test_support::complete_message;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::added_nodes;
+use crate::revision_tree::support::assert_entries_then_batch_then_complete;
+use crate::revision_tree::support::batch_outcomes;
+use crate::revision_tree::support::children_of;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::node_info_event;
+use crate::revision_tree::support::release;
+use crate::revision_tree::support::settle;
+
 /// Call-level id every test batch is submitted under, distinct from the
 /// per-entry ids so the two cannot be confused in an assertion.
 const CALL_ID: u64 = 700;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Complete(i32, String),
-    RevisionTreeLoaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    DeleteComplete(u64, u64, LoreErrorCode),
-    BatchComplete(u64, LoreErrorCode),
-    Child(NodeID, u32, u32),
-    NodeInfo(NodeID, u32, u32, Address),
-    Other(u32),
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => {
-                Self::Complete(data.status, data.error.message.as_str().to_string())
-            }
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
+fn delete_outcomes(events: &[LoreEvent]) -> Vec<(u64, u64, LoreErrorCode)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
             LoreEvent::RevisionTreeDeleteComplete(data) => {
-                Self::DeleteComplete(data.entry_id, data.node_count, data.error_code)
+                Some((data.entry_id, data.node_count, data.error_code))
             }
-            LoreEvent::RevisionTreeBatchComplete(data) => {
-                Self::BatchComplete(data.batch_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeChild(data) => {
-                Self::Child(data.node_id, data.kind, data.staged_action)
-            }
-            LoreEvent::RevisionTreeNodeInfo(data) => {
-                Self::NodeInfo(data.node_id, data.kind, data.staged_action, data.address)
-            }
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn delete_outcomes(events: &[CapturedEvent]) -> Vec<(u64, u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::DeleteComplete(id, count, code) => Some((*id, *count, *code)),
             _ => None,
         })
         .collect()
-}
-
-/// Every batch terminal in emission order, so a test can pin that exactly one
-/// fired and what it carried.
-fn batch_outcomes(events: &[CapturedEvent]) -> Vec<(u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::BatchComplete(id, code) => Some((*id, *code)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The rejection reason the call completed with, which is the only place the
-/// offending entry's batch index and the rule it broke are reported — the
-/// per-entry terminal carries an error code alone.
-fn rejection_reason(events: &[CapturedEvent]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::Complete(_, message) => Some(message.clone()),
-            _ => None,
-        })
-        .expect("the call must complete")
 }
 
 fn file_id() -> Context {
@@ -139,47 +78,13 @@ fn entry(entry_id: u64, node_id: NodeID) -> LoreRevisionTreeDeleteEntry {
     LoreRevisionTreeDeleteEntry { entry_id, node_id }
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 /// Run one add batch and return the node id each entry produced, in entry
 /// order.
 async fn run_add(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeAddEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -187,10 +92,10 @@ async fn run_add(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
@@ -216,39 +121,20 @@ fn add_entry(
 async fn seed(handle: LoreRevisionTree, parent: NodeID, name: &str, kind: LoreNodeType) -> NodeID {
     let (status, events) = run_add(handle, vec![add_entry(1, parent, name, kind)]).await;
     assert_eq!(status, 0, "seeding {name} must succeed");
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .expect("seeding must report a node id")
-}
-
-/// Commit-free stand-in for a node the loaded revision holds: seed it, then
-/// clear the staging flags the add left behind, which is what commit does to
-/// everything it writes.
-async fn settle(handle: LoreRevisionTree, node_ids: &[NodeID]) {
-    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
-    for node_id in node_ids {
-        let block_index = lore_revision::node::NodeBlock::index(*node_id);
-        let block = internal
-            .state_for_tests()
-            .block(internal.repository_context.clone(), block_index)
-            .await
-            .expect("the block must be readable");
-        let mut writer = block.write_for_tests();
-        writer
-            .node(lore_revision::node::Node::index(*node_id))
-            .clear_all_change_flags();
-    }
+    let (node_id, error_code) = add_outcome(&events, 1).expect("seeding must report a node id");
+    assert_eq!(
+        error_code,
+        LoreErrorCode::None,
+        "seeding {name} must report no error"
+    );
+    node_id
 }
 
 async fn run_delete(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeDeleteEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = delete(
         LoreGlobalArgs::default(),
         LoreRevisionTreeDeleteArgs {
@@ -256,36 +142,11 @@ async fn run_delete(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
-}
-
-/// Every child the listing reports for `parent`, as `(node_id,
-/// staged_action)`.
-async fn children_of(handle: LoreRevisionTree, parent: NodeID) -> Vec<(NodeID, u32)> {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = list_children(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeListChildrenArgs {
-            id: 5,
-            handle,
-            parent_node_id: parent,
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "listing children must succeed");
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::Child(node_id, _, staged_action) => Some((*node_id, *staged_action)),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The common deletion: a subtree the loaded revision holds is staged, every
@@ -410,7 +271,7 @@ async fn delete_rejects_the_root() {
         vec![(10, 0, LoreErrorCode::InvalidArguments)],
         "the root must be refused as a bad argument, reporting nothing removed"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("the root is the revision itself"),
         "the root must be refused on its own terms, got {reason:?}"
@@ -426,7 +287,7 @@ async fn delete_rejects_an_unknown_node() {
 
     let (status, events) = run_delete(handle, vec![entry(10, INVALID_NODE)]).await;
     assert_ne!(status, 0, "an unknown node must not be deletable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("entry 0: node id is unknown"),
         "the reason must name the offending entry's batch index, got {reason:?}"
@@ -446,7 +307,7 @@ async fn delete_rejects_a_node_id_on_an_unallocated_slot() {
 
     let (status, events) = run_delete(handle, vec![entry(10, 400)]).await;
     assert_ne!(status, 0, "an unallocated slot must not be deletable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("does not resolve to a named node"),
         "an unallocated slot must be refused as unnamed, got {reason:?}"
@@ -469,7 +330,7 @@ async fn delete_rejects_a_node_already_staged_for_deletion() {
 
     let (status, events) = run_delete(handle, vec![entry(11, node_id)]).await;
     assert_ne!(status, 0, "the second deletion must reject");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("already staged for deletion"),
         "the repeat must be refused as already staged, got {reason:?}"
@@ -494,7 +355,7 @@ async fn delete_rejects_two_entries_naming_one_node() {
         vec![(11, 0, LoreErrorCode::InvalidArguments)],
         "only the repeating entry reports; the first was never applied"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("two entries delete one node"),
         "the repeat must be refused as a repeat, got {reason:?}"
@@ -521,7 +382,7 @@ async fn delete_rejects_an_entry_whose_ancestor_another_entry_deletes() {
 
     let (status, events) = run_delete(handle, vec![entry(10, directory), entry(11, leaf)]).await;
     assert_ne!(status, 0, "an entry under another entry must reject");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("deletes an ancestor of this node"),
         "the descendant must be refused for its ancestor, got {reason:?}"
@@ -547,7 +408,7 @@ async fn delete_rejects_a_repeated_caller_id_but_accepts_repeated_zeros() {
 
     let (status, events) = run_delete(handle, vec![entry(10, first), entry(10, second)]).await;
     assert_ne!(status, 0, "a repeated non-zero caller id must reject");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("two entries share one caller id"),
         "the repeat must be refused as a shared id, got {reason:?}"
@@ -641,22 +502,9 @@ async fn delete_reports_entries_then_the_batch_terminal_then_complete() {
     settle(handle, &[first, second]).await;
 
     let (_, events) = run_delete(handle, vec![entry(10, first), entry(11, second)]).await;
-    let batch_at = events
-        .iter()
-        .position(|event| matches!(event, CapturedEvent::BatchComplete(..)))
-        .expect("the batch terminal must fire");
-    let complete_at = events
-        .iter()
-        .position(|event| matches!(event, CapturedEvent::Complete(..)))
-        .expect("Complete must fire");
-    let last_entry_at = events
-        .iter()
-        .rposition(|event| matches!(event, CapturedEvent::DeleteComplete(..)))
-        .expect("both entries must report");
-    assert!(
-        last_entry_at < batch_at && batch_at < complete_at,
-        "order must be entries, then the batch terminal, then Complete: {events:?}"
-    );
+    assert_entries_then_batch_then_complete(&events, |event| {
+        matches!(event, LoreEvent::RevisionTreeDeleteComplete(_))
+    });
     release(handle, store_handle_id);
 }
 
@@ -682,13 +530,7 @@ async fn delete_stages_more_nodes_than_one_block_holds() {
         .collect();
     let (status, events) = run_add(handle, entries).await;
     assert_eq!(status, 0, "seeding a multi-block directory must succeed");
-    let mut settled: Vec<NodeID> = events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .collect();
+    let mut settled: Vec<NodeID> = added_nodes(&events);
     assert_eq!(settled.len(), children, "every child must have been seeded");
     settled.push(directory);
     settle(handle, &settled).await;
@@ -734,8 +576,8 @@ async fn marks_of(handle: LoreRevisionTree, node_id: NodeID) -> (u32, u16) {
 async fn run_modify(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeModifyEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = modify(
         LoreGlobalArgs::default(),
         LoreRevisionTreeModifyArgs {
@@ -743,10 +585,10 @@ async fn run_modify(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
@@ -835,6 +677,31 @@ async fn modify_keeps_an_added_node_staged_as_an_addition() {
     release(handle, store_handle_id);
 }
 
+/// A node staged as moved stays a move however it is rewritten, the move carrying its new
+/// content: a modification in its place records no move at the commit.
+#[tokio::test]
+async fn modify_keeps_a_moved_node_staged_as_a_move() {
+    let partition = Partition::from([0xe0u8; 16]);
+    let (handle, store_handle_id) = load_handle("mark-move-modify", partition).await;
+
+    let directory = seed(handle, ROOT_NODE, "dir", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "a.bin", LoreNodeType::File).await;
+    settle(handle, &[directory, node_id]).await;
+    move_into(handle, node_id, directory, "a.bin").await;
+
+    let (status, _) = run_modify(handle, vec![modify_entry(10, node_id)]).await;
+    assert_eq!(status, 0, "modifying a moved node must succeed");
+    assert_eq!(
+        marks_of(handle, node_id).await,
+        (
+            LoreNodeStagedAction::Move as u32,
+            NodeFlags::DirtyMove.bits()
+        ),
+        "a rewritten moved node must still read as a move"
+    );
+    release(handle, store_handle_id);
+}
+
 /// Deleting after modifying replaces the modification: the node goes either
 /// way, so what was rewritten no longer matters.
 #[tokio::test]
@@ -918,13 +785,12 @@ async fn add_restores_a_node_staged_for_deletion_of_the_same_kind() {
     )
     .await;
     assert_eq!(status, 0, "adding the name back must succeed");
-    let restored = events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::AddComplete(20, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .expect("the add must report a node id");
+    let (restored, error_code) = add_outcome(&events, 20).expect("the add must report a node id");
+    assert_eq!(
+        error_code,
+        LoreErrorCode::None,
+        "the add must report no error"
+    );
     assert_eq!(
         restored, node_id,
         "the restore must return the node that was deleted, not a new one"
@@ -1080,13 +946,12 @@ async fn add_creates_a_new_node_when_the_deleted_namesake_is_another_kind() {
     )
     .await;
     assert_eq!(status, 0, "replacing with another kind must succeed");
-    let created = events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::AddComplete(20, created, LoreErrorCode::None) => Some(*created),
-            _ => None,
-        })
-        .expect("the add must report a node id");
+    let (created, error_code) = add_outcome(&events, 20).expect("the add must report a node id");
+    assert_eq!(
+        error_code,
+        LoreErrorCode::None,
+        "the add must report no error"
+    );
     assert_ne!(
         created, node_id,
         "a different kind must not restore the deleted node"
@@ -1181,7 +1046,7 @@ async fn modify_rejects_a_node_staged_for_deletion() {
         status, 0,
         "a node staged for deletion must not be modifiable"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("staged for deletion"),
         "the rejection must name the deletion, got {reason:?}"
@@ -1207,7 +1072,7 @@ async fn add_rejects_a_parent_staged_for_deletion() {
     )
     .await;
     assert_ne!(status, 0, "adding under a deleted parent must reject");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("parent node is staged for deletion"),
         "the rejection must name the parent's deletion, got {reason:?}"
@@ -1230,10 +1095,10 @@ async fn a_target_discarded_after_validation_fails_only_its_own_entry() {
     let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
     settle(handle, &[doomed, intact]).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         CALL_ID,
         delete,
@@ -1270,7 +1135,7 @@ async fn a_target_discarded_after_validation_fails_only_its_own_entry() {
     .await;
 
     assert_ne!(status, 0, "a target that vanished must fail the call");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         delete_outcomes(&events),
         vec![
@@ -1331,7 +1196,7 @@ async fn node_info_reports_a_node_staged_for_deletion() {
     let node_id = seed(handle, ROOT_NODE, "a.bin", LoreNodeType::File).await;
     settle(handle, &[node_id]).await;
 
-    let before = fetch_node_info(handle, node_id).await;
+    let before = node_kind_and_staged_action(handle, node_id).await;
     assert_eq!(
         before,
         (
@@ -1345,7 +1210,7 @@ async fn node_info_reports_a_node_staged_for_deletion() {
     let (status, _) = run_delete(handle, vec![entry(10, node_id)]).await;
     assert_eq!(status, 0, "deleting must succeed");
     assert_eq!(
-        fetch_node_info(handle, node_id).await,
+        node_kind_and_staged_action(handle, node_id).await,
         (
             node_id,
             LoreNodeType::File as u32,
@@ -1357,8 +1222,11 @@ async fn node_info_reports_a_node_staged_for_deletion() {
 }
 
 /// The queried node's `(node_id, kind, staged_action)`.
-async fn fetch_node_info(handle: LoreRevisionTree, node_id: NodeID) -> (NodeID, u32, u32) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+async fn node_kind_and_staged_action(
+    handle: LoreRevisionTree,
+    node_id: NodeID,
+) -> (NodeID, u32, u32) {
+    let (sink, callback) = recording_callback();
     let status = node_info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeNodeInfoArgs {
@@ -1366,20 +1234,13 @@ async fn fetch_node_info(handle: LoreRevisionTree, node_id: NodeID) -> (NodeID, 
             handle,
             node_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
     assert_eq!(status, 0, "node_info must succeed");
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::NodeInfo(node_id, kind, staged_action, _) => {
-                Some((*node_id, *kind, *staged_action))
-            }
-            _ => None,
-        })
-        .expect("node_info must emit a record")
+    let events = take_recorded(&sink);
+    let data = node_info_event(&events).expect("node_info must emit a record");
+    (data.node_id, data.kind, data.staged_action)
 }
 
 /// A live child holds its name even when a deleted namesake sits beside it,
@@ -1406,7 +1267,7 @@ async fn add_rejects_a_name_a_live_child_holds_beside_a_deleted_one() {
     )
     .await;
     assert_ne!(status, 0, "a live child must still hold the name");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("a child with this name already exists"),
         "the rejection must be the ordinary collision, got {reason:?}"
@@ -1416,7 +1277,7 @@ async fn add_rejects_a_name_a_live_child_holds_beside_a_deleted_one() {
 
 /// The address `node_info` reports for `node_id`, whose context is the file id.
 async fn fetch_node_address(handle: LoreRevisionTree, node_id: NodeID) -> Address {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = node_info(
         LoreGlobalArgs::default(),
         LoreRevisionTreeNodeInfoArgs {
@@ -1424,18 +1285,14 @@ async fn fetch_node_address(handle: LoreRevisionTree, node_id: NodeID) -> Addres
             handle,
             node_id,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
     assert_eq!(status, 0, "node_info must succeed");
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::NodeInfo(_, _, _, address) => Some(*address),
-            _ => None,
-        })
+    let events = take_recorded(&sink);
+    node_info_event(&events)
         .expect("node_info must emit a record")
+        .address
 }
 
 /// A deleted added directory reads as a freed id does until the commit frees it: gone from its
@@ -1469,7 +1326,7 @@ async fn a_deleted_added_directory_reads_as_a_freed_id() {
             "a deleted node lists as empty"
         );
         assert_eq!(
-            fetch_node_info(handle, node).await,
+            node_kind_and_staged_action(handle, node).await,
             (
                 node,
                 LoreNodeType::Directory as u32,
@@ -1508,7 +1365,7 @@ async fn a_deleted_added_link_reads_as_a_freed_id() {
         "and lists as empty"
     );
     assert_eq!(
-        fetch_node_info(handle, link).await,
+        node_kind_and_staged_action(handle, link).await,
         (
             link,
             LoreNodeType::Directory as u32,
@@ -1566,7 +1423,7 @@ impl DroppedDelete {
         );
         call.abort();
         assert!(
-            call.await.expect_err("the call is dropped").is_cancelled(),
+            call.await.is_err_and(|err| err.is_cancelled()),
             "the call must be dropped, not finished"
         );
         let dropped = Self {
@@ -1670,11 +1527,14 @@ async fn a_close_waits_for_a_dropped_deletes_task() {
     let handle = dropped.handle;
     #[allow(clippy::disallowed_methods)]
     let closing = tokio::spawn(async move {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         close(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
-            make_callback(sink),
+            LoreRevisionTreeCloseArgs {
+                id: 1,
+                handle,
+                ..Default::default()
+            },
+            None,
         )
         .await
     });
@@ -1703,7 +1563,6 @@ async fn move_into(handle: LoreRevisionTree, node: NodeID, destination: NodeID, 
     use lore::revision_tree::move_node::LoreRevisionTreeMoveEntry;
     use lore::revision_tree::move_node::move_node;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let status = move_node(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMoveArgs {
@@ -1716,7 +1575,7 @@ async fn move_into(handle: LoreRevisionTree, node: NodeID, destination: NodeID, 
                 dst_name: LoreString::from_str(name),
             }]),
         },
-        make_callback(sink.clone()),
+        None,
     )
     .await;
     assert_eq!(status, 0, "the move into {destination} must succeed");
@@ -1746,7 +1605,7 @@ async fn a_deleted_tracked_node_below_an_added_directory_goes_with_it() {
     );
     for node in [n, y] {
         assert_eq!(
-            fetch_node_info(handle, node).await,
+            node_kind_and_staged_action(handle, node).await,
             (
                 node,
                 LoreNodeType::Directory as u32,
@@ -1795,6 +1654,87 @@ async fn an_added_directory_holding_a_moved_tracked_node_fails_its_entry() {
     release(handle, store_handle_id);
 }
 
+/// A tracked directory holding an added directory that a moved tracked node makes mixed fails its
+/// entry with nothing staged, the directory itself included, so no added node is left below a
+/// directory staged for deletion. The entry beside it, a tracked directory holding a clean added
+/// directory two staged levels down, goes whole.
+#[tokio::test]
+async fn a_tracked_directory_holding_a_mixed_added_directory_fails_its_entry_unchanged() {
+    let partition = Partition::from([0xe7u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-mixed-below-tracked", partition).await;
+    let d = seed(handle, ROOT_NODE, "d", LoreNodeType::Directory).await;
+    let sub = seed(handle, d, "sub", LoreNodeType::Directory).await;
+    let kept = seed(handle, d, "kept.bin", LoreNodeType::File).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    let e = seed(handle, ROOT_NODE, "e", LoreNodeType::Directory).await;
+    let s = seed(handle, e, "s", LoreNodeType::Directory).await;
+    settle(handle, &[d, sub, kept, y, e, s]).await;
+    let n = seed(handle, d, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    let m = seed(handle, s, "m", LoreNodeType::Directory).await;
+    let f = seed(handle, m, "f.bin", LoreNodeType::File).await;
+    let before = [
+        marks_of(handle, d).await,
+        marks_of(handle, sub).await,
+        marks_of(handle, kept).await,
+    ];
+
+    let (status, events) = run_delete(handle, vec![entry(10, d), entry(11, e)]).await;
+    assert_ne!(status, 0, "the mixed subtree fails the call: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 4, LoreErrorCode::None)
+        ],
+        "the mixed entry fails alone, the clean one counting its tracked and added nodes"
+    );
+    assert_eq!(
+        batch_outcomes(&events),
+        vec![(CALL_ID, LoreErrorCode::Internal)],
+        "the call reports the failure for the batch"
+    );
+    assert_eq!(
+        [
+            marks_of(handle, d).await,
+            marks_of(handle, sub).await,
+            marks_of(handle, kept).await,
+        ],
+        before,
+        "the failed entry stages nothing"
+    );
+    assert!(
+        children_of(handle, d)
+            .await
+            .contains(&(n, LoreNodeStagedAction::Add as u32)),
+        "the added directory stays below the directory"
+    );
+    assert_eq!(
+        children_of(handle, n).await,
+        vec![(y, LoreNodeStagedAction::Move as u32)],
+        "the moved node stays below the added directory"
+    );
+    for node in [e, s] {
+        assert_eq!(
+            marks_of(handle, node).await.0,
+            LoreNodeStagedAction::Delete as u32,
+            "{node} of the clean entry is staged for deletion"
+        );
+    }
+    for node in [m, f] {
+        assert_eq!(
+            node_kind_and_staged_action(handle, node).await,
+            (
+                node,
+                LoreNodeType::Directory as u32,
+                LoreNodeStagedAction::None as u32
+            ),
+            "{node} of the clean entry reads as a freed id does"
+        );
+    }
+    release(handle, store_handle_id);
+}
+
 /// Plans `entries`, runs `between` on the tree, then applies the plan, all inside one call, as
 /// [`a_target_discarded_after_validation_fails_only_its_own_entry`] does; answers the call's
 /// status and events.
@@ -1806,11 +1746,11 @@ async fn plan_change_apply(
         Arc<lore_revision::repository::RepositoryContext>,
     ) + Send
     + 'static,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         CALL_ID,
         delete,
@@ -1825,8 +1765,211 @@ async fn plan_change_apply(
         },
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
+}
+
+/// A tracked `t` holding the staged `t/sub`, with an added file below it, and the tracked `t/a`;
+/// a tracked `intact.bin` beside it; and `y` moved into an added `n`, so a delete walks tracked
+/// subtrees. Answers `(t, sub, a, intact)`.
+async fn subtree_beside_a_move_below_an_added_directory(
+    handle: LoreRevisionTree,
+) -> (NodeID, NodeID, NodeID, NodeID) {
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let sub = seed(handle, t, "sub", LoreNodeType::Directory).await;
+    let a = seed(handle, t, "a.bin", LoreNodeType::File).await;
+    let intact = seed(handle, ROOT_NODE, "intact.bin", LoreNodeType::File).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[t, sub, a, intact, y]).await;
+    seed(handle, sub, "x.bin", LoreNodeType::File).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    (t, sub, a, intact)
+}
+
+/// Breaks the child link of `directory`, naming a block the tree does not have, as a block that
+/// cannot be read leaves a walk of it.
+async fn break_child_link(
+    state: Arc<lore_revision::state::State>,
+    repository: Arc<lore_revision::repository::RepositoryContext>,
+    directory: NodeID,
+) {
+    let block = state
+        .block(repository, lore_revision::node::NodeBlock::index(directory))
+        .await
+        .expect("the directory's block");
+    block
+        .write_for_tests()
+        .node(lore_revision::node::Node::index(directory))
+        .child = 0x00ff_ff00;
+}
+
+/// An entry whose check cannot read a directory of its subtree, here a staged `t/sub` whose child
+/// link names a block the tree does not have, fails with nothing staged, its nodes keeping their
+/// marks; the entry beside it reports what it removed.
+#[tokio::test]
+async fn an_entry_whose_check_cannot_read_its_subtree_fails_unchanged() {
+    let partition = Partition::from([0xe8u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-check-unreadable", partition).await;
+    let (t, sub, a, intact) = subtree_beside_a_move_below_an_added_directory(handle).await;
+    let before = [
+        marks_of(handle, t).await,
+        marks_of(handle, sub).await,
+        marks_of(handle, a).await,
+    ];
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, t), entry(11, intact)],
+        async move |state, repository| break_child_link(state, repository, sub).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![
+            (10, 0, LoreErrorCode::Internal),
+            (11, 1, LoreErrorCode::None)
+        ],
+        "the entry whose check failed fails alone"
+    );
+    assert_eq!(
+        [
+            marks_of(handle, t).await,
+            marks_of(handle, sub).await,
+            marks_of(handle, a).await,
+        ],
+        before,
+        "the failed entry stages nothing"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Until a move puts a tracked node below an added directory, a delete does not walk a tracked
+/// subtree before it stages it: the same unreadable `t/sub` fails the entry only once the marks
+/// reach it, `t` staged for deletion by then.
+#[tokio::test]
+async fn a_tracked_subtree_is_not_checked_before_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xe9u8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-check-skipped", partition).await;
+    let t = seed(handle, ROOT_NODE, "t", LoreNodeType::Directory).await;
+    let sub = seed(handle, t, "sub", LoreNodeType::Directory).await;
+    settle(handle, &[t, sub]).await;
+    seed(handle, sub, "x.bin", LoreNodeType::File).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, t)],
+        async move |state, repository| break_child_link(state, repository, sub).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails"
+    );
+    assert_eq!(
+        marks_of(handle, t).await.0,
+        LoreNodeStagedAction::Delete as u32,
+        "the marks ran before any walk of the subtree"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Until a move puts a tracked node below an added directory, a delete does not walk an added
+/// subtree before it detaches it either: an unreadable `n/m` fails the entry only once the detach
+/// reaches it, `n` detached by then.
+#[tokio::test]
+async fn an_added_subtree_is_not_checked_before_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xebu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-added-check-skipped", partition).await;
+    let n = seed(handle, ROOT_NODE, "n", LoreNodeType::Directory).await;
+    let m = seed(handle, n, "m", LoreNodeType::Directory).await;
+    seed(handle, m, "x.bin", LoreNodeType::File).await;
+
+    let (status, events) = plan_change_apply(
+        handle,
+        vec![entry(10, n)],
+        async move |state, repository| break_child_link(state, repository, m).await,
+    )
+    .await;
+
+    assert_ne!(status, 0, "the unreadable subtree fails the call");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails"
+    );
+    assert!(
+        children_of(handle, ROOT_NODE).await.is_empty(),
+        "the detach ran before any walk of the subtree"
+    );
+    release(handle, store_handle_id);
+}
+
+/// Sets the parent link of `node` to `parent`.
+async fn set_parent_link(handle: LoreRevisionTree, node: NodeID, parent: NodeID) {
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let block = internal
+        .state_for_tests()
+        .block(
+            internal.repository_context.clone(),
+            lore_revision::node::NodeBlock::index(node),
+        )
+        .await
+        .expect("the node's block");
+    block
+        .write_for_tests()
+        .node(lore_revision::node::Node::index(node))
+        .parent = parent;
+}
+
+/// A tracked `d` left unmarked above the staged `d/s`, as an add's climb that failed on a block
+/// leaves it and the add retried then, holding an added `d/s/n` that a moved tracked `y` makes
+/// mixed: the delete of `d` fails with nothing staged and `y` still held, though the staged bits
+/// that a check below a tracked directory follows stop at `d`.
+#[tokio::test]
+async fn a_mixed_directory_below_a_climb_that_failed_fails_its_entry_unchanged() {
+    let partition = Partition::from([0xecu8; 16]);
+    let (handle, store_handle_id) = load_handle("delete-mixed-broken-climb", partition).await;
+    let d = seed(handle, ROOT_NODE, "d", LoreNodeType::Directory).await;
+    let s = seed(handle, d, "s", LoreNodeType::Directory).await;
+    let y = seed(handle, ROOT_NODE, "y.bin", LoreNodeType::File).await;
+    settle(handle, &[d, s, y]).await;
+    set_parent_link(handle, s, 0x00ff_ff00).await;
+    let (status, _) = run_add(handle, vec![add_entry(1, s, "n", LoreNodeType::Directory)]).await;
+    assert_ne!(status, 0, "the add's climb fails above 's'");
+    set_parent_link(handle, s, d).await;
+    let n = seed(handle, s, "n", LoreNodeType::Directory).await;
+    move_into(handle, y, n, "y.bin").await;
+    let before = [marks_of(handle, d).await, marks_of(handle, s).await];
+    assert_eq!(
+        before[0],
+        (0, 0),
+        "'d' is left unmarked above the staged 's'"
+    );
+
+    let (status, events) = run_delete(handle, vec![entry(10, d)]).await;
+    assert_ne!(status, 0, "the mixed subtree fails the call: {events:?}");
+    assert_eq!(
+        delete_outcomes(&events),
+        vec![(10, 0, LoreErrorCode::Internal)],
+        "the entry fails, reporting nothing removed"
+    );
+    assert_eq!(
+        [marks_of(handle, d).await, marks_of(handle, s).await],
+        before,
+        "the failed entry stages nothing"
+    );
+    assert_eq!(
+        children_of(handle, n).await,
+        vec![(y, LoreNodeStagedAction::Move as u32)],
+        "'y' is still held below 'n'"
+    );
+    release(handle, store_handle_id);
 }
 
 /// An entry whose marks of the directories above it fail, here at an ancestor whose parent link
@@ -1952,7 +2095,7 @@ async fn added_roots_below_two_directories_are_detached_per_entry() {
     );
     for node in [x, xc, z] {
         assert_eq!(
-            fetch_node_info(handle, node).await,
+            node_kind_and_staged_action(handle, node).await,
             (
                 node,
                 LoreNodeType::Directory as u32,

@@ -26,6 +26,7 @@ use lore_revision::state::Ext;
 use lore_revision::state::LinkPin;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::hash::hash_string;
 
 use crate::harness::faults::FailingStore;
@@ -54,7 +55,7 @@ pub async fn failing_repository() -> (Arc<RepositoryContext>, Arc<FailingStore>)
 }
 
 /// An in-memory immutable store.
-async fn immutable() -> Arc<dyn lore_storage::ImmutableStore> {
+pub async fn immutable() -> Arc<dyn lore_storage::ImmutableStore> {
     lore_storage::local::immutable_store::create(
         None::<&str>,
         lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
@@ -67,14 +68,25 @@ async fn immutable() -> Arc<dyn lore_storage::ImmutableStore> {
 
 /// A repository context over `immutable` and an in-memory mutable store over it.
 async fn over(immutable: Arc<dyn lore_storage::ImmutableStore>) -> Arc<RepositoryContext> {
-    let mutable = lore_storage::local::mutable_store::create(
+    let mutable = mutable_over(immutable.clone()).await;
+    Arc::new(RepositoryContext::new_null_context(
+        immutable,
+        mutable,
+        allow_all_repositories(),
+    ))
+}
+
+/// An in-memory mutable store over `immutable`.
+pub async fn mutable_over(
+    immutable: Arc<dyn lore_storage::ImmutableStore>,
+) -> Arc<dyn lore_storage::MutableStore> {
+    lore_storage::local::mutable_store::create(
         None::<&str>,
         lore_storage::MutableStoreSettings::default(),
-        immutable.clone(),
+        immutable,
     )
     .await
-    .expect("an in-memory mutable store");
-    Arc::new(RepositoryContext::new_null_context(immutable, mutable))
+    .expect("an in-memory mutable store")
 }
 
 /// A State and its repository, with the nodes a scenario names, and the revision it stands
@@ -424,14 +436,7 @@ impl Tree {
             .await
             .expect("the State saves");
         let store = FailingStore::new(self.repository.immutable_store());
-        let mutable = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            store.clone(),
-        )
-        .await
-        .expect("an in-memory mutable store");
-        let repository = Arc::new(RepositoryContext::new_null_context(store.clone(), mutable));
+        let repository = over(store.clone()).await;
         let state = State::deserialize(repository.clone(), signature)
             .await
             .expect("the State loads");

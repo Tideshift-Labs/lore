@@ -103,6 +103,7 @@ async fn connect(peer: &Peer, access_token: &str) -> Arc<StorageClient> {
         partition(),
         &Arc::new(SuppliedCredentials::new("", access_token)),
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect to the scripted peer")
@@ -386,6 +387,7 @@ async fn each_session_keeps_the_exp_of_the_token_it_started_with() {
         partition(),
         &credentials,
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect");

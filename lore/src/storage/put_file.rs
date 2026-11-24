@@ -56,9 +56,55 @@ pub struct LoreStoragePutFileItem {
     pub remote_write: u8,
     /// Tag the resulting fragment with `PayloadLocalCachePriority` so future remote reads always cache it locally
     pub local_cache: u8,
+    /// Ask the remote whether it already holds each fragment at its exact address before
+    /// compressing and uploading it, and upload none it holds. With `local_cache`, a fragment the
+    /// remote holds is still compressed for the local copy, and only its upload is spared. Costs a
+    /// round trip per fragment the local store does not know as stored remotely. A fragment it
+    /// knows under another context the remote holds is copied from there first, and asked about
+    /// only if the remote refuses the copy. Takes effect only where `remote_write` does. The field
+    /// sits in what was padding, so zero the whole item with `memset`, or give it static storage,
+    /// before setting its fields: a non-zero padding byte from a caller built against an older
+    /// header turns the query on
+    pub remote_query: u8,
+    /// Read only the ranges of the file the file system holds data for, and store each hole between
+    /// them as a hole in the fragment list: never read, hashed or stored. A hole is a range holding
+    /// no data, never written, or allocated and never written (an unwritten extent), as the file
+    /// system's extent map tells on Linux and `SEEK_DATA` on macOS, each with the file synced
+    /// first. APFS allocates a hole of under 16 MiB beside data as zeros when it writes that data
+    /// out, so such a range is data there. On Windows, on NTFS, everything at or past the
+    /// file's valid data length was never written and is a hole, in a file that is sparse or not;
+    /// below it, and on any other file system, a hole is a range a sparse file leaves unallocated,
+    /// and every allocated range is data. Where the put cannot write the file's data out first, as
+    /// for a read-only file or while another handle to it shares no write access, the whole file
+    /// is data, with no hole, and so is a file whose data its file system may keep elsewhere until
+    /// it is read, as a cloud placeholder, an offline file or one behind a reparse point. Without
+    /// this field the file is read whole, and nothing here applies.
+    /// Zeros written to the file are data and stored as such: a file with a hole and the same file
+    /// with zeros written over it get different addresses, unless the file system itself leaves
+    /// those zeros unallocated, as NTFS can for a small write of zeros alone in an allocation unit
+    /// of a sparse file: then they are a hole. A file larger than one fragment that has holes gets
+    /// a different address than it gets without this; one without holes gets the same.
+    /// `lore_storage_get_file` leaves each hole unwritten, a hole of the file it writes. The field
+    /// sits in what was padding, after `remote_query`, so zero the whole item before setting its
+    /// fields, as for `remote_query`
+    pub skip_holes: u8,
     /// Leaf fragment size cap for large files; `0` lets `write_content` choose
     pub fixed_size_chunk: u64,
 }
+
+// Lock the C ABI layout of `LoreStoragePutFileItem` on a 64-bit target. `remote_query` and
+// `skip_holes` sit in the padding after `local_cache`, so a caller built against a header without
+// them passes an item of the same size, with `fixed_size_chunk` at the same offset.
+const _: () = assert!(std::mem::size_of::<LoreStoragePutFileItem>() == 72);
+const _: () = assert!(std::mem::offset_of!(LoreStoragePutFileItem, fixed_size_chunk) == 64);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileItem, remote_query)
+        == std::mem::offset_of!(LoreStoragePutFileItem, local_cache) + 1
+);
+const _: () = assert!(
+    std::mem::offset_of!(LoreStoragePutFileItem, skip_holes)
+        == std::mem::offset_of!(LoreStoragePutFileItem, remote_query) + 1
+);
 
 impl core::fmt::Debug for LoreStoragePutFileItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -66,6 +112,8 @@ impl core::fmt::Debug for LoreStoragePutFileItem {
             .field("id", &self.id)
             .field("path", &self.path.as_str())
             .field("remote_write", &self.remote_write)
+            .field("remote_query", &self.remote_query)
+            .field("skip_holes", &self.skip_holes)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
@@ -83,12 +131,12 @@ pub struct LoreStoragePutFileArgs {
 }
 
 /// Read one or more files into the content-addressed store.
-pub async fn put_file(
+pub fn put_file(
     globals: LoreGlobalArgs,
     args: LoreStoragePutFileArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, put_file_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, put_file_local)
 }
 
 async fn put_file_local(
@@ -98,6 +146,7 @@ async fn put_file_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -112,7 +161,7 @@ async fn put_file_local(
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "put_file", |item| {
+            crate::storage::fan_out_items!(items, "put_file", stats = stats, |item| {
                 let session = reuse.session_for(
                     &store,
                     item.partition,
@@ -158,6 +207,12 @@ async fn resolve_put_file_item(
     }
     if item.local_cache != 0 {
         write_options = write_options.with_local_cache_priority();
+    }
+    if item.remote_query != 0 {
+        write_options = write_options.with_remote_query();
+    }
+    if item.skip_holes != 0 {
+        write_options = write_options.with_skip_holes();
     }
 
     write_from_file(

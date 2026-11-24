@@ -18,6 +18,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_revision::immutable;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::options::WriteOptions;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Serialize;
@@ -29,6 +30,7 @@ use crate::auth::jwt::matching_permissions;
 use crate::auth::jwt::write_permission_granted;
 use crate::auth::jwt_axum_middleware::http_permits;
 use crate::authnz::repository_authorizer::Action;
+use crate::http::failed_authorization_status;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -113,27 +115,40 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             let repository = match repository_id.parse::<Context>() {
-                Ok(repository_id)
-                    if !http_permits(
+                Ok(repository_id) => {
+                    match http_permits(
                         state.repository_authorizer.as_ref(),
                         &extensions,
                         repository_id.into(),
                         Action::Write,
                     )
-                    .await =>
-                {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        header_error,
-                        Body::from("Not permitted"),
-                    )
-                        .into_response();
+                    .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return (
+                                StatusCode::FORBIDDEN,
+                                header_error,
+                                Body::from("Not permitted"),
+                            )
+                                .into_response();
+                        }
+                        Err(status) => {
+                            return (
+                                failed_authorization_status(&status),
+                                header_error,
+                                Body::from("Authorization check failed"),
+                            )
+                                .into_response();
+                        }
+                    }
+                    Arc::new(RepositoryContext::new_server_context(
+                        state.immutable_store.clone(),
+                        state.mutable_store.clone(),
+                        repository_id.into(),
+                        no_link_traversal(),
+                    ))
                 }
-                Ok(repository_id) => Arc::new(RepositoryContext::new_server_context(
-                    state.immutable_store.clone(),
-                    state.mutable_store.clone(),
-                    repository_id.into(),
-                )),
                 Err(error) => {
                     debug!("Error parsing the repository ID {}", error);
                     return (

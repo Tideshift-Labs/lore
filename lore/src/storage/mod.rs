@@ -85,53 +85,56 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
+use lore_revision::immutable::send_fragment_stats;
 use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
+use lore_revision::store::event::LoreStoragePutStatsEventData;
+use lore_storage::FragmentWriteCounts;
 use lore_storage::StorageError;
 use lore_storage::StoreResult;
 
 /// Close every storage handle currently registered with the library.
 ///
 /// Drains the registry atomically (no new ops can find the handles after this call enters)
-/// and runs the close sequence — mark invalid, await in-flight counter, spawn flush — for
+/// and runs the drain sequence — mark invalid, await in-flight counter, spawn flush — for
 /// each one. Per-handle drains run in parallel: with N handles, wall time is the slowest
 /// drain rather than the sum. Returns once every handle is invalidated and drained; the
-/// per-handle flush tasks continue in the background and rely on the runtime staying alive
-/// long enough for them to terminate. The library shutdown path calls this before tearing
-/// down the runtime.
+/// per-handle flushes continue in tasks the library shutdown waits for. The library shutdown
+/// path calls this before tearing down the runtime.
 ///
-/// Per-handle flush spawns pass `sync_data = false` (no fsync). Blocking on per-store fsync
-/// at shutdown would defeat the fire-and-forget contract; explicit `lore_storage_close`
-/// calls remain the path for callers that want a sync'd flush.
+/// Per-handle flushes pass `sync_data = false` (no fsync), so shutdown does not wait on a sync
+/// of every store; `lore_storage_close` is the path for callers that want a synced flush.
 pub async fn close_all_handles() {
     drain_in_parallel(handle::drain_all()).await;
 }
 
 /// Close every storage handle whose owning IPC connection matches `connection_id`.
 ///
-/// The IPC dispatcher invokes this on connection teardown — when a server-side connection
-/// drops without an explicit `lore_storage_close` for handles it opened, the dispatcher hands
-/// the connection identifier here and the registry walks itself, draining matching entries
-/// and running the close sequence on each. Client-mode handles (no connection id recorded)
-/// are unaffected. Per-handle drains run in parallel.
+/// This is the teardown of a server-side connection that drops without a `lore_storage_close`
+/// for the handles it opened. The registry walks itself, draining matching entries and running
+/// the drain sequence on each. Client-mode handles (no connection id recorded) are unaffected.
+/// Per-handle drains run in parallel.
 ///
 /// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
 /// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
 /// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
 /// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
-/// Revision tree handles loaded against a drained storage handle are closed too, and this
-/// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
-/// design, but a dropped connection leaves nobody to release it. The cascade runs per
-/// storage handle, each draining its own trees in parallel.
+/// Revision tree handles loaded against a storage handle the connection opened are closed too,
+/// whether that storage handle is still open or was closed, and this is the only path that
+/// closes one for its caller: elsewhere a tree outlives its parent by design, but a dropped
+/// connection leaves nobody to release it. The trees drain in parallel, before the storage
+/// handles. As [`crate::revision_tree::drain_in_parallel`] describes, a tree on a storage
+/// handle still open leaves its flush to that handle's, and one on a storage handle closed
+/// flushes the stores itself. The trees' drain waits at most 10 seconds for their calls in
+/// flight; a tree whose calls end later is flushed once they have. The storage handles' drain
+/// waits for their calls without a bound.
 pub async fn close_for_connection(connection_id: u64) {
     let entries = handle::drain_for_connection(connection_id);
-    for (storage_handle_id, _) in &entries {
-        crate::revision_tree::close_for_storage_handle(*storage_handle_id).await;
-    }
+    crate::revision_tree::close_for_connection(connection_id).await;
     drain_in_parallel(entries).await;
 }
 
-/// Run the close sequence for each entry concurrently: every drain fires its own task so the
+/// Run the drain sequence for each entry concurrently: every drain fires its own task so the
 /// total wall time is bounded by the slowest drain, not the sum. The flush spawned inside is
 /// fire-and-forget; what runs in parallel here is the in-flight-counter await and the join of
 /// the claims each flush holds.
@@ -147,12 +150,11 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
             let claims = close::claims_for_flush(&store);
-            close::spawn_flush_stores(
-                store.immutable.clone(),
-                store.mutable.clone(),
+            drop(close::spawn_flush(
+                &store,
                 claims,
                 lore_storage::FlushOptions::default(),
-            );
+            ));
         });
     }
     while tasks.join_next().await.is_some() {}
@@ -218,7 +220,7 @@ impl PutItemOutcome {
         LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
             id,
             address: placed.map_or_else(Address::default, |outcome| outcome.address),
-            error: item_detail(&result),
+            error: LoreErrorDetail::from_result(&result),
             stored_local: u8::from(placed.is_some_and(|outcome| outcome.stored_local)),
             stored_remote: u8::from(placed.is_some_and(|outcome| outcome.stored_remote)),
         })
@@ -241,16 +243,6 @@ pub(crate) fn offset_past_end(offset: u64, size_content: u64) -> StorageError {
     invalid_item(format!(
         "item offset {offset} starts past the {size_content} byte content"
     ))
-}
-
-/// The detail an item's terminal event carries: the empty default on success, and on failure the
-/// error's own FFI code, message and trace. The default detail allocates nothing, so only a
-/// failure costs anything.
-pub(crate) fn item_detail<T>(result: &Result<T, StorageError>) -> LoreErrorDetail {
-    result
-        .as_ref()
-        .err()
-        .map_or_else(LoreErrorDetail::default, LoreErrorDetail::from_error)
 }
 
 /// How actionable a failure is, highest first. A rejected argument is the caller's own bug and
@@ -311,13 +303,15 @@ fn severity(err: &StorageError) -> u8 {
 /// Every spawned item is joined before returning, and a task that yields no result counts as an
 /// internal failure, so no item's slot is lost.
 ///
+/// With `stats = $stats` true, the call sends `STORAGE_PUT_STATS` once every item has finished
+/// ([`ItemOutcomes::into_put_call_result`]).
+///
 /// A macro rather than a function because `ObservedTask` records `Location::caller()` and the server
 /// labels its task metrics with it: expanding at the op's own line keeps one label per op, where a
 /// shared function body would report every op at a single location.
 macro_rules! fan_out_items {
-    ($items:expr, $op_name:literal, |$item:ident| $future:expr) => {{
+    (@outcomes $items:expr, |$item:ident| $future:expr) => {{
         let items = $items;
-        let total = items.len();
         if let [single] = items {
             let $item = single;
             let mut outcomes = $crate::storage::ItemOutcomes::default();
@@ -326,7 +320,7 @@ macro_rules! fan_out_items {
             #[allow(clippy::needless_borrow)]
             let result = $future.await;
             outcomes.push(result);
-            outcomes.into_call_result(total, $op_name)
+            outcomes
         } else {
             let mut tasks: ::tokio::task::JoinSet<
                 ::std::result::Result<(), ::lore_storage::StorageError>,
@@ -334,10 +328,20 @@ macro_rules! fan_out_items {
             for $item in items.iter().cloned() {
                 ::lore_base::lore_spawn!(tasks, $future);
             }
-            $crate::storage::ItemOutcomes::drain(tasks)
-                .await
-                .into_call_result(total, $op_name)
+            $crate::storage::ItemOutcomes::drain(tasks).await
         }
+    }};
+    ($items:expr, $op_name:literal, stats = $stats:expr, |$item:ident| $future:expr) => {{
+        let items = $items;
+        let total = items.len();
+        $crate::storage::fan_out_items!(@outcomes items, |$item| $future)
+            .into_put_call_result($stats, total, $op_name)
+    }};
+    ($items:expr, $op_name:literal, |$item:ident| $future:expr) => {{
+        let items = $items;
+        let total = items.len();
+        $crate::storage::fan_out_items!(@outcomes items, |$item| $future)
+            .into_call_result(total, $op_name)
     }};
 }
 pub(crate) use fan_out_items;
@@ -399,6 +403,29 @@ impl ItemOutcomes {
             }));
         }
         outcomes
+    }
+
+    /// [`Self::into_call_result`] of a put or upload call, after sending its `STORAGE_PUT_STATS`
+    /// for the `total` items where `stats` is set.
+    ///
+    /// The call's execution context is its own, so its fragment counters cover exactly the writes
+    /// of these items and need no baseline.
+    pub(crate) fn into_put_call_result(
+        self,
+        stats: bool,
+        total: usize,
+        op_name: &str,
+    ) -> Result<(), StorageError> {
+        if stats {
+            send_fragment_stats(&FragmentWriteCounts::default(), |fragments| {
+                LoreEvent::StoragePutStats(LoreStoragePutStatsEventData {
+                    items: total as u64,
+                    items_failed: self.failed as u64,
+                    fragments,
+                })
+            });
+        }
+        self.into_call_result(total, op_name)
     }
 
     /// The call-level result: the dominant failure, reported with its own code and message. How

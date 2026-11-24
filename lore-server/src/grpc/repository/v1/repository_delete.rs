@@ -12,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::InstrumentProvider;
 use tonic::Request;
 use tonic::Response;
@@ -29,12 +30,13 @@ use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::RepositoryAdministration;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
-use crate::grpc::may_administer_repository;
+use crate::grpc::repository_administration;
 use crate::grpc::requested_repository_id;
 use crate::util::setup_execution;
 
@@ -89,29 +91,37 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // Fork (CR-029, ruling D-1): an admitted governed delete is
+            // authorized by its domain admission (verified control-plane
+            // service identity, claim and witness). Upstream's
+            // creator-or-owner/admin check, and its be2f3914
+            // unreachable-as-missing answer, guard the ungoverned path only.
+            //
+            // Asked before the load, so a repository the caller's grants do not
+            // reach is answered as a missing one.
+            let administration = if governed.is_none() {
+                let administration = repository_administration(authorizer, &extensions, id).await?;
+                if administration == RepositoryAdministration::Unreachable {
+                    return Err(Status::not_found(format!("Repository {id} not found")));
+                }
+                Some(administration)
+            } else {
+                None
+            };
+
             let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
                 .await
                 .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            // Fork (CR-029, ruling D-1): an admitted governed delete is
-            // authorized by its domain admission (verified control-plane
-            // service identity, claim and witness). Upstream's
-            // creator-or-owner/admin check guards the ungoverned path.
-            if governed.is_none()
-                && !may_administer_repository(
-                    authorizer,
-                    &extensions,
-                    id,
-                    &metadata.creator,
-                    &user_id,
-                )
-                .await
+            if let Some(administration) = administration
+                && !administration.permits(&metadata.creator, &user_id)
             {
                 info!(
                     "Repository delete refused for user {user_id}, creator {}",

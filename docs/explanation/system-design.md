@@ -56,7 +56,7 @@ treated as opaque byte streams; text and binary data flow through the same primi
 Structurally, Lore is two systems: a *storage subsystem* - a partition-based, content-addressed
 store that deduplicates all content while enforcing strict per-partition access boundaries, usable
 entirely on its own through its own public API - and a *version control subsystem* that builds
-revisions, branches, merges, and staging out of storage primitives. Version control is one consumer
+revisions, branches, merging, and staging out of storage primitives. Version control is one consumer
 of the storage API, not a layer with privileged access to it.
 
 The storage subsystem is built from two stores. Every piece of content is stored once in an
@@ -122,7 +122,7 @@ it first becomes load-bearing.
 - **Storage subsystem.** The combination of the immutable content-addressed store and the mutable
   key-value store, exposed as a first-class public API. Independent of, and used by, the version
   control subsystem.
-- **Version control subsystem.** Revisions, branches, merges, staging, sync, push, diff, query -
+- **Version control subsystem.** Revisions, branches, merging, staging, sync, push, diff, query -
   the version control layer built on top of the storage subsystem and exposed through its own public
   API.
 - **Hash.** A 32-byte BLAKE3 hash of a content payload. Lore's address function throughout.
@@ -140,7 +140,8 @@ it first becomes load-bearing.
 - **Mutable store.** The key-value store holding non-content-addressed state, such as branch
   pointers and other small bookkeeping.
 - **Revision.** A frozen snapshot of the repository tree, identified by the hash of its serialized
-  state. Revisions form a graph; each has one parent, or two on a merge.
+  state. Revisions form a graph; each has one parent, or two when two lines of history were merged
+  into it.
 - **Branch.** A named, mutable pointer to a *latest revision* - Lore's analogue of Git's HEAD.
   Branch state lives in the mutable store and may differ between a client and the remote, or
   between two separate remotes.
@@ -149,17 +150,17 @@ it first becomes load-bearing.
 - **View** (`.lore/view`). Inbound filter declaring the sparse subset of the repository materialized
   to disk.
 - **Ignore** (`.loreignore`). Outbound filter declaring paths excluded from staging and committing.
-- **Stage.** Recorded intent to include a set of file changes in the next revision. Staging does not
-  produce fragments; committing does.
+- **Stage.** To mark a file's change for inclusion in the next revision. Staging records intent and
+  does not produce fragments; committing does.
 - **Dirty.** A flag on a tree node indicating that the file at that path differs from the committed
-  revision. Orthogonal to *stage*: a file can be dirty, staged, or both.
+  revision. Orthogonal to staging: a file can be dirty, staged, or both.
 - **Staged anchor.** A per-instance pointer in the local mutable store to the state tree that
   records the instance's divergence from the committed revision. The state tree itself is
   content-addressed in the immutable store and persists both dirty and staged flags; neither the
   anchor nor the tree is ever transmitted to the remote.
 - **Link.** A reference from one repository to a specific subset and revision of another, mounted at
   a path. Each linked repository is its own partition with its own access control. Links are part of
-  the committed revision: every clone of a revision sees the same links.
+  the committed revision: every instance on a revision sees the same links.
 - **Layer.** An overlay of a subset of one repository's content into another at a path, applied
   locally rather than stored in the revision. Layers do not travel with a revision; different
   machines can have different layer configurations.
@@ -295,8 +296,9 @@ hot-path throughput, and memory footprint are design constraints from day one. O
 multi-million-file repository must stay interactive; operations on a multi-gigabyte file must stream
 rather than materialize; data structures are chosen for cache locality, zero-copy deserialization,
 and constant-time indexing in preference to flexible-but-slow alternatives. The performance
-discipline runs through the document rather than living in any one section: zero-copy node layout
-in §10, fragment-time-not-stage-time hashing in §15, and stateless reads with edge tiering in §21.
+discipline runs through the document rather than living in any one section: zero-copy node layout in
+§10, hashing when committing rather than when staging in §15, and stateless reads with edge tiering
+in §21.
 
 **Backend-scalable.** The server tier scales horizontally. Hot/warm/cold storage tiering, edge
 caching, and read replicas are deployment decisions, not invasive system rewrites.
@@ -340,7 +342,7 @@ store, with its own public API. Operations include adding fragments, looking up 
 address, advancing mutable pointers atomically, and listing entries; the storage subsystem knows
 nothing about revisions, branches, or files.
 
-The *version control subsystem* (revisions, branches, merges, staging, sync, push, diff, query) is
+The *version control subsystem* (revisions, branches, merging, staging, sync, push, diff, query) is
 implemented on top of the storage subsystem and exposes its own public API.
 
 The separation is not an implementation detail. An application that needs only the storage
@@ -381,13 +383,14 @@ changes the address, and the old address still resolves to the old bytes.
 
 A *revision* is a frozen snapshot of the entire repository tree, identified by the hash of its
 serialized state. Each revision references its parent or parents - one for an ordinary revision, two
-for a merge revision. Revisions form a directed acyclic graph in which every edge is a cryptographic
-link.
+for a merged revision. Revisions form a directed acyclic graph in which every edge is a
+cryptographic link.
 
 A *branch* is a named, mutable pointer to a revision in this graph - the branch's *latest* revision,
 Lore's equivalent of Git's HEAD. Branches do not own revisions; a branch is just a name pointing at
-one revision in the graph. Operations such as rebase, cherry-pick, and merge are operations over the
-graph that produce new revisions whose parents and contents follow from the operation semantics.
+one revision in the graph. Operations such as rebasing, cherry-picking, and merging are operations
+over the graph that produce new revisions whose parents and contents follow from the operation
+semantics.
 
 #### 4.5 The repository as a Merkle tree
 
@@ -487,7 +490,7 @@ this point.
 
 #### 5.4 The version control subsystem
 
-The version control subsystem implements revisions, branches, merges, staging, and sync as
+The version control subsystem implements revisions, branches, merging, staging, and sync as
 compositions of storage operations. To commit, the subsystem writes a sequence of fragments to the
 immutable store and then issues a single conditional put on the latest pointer in the mutable
 store. To diff, it walks the two trees and fetches only the fragments along the differing paths. To
@@ -512,10 +515,10 @@ to satisfy reads from the closest tier with fall-through to the durable backend.
 #### 5.6 Sub-repository links and per-directory access control
 
 A *link* is a reference from one repository to a specific revision of another, mounted at a path in
-the parent's tree. The link is recorded in the parent's revision and travels with it: every clone of
-the parent sees the same links. Architecturally, a link is just a tree node with a flag and a target
-address; functionally, traversing into a link transparently switches to the linked repository's
-storage and version control state.
+the parent's tree. The link is recorded in the parent's revision and travels with it: every instance
+of the parent sees the same links. Architecturally, a link is just a tree node with a flag and a
+target address; functionally, traversing into a link transparently switches to the linked
+repository's storage and version control state.
 
 The architectural consequence that matters most is access control. A *partition* is Lore's access
 boundary; inside a single partition, Lore deliberately does not have per-path ACLs - every byte in a
@@ -537,8 +540,9 @@ isolation at the storage and access control layer.
 #### 5.7 Layers: local overlays
 
 A *layer* is an overlay of a subset of one repository's content into another at a path, applied
-locally rather than stored in the parent's revision. A layer is configured on a workstation and does
-not travel with a clone; two machines on the same revision can have different layer configurations.
+locally rather than stored in the parent's revision. A layer is configured on a workstation and is
+not carried over when cloning; two machines on the same revision can have different layer
+configurations.
 
 Architecturally, layers and links solve overlapping problems with different semantics. A link is a
 versioned dependency every consumer of the parent sees; a layer is a local decoration of the
@@ -575,12 +579,22 @@ open a repository, stage and commit changes, create branches, merge, rebase, che
 query history, sync with a remote, manage links. None of these is reachable only through the CLI;
 every one is a function call on the C header.
 
+The C header names each operation for its surface. The storage subsystem has one surface, and the
+version control subsystem three:
+
+| Surface | Works on | Reached through | Prefix |
+| --- | --- | --- | --- |
+| **Storage API** | Fragments and mutable-store keys in a partition | A storage handle | `lore_storage_*` |
+| **Revision tree API** | One revision's tree, in memory | A revision tree handle, loaded from a storage handle | `lore_revision_tree_*` |
+| **Revision graph API** | A repository's branches and revisions | A storage handle and a repository ID | `lore_revision_graph_*` |
+| **File-system-based API** | A repository instance and its working tree | The instance's path | `lore_branch_*`, the other `lore_revision_*` calls, and others |
+
 #### 6.3 The storage subsystem as a standalone API
 
 The storage subsystem is a first-class public API, usable with no repository, no branch, and no
-revision involved. An application opens a store handle and operates on content directly:
+revision involved. An application opens a storage handle and operates on content directly:
 
-- *Open and close.* A store handle is opened in one of two modes: *disk-backed*, against a
+- *Open and close.* A storage handle is opened in one of two modes: *disk-backed*, against a
   local path whose packfiles persist across runs, or *in-memory*, a fresh ephemeral store that
   lives only as long as the handle - useful as a transient deduplicating cache, a scratch store
   for a pipeline stage, or a test fixture. Either mode can carry an optional remote endpoint for
@@ -588,12 +602,20 @@ revision involved. An application opens a store handle and operates on content d
   access; nothing about revisions or working trees is required to obtain one.
 - *Content operations.* Through the handle, an application writes and reads content-addressed
   fragments, copies a fragment from one partition to another, uploads not-yet-durable local
-  content to the remote, and obliterates content.
+  content to the remote, and obliterates content. A read that fetches a fragment from the remote
+  writes it to the local store as held by the remote: with its payload where the read caches it
+  or the fragment asks for that, and as an entry without its payload otherwise, so a later write
+  of the same content uploads nothing. A metadata query the remote answers writes the fragment
+  the same way, without its payload. A write to the remote can first ask whether the remote
+  already holds each fragment at its exact address, and send no payload for one it holds: a store
+  that knows nothing of content the remote has, such as one on a fresh machine, then uploads only
+  what the remote lacks, at the cost of a round trip per fragment.
 - *File ingest and extract.* The same handle reads a file directly into content-addressed
   fragments - chunking and hashing it through the storage subsystem's own machinery (§8) - and
   writes a stored payload straight back to a filesystem path, without the caller assembling bytes
-  in memory or implementing chunking itself. This is the bridge that lets storage back an asset
-  or build pipeline directly.
+  in memory or implementing chunking itself. A large write of content, or of a range of it, to a
+  path that is interrupted resumes on a retry of the same content and range (§14.4). This is the
+  bridge that lets storage back an asset or build pipeline directly.
 - *Metadata probe.* An application can fetch a fragment's metadata - its size, flags, and
   compression - without paying for the payload bytes, to decide whether content is present or
   worth fetching before committing to the transfer.
@@ -614,12 +636,25 @@ in a partition the session is not entitled to (§17.5, §17.6). Storage cost is 
 is per-partition; the two are decoupled without compromising either.
 
 It is *completely independent of version control*. The storage API knows nothing about revisions,
-trees, branches, staging, or merges - it deals only in partitions, addresses, fragments, and
-bytes. An application that needs content-addressed, deduplicated, access-controlled blob storage
-- a build cache, an asset pipeline, a backup target, a multi-tenant artifact service - can use
-Lore purely as a storage system and never touch the version control subsystem. The version
-control subsystem is then one such consumer of the storage API among many, not a privileged
-layer with private access to it.
+trees, branches, staging, or merging - it deals only in partitions, addresses, fragments, and
+bytes. An application that needs content-addressed, deduplicated, access-controlled blob storage -
+a build cache, an asset pipeline, a backup target, a multi-tenant artifact service - can use Lore
+purely as a storage system and never touch the version control subsystem. The version control
+subsystem is then one such consumer of the storage API among many, not a privileged layer with
+private access to it.
+
+The revision tree and revision graph APIs (§6.2) work through the storage handle the storage API
+opens, so a pipeline goes from content to branches without a repository instance. The revision tree
+API loads one revision's tree from a storage handle and a repository ID, edits it in memory, and
+commits it. The revision graph API works on a repository's branches and revisions from the same two
+values, with no handle of its own. All three surfaces use the handle's local stores, reach the
+remote through the handle's remote endpoint, and trust it as the handle does. So a revision tree
+adds content by the address the storage API stored it under. Committing it moves the branch's latest
+in the handle's local mutable store, where the revision graph API reads it. The revision tree API
+loads a revision the revision graph API resolves, by its hash. The handle counts the storage and
+revision graph calls in flight, and closing it waits for them before it flushes the stores. A
+revision tree holds the handle's stores past a close, until the tree itself is closed. A revision
+tree does not support content stored with its holes skipped (§8.5).
 
 #### 6.4 Specifications behind the API
 
@@ -857,11 +892,11 @@ Fixed-size chunking is the right answer when canonical addressing matters more t
 robustness, or when the property above must hold. Boundaries are determined by offset alone, so
 the same content always produces the same chunks and therefore the same top-level hash,
 regardless of chunking history. The address is canonical - one piece of content has exactly one
-address - and `address(A) != address(B) => content(A) != content(B)` holds unconditionally. A
-chunk at offset 12 GiB has a deterministic address that any party can compute by reading just
-that chunk's bytes. The cost is that dedup is preserved only for aligned, identical regions;
-an insertion at the beginning of a file shifts every subsequent boundary, and no chunk after
-the insertion deduplicates with the original.
+address - and `address(A) != address(B) => content(A) != content(B)` holds for content stored
+without its holes skipped (§8.5). A chunk at offset 12 GiB has a deterministic address that any
+party can compute by reading just that chunk's bytes. The cost is that dedup is preserved only
+for aligned, identical regions; an insertion at the beginning of a file shifts every subsequent
+boundary, and no chunk after the insertion deduplicates with the original.
 
 Lore offers both strategies; the choice for any given content is made by the application calling
 the storage subsystem, not by Lore itself. An application can map content types to strategies in
@@ -899,6 +934,19 @@ advantage of this). Reading a byte range fetches only the fragments that overlap
 typically a small fraction of the file - and those fragments can be fetched in parallel and
 processed out of order, since each is independent of the others. Sparse reads scale with the
 requested range, not with the file size.
+
+A reference can be a *hole*: it names no fragment, and stands for a range holding no data, which
+reads as zeros. A file the file system holds mostly as holes, such as a disk image, can be stored
+with its holes skipped: only the ranges the file system holds data for are read, chunked and stored,
+and each hole between them costs one reference, however large it is. Zeros written to the file are
+data, stored as any other content, so a file with a hole and the same file with zeros written over
+it are different content with different addresses, unless the file system itself leaves those
+written zeros unallocated: then they are a hole, as Lore never reads content to decide what is a
+hole. A fixed-size chunk wholly inside the data has the address it has without the holes skipped,
+so that data deduplicates against the same file stored whole. Writing the content to a file leaves
+its holes as holes wherever the file system supports them, a resumed write included (§14.4), and
+writes every range of data, zeros included. Readers of the storage API see zeros for a hole, but
+fragment delivery passes it on as a hole.
 
 #### 8.6 Compression as an orthogonal concern
 
@@ -1027,13 +1075,12 @@ contend; two clients writing fragments to the same partition do not contend. The
 exclusively at the `cas` on a mutable key, and only when both writers target the
 same key.
 
-Atomicity follows from this single primitive. A higher-level operation (a commit and push, for
-instance) writes all its fragments to the immutable store first, then issues a single
-`cas` to advance the latest pointer. A push interrupted before that put is not
-visible to readers - the fragments are in the immutable store but no pointer points at them
-yet, and the branch still appears at its prior latest revision. The advance is the only thing
-that promotes a set of fragments to "the current state of the branch", and it either happens
-fully or not at all.
+Atomicity follows from this single primitive. A higher-level operation (committing and pushing,
+for instance) writes all its fragments to the immutable store first, then issues a single `cas`
+to advance the latest pointer. A push interrupted before that put is not visible to readers -
+the fragments are in the immutable store but no pointer points at them yet, and the branch still
+appears at its prior latest revision. The advance is the only thing that promotes a set of
+fragments to "the current state of the branch", and it either happens fully or not at all.
 
 ### 10. Revisions and the Merkle Tree
 
@@ -1051,13 +1098,13 @@ things. The fields are:
 
 - A magic number and a format version for self-identification.
 - The revision number (an integer that increments by one along a branch's first-parent chain).
-- Hash signatures of the parent revision states - one for an ordinary revision, two for a
-  merge.
+- Hash signatures of the parent revision states - one for an ordinary revision, two for a merged
+  revision.
 - The hash of the serialized Merkle tree (the full file and directory structure).
-- The hash of the serialized metadata (revision commit message, author, timestamps, additional
+- The hash of the serialized metadata (revision message, author, timestamps, additional
   key-value metadata).
 - The hash of the serialized link list (for repositories that mount linked repositories).
-- A repository ID for the second parent in cross-repository merges.
+- A repository ID for the second parent when merging across repositories.
 - A few reserved fields for forward compatibility.
 
 The size matters. 320 bytes is small enough to be freely cached, fetched in one round trip,
@@ -1130,11 +1177,11 @@ revision is a mutable-store insertion: new branch ID, new name-to-ID mapping, la
 initialized to the branch-point revision. No new revisions are written by the branch operation
 itself.
 
-A *merge* is a revision with two parents instead of one. Both parent state hashes are recorded
-in the merge revision's 320-byte state; the merge revision's tree is the result of combining the
-two parent trees, with conflicts resolved at commit time (automatic for non-conflicting changes,
-manual otherwise). The graph remains a DAG because the merge revision is a fresh node, not an
-edit to an existing one.
+A *merged revision* is a revision with two parents instead of one. Both parent state hashes are
+recorded in the merged revision's 320-byte state; the merged revision's tree is the result of
+combining the two parent trees, with conflicts resolved when committing (automatic for
+non-conflicting changes, manual otherwise). The graph remains a DAG because the merged revision
+is a fresh node, not an edit to an existing one.
 
 Two branches can share the same revision history up to some point and diverge from there, and
 the mutable store can hold both names mapping to different latest revisions in the same shared
@@ -1173,7 +1220,7 @@ data model supports each of them, but some are still on the roadmap.
 
 Metadata in Lore is a typed key-value store attached to entities in the system - files,
 revisions, branches, and repositories. It is the primary extension point for both built-in
-system data (revision commit messages, timestamps, branch categories) and arbitrary
+system data (revision messages, timestamps, branch categories) and arbitrary
 application-defined data. This section explains where metadata lives, how immutable
 revision-attached metadata differs from mutable branch- and repository-attached metadata, the
 format, and how Lore divides the key space between built-in and application use.
@@ -1185,9 +1232,9 @@ is *how* the entity references the blob, and therefore whether the metadata is p
 committed revision history or is a mutable annotation outside of history.
 
 - *Revision metadata*. Referenced by hash from the 320-byte revision state. Part of the
-  committed revision: every clone of the revision sees the same metadata, and the metadata is
-  hash-chained into the revision's state hash. It cannot be changed after commit; "revising" a
-  revision's metadata would produce a different revision.
+  committed revision: every instance on the revision sees the same metadata, and the metadata
+  is hash-chained into the revision's state hash. It cannot be changed after committing;
+  "revising" a revision's metadata would produce a different revision.
 - *File metadata*. Stored in the file metadata block stream parallel to the node block stream.
   Part of the committed revision in the same way.
 - *Branch metadata*. Referenced by a metadata pointer in the mutable store. Mutable: a write
@@ -1249,8 +1296,8 @@ the keys it understands, and ignores the rest.
 
 ### 12. Sparseness and Partial Working Copies
 
-Lore is built for repositories where the full tree is far too big to materialize on every
-clone. Sparse instances and lazy data fetching are not power-user features bolted on the
+Lore is built for repositories where the full tree is far too big to materialize in every
+instance. Sparse instances and lazy data fetching are not power-user features bolted on the
 side; they are the default operating mode of the system. This section explains how Lore
 filters what gets to disk, what gets staged, what gets fetched, and how the local cache makes
 the whole thing efficient.
@@ -1280,7 +1327,7 @@ The view is defined locally by the user. It is a file of glob rules the user wri
 an instance at, supplied at clone time (`lore clone --view`) or left out for the whole tree.
 Nothing in the repository declares it and no deployment policy imposes one, so two clients on
 the same revision can hold different views and materialize different subsets of the same tree.
-It is not part of the committed revision and does not travel with a clone.
+It is not part of the committed revision and is not carried over when cloning.
 
 A view is not fixed for the life of an instance either. The user can point an existing
 instance at a different view file at any later point (`lore sync --view <file>`), and the
@@ -1302,9 +1349,9 @@ For the rule syntax and worked examples, see
 #### 12.3 Ignore files: outbound filtering
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
-want included in commits. Paths matching ignore rules that the tree does not already track are
-not staged, not committed, and not reported in status. A forced stage or a merge can still stage
-such a path; status lists it and the commit takes it. Build artifacts, editor temporary files,
+want included in revisions. Paths matching ignore rules that the tree does not already track are
+not staged, not committed, and not reported in status. Forced staging or merging can still stage
+such a path; status lists it and committing takes it. Build artifacts, editor temporary files,
 machine-local configuration: all typical inhabitants.
 
 An instance can add rules of its own in `ignore`, in its Lore directory (`.lore/ignore` for a
@@ -1330,16 +1377,17 @@ The rule is simple: operations on *committed state* consult the view only; opera
   ignore rule was added must still flow through, otherwise the system would refuse to update
   perfectly legitimate committed paths. Resetting to a revision is one of them, so the ignore
   file has no say in what a reset restores or removes.
-- Operations on the working directory or staging area - staging, status, locking - filter
-  through both. The view limits what the operation sees on disk; the ignore file then further
-  excludes things the user has declared shouldn't be staged. The ignore file is asked only about
-  paths the tree does not hold yet: a path already staged or committed, for example one staged
-  past the ignore file with `--force`, keeps flowing through staging, status and locking like any
-  other, its deletion included. A working-tree entry of another kind at its path is new content.
-  A change staged past the view, by a forced stage or a merge, is listed by status and committed
-  like any other. A forced stage of a file a merge staged there resolves the merge with the
-  working tree's file. Unstaging follows the view, below links too but not yet below a layer
-  mount, and a forced unstage takes back what a forced stage staged there outside a merge.
+- Operations on the working directory or staging area - staging, status, locking - filter through
+  both. The view limits what the operation sees on disk; the ignore file then further excludes
+  things the user has declared shouldn't be staged. The ignore file is asked only about paths the
+  tree does not hold yet: a path already staged or committed, for example one staged past the
+  ignore file with `--force`, keeps flowing through staging, status and locking like any other,
+  its deletion included. A working-tree entry of another kind at its path is new content. A
+  change staged past the view, by forced staging or by merging, is listed by status and committed
+  like any other. Force-staging a file that merging staged there resolves the merge operation
+  with the working tree's file. Unstaging follows the view, below links too but not yet below a
+  layer mount, and force-unstaging takes back what force-staging staged there outside a merge
+  operation.
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult
@@ -1366,9 +1414,18 @@ deployment decision, not a client concern.
 
 #### 12.6 The local cache
 
-A client's local store doubles as a fragment cache. Fragments fetched on demand stay locally
-once they are read, so subsequent reads of the same fragment do not contact the remote. The
-cache is the instance's footprint plus whatever was loaded along the way to producing it.
+A client's local store doubles as a fragment cache. Fragments a read caches stay locally once
+they are fetched, so subsequent reads of the same fragment do not contact the remote. The cache
+is the instance's footprint plus whatever was loaded along the way to producing it.
+
+A fragment written with local cache priority, or one that holds a revision state, asks every
+read that fetches it to keep its payload, whether or not the read caches. A read that doesn't
+keep a fetched fragment's payload still writes the fragment to the local store, as an entry
+without its payload, and so does a metadata query the remote answers. Whatever a read writes is
+marked as held by the remote, so a later write of the same content finds it there and uploads
+nothing, with no round trip to ask. Each is an entry in the local index, so the index grows with
+what the store has read, not only with what it keeps. An entry without its payload names
+content the store doesn't hold, so a read of it still fetches the payload.
 
 The cache is sized by the user: an LRU policy evicts the least-recently-used fragments when
 the configured budget is exceeded. A developer iterating on the same area of the repository
@@ -1376,17 +1433,17 @@ keeps a small working set hot; switching to a different area pulls in the new wo
 gradually evicts the old one. There is no system-imposed "right amount to cache" - the budget
 is set per workstation according to the disk space the user is willing to spend.
 
-Multiple repositories or clones on the same machine can share a single local store. Fragment
-addresses are content-derived, so two clones that happen to share content also share the
-cached bytes; the instances are separate, but the underlying fragment store is one.
+Multiple repositories or instances on the same machine can share a single local store.
+Fragment addresses are content-derived, so two instances that happen to share content also
+share the cached bytes; the instances are separate, but the underlying fragment store is one.
 
 ### 13. Binary-First by Design
 
 Lore treats every file as opaque bytes on the hot path. Text-aware behavior - line-oriented
-diff, line-ending normalization, encoding inference, syntax-aware merge - exists in tools that
-sit above the storage subsystem, not inside it. This section explains what binary-first means
-concretely, how text features layer on top, what it implies for diff/merge/review tooling, and
-how file-level locking handles content that cannot be merged at all.
+diff, line-ending normalization, encoding inference, syntax-aware merging - exists in tools
+that sit above the storage subsystem, not inside it. This section explains what binary-first
+means concretely, how text features layer on top, what it implies for diff/merge/review
+tooling, and how file-level locking handles content that cannot be merged at all.
 
 #### 13.1 What "binary first" means concretely
 
@@ -1399,8 +1456,8 @@ Binary-first is a discipline about what the storage and transport paths *don't* 
   ASCII, an arbitrary binary container that happens to contain readable text - all are
   treated identically, as byte sequences.
 - No clean/smudge filters in the data path. There is no on-write transformation that rewrites
-  file content during commit, and no on-read transformation that rewrites file content when
-  the instance is materialized. Bytes go in unchanged; bytes come out unchanged.
+  file content while committing, and no on-read transformation that rewrites file content
+  when the instance is materialized. Bytes go in unchanged; bytes come out unchanged.
 - No 7-bit assumptions. Hashing, chunking, transfer, and storage all operate on full 8-bit
   bytes. There is no special handling of NUL, no encoding of "control" characters, no
   expectation that any byte value carries semantic meaning to the storage path.
@@ -1428,19 +1485,19 @@ text-as-such happens above.
 
 Binary-first means the *storage subsystem* knows nothing about text. The *version control
 subsystem* above it ships built-in implementations of the common text-handling operations -
-text diff, three-way text merge, line-oriented conflict resolution - so that ordinary
-"two contributors edited the same file" workflows work out of the box. These implementations
-are top-level features, not part of the storage layer, and applications are free to replace
-them with their own.
+text diff, three-way text merging, line-oriented conflict resolution - so that ordinary "two
+contributors edited the same file" workflows work out of the box. These implementations are
+top-level features, not part of the storage layer, and applications are free to replace them
+with their own.
 
-- *Text diff and merge*. The version control subsystem ships a line-oriented text diff and
+- *Text diff and merging*. The version control subsystem ships a line-oriented text diff and
   a standard three-way merge implementation, used by default for text-shaped content.
-  Applications that want different semantics - word-level diff, semantic merge,
+  Applications that want different semantics - word-level diff, semantic merging,
   language-aware tooling - can plug in their own without touching anything below.
-- *Binary diff and merge*. There is no universal answer. A texture-file diff is meaningful as
-  an image, not as a hex dump; a 3D model merge requires a tool that understands the model's
-  topology; a database snapshot diff is a different operation again. Lore makes the bytes
-  available; specialized tools do the rest.
+- *Binary diff and merging*. There is no universal answer. A texture-file diff is meaningful
+  as an image, not as a hex dump; merging a 3D model requires a tool that understands the
+  model's topology; a database snapshot diff is a different operation again. Lore makes the
+  bytes available; specialized tools do the rest.
 - *Review surfaces*. Code review systems built on top of Lore can render each file with the
   viewer appropriate to its type - source as a syntax-highlighted line diff, an image as
   side-by-side rendering, a binary as a structured viewer. The renderer chooses per file;
@@ -1454,9 +1511,9 @@ behavior.
 
 Some files cannot be merged in any meaningful sense. A binary world-state file in a game
 engine, an image authoring document, a serialized scene - any format where two parallel edits
-produce a result no automated process can reconcile, and where a manual three-way merge would
-mean opening the file in a tool and re-doing the work. For these files, optimistic concurrency
-(commit, discover the conflict, merge) is the wrong model.
+produce a result no automated process can reconcile, and where merging three ways by hand
+would mean opening the file in a tool and re-doing the work. For these files, optimistic
+concurrency (commit, discover the conflict, merge) is the wrong model.
 
 Lore offers explicit file-level locking for this case. Three operations cover it:
 
@@ -1522,10 +1579,11 @@ work:
   without contacting the remote.
 - *A fragment cache.* Bytes for fragments that have been fetched at any point. Subsequent
   reads of those fragments do not hit the remote.
-- *File metadata blocks, after a clone prepared for offline work.* A clone that writes its
-  files, given `--offline` or `--cache`, holds every file metadata block of its revision, which
-  staging and committing write to. Any other clone fetches a block the first time a command
-  needs it, so offline work right after it, such as a commit, can need the remote.
+- *File metadata blocks, after cloning for offline work.* An instance cloned with its files
+  written, given `--offline` or `--cache`, holds every file metadata block of its revision,
+  which staging and committing write to. Any other instance fetches a block the first time a
+  command needs it, so offline work right after cloning, such as committing, can need the
+  remote.
 
 What the client does *not* hold is the canonical answer to "what is the current latest of
 this branch on the remote." That answer can be queried at sync time; between syncs, the
@@ -1574,36 +1632,52 @@ fetches fragment by fragment; an interruption leaves the already-fetched fragmen
 local fragment cache, and the resume picks up where it stopped. The fragment cache and the
 upload protocol are mirror images in this respect.
 
-#### 14.5 Conflict handling and merge
+A storage API read of content into a file resumes without the fragment cache. A large read that
+is interrupted keeps what it wrote, and a retry of the same content and range to the same path
+checks each fragment it finds there against its address and fetches only the fragments it cannot
+verify, every fragment of zeros among them, since a range no read wrote reads as zeros too. The
+check reads back what was written rather than trusting a record of it, since a crash can lose or
+tear writes to a file outside the store: on a slow disk a resume of a mostly written range can take
+longer than fetching it again over a fast link. Holes stay holes on a resume, as in a fresh read,
+and a retry that cannot trust the file, as where it finds data in a hole of the content, writes it
+afresh. Only a large read resumes: keeping a read resumable costs it a small, fixed amount of
+file-system work, a large share of a small read's time spent to save at most a fetch of that small
+range. Resuming reads to one path exclude each other, so that none writes into a file another is
+writing or moving into place; other reads neither exclude nor wait.
+
+#### 14.5 Conflict handling and merging
 
 When a push's conditional put fails, the server is telling the client "the branch has moved
 since your last sync." The local revision is now based on a parent that is no longer the
 latest on the remote, and the user has to reconcile.
 
-Reconciliation in Lore is a sync followed by a merge, initiated by the user. Sync fetches
+Reconciliation in Lore is syncing followed by merging, initiated by the user. Sync fetches
 the new remote revisions on the branch - those between the client's old latest and the new
-remote latest - and produces a *merge revision* whose two parents are the local latest and
-the remote latest. The merge revision's tree is the combination of the two parent trees.
-Once the merge revision has been committed locally (and any content conflicts resolved by
+remote latest - and produces a *merged revision* whose two parents are the local latest and
+the remote latest. The merged revision's tree is the combination of the two parent trees.
+Once the merged revision has been committed locally (and any content conflicts resolved by
 the user), the client retries the push: the new H_old in the conditional put is now the
-remote latest, the merge revision descends from it, and the push advances the remote latest
-to the merge revision.
+remote latest, the merged revision descends from it, and the push advances the remote latest
+to the merged revision.
 
 Two clients pushing to the same branch interleave through this protocol. Whichever pushes
-first wins the conditional put; the loser syncs, merges, and pushes the resulting merge
+first wins the conditional put; the loser syncs, merges, and pushes the resulting merged
 revision. Most pairs of parallel changes merge cleanly without user intervention; pairs that
-touch the same content in incompatible ways surface as conflicts during the merge step,
-where the user resolves them before committing the merge revision.
+touch the same content in incompatible ways surface as conflicts while merging, where the
+user resolves them before committing the merged revision.
 
 A push can opt in to *server-side fast-forward merge*. With the option enabled, when the
 branch has moved on the remote between the client's last sync and the push, the server
-attempts to create the merge revision itself - `parent_self` set to the current remote
+attempts to create the merged revision itself - `parent_self` set to the current remote
 latest, `parent_other` set to the incoming revision - and advances the latest pointer to
-that merge revision. This succeeds when the parallel changes don't touch the same content.
-If the server-side merge encounters a conflict, the push fails with a signal back to the
-client that the user should sync and merge locally. Server-side fast-forward merge is an
-optimization that lets a successful concurrent push complete in one round trip; it is not
-a substitute for client-side reconciliation when there is a real conflict.
+that merged revision. This succeeds when the parallel changes don't touch the same content.
+If merging on the server encounters a conflict, the push fails with a signal back to the
+client that the user should sync and merge locally. A push of several revisions has the
+changes of each one from its own first parent merged onto the latest in turn, from the first
+revision that needs a merge on; one that conflicts fails the push, with the revisions before it
+pushed, and stays the local latest for a sync to merge. Server-side fast-forward merge is an
+optimization that lets a successful concurrent push complete with one offer per revision; it is
+not a substitute for client-side reconciliation when there is a real conflict.
 
 ### 15. State Detection and Staging
 
@@ -1611,9 +1685,9 @@ Lore takes the filesystem as the source of truth for file content, treats *stagi
 as recorded intent about which file changes to include in the next revision, and
 keeps a separate persistent record of which files currently differ from the committed
 revision. The split between *what is on disk*, *what has changed*, and *what is meant
-for the next commit* is what makes the iteration-and-commit loop fast at repository
-scale, and what lets external tools report changes into Lore without an in-core
-watcher.
+for the next revision* is what makes the loop of editing and committing fast at
+repository scale, and what lets external tools report changes into Lore without an
+in-core watcher.
 
 #### 15.1 Filesystem as ground truth
 
@@ -1650,6 +1724,8 @@ that the file at that path differs from the committed revision. The two flags sh
 single per-node action - modify, add, delete, move, or copy - so a node has one
 action regardless of whether that action is dirty, staged, or both.
 
+A staged action stands until it's unstaged: marking the node dirty again sets the dirty flag beside it and leaves the action as staged.
+
 Dirty propagates to parent directories: any directory containing a dirty file is
 itself dirty. Marking a single file dirty walks up to the root and stops as soon as it
 encounters a directory already flagged, so propagation cost is bounded by the depth
@@ -1673,23 +1749,32 @@ its tracked node by size first, then modification time, and only by content hash
 when the size matches but the recorded modification time differs. The per-file
 modification time is held in the instance's own Lore directory, in `.lore/records/`,
 keyed by path, rather than on the tree node - so the common case (size and mtime
-unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS or
-in-memory instance keeps its times in the local mutable store, keyed by instance and
-path, and an instance an older client created still reads a time from there when its
-own records hold none. This is what keeps a full scan linear in file count rather than
-in total bytes: most files are dismissed on metadata alone.
+unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS
+instance keeps its times in the local mutable store, keyed by instance and path, any
+other instance whose stores are in memory keeps them in memory beside its stores until
+the process releases them, and an instance an older client created still reads a time from
+the mutable store when its own records hold none. This is what keeps a full scan linear
+in file count rather than in total bytes: most files are dismissed on metadata alone.
+
+A FUSE instance holds the working tree as a state tree, so a scan diffs addresses and descends only
+where either side is dirty, and a file the mount serves from the store is compared by address. Its
+records hold the time the mount reports for each such file, recorded by the operation that serves
+it. A file written through the mount is held locally. A plain status compares it as an instance on
+disk compares a file, by size and recorded time, reading it only where those differ and recording
+its time once its content matches. A stage, and a status that updates dirty flags, read every such
+file, and the mount serves one that holds the revision's content from the store again, as it does a
+file a commit stores. A recorded time stands only for content read after no write could still carry
+that time, and only for the revision the mount serves, and a file returns to the store only while
+it still shows the time that was read, so no write racing a status, a stage or a commit is missed.
+It holds a link as the link's node alone, so nothing at or below a link is a change of its working
+tree, and nothing of a link is written through it: a merge bringing one, or a link's update or
+removal, changes the node.
 
 #### 15.3 Paths into the dirty set
 
 A file becomes marked dirty in one of three ways.
 
-The first is *notification*. A `file dirty` operation marks one or more paths as
-modified, classifying the action from the current filesystem state - modify if the
-file exists and is in the committed revision, add if it exists and is not, delete if
-it is missing but was in the revision. Move and copy variants record their actions
-without filesystem checks: the caller has already decided what happened. A
-notification costs a flag update on the staged anchor and a short walk up to the
-root; nothing else in the tree is touched.
+The first is *notification*. A `file dirty` operation marks one or more paths as modified, classifying the action from the current filesystem state - modify if the file exists and is in the committed revision, add if it exists and is not, delete if it is missing but was in the revision. Move and copy variants record their actions without filesystem checks: the caller has already decided what happened. A move onto a path another node holds marks that node deleted, or stages its deletion where it holds a staged change, as a staged move does. Marking a path costs a flag update on the staged anchor and a short walk up to the root, and a directory moved or replaced marks what it holds as well.
 
 The second is *scanning*. A status scan walks the working tree, compares each file
 against the committed revision, and updates the dirty set inline - marking modified
@@ -1750,26 +1835,29 @@ the core library stays small.
 
 #### 15.5 Staging as recorded intent
 
-A *stage* in Lore is a set of file paths the user has marked for inclusion in the
-next revision. Staging is purely about *intent*: which of the changes currently on
-disk should be part of the next commit, and which should not.
+To *stage* a file in Lore is to mark its path for inclusion in the next revision;
+the staged paths together are the staged changes. Staging is purely about *intent*:
+which of the changes currently on disk should go into the next revision, and which
+should not.
 
-The stage records intent in two senses. First, it pins the *path*: the user has said
-"I want this file's change in the next commit," not "I want this specific content in
-the next commit." Second, it does *not* freeze the content. Between staging and
-committing, the user can keep editing the file, and the commit picks up whatever the
-file looks like at commit time - not whatever it looked like at stage time.
+Staging records intent in two senses. First, it pins the *path*: the user has said
+"I want this file's change in the next revision," not "I want this specific content
+in the next revision." Second, it does *not* freeze the content. Between staging and
+committing, the user can keep editing the file, and committing picks up whatever the
+file looks like at that moment - not whatever it looked like when it was staged.
+
+The commit takes what the working tree holds at staged paths, and deletes only what was staged: a staged path the working tree no longer holds is committed as deleted, and one staged as added is left out.
 
 This matches how iteration actually works. A developer stages a file, keeps editing,
-runs tests, fixes, and commits. The commit captures the latest state of the staged
-file, not a snapshot taken when the user first ran stage. If the developer wants a
-different set of files staged for a particular commit, they unstage and restage; the
-underlying content does not need to be moved or re-stored.
+runs tests, fixes, and commits. Committing captures the latest state of the staged
+file, not a snapshot taken when the user first staged it. If the developer wants a
+different set of files staged for a particular revision, they unstage and restage;
+the underlying content does not need to be moved or re-stored.
 
 Staging does not clear dirty: a file can be dirty, staged, or both. The two flags
-answer different questions - "has it changed?" and "will it be in the next commit?"
-- and a typical iteration moves through dirty-only (notified or scanned), to
-dirty+staged (user has marked it for the next commit), to clean (committed).
+answer different questions - "has it changed?" and "will it be in the next
+revision?" - and a typical iteration moves through dirty-only (notified or scanned),
+to dirty+staged (user has marked it for the next revision), to clean (committed).
 Unstaging a still-modified file leaves it in the dirty set; restoring it from the
 committed revision clears both.
 
@@ -1777,41 +1865,40 @@ committed revision clears both.
 
 Dirty state outlives most operations that touch the working tree. Sync to a new
 revision preserves dirty flags, so the user's pending modifications travel with them.
-Branch switches preserve them by default; a forced switch that explicitly drops
-local changes also drops dirty state. Merge, cherry-pick, and revert preserve dirty
+Branch switches preserve them by default; a forced switch that explicitly drops local
+changes also drops dirty state. Merging, cherry-picking, and reverting preserve dirty
 via additive flag updates. The principle is that the dirty set represents user work
-that has not been committed; nothing short of an explicit reset or a successful
-commit should discard it.
+that has not been committed; nothing short of an explicit reset or successfully
+committing should discard it.
 
-Commit is the natural clearing point. A committed file is no longer dirty against
+Committing is the natural clearing point. A committed file is no longer dirty against
 the new committed revision, and its flags are cleared. Files that were dirty but not
-included in the commit remain dirty, now relative to the new revision; the staged
-anchor is re-parented and persisted so subsequent status calls see them under the new
-baseline.
+committed remain dirty, now relative to the new revision; the staged anchor is
+re-parented and persisted so subsequent status calls see them under the new baseline.
 
-#### 15.7 Fragments at commit time, not at stage time
+#### 15.7 Fragments when committing, not when staging
 
 Staging records intent; committing produces fragments. The split is deliberate.
 
 Hashing and chunking a multi-gigabyte file is expensive. If staging produced
-fragments, every intermediate stage of an iterative edit would re-fragment and
+fragments, every intermediate step of an iterative edit would re-fragment and
 re-store the file - the user would pay the cost of full content addressing every time
-they decided "yes, this file should be in the next commit," even though they hadn't
+they decided "yes, this file should be in the next revision," even though they hadn't
 yet decided what content to commit. Repeated staging of a file the user hasn't
 finished editing would be the normal case, and the content stored would be a sequence
 of working drafts, not the final state.
 
-By deferring fragmentation to commit time, the cost is paid once per file per
-commit, on the content the user actually decided to commit. Staging is a metadata
-operation - a few filesystem-attribute checks, a size-and-modification-time check
-(rehashing only when those are inconclusive) to confirm the file is what status
-thinks it is, and a stage-list update on the staged anchor. Marking a file dirty is
-even cheaper: a flag update, no content read at all. Both remain fast on a repository
-with millions of files.
+By deferring fragmentation until committing, the cost is paid once per file each time
+it is committed, on the content the user actually decided to commit. Staging is a
+metadata operation - a few filesystem-attribute checks, a size-and-modification-time
+check (rehashing only when those are inconclusive) to confirm the file is what status
+thinks it is, and an update to the staged paths on the staged anchor. Marking a file
+dirty is even cheaper: a flag update, no content read at all. Both remain fast on a
+repository with millions of files.
 
-The same separation makes unstage cheap: removing a file from the stage is just
-clearing the staged flag; no fragment rewriting, no content migration. Removing a
-dirty mark is similarly cheap.
+The same separation makes unstaging cheap: unstaging a file is just clearing the
+staged flag; no fragment rewriting, no content migration. Removing a dirty mark is
+similarly cheap.
 
 ### 16. Fault Tolerance and Atomicity
 
@@ -1828,12 +1915,15 @@ single conditional put on the mutable store.
   working tree, fetching fragments on demand, materializing a view.
 - *Fully atomic.* The operation either completes in full or leaves the repository in its
   prior state, with no observable intermediate. Examples: advancing a branch's latest
-  pointer, obliterating a fragment, the local mutable-store update at the end of a commit.
+  pointer, obliterating a fragment.
 
 A push uploads many fragments (resumable partial), then issues a single conditional put on
-the latest pointer (atomic). A commit creates many fragments locally (resumable partial),
+the latest pointer (atomic). Committing creates many fragments locally (resumable partial),
 then writes the new revision state and advances the local latest pointer (atomic). The
-shape recurs.
+shape recurs. A flush of the local mutable store is not atomic across keys, so a commit
+orders its local writes across several flushes and records the revision it publishes as a
+commit intent, which lets the next commit finish one killed part way
+([ADR-00038](../developing/decisions/00038-commit-intent-orders-anchor-writes.md)).
 
 #### 16.2 Why immutability makes this tractable
 
@@ -1872,13 +1962,13 @@ Failures have well-defined user-visible shapes:
 - *Network interruption during push.* Some fragments are uploaded; the latest pointer has
   not advanced. A re-run resumes from where the interruption occurred. The branch on the
   remote is unchanged.
-- *Client crash during commit.* Local fragments may have been written; the local latest
-  pointer has not advanced. The next commit re-creates fragments (cheap, because the
+- *Client crash while committing.* Local fragments may have been written; the local latest
+  pointer has not advanced. Committing again re-creates fragments (cheap, because the
   immutable store deduplicates) and completes.
 - *Server crash during a conditional put.* The crash is either before the put (no change)
   or after (latest pointer advanced, revision visible). No intermediate state.
-- *Concurrent push collision.* The conditional put fails; the client reconciles via
-  sync-and-merge (§14.5). The local state is unaffected.
+- *Concurrent push collision.* The conditional put fails; the client reconciles by syncing
+  and merging (§14.5). The local state is unaffected.
 - *Validation failure on push.* The server rejects the push. Fragments uploaded in phase 1
   may be in the immutable store, but no branch latest pointer references them; the failed
   revision is unreachable, and the unreferenced fragments can be obliterated if desired.
@@ -2203,13 +2293,13 @@ bytes are gone, or where the bytes are gone but no metadata records the oblitera
 
 #### 19.6 Implications for revision integrity
 
-Removing file content leaves revision metadata and history intact. Clone and sync attempt the
+Removing file content leaves revision metadata and history intact. Cloning and syncing attempt the
 remaining available files when an individual file cannot be materialised. They report failed
 attempts and return a nonzero status because the working tree does not fully match the revision.
 This restores the continuation behavior established by UCS-14675; it does not recreate removed
-content, rewrite history, or exclude missing files from tracking. A bare clone can still retrieve
-the retained revision metadata. Missing repository access or required structural metadata remains
-a hard failure and can prevent discovery of the files themselves.
+content, rewrite history, or exclude missing files from tracking. Cloning with `--bare` can still
+retrieve the retained revision metadata. Missing repository access or required structural metadata
+remains a hard failure and can prevent discovery of the files themselves.
 
 Before `lore file obliterate` deletes locally or remotely, it checks the content dependencies
 of active branches' latest snapshots and warns about affected branches. The check includes
@@ -2217,9 +2307,9 @@ children recursively deleted with the requested fragment, including children sha
 and current file versions. Both the address and path forms use this check; staging a path's
 deletion does not change the published latest revision.
 
-The warning is advisory: administrators can still delete the content, and affected clones and
-syncs can still fail afterward. Inspection reads snapshot metadata and fragment lists without
-walking revision history or downloading ordinary file payloads. It ignores the instance's
+The warning is advisory: administrators can still delete the content, and cloning or syncing the
+affected content can still fail afterward. Inspection reads snapshot metadata and fragment lists
+without walking revision history or downloading ordinary file payloads. It ignores the instance's
 sparse view and follows versioned links at their recorded revisions.
 
 The check has time and work limits and reports when it cannot complete. Remote enumeration
@@ -2242,9 +2332,9 @@ related things:
 - *Recover an old hash.* The hash was derived from the bytes; the bytes are gone. The
   hash can no longer be re-derived even though it is still recorded in revisions.
 - *Un-leak data already cloned by a tenant.* Once a fragment has left the deployment - in
-  a clone, a backup, an export - obliteration on the deployment cannot reach those copies.
-  Defense against leakage is upstream of obliteration, in access control and in policies
-  against extraction.
+  an instance, a backup, an export - obliteration on the deployment cannot reach those
+  copies. Defense against leakage is upstream of obliteration, in access control and in
+  policies against extraction.
 - *Forget the fact that a revision existed.* The revision state is itself a fragment with
   its own hash. Obliterating its content fragments removes the bytes; the revision's hash
   and the surrounding graph still record that some revision was committed.
@@ -2392,8 +2482,8 @@ Per-branch contention is the natural granularity. A repository with many branche
 parallelizes across them; a single branch with many simultaneous pushers is the worst
 case. In practice the worst case is rare - branches typically have a single primary
 contributor at any moment - but the system handles the contended case correctly:
-failed conditional puts surface as conflicts (§14.5), which clients reconcile via
-sync-and-merge.
+failed conditional puts surface as conflicts (§14.5), which clients reconcile by
+syncing and merging.
 
 Sizing the mutable store is the most consequential capacity decision in a deployment.
 Reads and fragment writes can be scaled by adding servers; latest-pointer advances
@@ -2523,22 +2613,22 @@ same way at any depth.
 #### 22.3 Pinning, auto-follow, and branch mirroring
 
 A link in a parent revision always encodes a *specific* revision hash of the linked
-repository. The link is intrinsic to the parent's revision (§5.6, §22.2): every
-clone of a given parent revision sees the same linked content, because the linked
-revision is recorded in the parent's tree. The pin does not silently track a moving
-target - that would break the parent revision's immutability.
+repository. The link is intrinsic to the parent's revision (§5.6, §22.2): every instance
+on a given parent revision sees the same linked content, because the linked revision is
+recorded in the parent's tree. The pin does not silently track a moving target - that
+would break the parent revision's immutability.
 
 What *auto-follow* controls is whether the link participates in branch *operations* on
 the parent, not whether the pin moves on its own. Two modes:
 
-- *Auto-follow enabled* (the default). When a new branch is created in the parent,
-  Lore creates a corresponding branch in each auto-follow-enabled linked repository,
-  starting at the link's currently-pinned revision. The link records which branch in
-  the linked repo it belongs to; subsequent operations on the parent's branch (merge,
-  pin update) flow through to the same-named branch in the linked repository. This is
-  what gives multi-repo workflows their branch-and-merge symmetry: a parent branch
-  named `feature-x` automatically gets a `feature-x` in each linked repository, with
-  the same metadata.
+- *Auto-follow enabled* (the default). When a new branch is created in the parent, Lore
+  creates a corresponding branch in each auto-follow-enabled linked repository, starting
+  at the link's currently-pinned revision. The link records which branch in the linked
+  repo it belongs to; subsequent operations on the parent's branch (merging, updating
+  pins) flow through to the same-named branch in the linked repository. This is what
+  gives multi-repo workflows their branch-and-merge symmetry: a parent branch named
+  `feature-x` automatically gets a `feature-x` in each linked repository, with the same
+  metadata.
 - *Auto-follow disabled* (`DisableAutoFollow` flag). The link does not grow new
   branches when the parent does, and is not eligible for cross-link merge operations.
   This is the right choice for vendored third-party content - the parent's branch
@@ -2549,26 +2639,83 @@ Updating the link to a different revision is an explicit `link update` operation
 produces a new parent revision; the previous parent revision still pins the previous
 linked revision.
 
-A merge of the parent carries its link changes as the parent's diff records them. A link
-the merged branch removes is removed, and its repository is not merged. A link the merged
-branch adds keeps the pin it was given. A link the merged branch moves is merged where it
-moves to.
+A parent may link one repository at several paths, each mount exposing another folder of
+it. The mounts share one pin, branch and flags ([ADR-00043](../developing/decisions/00043-one-pin-per-linked-repository.md)):
+`link add` of a repository the parent already links takes the pin of its other mounts, and
+`link update` and a commit through any one mount move every mount together, as unstaging
+an update does in the top-level repository.
 
-#### 22.4 Link-scoped commit and single-link merge
+A branch create also reaches nested links, so the repositories those link to get the
+branch too, up to the link depth limit of 8. It follows three rules:
 
-By default, commits and merges in Lore cascade through the parent and any linked
+- *One branch per repository.* If several links reach the same repository at different
+  pins, the branch starts at the newest pin. That needs the pins to lie on one line of
+  history. If they diverged there is no newest pin, so the create is refused, even in a
+  dry run, and the user is asked to pin them on one line first.
+- *Links move to the new branch.* A link that tracks its parent's branch already follows
+  the new one and is left as it is. A link that names another branch is changed to track
+  the new one. Lore records that change as a revision on the new branch, with the message
+  `Repin links onto branch <name>`. The link into that repository then pins that
+  revision, so every repository above it gets a repin revision too.
+- *Rolled back on failure.* If the create fails in any linked repository, Lore deletes the
+  branches it already created there. A branch it fails to delete stays, with a warning.
+
+Merging the parent carries its link changes as the parent's diff records them. A link the
+merged branch removes is removed, and its repository is not merged, unless this branch changed
+it: outside a linked repository, a link one branch removes and the other changes conflicts at
+the mount, as does a link against a folder, a file or a link to another repository. `theirs`
+takes the merged branch's side whole, landing a link as a merge brings one in; `mine` keeps
+this branch's. The repository of an
+auto-following link the merged branch adds is merged into the linked branch the link lands
+on, and the link pins the result: the pin it was given names a revision of the merged
+branch's counterpart, which the target's need not hold. A link with an explicit branch keeps
+the pin it was given. A link the merged branch moves is merged where it moves to. The merge of a
+linked repository treats the links that repository holds by the same rules, so a merge reaches
+nested links up to the link depth limit of 8, and the link holding them pins the result. A link
+back to a repository the merge is already inside is left out. A repository several links reach
+is merged once, and every one of them pins the result. That needs the links to pin it at one
+revision on one branch, and its merge to be free of conflicts; otherwise the merge is refused
+before it writes anything. A link the merged branch adds to such a repository is still merged on
+its own. A commit commits a staged linked revision only a merge staged once for all the links
+pinning it, which therefore take one per-link message. Before it writes anything, it refuses
+changes made in the working tree under several links to one repository, two staged revisions of
+one repository on one branch, and a commit of one of the links alone.
+
+A link's row, its pin, the branch it follows, its flags and the folder it mounts, is merged
+three ways against the common ancestor. A row only the merged branch changed lands whole. A
+row both branches changed is a conflict the merge holds open: the user settles it to either
+side's whole row with `branch merge resolve mine|theirs`, or to this branch's row with a plain
+`branch merge resolve`, and the commit is refused until then. Where both sides follow their own
+parent's branch, only the pin differs: it is left to the link's own merge, and otherwise stays.
+A row's branch is read under its own parent's branch, so a row following its parent names the
+same branch on either side. A row of a nested link is held open and settled the same way, in the
+merge of the link holding it. Which side was chosen is bookkeeping for the merge in progress and
+never reaches a committed revision.
+
+#### 22.4 Link-scoped committing and single-link merging
+
+By default, committing and merging in Lore cascade through the parent and any linked
 repositories that have changes. Two operations are scoped to a single link:
 
-- *Link-scoped commit.* `commit --link <path>` commits staged changes in one linked
-  repository only, advancing that link's pin in the parent's staged state without
-  touching the parent's other links or content. The parent itself is not committed;
-  the new pin shows up in the parent's next commit. This is useful when resolving
-  conflicts in one linked repository, or when making incremental progress on a link
-  before committing at the parent level.
-- *Single-link merge.* `branch merge start <branch> --link <path>` runs a merge through
-  one link's mounted repository, leaving the parent and other links untouched.
-  Conflicts are resolved at the link's mount path; the parent's link pin updates to
-  the resulting merged revision when the merge completes.
+- *Link-scoped committing.* `commit --link <path>` commits staged changes in one
+  linked repository only, advancing that link's pin in the parent's staged state
+  without touching the parent's other links or content. The parent itself is not
+  committed; the new pin shows up in the parent's next revision. This is useful when
+  resolving conflicts in one linked repository, or when making incremental progress
+  on a link before committing at the parent level.
+- *Single-link merging.* `branch merge start <branch> --link <path>` runs a merge
+  operation through one link's mounted repository and the links nested in it, leaving
+  the parent and its other links untouched. Conflicts are resolved at the link's mount
+  path; the link's pin in the repository holding it updates to the resulting merged
+  revision when the merge operation completes. For a link nested in other links, each
+  repository on the way pins the next one's staged state, and changes nothing else.
+  `branch merge abort --link <path>` rolls the link back, the links nested in it whose
+  merges it holds first, and each repository on the way that holds nothing else of the
+  merge goes back to its pin from before it. One that holds work of its own keeps it, and
+  the links above it stay staged. `commit --link` of a link commits it and each repository on
+  the way to it whole, the merges they hold included, and an abort of the link after it leaves the pin the
+  commit made. A merge of links alone ends with its last link, aborted or committed, and
+  leaves the parent's own staged changes in place.
 
 Both operations exist because the cascading default isn't always what the user wants.
 Working on a single linked repository at a time, with the parent quiet, matches the
@@ -2591,7 +2738,7 @@ repository's content onto another at a path, applied locally rather than stored 
 parent's revision. This section unpacks the parts §5.7 didn't reach: what overlay
 problems layers solve, how the local configuration stores subset-and-path information
 the same way a link encodes it in a tree node, how layers decide which revision of the
-source repository to materialize, and how staging, commit, and per-layer revision
+source repository to materialize, and how staging, committing, and per-layer revision
 messages work when several layers move together.
 
 #### 23.1 The overlay problem
@@ -2599,10 +2746,11 @@ messages work when several layers move together.
 The overlay shape recurs across many workflows. A developer wants to overlay a
 personal asset library onto a project tree without committing the overlay path into
 the project. A CI pipeline wants to mount an additional set of scripts on top of a
-clean clone for a build run, without polluting the parent revision. A release engineer
-wants a private build-tools repository mounted beneath a public source tree on the
-build machine. None of these uses should appear in the parent's history; all of them
-want the path-resolution machinery that links provide for committed dependencies.
+freshly cloned instance for a build run, without polluting the parent revision. A
+release engineer wants a private build-tools repository mounted beneath a public
+source tree on the build machine. None of these uses should appear in the parent's
+history; all of them want the path-resolution machinery that links provide for
+committed dependencies.
 
 Layers are this overlay model. They are configured per machine, applied at
 materialization time, and absent from every revision the parent ever commits. Two
@@ -2655,7 +2803,7 @@ branch level. This keeps multi-team workflows coherent: when the parent team sta
 new release branch, every machine that uses the project's standard layer set picks up
 matching branches in each layer without manual reconfiguration.
 
-#### 23.4 Per-layer staging, commit, and revision commit messages
+#### 23.4 Per-layer staging, committing, and revision messages
 
 Layers participate in staging and commit operations alongside the parent. By default,
 `stage` and `commit` cascade through the parent and any layers that have changes in
@@ -2665,14 +2813,14 @@ the staged paths. Three operations narrow the scope to a single layer:
   populates that layer's own staged state. Each layer has its own working tree, view,
   and conflict resolution; the same path can be staged in either the parent or a
   layer depending on which side the change actually belongs to.
-- *Layer-scoped commit.* `commit --layer <path>` commits staged changes in one layer
+- *Layer-scoped committing.* `commit --layer <path>` commits staged changes in one layer
   independently, advancing that layer's current revision in the local layer configuration without
-  touching the parent or any other layers. The parent itself is not committed; the
-  parent's next commit will see the layer's new revision in its staged context.
-- *Per-layer revision commit messages.* When committing across multiple layers, each layer
-  can carry its own revision commit message - either via an interactive prompt or the
-  `--layer-message <path> <message>` form. A single high-level commit produces a
-  parent revision and one revision per affected layer, each with its own message.
+  touching the parent or any other layers. The parent itself is not committed; committing the
+  parent next picks up the layer's new revision from its staged context.
+- *Per-layer revision messages.* When committing across multiple layers, each layer can carry its
+  own revision message - either via an interactive prompt or the
+  `--layer-message <path> <message>` form. Committing once at the parent level produces a parent
+  revision and one revision per affected layer, each with its own message.
 
 The mode reflects the realistic workflow: layers are usually long-lived overlays that
 evolve at their own pace, and the system supports working on one at a time without
@@ -2720,6 +2868,8 @@ Per-instance state lives in the local mutable store under instance-keyed entries
 - The instance's *current branch* - which branch this working directory is operating on.
 - The instance's *staged anchor* - a pointer to the state tree recording the instance's dirty
   and staged divergence from the committed revision.
+- The instance's *commit intent* - the revision a commit is publishing, set until the
+  commit's anchors are on disk.
 - The instance's *metadata blob* - the path on disk, creation time, and other information for
   diagnostics and stale-instance detection.
 
@@ -2783,12 +2933,12 @@ proof as background.
 
 *Where Lore diverges.*
 
-- *Distributed vs centralized.* Git is a true peer-to-peer DVCS; every clone is a
-  full participant. Lore is centralized in role: a deployment is the source of truth,
-  and clones are sparse, lazy views into it (§14). The asymmetry enables multi-tenant
+- *Distributed vs centralized.* Git is a true peer-to-peer DVCS; every clone is a full
+  participant. Lore is centralized in role: a deployment is the source of truth, and
+  instances are sparse, lazy views into it (§14). The asymmetry enables multi-tenant
   safety, partition-scoped access control, and storage tiering at scale.
-- *Full clone vs sparse default.* A Git clone fetches the full repository history
-  and tree by default. A Lore clone fetches only what the user's view requests, with
+- *Full clone vs sparse default.* A Git clone fetches the full repository history and
+  tree by default. Cloning in Lore fetches only what the user's view requests, with
   the rest fetched lazily (§12). Git's modern partial-clone + sparse-checkout
   combination approaches this but is opt-in and has sharp edges (§2.3).
 - *Object format vs fragment + chunking.* Git stores each file as one object; large
@@ -2849,7 +2999,7 @@ Perforce's role seriously and rebuilds the substrate underneath.
 *Concepts shared with Perforce.*
 
 - *Server as source of truth.* The model where canonical state lives at the server
-  rather than at every clone is Perforce's contribution to the design space.
+  rather than on every client is Perforce's contribution to the design space.
 - *File-level locking for unmergeable content.* Lore's locking model (§13.4)
   recognizes that some content cannot be merged automatically - the same insight
   Perforce has had for decades.
@@ -3008,33 +3158,33 @@ conflict explicitly when those branches merge.
 Policy-driven acquisition layers on top of the branch-aware mechanics: lock behavior can vary
 by configured policy - auto-locking files matching a pattern (binary asset directories), lease
 expiry to release stale locks, approval workflows for sensitive content, audit trails of who
-held what when. A locked file that moves through merge, rebase, or cherry-pick has to follow
-the operation correctly: the result of the operation in the new branch is still the result of
-the original lock, and the locking semantics must account for that without forcing manual
-reacquisition.
+held what when. A locked file that moves through merging, rebasing, or cherry-picking has to
+follow the operation correctly: the result of the operation in the new branch is still the
+result of the original lock, and the locking semantics must account for that without forcing
+manual reacquisition.
 
-#### 26.3 Multiple concurrent stages
+#### 26.3 Multiple concurrent staged revisions
 
-The working tree holds a single stage today: one set of staged paths waiting to be committed
-to the next revision. The stage is recorded as intent in the local mutable store (§15.2);
-committing turns the stage into a revision and clears it.
+The working tree holds a single staged revision today: one set of staged paths waiting to be
+committed to the next revision. The staged paths are recorded as intent in the local mutable
+store (§15.2); committing turns the staged revision into a revision and clears it.
 
-Multi-stage support would let a single working tree carry several disjoint stages in flight
-at once, each committable independently. A given file can be in at most one stage at a time -
-no ambiguity about which stage owns the change - but two stages with disjoint file sets
-coexist over the same working tree without interference. The pattern is the one Perforce calls
-a *changelist*: a developer can have a bug fix and a feature in flight simultaneously, each
-with its own set of staged paths and its own revision commit message, and ship them as separate
-revisions in either order.
+Support for multiple staged revisions would let a single working tree carry several disjoint
+staged revisions in flight at once, each committable independently. A given file can be in at
+most one staged revision at a time - no ambiguity about which staged revision owns the change -
+but two staged revisions with disjoint file sets coexist over the same working tree without
+interference. The pattern is the one Perforce calls a *changelist*: a developer can have a bug
+fix and a feature in flight simultaneously, each with its own set of staged paths and its own
+revision message, and ship them as separate revisions in either order.
 
 The use cases the model fits include a bug fix that should ship quickly while a feature is
 still being polished, a pair of independent refactors in the same area of the tree that should
 land as separate revisions, and an emergency hotfix that needs to go out without picking up
-half-finished work in the working directory. The data model already supports it - each stage
-is a list of paths in the local mutable store, and a commit reads a specific stage's path
-list. What is missing is the API surface and the tooling: naming stages, switching the current
-stage, listing stages, surfacing the right stage in `status`, and integrating with the rest of
-the version-control workflow.
+half-finished work in the working directory. The data model already supports it - each staged
+revision is a list of paths in the local mutable store, and committing reads a specific staged
+revision's path list. What is missing is the API surface and the tooling: naming staged
+revisions, switching the current staged revision, listing staged revisions, surfacing the right
+staged revision in `status`, and integrating with the rest of the version-control workflow.
 
 #### 26.4 Hash-based server sharding
 

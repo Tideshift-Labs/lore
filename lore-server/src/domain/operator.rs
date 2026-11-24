@@ -548,8 +548,7 @@ impl DomainOperatorContext {
                 settings
                     .lock_store
                     .as_ref()
-                    .map(|lock_store| lock_store.mode.as_str())
-                    .unwrap_or_default(),
+                    .map_or_default(|lock_store| lock_store.mode.as_str()),
             ),
         ] {
             if mode != POSTGRES_MODE {

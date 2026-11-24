@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinError;
 use tokio::task::JoinSet;
 
+use crate::chunker::Chunk;
 use crate::chunker::FileChunker;
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::concurrency::FRAGMENT_SIZE_EXPECTED;
@@ -26,10 +27,10 @@ use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Partition;
+use crate::write::FragmentOptions;
 use crate::write::FusedPublish;
 use crate::write::Payload;
 use crate::write::StoreResult;
-use crate::write::store_fragment;
 use crate::write::store_fragment_publishing;
 use crate::write_tracker::WriteContext;
 
@@ -60,7 +61,8 @@ fn chunk_boundaries(
     }
 }
 
-/// Cuts `buffer` into chunks and stores each one via [`store_fragment`].
+/// Cuts `buffer` into chunks and stores each one as [`crate::write::store_fragment`] does, asking
+/// the remote first where `flags` sets [`WriteOptions::remote_query`].
 ///
 /// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
@@ -127,7 +129,7 @@ pub async fn write_fragmented(
                 Address { context, hash },
                 fragment,
                 Payload::Shared(chunk_buffer),
-                flags.cache_local(),
+                FragmentOptions::of(flags),
                 remote_session,
                 writes,
                 chunk_permit,
@@ -146,16 +148,17 @@ pub async fn write_fragmented(
             let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
-                let result = store_fragment(
+                let result = store_fragment_publishing(
                     store,
                     partition,
                     Address { context, hash },
                     fragment,
-                    chunk_buffer,
-                    flags.cache_local(),
+                    Payload::Shared(chunk_buffer),
+                    FragmentOptions::of(flags),
                     session,
                     task_writes,
                     chunk_permit,
+                    None,
                 )
                 .await?;
                 (result.address, result.stored_local, result.stored_durable)
@@ -189,8 +192,8 @@ pub async fn write_fragmented(
     .await
 }
 
-/// Cuts a file into chunks with [`FileChunker`] and stores each one via
-/// [`store_fragment`], without ever holding the file whole. Boundaries are identical
+/// Cuts a file into chunks with [`FileChunker`] and stores each one as
+/// [`write_fragmented`] does, without ever holding the file whole. Boundaries are identical
 /// to fragmenting the same bytes in memory; see [`crate::chunker`].
 ///
 /// Each chunk's memory permit is taken before its task is spawned, so the chunker
@@ -211,7 +214,11 @@ pub async fn write_fragmented(
 ///
 /// This is only reached for files larger than one fragment, so the single-fragment
 /// fast path in [`write_fragmented`] cannot apply — no chunk ever exceeds
-/// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks.
+/// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks, unless
+/// [`WriteOptions::skip_holes`] finds it is one hole, which is a list of that one hole.
+///
+/// Under [`WriteOptions::skip_holes`] each hole the chunker hands out becomes a hole reference in
+/// the list, with no task, no budget and no store.
 ///
 /// `publish` fuses a `KeyType::Resolve` mapping into the upload of the tree's top-level fragment,
 /// as it does in [`write_fragmented`]: publishing a file costs no round trip beyond the ones its
@@ -241,6 +248,9 @@ pub(crate) async fn write_fragmented_from_file(
     } else {
         FileChunker::content_defined(handle, file_size).await
     };
+    if flags.skip_holes {
+        chunker = chunker.skipping_holes();
+    }
 
     // The chunk the chunker pre-paid, as a slot so its use is tracked rather than inferred.
     let reserved_chunk = Arc::new(Semaphore::new(1));
@@ -253,8 +263,16 @@ pub(crate) async fn write_fragmented_from_file(
             break;
         }
 
-        let chunk_offset = chunk.offset as usize;
-        let chunk_buffer = chunk.data;
+        let (chunk_offset, chunk_buffer) = match chunk {
+            Chunk::Data { offset, data } => (offset as usize, data),
+            Chunk::Hole { offset, .. } => {
+                results
+                    .entries
+                    .push(StoredChunk::hole(chunk_index, offset as usize, context));
+                chunk_index += 1;
+                continue;
+            }
+        };
         let chunk_size = chunk_buffer.len();
 
         let fragment = Fragment {
@@ -274,16 +292,17 @@ pub(crate) async fn write_fragmented_from_file(
             let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
-                let result = store_fragment(
+                let result = store_fragment_publishing(
                     store,
                     partition,
                     Address { context, hash },
                     fragment,
-                    chunk_buffer,
-                    flags.cache_local(),
+                    Payload::Shared(chunk_buffer),
+                    FragmentOptions::of(flags),
                     session,
                     task_writes,
                     chunk_budget,
+                    None,
                 )
                 .await?;
                 (result.address, result.stored_local, result.stored_durable)
@@ -330,6 +349,23 @@ struct StoredChunk {
     /// refuse to name content the server holds only part of.
     local: bool,
     remote: bool,
+}
+
+impl StoredChunk {
+    /// The reference for a hole at `content_offset`: the zero hash, naming no fragment, which every
+    /// store holds as much of as it needs.
+    fn hole(index: usize, content_offset: usize, context: Context) -> Self {
+        Self {
+            index,
+            content_offset,
+            address: Address {
+                hash: crate::types::Hash::default(),
+                context,
+            },
+            local: true,
+            remote: true,
+        }
+    }
 }
 
 /// Chunk store results gathered so far, so a file can drain its in-flight tasks part
@@ -523,7 +559,8 @@ async fn write_fragmentlist_impl(
                 Address { context, hash },
                 fragment,
                 Payload::Shared(buffer),
-                true, /* Fragment lists have local priority */
+                // Fragment lists have local priority.
+                FragmentOptions::new(true, flags.remote_query),
                 remote_session,
                 writes,
                 permit,
@@ -588,16 +625,17 @@ async fn write_fragmentlist_impl(
                     (Address { context, hash }, false, false)
                 } else {
                     let permit = chunk_permit;
-                    let result = store_fragment(
+                    let result = store_fragment_publishing(
                         store,
                         partition,
                         Address { context, hash },
                         fragment,
-                        chunk_buffer,
-                        flags.cache_local(),
+                        Payload::Shared(chunk_buffer),
+                        FragmentOptions::of(flags),
                         session,
                         task_writes,
                         permit,
+                        None,
                     )
                     .await?;
                     (result.address, result.stored_local, result.stored_durable)

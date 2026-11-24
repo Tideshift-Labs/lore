@@ -24,6 +24,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::store::event::LoreStorageUploadItemCompleteEventData;
@@ -40,7 +41,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One upload item — the `(partition, address)` of locally-stored content to push to remote.
@@ -69,12 +69,12 @@ pub struct LoreStorageUploadArgs {
 }
 
 /// Push one or more `(partition, address)` entries to the remote store.
-pub async fn upload(
+pub fn upload(
     globals: LoreGlobalArgs,
     args: LoreStorageUploadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, upload_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, upload_local)
 }
 
 async fn upload_local(
@@ -84,6 +84,7 @@ async fn upload_local(
 ) -> i32 {
     let handle = args.handle;
     let per_call = crate::storage::store::PerCallFlags::from_globals(&globals);
+    let stats = globals.stats();
     storage_call(
         globals,
         callback,
@@ -111,7 +112,7 @@ async fn upload_local(
 
             let mut reuse = crate::storage::store::SessionReuse::default();
 
-            crate::storage::fan_out_items!(items, "upload", |item| {
+            crate::storage::fan_out_items!(items, "upload", stats = stats, |item| {
                 let session = reuse.session_for(&store, item.partition, true);
                 let store = store.clone();
                 // Spawned per-item tasks re-scope `LORE_CONTEXT` only, so the managed caller
@@ -216,7 +217,7 @@ fn emit_complete(
         id: item.id,
         address,
         already_durable,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

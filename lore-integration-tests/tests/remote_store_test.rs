@@ -2,31 +2,22 @@
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
 mod remote_store_tests {
-    use std::collections::HashMap;
     use std::error::Error;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_revision::fragment;
     use lore_revision::lore::RepositoryId;
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_revision::store::remote::RemoteMutableStore;
-    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::grpc::server::GrpcTimeouts;
-    use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
-    use lore_server::settings::BaselineAccess;
+    use lore_server::settings::RemoteStoreSettings;
     use lore_storage::CallerBuffer;
     use lore_storage::CompressionMode;
     use lore_storage::ImmutableStore;
@@ -40,10 +31,15 @@ mod remote_store_tests {
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_transport::quic::client::CongestionAlgorithm;
     use rand::random;
 
+    use crate::common::net_common::Partitions;
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::bind_matched_pair;
     use crate::common::net_common::cached_connection;
+    use crate::common::net_common::make_backends;
+    use crate::common::net_common::spawn_grpc_server;
     use crate::common::net_common::wait_out_connect_back_off;
     use crate::setup_execution;
 
@@ -54,135 +50,37 @@ mod remote_store_tests {
         mutable_store: Arc<RemoteMutableStore>,
         /// The store behind the server, written directly to plant what the protocol would refuse.
         backend: Arc<dyn ImmutableStore>,
-        _shutdown: tokio::sync::oneshot::Sender<()>,
+        _stop: TestServerStop,
     }
 
     /// The stores a real server runs, behind its gRPC services. Both harnesses build on this; the
     /// QUIC one adds a storage endpoint on the same address.
     async fn start_backend(
         listener: std::net::TcpListener,
-        addr: SocketAddr,
     ) -> (
         Arc<dyn ImmutableStore>,
         Arc<dyn MutableStore>,
-        tokio::sync::oneshot::Sender<()>,
+        TestServerStop,
     ) {
-        let backend_immutable = lore_storage::local::immutable_store::create(
-            None::<&str>,
-            ImmutableStoreCreateOptions::none(),
-            false,
-            ImmutableStoreSettings {
-                protect_local_fragment: false,
-                implicit_durable_stored: true,
-                // As a real server runs it. One process holds content for every tenant, so it
-                // serves the association it was asked for and nothing else.
-                isolate_partitions: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let backend_mutable = lore_storage::local::mutable_store::create(
-            None::<&str>,
-            lore_storage::MutableStoreSettings::default(),
-            backend_immutable.clone(),
-        )
-        .await
-        .unwrap();
-
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let signal = async {
-            shutdown_rx.await.ok();
-        };
-
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        let hook_dispatcher = Arc::new(HookDispatcher::empty());
-
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
-        let served_immutable = backend_immutable.clone();
-        let served_mutable = backend_mutable.clone();
-        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
-                BaselineAccess::Reachable,
-                served_immutable.clone(),
-                served_mutable.clone(),
-            ));
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(served_immutable.clone(), served_immutable)
-                .with_mutable_store(served_mutable)
-                .with_lock_store(None)
-                // CR-029 inserted this step; `None` is the non-Postgres cell path these
-                // harnesses run, which is the same unsynchronised behaviour as before.
-                .with_domain_context(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(hook_dispatcher)
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    GrpcTimeouts {
-                        request_handler: Duration::from_secs(30),
-                        authorization: Duration::from_secs(30),
-                    },
-                    Default::default(),
-                    Default::default(),
-                    None,
-                )
-                // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
-                // regardless -- `false` for clarity.
-                .with_token_verification(
-                    lore_server::auth::jwt::TokenVerification::Ignore,
-                    false,
-                    Arc::new(AllowAllRepositoryAuthorizer),
-                    repository_catalog,
-                )
-                .unwrap()
-                .serve_with_listener(listener, signal)
-                .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
-        });
-
-        // A server that never starts must say so. Falling through to a client that can never be
-        // answered is what turns a startup failure into a test that hangs with nothing on stderr.
-        let mut ready = false;
-        for _ in 0..50 {
-            if let Ok(reason) = stopped_rx.try_recv() {
-                panic!("test server on {addr} {reason}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                ready = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(ready, "test server on {addr} never accepted a connection");
-
-        (backend_immutable, backend_mutable, shutdown_tx)
+        // As a real server runs it. One process holds content for every tenant, so it serves the
+        // association it was asked for and nothing else.
+        let (backend_immutable, backend_mutable) = make_backends(Partitions::Isolated).await;
+        let stop = spawn_grpc_server(listener, backend_immutable.clone(), backend_mutable.clone());
+        (backend_immutable, backend_mutable, stop)
     }
 
     async fn start_test_server() -> TestServer {
         // gRPC only, so no UDP half is needed: bind TCP and hand it straight over.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        let (backend, _mutable, shutdown_tx) = start_backend(listener, addr).await;
+        let (backend, _mutable, stop) = start_backend(listener).await;
 
         let url = format!("grpc://127.0.0.1:{}", addr.port());
         TestServer {
             immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
             mutable_store: Arc::new(RemoteMutableStore::new(&url, None)),
             backend,
-            _shutdown: shutdown_tx,
+            _stop: stop,
         }
     }
 
@@ -190,7 +88,7 @@ mod remote_store_tests {
         url: String,
         immutable_store: Arc<RemoteImmutableStore>,
         _server: QuinnServer,
-        _shutdown: tokio::sync::oneshot::Sender<()>,
+        _stop: TestServerStop,
     }
 
     /// The same stores, with reads and writes carried over QUIC instead of gRPC. A `lore://`
@@ -206,7 +104,7 @@ mod remote_store_tests {
         // something else between being told the number and binding it.
         let (listener, udp) = bind_matched_pair();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        let (backend_immutable, backend_mutable, shutdown_tx) = start_backend(listener, addr).await;
+        let (backend_immutable, backend_mutable, stop) = start_backend(listener).await;
 
         let (cert_file, pkey_file, _ca) =
             lore_server::quic::tests::server_certs().expect("test certificate paths");
@@ -232,7 +130,7 @@ mod remote_store_tests {
             immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
             url,
             _server: server,
-            _shutdown: shutdown_tx,
+            _stop: stop,
         }
     }
 
@@ -771,6 +669,37 @@ mod remote_store_tests {
                 .await?;
 
                 assert_eq!(StoreMatch::MatchFull, match_result.match_made);
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The storage connections a remote store establishes to its upstream, which no other
+    /// connection reaches, run the congestion controller its settings name, read back from the
+    /// QUIC connection.
+    #[tokio::test]
+    async fn a_remote_store_runs_the_congestion_algorithm_its_settings_name() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_quic_server().await;
+                let settings = RemoteStoreSettings {
+                    remote_url: server.url.clone(),
+                    congestion_algorithm: CongestionAlgorithm::Cubic,
+                    ..Default::default()
+                };
+                let store = lore_server::server::configure_remote_immutable_store(&settings, 1)?;
+                let (_, address, _) = fragment::generate_random();
+                query_one(&store, random::<RepositoryId>(), address).await?;
+
+                let connection =
+                    cached_connection(&server.url).expect("the store's connection is cached");
+                let storage = connection.storage().await?;
+                assert_eq!(
+                    storage.running_congestion_algorithm().await,
+                    Some(CongestionAlgorithm::Cubic)
+                );
 
                 Ok(())
             })

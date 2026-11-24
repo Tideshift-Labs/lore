@@ -13,6 +13,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -128,6 +129,7 @@ async fn missing_name_mapping_repair_failure_does_not_fail_the_get() {
         immutable,
         faulty_mutable,
         repository_id,
+        lore_revision::state::allow_all_repositories(),
     ));
 
     let (metadata, hash) = repository_load_id(repository, repository_id, None, None)
@@ -150,10 +152,10 @@ mod forwarded_request {
     use lore_server::grpc::forwarded_requests::RpcFlags;
     use lore_server::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient;
     use lore_server::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
-    use lore_server::grpc::repository::v1::repository_get::*;
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::RefusingAuthorizer;
     use crate::store::test_support::test_store_create;
 
     /// Single-use client that returns a pre-configured result on its one call.
@@ -255,6 +257,7 @@ mod forwarded_request {
             immutable_store,
             mutable_store,
             id,
+            allow_all_repositories(),
         ));
         let metadata_hash = repository::metadata_store(
             repository.clone(),
@@ -411,25 +414,9 @@ mod forwarded_request {
         .await;
     }
 
-    /// Denial answers `RepositoryNotFound`, not `permission_denied`: a
-    /// distinct status would let an unauthorized caller distinguish a
-    /// partition that exists from one that does not.
-    #[tokio::test]
-    async fn denied_get_answers_not_found_for_an_existing_repository() {
-        struct DenyAllRepositoryAuthorizer;
-
-        #[async_trait]
-        impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
-            async fn check_repository_access(
-                &self,
-                _token: Option<&VerifiedToken<'_>>,
-                _repository_id: lore_base::types::RepositoryId,
-                _action: Action,
-            ) -> Result<(), Status> {
-                Err(Status::permission_denied("denied"))
-            }
-        }
-
+    /// The status a local get of an existing repository answers when every
+    /// authorization check ends in `refusal`.
+    async fn get_existing_refused_with(refusal: Status) -> Status {
         let id = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -443,20 +430,53 @@ mod forwarded_request {
             )
             .await;
 
-            let err = handler(
+            handler(
                 make_request("my-repo"),
-                Arc::new(DenyAllRepositoryAuthorizer),
+                Arc::new(RefusingAuthorizer(refusal)),
                 immutable_store,
                 mutable_store,
                 &None,
                 None, // no domain context
             )
             .await
-            .expect_err("denied get must fail");
-
-            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+            .expect_err("a refused get must fail")
         }))
-        .await;
+        .await
+    }
+
+    /// Denial answers `RepositoryNotFound`, not `permission_denied`: a
+    /// distinct status would let an unauthorized caller distinguish a
+    /// partition that exists from one that does not.
+    #[tokio::test]
+    async fn denied_get_answers_not_found_for_an_existing_repository() {
+        for denial in [
+            Status::permission_denied("denied"),
+            Status::unauthenticated("token refused"),
+        ] {
+            let err = get_existing_refused_with(denial).await;
+            assert_eq!(err.code(), tonic::Code::NotFound, "{err:?}");
+        }
+    }
+
+    /// A check that could not be made answers its failure rather than telling
+    /// the client the repository does not exist: `RESOURCE_EXHAUSTED`, which
+    /// the client retries, for an auth service that is down or rate limiting,
+    /// and `INTERNAL` otherwise.
+    #[tokio::test]
+    async fn failed_authorization_check_answers_its_failure() {
+        for (failure, code) in [
+            (
+                Status::resource_exhausted("auth service rate limited"),
+                tonic::Code::ResourceExhausted,
+            ),
+            (
+                Status::internal("auth service failed"),
+                tonic::Code::Internal,
+            ),
+        ] {
+            let err = get_existing_refused_with(failure).await;
+            assert_eq!(err.code(), code, "{err:?}");
+        }
     }
 }
 
@@ -481,7 +501,10 @@ mod refresh_generation {
     ) {
         seed_repository_metadata(immutable.clone(), mutable.clone(), id, "my-repo", "desc").await;
         let repository = Arc::new(RepositoryContext::new_server_context(
-            immutable, mutable, id,
+            immutable,
+            mutable,
+            id,
+            allow_all_repositories(),
         ));
         repository::store_name_to_id(repository, "my-repo", id)
             .await
@@ -801,6 +824,7 @@ mod refresh_generation {
             immutable.clone(),
             mutable.clone(),
             moved_to,
+            lore_revision::state::allow_all_repositories(),
         ));
         let hook: ReadHook = Arc::new(move || {
             let other = other.clone();
@@ -873,6 +897,7 @@ mod refresh_generation {
             immutable.clone(),
             mutable.clone(),
             moved_to,
+            lore_revision::state::allow_all_repositories(),
         ));
         let hook: ReadHook = Arc::new(move || {
             let other = other.clone();

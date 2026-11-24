@@ -16,6 +16,7 @@ use crate::repository::create_immutable_store_at_path;
 use crate::repository::create_mutable_store_at_path;
 use crate::shared_store::SHARED_STORE_DIR;
 use crate::shared_store::SHARED_STORES_DIR;
+use crate::state::allow_all_repositories;
 use crate::util::config::SaveableConfig;
 
 #[error_set]
@@ -89,9 +90,22 @@ impl SharedStoreRegistryEntry {
             })
             .await?;
         Ok(Arc::new(
-            RepositoryContext::new_null_context(immutable_store, mutable_store)
-                .with_store_hold(stores),
+            RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+                allow_all_repositories(),
+            )
+            .with_store_hold(stores),
         ))
+    }
+
+    /// The entry of the shared store in the directory `dir`, which holds its `shared_store`
+    /// directory, with no remote named.
+    pub fn in_directory(dir: String) -> SharedStoreRegistryEntry {
+        SharedStoreRegistryEntry {
+            remote_url: String::new(),
+            path: dir,
+        }
     }
 }
 

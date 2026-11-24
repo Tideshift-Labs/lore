@@ -97,8 +97,7 @@ pub async fn initialize(
             settings
                 .lock_store
                 .as_ref()
-                .map(|store| store.mode.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|store| store.mode.as_str()),
         ),
     ] {
         if mode != "postgres" {

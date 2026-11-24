@@ -24,7 +24,9 @@
 //! With `fragments` set the leaves arrive as stored: `GET_HEADER`, then one
 //! `GET_FRAGMENT { id, address, offset, fragment, bytes }` per leaf in content order, then
 //! `GET_ITEM_COMPLETE`. `fragment` describes `bytes`. No leaf is expanded or checked against its
-//! hash. `offset` and the byte-count backstop count content, as in streaming mode.
+//! hash. `offset` and the byte-count backstop count content, as in streaming mode. A hole of the
+//! content arrives as a `LORE_EVENT_STORAGE_GET_FRAGMENT` whose fragment has a `size_payload` of
+//! zero and no payload, covering `size_content` bytes that read as zeros.
 //!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
@@ -50,6 +52,7 @@ use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreBytesMut;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::lore::execution_context;
@@ -68,7 +71,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One get-resolved item — the mutable key to resolve and the context to read it in.
@@ -91,13 +93,16 @@ pub struct LoreStorageGetResolvedItem {
     /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
     /// success code
     pub streaming: u8,
-    /// Cache fetched bytes back to the local store even without the producer's
-    /// `PayloadLocalCachePriority` hint
+    /// Cache fetched bytes in the local store, as they always are for a fragment written with
+    /// `PayloadLocalCachePriority` or one of revision state. A fetched fragment whose bytes are not
+    /// cached is still written to the local store as an entry without its payload, so a put of
+    /// the same content uploads nothing. Either is marked stored durable
     pub local_cache: u8,
     /// Deliver one `GET_FRAGMENT` per leaf fragment in content order in place of `GET_DATA`, each
     /// carrying the leaf's fragment and its payload as stored, with `streaming` ignored. No leaf
-    /// is expanded or checked against its hash. An item with `data_out` supplied rejects with
-    /// `INVALID_ARGUMENTS`
+    /// is expanded or checked against its hash. A hole of the content arrives as a `GET_FRAGMENT`
+    /// whose fragment has a `size_payload` of zero and no payload, covering `size_content` bytes
+    /// that read as zeros. An item with `data_out` supplied rejects with `INVALID_ARGUMENTS`
     pub fragments: u8,
     /// Writable buffer receiving the content, `len` stating its capacity. Zero-initialized selects
     /// delivery in events.
@@ -134,12 +139,12 @@ pub struct LoreStorageGetResolvedArgs {
 }
 
 /// Resolve one or more mutable keys and read the content they point at.
-pub async fn get_resolved(
+pub fn get_resolved(
     globals: LoreGlobalArgs,
     args: LoreStorageGetResolvedArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_resolved_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_resolved_local)
 }
 
 async fn get_resolved_local(
@@ -427,7 +432,7 @@ fn emit_item_complete(
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

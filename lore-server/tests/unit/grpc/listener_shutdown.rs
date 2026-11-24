@@ -99,7 +99,7 @@ async fn a_new_connect_is_refused_while_an_old_stream_holds_its_connection() {
     let server = GrpcServerBuilder::new()
         .with_environment(EnvironmentConfig::default())
         .with_feature(FeatureSettings::default())
-        .with_immutable_store(immutable.clone(), immutable)
+        .with_immutable_store(immutable.clone(), immutable, None)
         .with_mutable_store(mutable)
         .with_lock_store(None)
         .with_domain_context(None)

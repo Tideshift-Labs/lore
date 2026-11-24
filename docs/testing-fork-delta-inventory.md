@@ -75,6 +75,16 @@ For detailed historical context, gotchas, and design invariants, see the [Append
 - **CR-033 cell dispatch authority: continuity family and separate-process service shell removed   [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-cell-dispatch-authority-continuity-family-and-separate-process-service-shell-removed-server). Gates: `cargo test -p lore-object-dispatch
   --test no_dispatch --test reserve_put --test upload -j 4` `cargo test -p lore-object-dispatch --test terminal_result -j 4` `cargo test -p lore-object-dispatch --test result_ack -j 4` `cargo test -p lore-object-dispatch --test result_discard -j 4` `cargo test -p lore-object-dispatch --test result_disposition -j 4` `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
   payload_purge -j 4` `cargo test -p lore-object-dispatch --test cell_schema_install` `cargo test -p lore-object-dispatch --test provider_client -j 4` `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` `lore-object-dispatch/tests/run-provider-charge-live.ps1` `lore-object-dispatch/tests/run-budget-pin-refresh-live.ps1`
+- **WP-120/A6 `BranchPush` unknown outcome (`BranchPushError::OutcomeUnknown`) and `ManagedPushRunner::run_unlatched` [CLIENT]**:
+  a lost answer under a caller operation is `OutcomeUnknown` (FFI 248, attempt left unresolved, never resent); the
+  marked `BranchAdvanced` refusal stays `BranchAdvanced` and settles not applied; the marker outranks the 32-byte
+  details in `branch_push_error`. Gates: `lore-transport/tests/unit/grpc/branch_push_wire_tests.rs` (real tonic server,
+  managed + `with_reconnect_classified`), `unit/grpc.rs` (`branch_push_error` precedence), `lore-revision/tests/unit/branch/push.rs`
+  (`over_branch_push_error`, `a_not_sent_expiry_is_never_read_as_a_divergence`), `lore-revision/tests/managed_push.rs`
+  (`run_unlatched_*`), `lore/tests/lock_refusal.rs` (CLI entry runs managed), `lore-client/tests/unit/commands/branch.rs`
+  (source pin of the CLI route). A lost unjournaled QUIC `Put` is NOT 248 (ordinary `Internal`; `lore-revision/tests/put_fence_quic.rs`).
+  Mutation-probe a mid-merge tree in a COPY (`robocopy` without `.git`/`target`, own `CARGO_TARGET_DIR`): the
+  worktree's rustup directory override does not follow it, so set `RUSTUP_TOOLCHAIN` to the override's toolchain.
 - **WP-120 strict caller admission on QUIC (`admit_quic`, storage status 200) [SERVER]**: unit
   table (every command x both policies x v4/urc0.2, counting stores, admission-before-authz) in
   `lore-server/tests/unit/grpc/caller_capabilities/quic_admission.rs`; urc/0.2 answers

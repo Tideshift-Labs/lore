@@ -16,17 +16,17 @@ use lore_base::error::InvalidPath;
 use lore_base::error::NotSupported;
 use lore_error_set::prelude::*;
 use lore_io::clone::Backend;
-use lore_io::clone::CloneStats;
 use lore_io::clone::Detection;
 use lore_io::clone::Kind;
-use lore_io::clone::Progress;
-use lore_io::clone::Visit;
 
 use crate::fs::filesystem_provider::CloneAnswer;
 use crate::fs::filesystem_provider::CloneRun;
 use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::clone_io_failure;
 use crate::fs::filesystem_provider::lore_directory_within;
+use crate::fs::walk::CloneStats;
+use crate::fs::walk::Progress;
+use crate::fs::walk::Visit;
 use crate::instance::CLONE_IN_PROGRESS_MARK;
 use crate::records::NO_STORE_RECORDS;
 use crate::records::RECORDS_DIR;
@@ -46,7 +46,7 @@ use crate::repository::TEMP_FILE_EXTENSION;
 /// - the temporary files of interrupted writes: `.~loretemp` and `.tmp` files, as a records shard
 ///   or a configuration is written to, and a clone's probe files.
 #[lore_macro::test_pub]
-fn visit(dot_dir: &Path, relative: &Path, kind: Kind) -> Visit {
+pub(crate) fn visit(dot_dir: &Path, relative: &Path, kind: Kind) -> Visit {
     let Ok(inside) = relative.strip_prefix(dot_dir) else {
         return Visit::Clone;
     };
@@ -94,7 +94,7 @@ fn is_lore_directory(relative: &Path) -> bool {
 /// working tree whose files the tree holds, or of a repository created in the tree after its
 /// parent was checked, so no copy carries another instance's ID.
 #[lore_macro::test_pub]
-fn visit_tree(
+pub(crate) fn visit_tree(
     dot_dir: &Path,
     holds_nested: &HashSet<PathBuf>,
     path: &Path,
@@ -138,7 +138,7 @@ fn directories_above_nested_repositories(
     }
     let own = source.join(dot_dir);
     let device = device_of(source)?;
-    let found = lore_io::clone::find_directories(
+    let found = crate::fs::walk::find_directories(
         source,
         &|path| {
             path == own
@@ -181,7 +181,7 @@ fn device_of(_path: &Path) -> std::io::Result<u64> {
 }
 
 /// Clones the tree at `source`, whose Lore directory is at `dot_dir` relative to it, into
-/// `destination` with `backend`, as [`lore_io::clone::clone_into`] does, leaving out what
+/// `destination` with `backend`, as [`crate::fs::walk::clone_into`] does, leaving out what
 /// [`visit_tree`] skips, with the directories in `holds_nested` cloned entry by entry.
 #[lore_macro::test_pub]
 fn clone_tree(
@@ -193,7 +193,7 @@ fn clone_tree(
     copy_unclonable: bool,
     progress: &Progress,
 ) -> std::io::Result<CloneStats> {
-    lore_io::clone::clone_into(
+    crate::fs::walk::clone_into(
         backend,
         source,
         destination,
@@ -227,15 +227,13 @@ fn reason_to_copy(detection: &Detection) -> String {
 /// [`crate::fs::filesystem_provider::FilesystemProvider::clone_answer`] for a tree on disk:
 /// probes the backends from the source's Lore directory into the destination's parent, and finds
 /// the directories a whole-directory clone clones entry by entry where one shares blocks, outside a
-/// dry run, or measures the tree where none does. Dropping the future stops the search or the measurement.
+/// dry run, or measures the tree where none does ([`answer_between`]).
 pub(super) async fn answer(
     source: &Path,
     dot_path: &Path,
     destination: &Path,
 ) -> Result<CloneAnswer, InstanceCloneError> {
     let dot_dir = lore_directory_within(source, dot_path)?.to_path_buf();
-    let source = source.to_path_buf();
-    let dot_path = dot_path.to_path_buf();
     let parent = destination
         .parent()
         .ok_or_else(|| InvalidPath {
@@ -244,23 +242,45 @@ pub(super) async fn answer(
         .to_path_buf();
     // A dry run makes no clone, which the search serves.
     let search = !crate::lore::execution_context().globals().dry_run();
-    let progress = Arc::new(Progress::default());
-    let mut stop = StopOnDrop(Some(Arc::clone(&progress)));
-    let answered = lore_base::lore_spawn_blocking!(move || {
-        let detection = lore_io::clone::detect(&dot_path, &parent)
-            .map_err(|err| clone_io_failure(err, "probing how the instance can be cloned"))?;
-        if detection.backend.shares_blocks() {
-            let entry_by_entry = if search {
-                directories_above_nested_repositories(
-                    detection.backend,
-                    &source,
-                    &dot_dir,
-                    &progress,
-                )
+    let source = source.to_path_buf();
+    let searched = (source.clone(), dot_dir.clone());
+    answer_between(
+        (dot_path.to_path_buf(), parent),
+        source,
+        move |path, relative, kind| visit_tree(&dot_dir, &HashSet::new(), path, relative, kind),
+        move |backend, progress| {
+            if search {
+                directories_above_nested_repositories(backend, &searched.0, &searched.1, progress)
             } else {
                 Ok(HashSet::new())
             }
-            .map_err(|err| {
+        },
+    )
+    .await
+}
+
+/// [`crate::fs::filesystem_provider::FilesystemProvider::clone_answer`] for cloning that probes the
+/// backends from `probe` into `parent`, the directory its copy is made in: where one shares blocks,
+/// with the directories `entry_by_entry` finds to clone entry by entry; where none does, with the
+/// size of what `visit` takes of the tree at `root`, against `parent`'s free space. Dropping the
+/// future stops the search or the measurement.
+pub(crate) async fn answer_between<V, E>(
+    (probe, parent): (PathBuf, PathBuf),
+    root: PathBuf,
+    visit: V,
+    entry_by_entry: E,
+) -> Result<CloneAnswer, InstanceCloneError>
+where
+    V: Fn(&Path, &Path, Kind) -> Visit + Send + Sync + 'static,
+    E: FnOnce(Backend, &Progress) -> std::io::Result<HashSet<PathBuf>> + Send + 'static,
+{
+    let progress = Arc::new(Progress::default());
+    let mut stop = StopOnDrop(Some(Arc::clone(&progress)));
+    let answered = lore_base::lore_spawn_blocking!(move || {
+        let detection = lore_io::clone::detect(&probe, &parent)
+            .map_err(|err| clone_io_failure(err, "probing how the instance can be cloned"))?;
+        if detection.backend.shares_blocks() {
+            let entry_by_entry = entry_by_entry(detection.backend, &progress).map_err(|err| {
                 clone_io_failure(err, "finding the repositories nested in the instance")
             })?;
             return Ok(CloneAnswer::SharesBlocks {
@@ -270,14 +290,9 @@ pub(super) async fn answer(
             });
         }
         let space = lore_io::clone::space_of(&parent)
-            .map_err(|err| clone_io_failure(err, "reading the destination's free space"))?;
-        let size = lore_io::clone::measure(
-            &source,
-            &|path, relative, kind| visit_tree(&dot_dir, &HashSet::new(), path, relative, kind),
-            space.block,
-            &progress,
-        )
-        .map_err(|err| clone_io_failure(err, "measuring the instance"))?;
+            .map_err(|err| clone_io_failure(err, "reading the free space for the copy"))?;
+        let size = crate::fs::walk::measure(&root, &visit, space.block, &progress)
+            .map_err(|err| clone_io_failure(err, "measuring what cloning copies"))?;
         Ok(CloneAnswer::CopiesBytes {
             reason: reason_to_copy(&detection),
             size,
@@ -303,9 +318,8 @@ impl Drop for StopOnDrop {
     }
 }
 
-/// [`crate::fs::filesystem_provider::FilesystemProvider::clone_instance`] for a tree on disk. A
-/// clone promised to share blocks that fails to clone an entry reports
-/// [`InstanceCloneError::NotSupported`].
+/// [`crate::fs::filesystem_provider::FilesystemProvider::clone_instance`] for a tree on disk, as
+/// [`clone_through`] makes it.
 pub(super) async fn clone(
     source: &Path,
     dot_path: &Path,
@@ -314,7 +328,39 @@ pub(super) async fn clone(
     copy_unclonable: bool,
     run: &CloneRun,
 ) -> Result<CloneStats, InstanceCloneError> {
-    let (backend, holds_nested) = match answer {
+    let dot_dir = lore_directory_within(source, dot_path)?.to_path_buf();
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    clone_through(answer, run, move |backend, holds_nested, progress| {
+        clone_tree(
+            backend,
+            &source,
+            &dot_dir,
+            &destination,
+            holds_nested,
+            copy_unclonable,
+            progress,
+        )
+    })
+    .await
+}
+
+/// [`crate::fs::filesystem_provider::FilesystemProvider::clone_instance`] through the backend
+/// `answer` names: `clone` runs on the blocking pool with the backend, the directories to clone
+/// entry by entry and `run`'s progress, and `run`'s hold is kept until it returns. An unsupported
+/// answer is refused, and cloning promised to share blocks that fails to clone an entry reports
+/// [`InstanceCloneError::NotSupported`]. Dropping the future stops cloning.
+pub(crate) async fn clone_through<C>(
+    answer: &CloneAnswer,
+    run: &CloneRun,
+    clone: C,
+) -> Result<CloneStats, InstanceCloneError>
+where
+    C: FnOnce(Backend, &HashSet<PathBuf>, &Progress) -> std::io::Result<CloneStats>
+        + Send
+        + 'static,
+{
+    let (backend, entry_by_entry) = match answer {
         CloneAnswer::SharesBlocks {
             backend,
             entry_by_entry,
@@ -328,26 +374,15 @@ pub(super) async fn clone(
             .into());
         }
     };
-    let dot_dir = lore_directory_within(source, dot_path)?.to_path_buf();
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
     let mut stop = StopOnDrop(Some(Arc::clone(&run.progress)));
     let progress = Arc::clone(&run.progress);
     let hold = Arc::clone(&run.hold);
     let cloned = lore_base::lore_spawn_blocking!(move || {
         let _hold = hold;
-        clone_tree(
-            backend,
-            &source,
-            &dot_dir,
-            &destination,
-            &holds_nested,
-            copy_unclonable,
-            &progress,
-        )
+        clone(backend, &entry_by_entry, &progress)
     })
     .await
-    .internal("cloning the instance's directory")?;
+    .internal("cloning the instance")?;
     stop.0 = None;
-    cloned.map_err(|err| clone_io_failure(err, "cloning the instance's directory"))
+    cloned.map_err(|err| clone_io_failure(err, "cloning the instance"))
 }

@@ -17,7 +17,10 @@ from error_types import (
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
+    SAME_SIZE_LINK_FILES,
     assert_mount_exposes,
+    assert_scan_matches_linked_files_by_time,
+    link_field,
     link_pin,
     make_parent_with_link,
     make_parent_with_remount,
@@ -174,7 +177,7 @@ def test_link(new_lore_repo):
     clone.push()
     sync_repo.branch_switch("another-feature")
 
-    linked_branch_list = link_repo.branch_list()
+    linked_branch_list = link_repo.branch_list(remote=True)
     assert "another-feature" in linked_branch_list.remote_branches, (
         "Branch for linked repository was not created"
     )
@@ -374,13 +377,9 @@ def test_link(new_lore_repo):
     assert not sync_repo.file_exists(link_deleted_file)
     assert sync_repo.compare_file(clone, some_file)
 
-    # Verify that new link is fixed
-    output = clone.link_list()
-
-    pattern = rf"Link\s+{restricted_repo.get_id()}.*?Flags:\s+DisableAutoFollow \(0x1\)"
-    match = re.search(pattern, output, re.DOTALL)
-
-    assert match, f"Restricted link {restricted_repo.get_id()} is not fixed"
+    assert (
+        link_field(clone, restricted_repo.get_id(), "Flags") == "DisableAutoFollow"
+    ), f"Restricted link {restricted_repo.get_id()} is not fixed"
 
     # Remove link
     output = clone.link_remove(link_relative_path)
@@ -770,8 +769,13 @@ def test_link_with_url(new_lore_repo):
 
     # Verify both links appear in link list
     link_list_output = repo.link_list()
-    assert link_list_output.count(link_repo_id) == 2, (
-        "Repository should appear twice in link list (once for each URL method)"
+    mounts = [
+        entry["linkPath"]
+        for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
+        if entry["link"] == link_repo_id
+    ]
+    assert len(mounts) == 2, (
+        "Repository should be mounted twice (once for each URL method)"
     )
 
     # Verify both link paths exist
@@ -1828,3 +1832,44 @@ def test_link_update_keeps_a_local_change_it_leaves_alone(
     assert link_pin(parent_repo, link_repo.get_id()) == pin_two
     with parent_repo.open_file(local_path) as f:
         assert f.read() == "locally edited\n", "the update should keep the local change"
+
+
+@pytest.mark.smoke
+def test_scan_after_link_add_measures_no_linked_file(new_lore_repo):
+    """`lore link add` records the modified time of every file it writes, so the first scan
+    after it hashes no linked file, yet a same-size edit after it is still found."""
+    parent_repo = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    link_repo = make_repo(new_lore_repo, SAME_SIZE_LINK_FILES)
+
+    parent_repo.link_add(DEFAULT_LINK_MOUNT, link_repo.get_id(), "/")
+
+    assert_scan_matches_linked_files_by_time(parent_repo)
+
+    edited = f"{DEFAULT_LINK_MOUNT}/data/file0.bin"
+    parent_repo.write_files({edited: "y" * 4096})
+
+    entries = status_by_path(parent_repo, scan=True)
+    linked = [
+        path for path in entries if path.startswith(f"{DEFAULT_LINK_MOUNT}/data/")
+    ]
+    assert linked == [edited], entries
+    assert entries[edited].get("action") == "keep", entries[edited]
+    assert entries[edited].get("flagDirty"), entries[edited]
+
+
+@pytest.mark.smoke
+def test_scan_after_syncing_a_link_add_measures_no_linked_file(new_lore_repo):
+    """A sync to a revision that adds a link records the modified time of every file it
+    clones into the mount, so the first scan after it hashes none."""
+    parent_repo = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    link_repo = make_repo(new_lore_repo, SAME_SIZE_LINK_FILES)
+    clone: Lore = parent_repo.clone()
+
+    parent_repo.link_add(DEFAULT_LINK_MOUNT, link_repo.get_id(), "/")
+    parent_repo.commit("Add link")
+    parent_repo.push()
+
+    clone.sync()
+
+    assert clone.file_exists(f"{DEFAULT_LINK_MOUNT}/data/file0.bin")
+    assert_scan_matches_linked_files_by_time(clone)

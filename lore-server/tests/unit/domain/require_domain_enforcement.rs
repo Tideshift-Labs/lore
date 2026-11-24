@@ -9,9 +9,7 @@ use lore_server::settings::Settings;
 /// `Settings` deserializes with a `'static` bound, so the assembled TOML is
 /// leaked; each test builds one.
 fn settings(mode: &str, require: Option<bool>) -> Settings {
-    let require = require
-        .map(|value| format!("require_domain_enforcement = {value}"))
-        .unwrap_or_default();
+    let require = require.map_or_default(|value| format!("require_domain_enforcement = {value}"));
     let config = format!(
         r#"
             [server]

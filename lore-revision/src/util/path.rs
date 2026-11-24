@@ -168,6 +168,62 @@ pub(crate) fn shared_component_depth(left: &str, right: &str) -> usize {
         .count()
 }
 
+/// `paths` in byte order, the order [`covers_any`] and [`overlaps_any`] search.
+pub(crate) fn sorted_paths<'a>(paths: impl Iterator<Item = &'a RelativePath>) -> Vec<&'a str> {
+    let mut sorted: Vec<&str> = paths.map(RelativePath::as_str).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
+/// Whether `sorted` holds `path` or a path below it. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes a binary search for `path` and one for the paths below it.
+#[lore_macro::test_pub]
+pub(crate) fn covers_any(sorted: &[&str], path: &str) -> bool {
+    if sorted.binary_search(&path).is_ok() {
+        return true;
+    }
+    // The paths below `path` follow `path/` in byte order, ahead of every other path. A sibling
+    // such as `path-x` sorts between `path` and `path/`.
+    let below = sorted.partition_point(|candidate| {
+        candidate
+            .bytes()
+            .lt(path.bytes().chain(std::iter::once(b'/')))
+    });
+    sorted.get(below).is_some_and(|candidate| {
+        candidate.as_bytes().get(path.len()) == Some(&b'/') && candidate.starts_with(path)
+    })
+}
+
+/// Whether a path of `sorted` covers `path`, as [`RelativePath::covers`] answers it: the two are
+/// equal, or the path of `sorted` is a path-ancestor of `path`. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes one binary search for `path` and one for each of its
+/// ancestors, where a scan compares every path.
+#[lore_macro::test_pub]
+pub(crate) fn covered_by_any(sorted: &[&str], path: &str) -> bool {
+    sorted.binary_search(&path).is_ok()
+        || path
+            .match_indices('/')
+            .any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
+}
+
+/// Whether a path of `sorted` overlaps `path`, as [`RelativePath::overlaps`] answers it: the two
+/// are equal, one is a path-ancestor of the other, or one is empty. `sorted` must be in byte order
+/// ([`sorted_paths`]); the answer takes the searches of [`covers_any`] and one binary search for
+/// each ancestor of `path`, where a scan compares every path.
+#[lore_macro::test_pub]
+pub(crate) fn overlaps_any(sorted: &[&str], path: &str) -> bool {
+    let Some(first) = sorted.first() else {
+        return false;
+    };
+    // The empty path sorts first.
+    first.is_empty()
+        || path.is_empty()
+        || covers_any(sorted, path)
+        || path
+            .match_indices('/')
+            .any(|(at, _)| sorted.binary_search(&&path[..at]).is_ok())
+}
+
 /// A repository-relative path carrying its own depth.
 ///
 /// Ordering is by depth and then by path, which the field order gives the
@@ -728,6 +784,26 @@ impl RelativePath {
             .into());
         }
         Ok(repository_path.as_ref().join(path))
+    }
+
+    /// [`Self::to_absolute_path`] written into `buffer`, whose allocation it reuses, for a caller
+    /// placing many paths below one directory.
+    pub fn place_below(
+        &self,
+        repository_path: &Path,
+        buffer: &mut PathBuf,
+    ) -> Result<(), PathError> {
+        let path = self.as_str();
+        if leaves_its_root(path) {
+            return Err(InvalidPath {
+                path: path.to_owned(),
+            }
+            .into());
+        }
+        buffer.as_mut_os_string().clear();
+        buffer.push(repository_path);
+        buffer.push(path);
+        Ok(())
     }
 
     /// [`Self::to_absolute_path`], held in `cache` and placed there only where `cache` holds
@@ -1545,4 +1621,18 @@ impl AsRef<str> for RelativePathBuf {
     fn as_ref(&self) -> &str {
         self.path.as_str()
     }
+}
+
+/// Whether a path `path_of` reads from an item of `sorted`, sorted by that path, is below
+/// `directory`.
+pub(crate) fn sorted_holds_below<T>(
+    sorted: &[T],
+    path_of: impl Fn(&T) -> &str,
+    directory: &RelativePath,
+) -> bool {
+    let prefix = format!("{directory}/");
+    let first = sorted.partition_point(|item| path_of(item) < prefix.as_str());
+    sorted
+        .get(first)
+        .is_some_and(|item| path_of(item).starts_with(&prefix))
 }

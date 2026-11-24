@@ -10,6 +10,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_metadata_set::*;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -107,6 +108,7 @@ async fn set_custom_key_succeeds() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;
@@ -152,6 +154,7 @@ async fn rejects_modification_of_read_only_name() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;
@@ -196,6 +199,7 @@ async fn rejects_removal_of_read_only_creator() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;
@@ -238,6 +242,7 @@ async fn allows_modification_of_protect_field() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;
@@ -280,6 +285,7 @@ async fn cas_fails_on_stale_expected_hash() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;
@@ -350,6 +356,7 @@ async fn rejects_modification_of_read_only_category() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository_id,
+            allow_all_repositories(),
         ));
 
         let current_hash = create_branch(repository.clone(), branch_id).await;

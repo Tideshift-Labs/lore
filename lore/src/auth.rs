@@ -122,12 +122,12 @@ pub struct LoreAuthUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name for each resolved user |
-pub async fn resolve_user_info(
+pub fn resolve_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthUserInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, resolve_user_info_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, resolve_user_info_local)
 }
 
 async fn resolve_user_info_local(
@@ -142,6 +142,7 @@ async fn resolve_user_info_local(
             user_ids: LoreArray::default(),
             with_identity_token: 0,
             with_access_token: 0,
+            with_claims: 0,
         };
         let execution = setup_execution(globals, callback);
         return LORE_CONTEXT
@@ -287,12 +288,12 @@ pub struct LoreAuthLoginWithTokenArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful token authentication |
-pub async fn login_with_token(
+pub fn login_with_token(
     globals: LoreGlobalArgs,
     args: LoreAuthLoginWithTokenArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, login_with_token_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, login_with_token_local)
 }
 
 async fn login_with_token_local(
@@ -412,12 +413,12 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// | [`LoreEvent::AuthUrl`](crate::interface::LoreEvent::AuthUrl) | Emitted with the login URL when no_browser mode is requested (instead of opening browser), and whenever the login has a code for the user to enter or confirm at that URL |
 /// | [`LoreEvent::AuthPending`](crate::interface::LoreEvent::AuthPending) | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires |
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
-pub async fn login_interactive(
+pub fn login_interactive(
     globals: LoreGlobalArgs,
     args: LoreAuthLoginInteractiveArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, login_interactive_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, login_interactive_local)
 }
 
 async fn login_interactive_local(
@@ -494,12 +495,12 @@ pub struct LoreAuthListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted once per stored identity with remote, resource, user id, authorized domains, expiry, and optionally the cached token |
-pub async fn list(
+pub fn list(
     globals: LoreGlobalArgs,
     args: LoreAuthListArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, list_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, list_local)
 }
 
 async fn list_local(
@@ -525,6 +526,7 @@ async fn list_local(
                         authorized_domains: identity.acceptable_root_domains.join(", ").into(),
                         expires: identity.expires_ms,
                         token: identity.token.into(),
+                        claims: LoreString::default(),
                     })
                     .send();
                 }
@@ -576,12 +578,12 @@ pub struct LoreAuthLogoutArgs {
 /// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
-pub async fn logout(
+pub fn logout(
     globals: LoreGlobalArgs,
     args: LoreAuthLogoutArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, logout_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, logout_local)
 }
 
 async fn logout_local(
@@ -656,12 +658,12 @@ pub struct LoreAuthClearArgs {
 /// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
 /// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
-pub async fn clear(
+pub fn clear(
     globals: LoreGlobalArgs,
     args: LoreAuthClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, clear_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, clear_local)
 }
 
 async fn clear_local(
@@ -701,6 +703,9 @@ pub struct LoreAuthLocalUserInfoArgs {
     /// Emit the repository's authorization (access) token. Requires running
     /// inside a repository
     pub with_access_token: u8,
+    /// Emit the claims of the repository's authorization (access) token.
+    /// Requires running inside a repository
+    pub with_claims: u8,
 }
 
 /// Resolves user identities to user information using locally stored JWT tokens.
@@ -718,10 +723,13 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// event carries the cached token when `with_identity_token` is set, and an
 /// empty `token` otherwise.
 ///
-/// When `with_access_token` is set, the call requires a repository and
-/// additionally emits an `AuthIdentity` event carrying the repository-scoped
-/// authorization (access) token for the current user, performing a token
-/// exchange when no valid cached token exists.
+/// When `with_access_token` or `with_claims` is set, the call requires a
+/// repository and additionally emits an `AuthIdentity` event for the
+/// repository-scoped authorization (access) token of the current user,
+/// performing a token exchange when no valid cached token exists. The event
+/// carries the token with `with_access_token`, and its claims as a JSON object
+/// with `with_claims`. With `with_claims`, the call fails with `NotSupported`
+/// when the token is not a JWT.
 ///
 /// For remote resolution of user IDs with proper authorization, use
 /// [`resolve_user_info`] which queries the remote user service.
@@ -745,13 +753,13 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
 /// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted for each identity with a cached token, with the token details. `token` is empty unless `with_identity_token` is set |
-/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
-pub async fn local_user_info(
+/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` or `with_claims` is set, with the repository-scoped authorization token and its claims as requested |
+pub fn local_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthLocalUserInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, local_user_info_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, local_user_info_impl)
 }
 
 /// `auth_endpoint` when given, else the auth URL the repository's remote advertises, with that
@@ -867,7 +875,7 @@ async fn local_user_info_impl(
 ) -> i32 {
     // The access token is scoped to a repository, so that variant runs as a
     // repository call. Plain identity resolution stays repository-free.
-    if args.with_access_token != 0 {
+    if args.with_access_token != 0 || args.with_claims != 0 {
         return repository_call_no_store(
             globals,
             callback,
@@ -875,9 +883,13 @@ async fn local_user_info_impl(
             local_user_info,
             |repository, args| async move {
                 emit_local_user_info(&args, true).await?;
-                auth::userinfo::repository_access_token(repository)
-                    .await
-                    .forward::<AuthStoreError>("resolving the repository access token")
+                auth::userinfo::repository_access_token(
+                    repository,
+                    args.with_access_token != 0,
+                    args.with_claims != 0,
+                )
+                .await
+                .forward::<AuthStoreError>("resolving the repository access token")
             },
         )
         .await;

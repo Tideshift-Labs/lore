@@ -3,8 +3,8 @@
 //! A loopback QUIC server speaking just enough of lore-storage/0.4 for client tests: session
 //! start and stop, the client's user agent, and `get` of any address on a live session, recording
 //! the authorization each session start presents and the partition of the session each `get` ran
-//! under. Every other command is answered with an empty success. A test can fault the stream that
-//! answers a request ([`StreamFault`]).
+//! under. An [`ECHO`] request is answered with its payload, and every other command with an empty
+//! success. A test can fault the stream that answers a request ([`StreamFault`]).
 //!
 //! Each connection serves one `get` at a time. How the server answers is its [`Answering`]. Its
 //! reading of request payloads can be paused, so that a client's large write is held.
@@ -27,6 +27,7 @@ use lore_base::types::Partition;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::connection::SuppliedCredentials;
 use lore_transport::quic::QuicServiceError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
 use lore_transport::quic::command_header::CommandHeader;
 use lore_transport::quic::storage_service::Command;
@@ -43,7 +44,11 @@ pub(crate) const PAYLOAD_SIZE: usize = 1024;
 
 /// How far a client may write ahead of what the server has read on one stream: small, so that a
 /// large request whose payload the server is not reading holds the client's write.
-const STREAM_WINDOW: u32 = 16 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 16 * 1024;
+
+/// The command the server answers with its request's payload, so that a test can check that a
+/// frame arrived whole.
+pub(crate) const ECHO: Command = Command::Copy;
 
 /// The partition test sessions are started for.
 pub(crate) fn test_partition() -> Partition {
@@ -382,6 +387,15 @@ impl TestStorageServer {
 
     /// Opens one storage connection.
     pub async fn connect_client(&self) -> Arc<StorageClient> {
+        self.connect_client_running(CongestionAlgorithm::default())
+            .await
+    }
+
+    /// Opens one storage connection, running `congestion_algorithm`.
+    pub async fn connect_client_running(
+        &self,
+        congestion_algorithm: CongestionAlgorithm,
+    ) -> Arc<StorageClient> {
         StorageClient::connect(
             Weak::new(),
             &self.url,
@@ -391,6 +405,7 @@ impl TestStorageServer {
             test_partition(),
             &Arc::new(SuppliedCredentials::default()),
             None,
+            congestion_algorithm,
         )
         .await
         .expect("connect to the test server")
@@ -470,6 +485,7 @@ async fn serve_stream(
             command if command == Command::Get as u8 => {
                 serve_get(header.session_id, gets, serial, sessions, answering).await
             }
+            command if command == ECHO as u8 => Ok(Bytes::from(request)),
             _ => Ok(Bytes::new()),
         };
         let (response_header, length) = match &response {

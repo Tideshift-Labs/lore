@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -12,7 +13,10 @@ use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
 use lore_base::lore_spawn;
+use lore_base::lore_spawn_blocking;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::runtime::core_blocking_threads;
+use lore_base::runtime::thread_counts;
 use lore_base::types::Address;
 use lore_base::types::BranchPoint;
 use lore_base::types::Context;
@@ -23,21 +27,26 @@ use lore_revision::change;
 use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
 use lore_revision::event::LoreEvent;
+use lore_revision::immutable;
 use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::*;
+use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::SALT_LORE;
 use lore_revision::revision;
 use lore_revision::revision::DiffItem;
 use lore_revision::state;
 use lore_revision::state::State;
-use lore_revision::state::StateData;
+use lore_revision::state::allow_all_repositories;
 use lore_storage::KeyType;
 use lore_storage::MutableStore;
+use lore_storage::ReadOptions;
 use lore_storage::StoreError;
 use lore_storage::WriteOptions;
 use lore_transport::ProtocolError;
@@ -48,7 +57,15 @@ mod push;
 mod races;
 
 use lore_revision::branch::*;
+pub(crate) use lore_revision::test_util::write_not_a_state;
+use lore_revision::test_util::write_state_revision;
 use lore_revision::util::path::RelativePathBuf;
+use lore_storage::test_util::Answered;
+use lore_storage::test_util::HookedImmutableStore;
+use lore_storage::test_util::HookedStore;
+use lore_storage::test_util::ImmutableCall;
+use lore_storage::test_util::StoreCall;
+use lore_storage::test_util::answered;
 
 use crate::helper::committed_repository;
 use crate::helper::create_branch_on_instance;
@@ -58,14 +75,14 @@ use crate::helper::setup_test_execution;
 use crate::helper::stage_paths;
 use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
-use crate::hooked_store::Answered;
-use crate::hooked_store::HookedStore;
-use crate::hooked_store::StoreCall;
-use crate::hooked_store::answered;
 use crate::paged_remote::PagedRemote;
 use crate::paged_remote::above_unverified;
+use crate::paged_remote::anchors;
+use crate::paged_remote::branch_metadata;
 use crate::paged_remote::client_stores;
 use crate::paged_remote::hooked_client_stores;
+use crate::paged_remote::paging_remote;
+use crate::paged_remote::remote_line;
 use crate::paged_remote::writing_client_on;
 
 fn branch_id(byte: u8) -> BranchId {
@@ -109,6 +126,42 @@ pub(crate) async fn store_unreadable_metadata(
     mutable_store_metadata(repository.clone(), branch, hash)
         .await
         .expect("storing the metadata hash");
+}
+
+/// The keys of a branch's values in the mutable store hash the lower-case hex of the repository
+/// and branch ids, whose digits here cover `0` to `f`: the expected values are the keys the stores
+/// already hold for these ids, so a change to the encoding fails here.
+#[test]
+fn branch_keys_hash_the_lower_case_hex_of_the_ids() {
+    let repository: RepositoryId = "00112233445566778899aabbccddeeff"
+        .parse()
+        .expect("a repository id");
+    let branch: BranchId = "fedcba98765432100123456789abcdef"
+        .parse()
+        .expect("a branch id");
+    let key = |hex: &str| hex.parse::<Hash>().expect("a key");
+
+    assert_eq!(
+        [
+            mutable_key(SALT_LORE, LATEST, repository, branch),
+            revision_step_key(SALT_LORE, repository, branch, 1234, 100),
+            revision_list_step_key(SALT_LORE, repository, branch, 1234, 100),
+        ],
+        [
+            (
+                key("8814b6c01de6ebaf28014bba0d7c525fa2e22d65fe9edb78be95e0cb6c6c0a3d"),
+                KeyType::BranchLatestPointer
+            ),
+            (
+                key("0559528277025a9a765665a5912c0c47993dc4d4a4cfd1a641f3c2ca999aad10"),
+                KeyType::Untyped
+            ),
+            (
+                key("c85784409597ca859b4bc8922b30ccf7b2300de0080ce9da7ff2ee3dced2f4a6"),
+                KeyType::Untyped
+            ),
+        ]
+    );
 }
 
 /// A branch merging the branch it was created from: the shared branch is the
@@ -250,6 +303,66 @@ fn empty_stacks_are_unresolvable() {
     );
 }
 
+/// A child branch's stack is its branch point, then the parent's stack: the one the parent's
+/// metadata holds, the one branch point an older client recorded without a stack, or none.
+#[test]
+fn child_stack_puts_the_branch_point_ahead_of_the_parents_stack() {
+    let point = branch_point(9, 90);
+    let parent = |stack: Vec<BranchPoint>| {
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata_populate(&mut metadata, branch_id(1), "parent", "", "ana", 0, stack)
+            .expect("populates the parent's metadata");
+        metadata
+    };
+    let mut older = lore_revision::metadata::Metadata::new();
+    older
+        .set_context(PARENT_DEPRECATED, branch_id(2))
+        .expect("sets the parent");
+    older
+        .set_hash(BRANCH_POINT_DEPRECATED, revision(20))
+        .expect("sets the branch point");
+
+    assert_eq!(
+        child_stack(
+            point.clone(),
+            &parent(vec![branch_point(2, 20), branch_point(3, 30)])
+        ),
+        [point.clone(), branch_point(2, 20), branch_point(3, 30)]
+    );
+    assert_eq!(
+        child_stack(point.clone(), &older),
+        [point.clone(), branch_point(2, 20)]
+    );
+    assert_eq!(child_stack(point.clone(), &parent(Vec::new())), [point]);
+}
+
+/// The creator filter reads a blob's creator only where it names one: with no filter, a blob
+/// without a creator, as older clients wrote, costs no allocation, where a read of the missing
+/// entry would build an error. A filter keeps a blob whose creator equals it, compared
+/// case-sensitively, and leaves out a blob without a creator.
+#[test]
+fn metadata_creator_matches_reads_the_creator_only_for_a_filter() {
+    let mut creatorless = lore_revision::metadata::Metadata::new();
+    creatorless
+        .set_string(NAME, "older")
+        .expect("sets the name");
+    let mut by_ana = lore_revision::metadata::Metadata::new();
+    by_ana.set_string(CREATOR, "ana").expect("sets the creator");
+
+    let (kept, allocated) = crate::util::allocations_during(|| {
+        metadata_creator_matches(None, std::hint::black_box(&creatorless))
+    });
+
+    assert!(kept);
+    assert_eq!(
+        allocated, 0,
+        "allocations of a creator read no filter needs"
+    );
+    assert!(!metadata_creator_matches(Some("ana"), &creatorless));
+    assert!(metadata_creator_matches(Some("ana"), &by_ana));
+    assert!(!metadata_creator_matches(Some("Ana"), &by_ana));
+}
+
 /// Run a body with an execution context installed, which the revision store
 /// reads through `execution_context()`.
 async fn with_execution<F: Future>(body: F) -> F::Output {
@@ -284,6 +397,7 @@ pub(crate) async fn null_repository() -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new_null_context(
         immutable_store,
         mutable_store,
+        allow_all_repositories(),
     ))
 }
 
@@ -315,17 +429,7 @@ pub(crate) async fn write_branch_revision(
     revision_number: u64,
     distinguisher: u8,
 ) -> Hash {
-    let token = repository
-        .try_write_token()
-        .expect("a null context carries a write token");
-    let state = State::new();
-    state.set_parent_self(parent);
-    state.set_revision_number(revision_number);
-    state.set_metadata_hash(revision(distinguisher));
-    state
-        .serialize(repository.clone(), token)
-        .await
-        .expect("serializing the revision state")
+    write_state_revision(repository, parent, revision_number, revision(distinguisher)).await
 }
 
 /// Write a merge revision, carrying the revision merged in as its other parent.
@@ -363,20 +467,6 @@ pub(crate) async fn write_line(
         line.push(parent);
     }
     line
-}
-
-/// Write a blob of a revision state's size that is not a revision state: zeroed, so its header
-/// lacks the state magic. Read as a state, it is a revision numbered 0 without parents.
-pub(crate) async fn write_not_a_state(repository: &Arc<RepositoryContext>) -> Hash {
-    lore_revision::immutable::write(
-        repository.clone(),
-        Context::default(),
-        Bytes::from(vec![0u8; size_of::<StateData>()]),
-        WriteOptions::default(),
-    )
-    .await
-    .expect("writes the blob")
-    .hash
 }
 
 /// The branch point of a branch that has not moved since it was created is
@@ -836,6 +926,27 @@ async fn common_ancestor_falls_back_to_the_older_branch_point() {
     .await;
 }
 
+/// The common ancestor [`search_common_ancestor_from_merges`] finds.
+async fn find_common_ancestor_from_merges(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+    base_revision: Hash,
+) -> Result<Option<Hash>, BranchError> {
+    Box::pin(search_common_ancestor_from_merges(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        base_revision,
+    ))
+    .await
+    .map(|search| search.found)
+}
+
 /// A trunk 2000 revisions past the branch point, against a search depth of 500,
 /// with the branch having merged the trunk once in between. The base is the
 /// revision that merge carried across, which only the merge search can find.
@@ -964,6 +1075,305 @@ async fn common_ancestor_is_what_the_trunk_already_merged_of_the_branch() {
         );
     }))
     .await;
+}
+
+/// Two branches that parted at a branch point and never merged. Both walks reach the branch
+/// point, and nothing above it, so the search proves that no merge joins them.
+#[tokio::test]
+async fn merges_search_proves_nothing_joins_branches_that_never_merged() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 1500).await;
+        let branch_point = trunk[999];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 1001, 230).await;
+        let branch_tip = write_branch_revision(&repository, branch_first, 1002, 231).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_tip,
+            branch_point,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: true,
+            },
+            "Only the branch point is reached from both sides"
+        );
+    }))
+    .await;
+}
+
+/// The branch merged the trunk once since the branch point, so the search finds a base above
+/// the floor and proves nothing about merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_once_a_merge_joins_the_branches() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 1500).await;
+        let branch_point = trunk[999];
+        let merged_in = trunk[1199];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 1001, 240).await;
+        let branch_merge = write_merge_revision(&repository, branch_first, merged_in, 1201).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_merge,
+            branch_point,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(merged_in),
+                none_above_floor: false,
+            },
+            "The merged revision is the base, above the floor"
+        );
+    }))
+    .await;
+}
+
+/// Both walks first reach a revision below the floor, the branch point of a floor only the source
+/// holds, so the search stops above a revision the target merged from the source's history, which
+/// it never read. That revision is numbered above the base, so the search proves nothing about
+/// merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_the_walks_meet_below_the_floor() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 5).await;
+        let branch_point = trunk[4];
+        let merged = write_branch_revision(&repository, branch_point, 6, 200).await;
+        let floor = write_branch_revision(&repository, merged, 10, 201).await;
+        let source = write_merge_revision(&repository, branch_point, floor, 11).await;
+        let target = write_merge_revision(&repository, branch_point, merged, 12).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            source,
+            branch_id(1),
+            target,
+            floor,
+        )
+        .await
+        .expect("the walk must not fail on readable history");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: false,
+            },
+            "The target merged a revision of the source's history above the base"
+        );
+    }))
+    .await;
+}
+
+/// A merged revision one walk cannot read leaves part of its history unwalked, so the search
+/// finds the branch point both walks reach and proves nothing about merges.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_a_revision_cannot_be_read() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let trunk = write_line(&repository, Hash::default(), 1, 20).await;
+        let branch_point = trunk[9];
+        let trunk_tip = *trunk.last().expect("the trunk has revisions");
+        let branch_first = write_branch_revision(&repository, branch_point, 11, 250).await;
+        let unreadable = Hash::from([0x5A; 32]);
+        let branch_merge = write_merge_revision(&repository, branch_first, unreadable, 21).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            trunk_tip,
+            branch_id(1),
+            branch_merge,
+            branch_point,
+        )
+        .await
+        .expect("the walks meet at the branch point");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: Some(branch_point),
+                none_above_floor: false,
+            },
+            "The merged revision may join the branches above the branch point"
+        );
+    }))
+    .await;
+}
+
+/// A base that cannot be read leaves the search without a floor, so walks that never meet prove
+/// nothing about merges above it.
+#[tokio::test]
+async fn merges_search_proves_nothing_where_the_base_cannot_be_read() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let one = write_line(&repository, Hash::default(), 1, 5).await;
+        let other = write_line(&repository, Hash::default(), 101, 5).await;
+
+        let search = search_common_ancestor_from_merges(
+            repository,
+            branch_id(9),
+            *one.last().expect("the line has revisions"),
+            branch_id(1),
+            *other.last().expect("the line has revisions"),
+            Hash::from([0x5B; 32]),
+        )
+        .await
+        .expect("the walks read both lines");
+
+        assert_eq!(
+            search,
+            MergeSearch {
+                found: None,
+                none_above_floor: false,
+            },
+            "Without the base the search has no floor to prove anything above"
+        );
+    }))
+    .await;
+}
+
+/// The walks read a line the local store lacks from the remote a page at a time, down to the
+/// floor, rather than a revision per request.
+#[tokio::test]
+async fn merges_search_reads_a_remote_line_a_page_at_a_time() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let mut line: Vec<crate::paged_remote::RemoteRevision> = Vec::new();
+            for number in 1..=20 {
+                let parent = line.last().map_or(Hash::default(), |below| below.signature);
+                line.push(
+                    crate::paged_remote::remote_revision(number, parent, Hash::from([0xA0; 32]))
+                        .await,
+                );
+            }
+            let tip = line[19].signature;
+            let remote = Arc::new(
+                PagedRemote::new(branch_id(9), tip).holding(&line).page(
+                    crate::paged_remote::Anchor::Signature(tip),
+                    line.iter()
+                        .rev()
+                        .zip((1..=20).rev())
+                        .map(|(revision, number)| (number, revision.signature))
+                        .collect(),
+                    Hash::default(),
+                ),
+            );
+            let stores = client_stores().await;
+            // A local revision on a branch from revision 4 of the remote line, the floor.
+            let state = State::new();
+            state.set_parent_self(line[3].signature);
+            state.set_revision_number(5);
+            let token = stores
+                .writer
+                .try_write_token()
+                .expect("a null context carries a write token");
+            let local = state
+                .serialize(stores.writer.clone(), token)
+                .await
+                .expect("serializing the local revision");
+            let client = crate::paged_remote::client_on(&stores, remote.clone());
+
+            let search = search_common_ancestor_from_merges(
+                client,
+                branch_id(9),
+                tip,
+                branch_id(1),
+                local,
+                local,
+            )
+            .await
+            .expect("the walks read the remote line");
+
+            assert_eq!(
+                search,
+                MergeSearch {
+                    found: None,
+                    none_above_floor: true,
+                }
+            );
+            assert_eq!(
+                remote.lists(),
+                1,
+                "One page holds the line down to the floor"
+            );
+        })
+        .await;
+}
+
+/// A line too long for the walk's first two pages is read by its pages ahead, by number on the
+/// branch its revisions were created on, and the search answers as it does reading each page by
+/// hash signature.
+#[tokio::test]
+async fn merges_search_reads_a_long_remote_line_ahead_by_number() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let stores = client_stores().await;
+            let metadata = branch_metadata(&stores, branch_id(9)).await;
+            let line = remote_line(1000, metadata).await;
+            let latest = line[999].signature;
+            let remote = Arc::new(paging_remote(branch_id(9), &line));
+            // A local revision on a branch from revision 4 of the remote line, the floor.
+            let state = State::new();
+            state.set_parent_self(line[3].signature);
+            state.set_revision_number(5);
+            let token = stores
+                .writer
+                .try_write_token()
+                .expect("a null context carries a write token");
+            let local = state
+                .serialize(stores.writer.clone(), token)
+                .await
+                .expect("serializing the local revision");
+            let client = crate::paged_remote::client_on(&stores, remote.clone());
+
+            let search = search_common_ancestor_from_merges(
+                client,
+                branch_id(9),
+                latest,
+                branch_id(1),
+                local,
+                local,
+            )
+            .await
+            .expect("the walks read the remote line");
+
+            assert_eq!(
+                search,
+                MergeSearch {
+                    found: None,
+                    none_above_floor: true,
+                }
+            );
+            let (signatures, numbers) = anchors(&remote);
+            assert_eq!(
+                (signatures.len(), numbers.len()),
+                (2, 8),
+                "The two pages from latest are read by signature, the eight below by number"
+            );
+        })
+        .await;
 }
 
 /// The source carries the earlier merge, and the revision it took sits 1500
@@ -1444,6 +1854,76 @@ async fn the_auto_resolve_step_does_not_hold_the_text_merge() {
     .await;
 }
 
+/// The text merge runs on the core workers, so a conflict auto-resolves while every core blocking
+/// thread is held.
+#[tokio::test]
+async fn a_conflict_auto_resolves_while_the_core_blocking_pool_is_held() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let state = State::new();
+        let context = Context::from(uuid::Uuid::now_v7());
+        let file = async |name: &str, text: &'static str| {
+            let address = immutable::write(
+                repository.clone(),
+                context,
+                Bytes::from_static(text.as_bytes()),
+                WriteOptions::default(),
+            )
+            .await
+            .expect("writing the file's content");
+            let node = Node {
+                size: text.len() as u64,
+                address,
+                ..in_memory::file(name)
+            };
+            in_memory::add(&state, repository.clone(), ROOT_NODE, node, name).await
+        };
+        let base = file("base", "one\ntwo\nthree\n").await;
+        let mine = file("mine", "one\ntwo\nmine\n").await;
+        let theirs = file("theirs", "theirs\ntwo\nthree\n").await;
+        let change = |to| {
+            let mut change = node_change(
+                &repository,
+                &state,
+                FileAction::Keep,
+                NodeFlags::File,
+                "file.txt",
+                None,
+            );
+            change.from.mapping.node = base;
+            change.to.mapping.node = to;
+            change
+        };
+        let (source, target) = (change(theirs), change(mine));
+
+        let mut releases = Vec::new();
+        for _ in 0..core_blocking_threads(thread_counts()) {
+            let (parked, ready) = tokio::sync::oneshot::channel::<()>();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            drop(lore_spawn_blocking!(move || {
+                let _ = parked.send(());
+                let _ = released.recv();
+            }));
+            ready.await.expect("a blocking thread parks");
+            releases.push(release);
+        }
+        let resolved = tokio::time::timeout(
+            Duration::from_secs(10),
+            try_auto_resolve_conflict(&source, &target),
+        )
+        .await;
+        drop(releases);
+
+        let resolved = resolved
+            .expect("the merge must not wait on the blocking pool")
+            .expect("auto-resolving must succeed")
+            .expect("the text merges cleanly");
+        assert!(resolved.flags.contains(change::Flags::ConflictAutomerged));
+        assert_eq!(resolved.to.mapping.node, mine);
+    }))
+    .await;
+}
+
 /// A resolved conflict replaces the item in place, so the auto-resolve step holds its item
 /// once, and the relay holds no item beside the step.
 #[tokio::test]
@@ -1474,6 +1954,8 @@ async fn each_relayed_diff_item_is_held_once() {
             None,
             None,
             None,
+            revision::MergesAcross::Unknown,
+            revision::LinkSettlement::Tree,
             inner_tx,
         ));
         let relay = relay_revision_diff3(driver, inner_rx, true, &tx);
@@ -1555,6 +2037,7 @@ async fn answering_repository(
             hook,
             answered,
         ),
+        allow_all_repositories(),
     ))
 }
 
@@ -2063,25 +2546,270 @@ async fn lookup_name_local_unwritten_answers_a_held_mapping() {
     .await;
 }
 
-/// A failed read of the name's mapping, or of the latest revision of the id derived from the
-/// name, fails the lookup.
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`], whose metadata
+/// key names bytes that are not metadata.
+async fn corrupt_derived_metadata() -> Arc<RepositoryContext> {
+    let repository = null_repository().await;
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    store_unreadable_metadata(&repository, fallback_id(CLAIMED_NAME)).await;
+    repository
+}
+
+/// A failed read of the name's mapping, or of the latest revision, the metadata key or the metadata
+/// blob of the id derived from the name, fails the lookup with the read's error.
 #[tokio::test]
 async fn lookup_name_local_unwritten_reports_a_failed_read() {
     Box::pin(with_execution(async {
-        for failing in [KeyType::BranchId, KeyType::BranchLatestPointer] {
-            let repository = hooked_repository(move |call, _key, key_type| match call {
-                StoreCall::Load if key_type == failing => Err(StoreError::from(Disconnected)),
-                _ => Ok(()),
-            })
-            .await;
-
+        let failing_mapping = hooked_repository(|call, _key, key_type| match call {
+            StoreCall::Load if key_type == KeyType::BranchId => Err(StoreError::from(Disconnected)),
+            _ => Ok(()),
+        })
+        .await;
+        let failing_mapping: (&str, _, fn(&BranchError) -> bool) = (
+            "a failed mapping load",
+            failing_mapping,
+            BranchError::is_disconnected,
+        );
+        for (shape, repository, failed) in
+            std::iter::once(failing_mapping).chain(unreadable_derived_branches().await)
+        {
             let found = lookup_name_local_unwritten(repository, CLAIMED_NAME).await;
 
-            assert!(
-                found.as_ref().is_err_and(|err| err.is_disconnected()),
-                "a failed {failing:?} read: got {found:?}"
+            assert!(found.as_ref().is_err_and(failed), "{shape}: got {found:?}");
+        }
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived as this version archives it (name released,
+/// metadata stamped archived, latest revision kept), names no branch: the lookup in the local
+/// store answers none, the name lookup finds no branch and maps the name to nothing, and a create
+/// takes the name.
+#[tokio::test]
+async fn an_archived_derived_branch_names_no_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        archive_branch(&repository, fallback_id(CLAIMED_NAME), CLAIMED_NAME).await;
+
+        let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+        let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+        assert_eq!(found, None);
+        assert!(
+            loaded.as_ref().is_err_and(|err| err.is_branch_not_found()),
+            "got {loaded:?}"
+        );
+        assert_eq!(
+            name_entries(&repository).await,
+            Vec::<BranchId>::new(),
+            "the name lookup maps the name to nothing"
+        );
+        create_root(&repository, branch_id(2), CLAIMED_NAME)
+            .await
+            .expect("the archived branch's name is free");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(branch_id(2)));
+    }))
+    .await;
+}
+
+/// The metadata of a branch whose id derives from [`CLAIMED_NAME`], naming it `name`.
+fn derived_metadata(name: &str) -> lore_revision::metadata::Metadata {
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata_populate(
+        &mut metadata,
+        fallback_id(CLAIMED_NAME),
+        name,
+        default_category(),
+        "creator",
+        1,
+        Vec::new(),
+    )
+    .expect("populating the branch's metadata");
+    metadata
+}
+
+/// A repository whose local store holds `metadata` as the metadata of the id derived from
+/// [`CLAIMED_NAME`].
+async fn with_derived_metadata(
+    metadata: lore_revision::metadata::Metadata,
+) -> Arc<RepositoryContext> {
+    let repository = null_repository().await;
+    let hash = metadata
+        .serialize(repository.clone())
+        .await
+        .expect("storing the branch's metadata");
+    mutable_store_metadata(repository.clone(), fallback_id(CLAIMED_NAME), hash)
+        .await
+        .expect("storing the branch's metadata hash");
+    repository
+}
+
+/// A name with no mapping names the id derived from it where that id has a latest revision and no
+/// metadata that says it is archived or names it otherwise: none, metadata naming the branch so in
+/// any case, metadata a restore left, metadata without a name, or a key naming a blob the store
+/// doesn't hold. Metadata naming the branch so is also what an older version's archive leaves
+/// (name released, metadata unchanged), which reads as live: the known limit. The name lookup maps
+/// the name to it.
+#[tokio::test]
+async fn a_live_derived_branch_still_resolves() {
+    Box::pin(with_execution(async {
+        let id = fallback_id(CLAIMED_NAME);
+        let mut restored = derived_metadata(CLAIMED_NAME);
+        restored
+            .set_u64(ARCHIVED, 1)
+            .expect("sets the archive time");
+        restored
+            .set_u64(RESTORED, 2)
+            .expect("sets the restore time");
+        let mut nameless = lore_revision::metadata::Metadata::new();
+        nameless.set_binary(ID, id.data()).expect("sets the id");
+        let unheld = null_repository().await;
+        mutable_store_metadata(unheld.clone(), id, revision(9))
+            .await
+            .expect("storing a metadata hash");
+
+        for (shape, repository) in [
+            ("no metadata", null_repository().await),
+            (
+                "live metadata, as an older version's archive leaves it",
+                with_derived_metadata(derived_metadata(CLAIMED_NAME)).await,
+            ),
+            (
+                "metadata naming it in another case",
+                with_derived_metadata(derived_metadata(&CLAIMED_NAME.to_uppercase())).await,
+            ),
+            ("restored metadata", with_derived_metadata(restored).await),
+            (
+                "metadata without a name",
+                with_derived_metadata(nameless).await,
+            ),
+            ("a metadata blob the store doesn't hold", unheld),
+        ] {
+            store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+
+            let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+                .await
+                .expect("the lookup reads the local store");
+            let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+            assert_eq!(found, Some(NamedBranch::Derived(id)), "{shape}");
+            assert_eq!(loaded.ok(), Some(id), "{shape}");
+            assert_eq!(
+                mapped(&repository, CLAIMED_NAME).await,
+                Some(id),
+                "{shape}: the name lookup maps the name"
             );
         }
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived, then restored under another name, holds the
+/// new name alone: the old name names no branch in the local store, the name lookup finds no
+/// branch and maps it to nothing, and a create takes it.
+#[tokio::test]
+async fn a_derived_branch_restored_under_another_name_frees_its_old_name() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let id = fallback_id(CLAIMED_NAME);
+        archive_branch(&repository, id, CLAIMED_NAME).await;
+        create_root(&repository, id, "renamed")
+            .await
+            .expect("the archived branch is restored under another name");
+
+        let found = lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+        let loaded = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+        assert_eq!(found, None);
+        assert!(
+            loaded.as_ref().is_err_and(|err| err.is_branch_not_found()),
+            "got {loaded:?}"
+        );
+        assert_eq!(
+            name_entries(&repository).await,
+            [id],
+            "the new name alone maps to the branch"
+        );
+        create_root(&repository, branch_id(2), CLAIMED_NAME)
+            .await
+            .expect("the old name is free");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(branch_id(2)));
+        assert_eq!(mapped(&repository, "renamed").await, Some(id));
+    }))
+    .await;
+}
+
+/// A branch whose id derives from its name, archived, is restored under its name by a create given
+/// its id, and the name maps to it again.
+#[tokio::test]
+async fn an_archived_derived_branch_is_restored_under_its_name() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let id = fallback_id(CLAIMED_NAME);
+        archive_branch(&repository, id, CLAIMED_NAME).await;
+
+        let restored = create_root(&repository, id, CLAIMED_NAME).await;
+
+        assert_eq!(restored.as_ref().ok(), Some(&id), "got {restored:?}");
+        assert_eq!(mapped(&repository, CLAIMED_NAME).await, Some(id));
+        assert_eq!(
+            lookup_name_local_unwritten(repository.clone(), CLAIMED_NAME)
+                .await
+                .expect("the lookup reads the local store"),
+            Some(NamedBranch::Mapped(id))
+        );
+    }))
+    .await;
+}
+
+/// The lookup in the local store reads the metadata of the id derived from the name from the local
+/// store alone: metadata only the remote holds, which says the branch is archived, reads as a blob
+/// the store doesn't hold, so the branch reads as live, and the local store still lacks the blob.
+#[tokio::test]
+async fn derived_metadata_only_the_remote_holds_reads_as_live() {
+    Box::pin(with_execution(async {
+        let id = fallback_id(CLAIMED_NAME);
+        let source = null_repository().await;
+        let mut archived = derived_metadata(CLAIMED_NAME);
+        archived
+            .set_u64(ARCHIVED, 1)
+            .expect("sets the archive time");
+        let hash = archived
+            .serialize(source.clone())
+            .await
+            .expect("storing the branch's metadata at the remote");
+        let stores = client_stores().await;
+        store_derived_latest(&stores.writer, CLAIMED_NAME, revision(1)).await;
+        mutable_store_metadata(stores.writer.clone(), id, hash)
+            .await
+            .expect("storing the branch's metadata hash");
+        let storage = crate::immutable::serving::serving_remote(
+            &source,
+            crate::immutable::serving::Serving::default(),
+        );
+        let remote = PagedRemote::new(branch_id(7), Hash::default());
+        let client =
+            crate::paged_remote::client_on_storage(&stores, Arc::new(remote), vec![storage]);
+
+        let found = lookup_name_local_unwritten(client, CLAIMED_NAME)
+            .await
+            .expect("the lookup reads the local store");
+
+        assert_eq!(found, Some(NamedBranch::Derived(id)));
+        let local = lore_revision::metadata::Metadata::deserialize_with(
+            stores.writer.clone(),
+            hash,
+            ReadOptions::default().no_remote(),
+        )
+        .await;
+        assert!(
+            matches!(&local, Err(err) if err.is_address_not_found()),
+            "the local store holds no copy of the blob"
+        );
     }))
     .await;
 }
@@ -2126,6 +2854,228 @@ async fn load_name_to_id_without_a_derived_latest_finds_no_branch() {
             Vec::<BranchId>::new(),
             "the lookup writes no mapping"
         );
+    }))
+    .await;
+}
+
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`], whose loads of
+/// that id's `function` value fail with `Disconnected`, and no other loads.
+async fn failing_derived_load(function: &'static str) -> Arc<RepositoryContext> {
+    let failing = Arc::new(std::sync::OnceLock::new());
+    let hooked = failing.clone();
+    let repository = hooked_repository(move |call, key, _key_type| {
+        if call == StoreCall::Load && hooked.get() == Some(&key) {
+            return Err(StoreError::from(Disconnected));
+        }
+        Ok(())
+    })
+    .await;
+    let (key, _) = mutable_key(
+        repository.salt(),
+        function,
+        repository.id,
+        fallback_id(CLAIMED_NAME),
+    );
+    failing.set(key).expect("the failing key is set once");
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    repository
+}
+
+/// A repository holding a latest revision of the id derived from [`CLAIMED_NAME`] and metadata
+/// that says the branch is archived, whose immutable store fails each read of that metadata blob
+/// with `Disconnected`.
+async fn failing_derived_metadata_read() -> Arc<RepositoryContext> {
+    let failing = Arc::new(std::sync::OnceLock::new());
+    let hooked = failing.clone();
+    let stores = null_repository().await;
+    let repository = Arc::new(RepositoryContext::new_null_context(
+        HookedImmutableStore::wrap(stores.immutable_store(), move |call, _, address| {
+            if call == ImmutableCall::Get && hooked.get() == Some(&address.hash) {
+                return Err(StoreError::from(Disconnected));
+            }
+            Ok(())
+        }),
+        stores
+            .try_mutable_store_arc()
+            .expect("a null context holds a write token"),
+        allow_all_repositories(),
+    ));
+    let mut archived = derived_metadata(CLAIMED_NAME);
+    archived
+        .set_u64(ARCHIVED, 1)
+        .expect("sets the archive time");
+    let hash = archived
+        .serialize(repository.clone())
+        .await
+        .expect("storing the branch's metadata");
+    mutable_store_metadata(repository.clone(), fallback_id(CLAIMED_NAME), hash)
+        .await
+        .expect("storing the branch's metadata hash");
+    failing.set(hash).expect("the failing blob is set once");
+    store_derived_latest(&repository, CLAIMED_NAME, revision(1)).await;
+    repository
+}
+
+/// Repositories where the id derived from [`CLAIMED_NAME`] has a latest revision, and a read of its
+/// latest, its metadata key or its metadata blob fails, the blob as a failed read and as bytes that
+/// are not metadata. Each with the shape's name and the test of the error the read fails with.
+async fn unreadable_derived_branches() -> [(
+    &'static str,
+    Arc<RepositoryContext>,
+    fn(&BranchError) -> bool,
+); 4] {
+    [
+        (
+            "a failed latest load",
+            failing_derived_load(LATEST).await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "a failed metadata key load",
+            failing_derived_load(METADATA).await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "a failed metadata blob read",
+            failing_derived_metadata_read().await,
+            BranchError::is_disconnected,
+        ),
+        (
+            "corrupt metadata",
+            corrupt_derived_metadata().await,
+            BranchError::is_internal,
+        ),
+    ]
+}
+
+/// Without a remote, a name with no mapping whose derived id's latest or metadata can't be read
+/// fails the name lookup with the read's error, and the lookup writes no mapping.
+#[tokio::test]
+async fn load_name_to_id_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let found = load_name_to_id(repository.clone(), CLAIMED_NAME).await;
+
+            assert!(found.as_ref().is_err_and(failed), "{shape}: got {found:?}");
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the lookup writes no mapping"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A create of a name with no mapping whose derived id's latest or metadata can't be read fails
+/// with the read's error and takes no name: the derived id may name a live branch.
+#[tokio::test]
+async fn a_create_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let created = create_root(&repository, branch_id(2), CLAIMED_NAME).await;
+
+            assert!(
+                created.as_ref().is_err_and(failed),
+                "{shape}: got {created:?}"
+            );
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the create claims no name"
+            );
+        }
+    }))
+    .await;
+}
+
+/// A restore under another name of an archived branch whose old name has no mapping, where a read
+/// of the id derived from the old name fails, fails with the read's error and claims no name.
+#[tokio::test]
+async fn a_restore_under_another_name_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            write_record(
+                &repository,
+                branch_id(2),
+                BranchLatestStatus::Divergent,
+                BranchId::default(),
+            )
+            .await
+            .expect("an unclaimed name is written");
+            let hash = metadata_hash(repository.clone(), branch_id(2))
+                .await
+                .expect("the record holds metadata");
+            let metadata = lore_revision::branch::metadata(repository.clone(), branch_id(2))
+                .await
+                .expect("the record holds metadata");
+            archive_record(
+                repository.clone(),
+                branch_id(2),
+                CLAIMED_NAME,
+                hash,
+                metadata,
+            )
+            .await
+            .expect("the branch holds its name");
+
+            let restored = create_root(&repository, branch_id(2), "renamed").await;
+
+            assert!(
+                restored.as_ref().is_err_and(failed),
+                "{shape}: got {restored:?}"
+            );
+            assert_eq!(
+                name_entries(&repository).await,
+                Vec::<BranchId>::new(),
+                "{shape}: the restore claims no name"
+            );
+        }
+    }))
+    .await;
+}
+
+/// An archive of a branch whose id derives from its name, which the local store doesn't map, where
+/// the read of that id's latest revision fails, fails with the read's error and archives nothing.
+/// The latest's read is the one that fails: a failed read of the metadata fails the archive before
+/// its lookup of the name.
+#[tokio::test]
+async fn an_archive_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        let repository = failing_derived_load(LATEST).await;
+        let (id, _) = branch_named_elsewhere(&repository, true).await;
+
+        let archived = lore_revision::branch::delete(repository.clone(), id).await;
+
+        assert!(
+            archived.as_ref().is_err_and(|err| err.is_disconnected()),
+            "got {archived:?}"
+        );
+        let metadata = lore_revision::branch::metadata(repository, id)
+            .await
+            .expect("the branch keeps its metadata");
+        assert!(
+            metadata.get_u64(ARCHIVED).is_err(),
+            "the metadata records no archive"
+        );
+    }))
+    .await;
+}
+
+/// A resolution of a name with no mapping, where a read of the id derived from the name fails,
+/// fails with the read's error rather than asking the remote, as the commands that resolve a branch
+/// by name do: a switch, a push, branch info and diff, and the lock commands.
+#[tokio::test]
+async fn resolve_fails_on_an_unreadable_derived_branch() {
+    Box::pin(with_execution(async {
+        for (shape, repository, failed) in unreadable_derived_branches().await {
+            let resolved = lore_revision::branch::resolve(repository, CLAIMED_NAME).await;
+
+            assert!(
+                resolved.as_ref().is_err_and(failed),
+                "{shape}: got {resolved:?}"
+            );
+        }
     }))
     .await;
 }
@@ -3825,7 +4775,7 @@ async fn a_delete_fails_when_the_mapping_changed_after_its_read() {
                             && armed.swap(false, Ordering::SeqCst);
                         async move {
                             if change {
-                                let value = held.map(Hash::from_context).unwrap_or_default();
+                                let value = held.map_or_default(Hash::from_context);
                                 inner.store(partition, key, value, key_type).await
                             } else {
                                 Ok(())
@@ -4408,6 +5358,295 @@ async fn reset_and_switch_onto_a_branch_whose_name_another_branch_holds_leave_th
     }
 }
 
+/// What happens to a branch reset's swap of the latest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResetSwap {
+    /// Another instance over the same store advances the branch after each read of the latest, so
+    /// the swap fails with `BranchAdvanced`.
+    Advanced,
+    /// Another instance over the same store resets the branch to the same revision once the reset
+    /// clears the last sync, so the swap fails with `BranchAdvanced`.
+    ResetAlongside,
+    /// [`ResetSwap::Advanced`], and another instance stores the revision reset to as the latest
+    /// once the reset puts the last sync back.
+    PutBackOvertaken,
+    /// The store fails the reset's clear of the last sync before its swap of the latest.
+    ClearFailed,
+    /// Another instance stores a last sync at another revision once the reset reads it.
+    ClearLost,
+    /// The store fails the swap before it lands.
+    Failed,
+    /// The swap succeeds.
+    Stored,
+}
+
+/// What [`reset_with_last_sync`] answers.
+struct ResetOutcome {
+    reset: Result<(), reset::ResetError>,
+    /// The stored last sync before the reset.
+    before: Hash,
+    /// The stored last sync after the reset.
+    after: Hash,
+    /// The latest before the reset.
+    latest_before: Hash,
+    /// The latest after the reset.
+    latest_after: Hash,
+    /// Whether the reset wrote the last sync before it swapped the latest.
+    cleared_before_swap: bool,
+}
+
+/// A write another instance makes from a [`reset_with_last_sync`] hook.
+enum PeerWrite {
+    /// The latest, and whether the last sync is then cleared, as a reset clears it.
+    Latest(Hash, bool),
+    LastSync(Hash),
+}
+
+/// A branch reset of the target of [`instance_whose_target_name_another_branch_holds`] to its
+/// branch point, the default branch's latest, which the instance is on, so the reset runs no sync.
+/// The stored last sync is at the branch point where `at_reset_revision`, and at the target's
+/// latest otherwise, and the reset goes as `swap` says.
+async fn reset_with_last_sync(at_reset_revision: bool, swap: ResetSwap) -> ResetOutcome {
+    let target = branch_id(8);
+    let (instance, _tempdir, _main, latest, target_latest) =
+        instance_whose_target_name_another_branch_holds(target).await;
+    let before = if at_reset_revision {
+        latest
+    } else {
+        target_latest
+    };
+    lore_revision::branch::store_last_sync(instance.clone(), target, before).await;
+    let token = instance
+        .try_write_token()
+        .expect("The repository was opened for writing");
+    let shared = instance
+        .try_mutable_store_arc()
+        .expect("the instance holds a write token");
+    let other = Arc::new(
+        RepositoryContext::new_with_state(
+            None,
+            instance.immutable_store(),
+            shared.clone(),
+            instance.id,
+            lore_revision::instance::InstanceId::generate(),
+            lore_revision::repository::RemoteState::Offline,
+            Arc::default(),
+            None,
+        )
+        .with_write_token(token.share()),
+    );
+    let (latest_key, _key_type) = mutable_key(instance.salt(), LATEST, instance.id, target);
+    let (last_sync_key, _key_type) = mutable_key(instance.salt(), LAST_SYNC, instance.id, target);
+    let last_sync_written = Arc::new(AtomicBool::new(false));
+    let cleared_before_swap = Arc::new(AtomicBool::new(false));
+    let seen_cleared = cleared_before_swap.clone();
+    let last_sync_swaps = Arc::new(AtomicUsize::new(0));
+    let last_sync_loads = Arc::new(AtomicUsize::new(0));
+    let clear_failures = Arc::new(AtomicUsize::new(0));
+    let advances = Arc::new(AtomicUsize::new(0));
+    let resetting = Arc::new(
+        RepositoryContext::new_with_state(
+            instance.paths.clone(),
+            instance.immutable_store(),
+            HookedStore::wrap(
+                shared,
+                move |call, key, _key_type| {
+                    let write = matches!(call, StoreCall::Store | StoreCall::CompareAndSwap);
+                    if write && key == last_sync_key {
+                        if swap == ResetSwap::ClearFailed
+                            && clear_failures.fetch_add(1, Ordering::SeqCst) == 0
+                        {
+                            return Err(StoreError::from(Disconnected));
+                        }
+                        last_sync_written.store(true, Ordering::SeqCst);
+                    }
+                    if call == StoreCall::CompareAndSwap && key == latest_key {
+                        seen_cleared
+                            .fetch_or(last_sync_written.load(Ordering::SeqCst), Ordering::SeqCst);
+                        if swap == ResetSwap::Failed {
+                            return Err(StoreError::from(Disconnected));
+                        }
+                    }
+                    Ok(())
+                },
+                answered(move |_inner, _partition, call, key, _key_type| {
+                    let other = other.clone();
+                    let advancing =
+                        matches!(swap, ResetSwap::Advanced | ResetSwap::PutBackOvertaken);
+                    let write = if advancing && call == StoreCall::Load && key == latest_key {
+                        let advance = advances.fetch_add(1, Ordering::SeqCst) as u8;
+                        Some(PeerWrite::Latest(revision(0x40 + advance), false))
+                    } else if call == StoreCall::CompareAndSwap && key == last_sync_key {
+                        match (swap, last_sync_swaps.fetch_add(1, Ordering::SeqCst)) {
+                            (ResetSwap::ResetAlongside, 0) => Some(PeerWrite::Latest(latest, true)),
+                            (ResetSwap::PutBackOvertaken, 1) => {
+                                Some(PeerWrite::Latest(latest, false))
+                            }
+                            _ => None,
+                        }
+                    } else if swap == ResetSwap::ClearLost
+                        && call == StoreCall::Load
+                        && key == last_sync_key
+                        && last_sync_loads.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        Some(PeerWrite::LastSync(target_latest))
+                    } else {
+                        None
+                    };
+                    async move {
+                        match write {
+                            Some(PeerWrite::Latest(advance, clear)) => {
+                                let held = load_latest(other.clone(), target)
+                                    .await
+                                    .expect("the other instance reads the latest");
+                                store_latest(
+                                    other.clone(),
+                                    target,
+                                    held,
+                                    advance,
+                                    BranchLatestStatus::Divergent,
+                                )
+                                .await
+                                .expect("the other instance advances the branch");
+                                if clear {
+                                    store_last_sync(other, target, Hash::default()).await;
+                                }
+                            }
+                            Some(PeerWrite::LastSync(last_sync)) => {
+                                store_last_sync(other, target, last_sync).await;
+                            }
+                            None => {}
+                        }
+                        Ok(())
+                    }
+                }),
+            ),
+            instance.id,
+            instance.instance_id,
+            lore_revision::repository::RemoteState::Offline,
+            instance.filter.clone(),
+            Some(instance.file_system()),
+        )
+        .with_write_token(token.share()),
+    );
+
+    let reset = reset::reset(resetting, token, target.to_string(), latest.to_string()).await;
+
+    ResetOutcome {
+        reset,
+        before,
+        after: load_stored_last_sync(instance.clone(), target).await,
+        latest_before: target_latest,
+        latest_after: load_latest(instance.clone(), target)
+            .await
+            .expect("the latest reads"),
+        cleared_before_swap: cleared_before_swap.load(Ordering::SeqCst),
+    }
+}
+
+/// A branch reset whose swap of the latest another instance over the same store wins fails with
+/// `BranchAdvanced` and leaves the stored last sync as it was: one at another revision, and one at
+/// the revision reset to, which the reset clears before the swap.
+#[tokio::test]
+async fn a_reset_that_another_instance_advances_the_branch_under_keeps_the_last_sync() {
+    for at_reset_revision in [false, true] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(at_reset_revision, ResetSwap::Advanced).await;
+
+            let case = format!("last sync at the reset revision {at_reset_revision}");
+            assert!(
+                outcome
+                    .reset
+                    .as_ref()
+                    .is_err_and(|err| err.is_branch_advanced()),
+                "{case}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, outcome.before, "{case}");
+        }))
+        .await;
+    }
+}
+
+/// A branch reset whose swap of the latest loses to another instance's reset to the same revision,
+/// before the reset puts the last sync back or after, fails with `BranchAdvanced` and leaves no
+/// stored last sync, so the latest the other instance stored does not read as a push the peer
+/// accepted and never recorded.
+#[tokio::test]
+async fn a_reset_that_loses_to_a_reset_to_the_same_revision_leaves_no_last_sync() {
+    for swap in [ResetSwap::ResetAlongside, ResetSwap::PutBackOvertaken] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(true, swap).await;
+
+            assert!(
+                outcome
+                    .reset
+                    .as_ref()
+                    .is_err_and(|err| err.is_branch_advanced()),
+                "{swap:?}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, Hash::default(), "{swap:?}");
+        }))
+        .await;
+    }
+}
+
+/// A branch reset whose clear of a last sync at the revision reset to fails fails before it stores
+/// the latest, and leaves both records as they were.
+#[tokio::test]
+async fn a_reset_whose_clear_of_the_last_sync_fails_stores_no_latest() {
+    Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+        let outcome = reset_with_last_sync(true, ResetSwap::ClearFailed).await;
+
+        assert!(
+            outcome
+                .reset
+                .as_ref()
+                .is_err_and(|err| err.is_disconnected()),
+            "got {:?}",
+            outcome.reset
+        );
+        assert_eq!(
+            (outcome.latest_after, outcome.after),
+            (outcome.latest_before, outcome.before)
+        );
+    }))
+    .await;
+}
+
+/// A branch reset whose swap of the latest succeeds, or fails other than as `BranchAdvanced`,
+/// leaves no stored last sync, whether it was at the revision reset to or at another. One at the
+/// revision reset to is cleared before the swap, so a reset stopped at the swap leaves none. One
+/// another instance moves off the revision reset to before the clear is cleared after the swap.
+#[tokio::test]
+async fn a_reset_that_stores_or_fails_to_store_the_latest_clears_the_last_sync() {
+    for (swap, at_reset_revision) in [
+        (ResetSwap::Stored, false),
+        (ResetSwap::Stored, true),
+        (ResetSwap::Failed, false),
+        (ResetSwap::Failed, true),
+        (ResetSwap::ClearLost, true),
+    ] {
+        Box::pin(LORE_CONTEXT.scope(setup_test_execution(), async {
+            let outcome = reset_with_last_sync(at_reset_revision, swap).await;
+
+            let case = format!("{swap:?}, last sync at the reset revision {at_reset_revision}");
+            assert_eq!(
+                outcome.reset.is_ok(),
+                swap != ResetSwap::Failed,
+                "{case}: got {:?}",
+                outcome.reset
+            );
+            assert_eq!(outcome.after, Hash::default(), "{case}");
+            if swap != ResetSwap::ClearLost {
+                assert_eq!(outcome.cleared_before_swap, at_reset_revision, "{case}");
+            }
+        }))
+        .await;
+    }
+}
+
 /// A claim unless another branch holds the name, whose read of the mapping fails other than as not
 /// found, fails with that error and claims nothing.
 #[tokio::test]
@@ -4847,4 +6086,513 @@ mod resolve_through_the_remote {
         .await;
         assert!(differing.is_empty(), "{differing:#?}");
     }
+}
+
+/// Repinning a cascade's links keeps the write of the repinned state in a box of its own, so a
+/// branch create over links that repins nothing holds no state write.
+#[tokio::test]
+async fn repinning_links_keeps_the_state_write_out_of_its_future() {
+    let (immutable, mutable, _execution) = crate::helper::test_store_create()
+        .await
+        .expect("creating the stores");
+    let repository = in_memory::repository(immutable, mutable);
+    let token = in_memory::token();
+    let state = State::new();
+
+    let repin =
+        lore_revision::branch::test_util::repin_links_future_size(&repository, &token, &state);
+    let write = state.serialize(repository.clone(), &token);
+
+    assert!(
+        repin < size_of_val(&write),
+        "repinning links holds {repin} bytes, a state write {}",
+        size_of_val(&write)
+    );
+}
+
+/// Commits `count` revisions on a line from `parent` in `repository`, each adding a file named
+/// after `line`, returning the hash and number of each.
+async fn commit_line(
+    repository: &Arc<RepositoryContext>,
+    line_name: &str,
+    parent: Hash,
+    count: usize,
+) -> Vec<(Hash, u64)> {
+    let branch = in_memory::branch_id();
+    let mut line = Vec::with_capacity(count);
+    let mut current = parent;
+    for _ in 0..count {
+        let state = if current.is_zero() {
+            State::new()
+        } else {
+            in_memory::revision_state(repository, current).await
+        };
+        in_memory::add(
+            &state,
+            repository.clone(),
+            lore_revision::node::ROOT_NODE,
+            in_memory::file(&format!("{line_name}{}.txt", line.len())),
+            &format!("{line_name}{}.txt", line.len()),
+        )
+        .await;
+        current = in_memory::commit(repository, &state, current, branch).await;
+        let number = in_memory::revision_state(repository, current)
+            .await
+            .revision_number();
+        line.push((current, number));
+    }
+    line
+}
+
+/// The repository `repository` reached through a link at each of `pins`, as (pin, number, leads).
+fn reached_at(
+    repository: &Arc<RepositoryContext>,
+    pins: &[(Hash, u64, bool)],
+) -> lore_revision::link::ReachedRepository {
+    lore_revision::link::ReachedRepository {
+        repository: repository.id,
+        context: repository.clone(),
+        reaches: pins
+            .iter()
+            .enumerate()
+            .map(
+                |(position, &(pin, _number, leads))| lore_revision::link::LinkReach {
+                    repository: repository.id,
+                    pin,
+                    branch: in_memory::branch_id(),
+                    mount_path: format!("mount{position}"),
+                    depth: 1,
+                    leads,
+                },
+            )
+            .collect(),
+        pins: pins
+            .iter()
+            .map(|&(pin, number, _leads)| lore_revision::link::WalkedPin {
+                pin,
+                number,
+                linked: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+/// A linked repository several links reach starts its branch at the newest of their pins when
+/// they are on one line, and where the walk spends its budget first, at the higher numbered one.
+/// Pins on lines that diverged refuse the create, unless the diverged link is one the staged state
+/// replaces.
+#[tokio::test]
+async fn a_cascade_starts_at_the_newest_pin_on_one_line() {
+    let (immutable, mutable, execution) = crate::helper::test_store_create()
+        .await
+        .expect("creating the stores");
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+        let repository = in_memory::repository(immutable, mutable);
+        let base = commit_line(&repository, "base", Hash::default(), 1).await[0];
+        let line = commit_line(&repository, "line", base.0, 2).await;
+        let other = commit_line(&repository, "other", base.0, 1).await[0];
+        let start = |pins: &[(Hash, u64, bool)]| {
+            lore_revision::branch::cascade_start(reached_at(&repository, pins))
+        };
+
+        let newer = start(&[(base.0, base.1, true), (line[1].0, line[1].1, true)])
+            .await
+            .expect("pins on one line");
+        assert_eq!(newer.start().pin, line[1].0);
+
+        let refused = start(&[(line[1].0, line[1].1, true), (other.0, other.1, true)])
+            .await
+            .err()
+            .expect("pins on diverged lines");
+        assert!(refused.is_invalid_arguments(), "{refused}");
+
+        let staged = start(&[(line[1].0, line[1].1, true), (other.0, other.1, false)])
+            .await
+            .expect("a replaced link doesn't choose the pin");
+        assert_eq!(staged.start().pin, line[1].0);
+
+        let long = commit_line(
+            &repository,
+            "long",
+            base.0,
+            lore_revision::branch::MAX_DIVERGENT_HISTORY_LENGTH + lore_revision::find::BATCH_COUNT,
+        )
+        .await;
+        let tip = long[long.len() - 1];
+        let exhausted = start(&[(other.0, other.1, true), (tip.0, tip.1, true)])
+            .await
+            .expect("a spent budget proves neither");
+        assert_eq!(exhausted.start().pin, tip.0);
+    }))
+    .await
+    .expect("the test task");
+}
+
+/// A repository is repinned after every repository it links, and a link cycle is cut.
+#[test]
+fn repin_levels_order_each_repository_after_those_it_links() {
+    // 0 links 1 and 2, 2 links 1, and 3 and 4 link each other.
+    let levels = repin_levels(&[vec![1, 2], vec![], vec![1], vec![4], vec![3]]);
+    assert_eq!(levels, [vec![1, 4], vec![2, 3], vec![0]]);
+}
+
+/// `archive_local` archives a live branch and answers `Now`; an archive of the branch after
+/// answers `Already` and writes nothing: the metadata key stays as the first archive left it.
+#[tokio::test]
+async fn archive_local_answers_already_for_an_archived_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+
+        let first = archive_local(repository.clone(), branch_id(2)).await;
+        let archived_key = mutable_value(repository.clone(), METADATA, branch_id(2)).await;
+        let second = archive_local(repository.clone(), branch_id(2)).await;
+
+        assert_eq!(first.ok(), Some(Archived::Now));
+        assert_eq!(second.ok(), Some(Archived::Already));
+        assert_eq!(
+            mutable_value(repository.clone(), METADATA, branch_id(2))
+                .await
+                .ok(),
+            archived_key.ok()
+        );
+        assert_eq!(mapped(&repository, "feature").await, None);
+    }))
+    .await;
+}
+
+/// `archive_local` archives the branch an instance's current anchor names, which `delete` refuses
+/// with `DeleteCurrent`.
+#[tokio::test]
+async fn archive_local_skips_the_current_anchor_check() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+        lore_revision::instance::store_current_anchor_branch(&repository, branch_id(2))
+            .await
+            .expect("the current branch is stored");
+
+        let deleted = delete(repository.clone(), branch_id(2)).await;
+        let archived = archive_local(repository.clone(), branch_id(2)).await;
+
+        assert!(
+            deleted.as_ref().is_err_and(|err| err.is_delete_current()),
+            "got {deleted:?}"
+        );
+        assert_eq!(archived.ok(), Some(Archived::Now));
+        assert_eq!(mapped(&repository, "feature").await, None);
+    }))
+    .await;
+}
+
+/// `archives_locally` answers whether the branch's name names it in the local store, by its
+/// mapping or by the id derived from it with no mapping, and writes nothing: false for a branch
+/// the store lacks and for one archived already.
+#[tokio::test]
+async fn archives_locally_follows_the_name_its_mapping_or_derived_id_gives() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let derived = fallback_id("legacy");
+        create_on(
+            &repository,
+            branch_id(2),
+            "feature",
+            vec![branch_point(9, 9)],
+        )
+        .await
+        .expect("the branch is created");
+        create_on(&repository, derived, "legacy", vec![branch_point(9, 9)])
+            .await
+            .expect("the derived branch is created");
+        release_name(repository.clone(), "legacy", derived)
+            .await
+            .expect("the derived branch's mapping is released");
+
+        let live = archives_locally(repository.clone(), branch_id(2)).await;
+        let unmapped_derived = archives_locally(repository.clone(), derived).await;
+        let absent = archives_locally(repository.clone(), branch_id(3)).await;
+        archive_local(repository.clone(), branch_id(2))
+            .await
+            .expect("the branch is archived");
+        let archived = archives_locally(repository.clone(), branch_id(2)).await;
+
+        assert_eq!(
+            [live, unmapped_derived, absent, archived].map(Result::ok),
+            [Some(true), Some(true), Some(false), Some(false)]
+        );
+        assert_eq!(
+            mapped(&repository, "legacy").await,
+            None,
+            "no mapping is written"
+        );
+    }))
+    .await;
+}
+
+/// `archives_locally` answers false for a branch whose id derives from its name once it is
+/// archived: the derived id no longer names the branch, whose metadata says it left the name.
+#[tokio::test]
+async fn archives_locally_answers_false_for_an_archived_derived_branch() {
+    Box::pin(with_execution(async {
+        let repository = null_repository().await;
+        let derived = fallback_id("legacy");
+        create_on(&repository, derived, "legacy", vec![branch_point(9, 9)])
+            .await
+            .expect("the derived branch is created");
+        archive_local(repository.clone(), derived)
+            .await
+            .expect("the derived branch is archived");
+
+        let gated = archives_locally(repository.clone(), derived).await;
+
+        assert_eq!(gated.ok(), Some(false));
+    }))
+    .await;
+}
+
+/// A latest stored convergent clears the latest status with a compare-and-swap from the latest it
+/// replaces, so a status another writer stores between the latest's swap and that clear, as a
+/// commit landing right after the swap stores it for its own revision, stays.
+#[tokio::test]
+async fn store_latest_keeps_a_status_stored_after_its_swap() {
+    with_execution(async {
+        let branch = branch_id(3);
+        let (previous, latest, committed) = (revision(4), revision(5), revision(6));
+        let armed = Arc::new(Mutex::new(None::<(Hash, Hash, KeyType)>));
+        let stores = crate::paged_remote::answering_client_stores(
+            |_call, _key, _key_type| Ok(()),
+            answered({
+                let armed = armed.clone();
+                move |inner, partition, call, key, _key_type| {
+                    let write = match (call, *armed.lock().expect("the arming lock")) {
+                        (
+                            StoreCall::CompareAndSwap,
+                            Some((latest_key, status_key, status_type)),
+                        ) if latest_key == key => Some((status_key, status_type)),
+                        _ => None,
+                    };
+                    if write.is_some() {
+                        *armed.lock().expect("the arming lock") = None;
+                    }
+                    async move {
+                        if let Some((status_key, status_type)) = write {
+                            inner
+                                .store(partition, status_key, committed, status_type)
+                                .await?;
+                        }
+                        Ok(())
+                    }
+                }
+            }),
+        )
+        .await;
+        let writer = stores.writer.clone();
+        store_latest(
+            writer.clone(),
+            branch,
+            Hash::default(),
+            previous,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .expect("stores the previous latest");
+        let (latest_key, _) = mutable_key(writer.salt(), LATEST, writer.id, branch);
+        let (status_key, status_type) =
+            mutable_key(writer.salt(), LATEST_STATUS, writer.id, branch);
+        *armed.lock().expect("the arming lock") = Some((latest_key, status_key, status_type));
+
+        store_latest(
+            writer.clone(),
+            branch,
+            previous,
+            latest,
+            BranchLatestStatus::Convergent,
+        )
+        .await
+        .expect("stores the latest");
+
+        assert_eq!(
+            mutable_value(writer, LATEST_STATUS, branch)
+                .await
+                .expect("loads the status"),
+            Some(committed)
+        );
+    })
+    .await;
+}
+
+/// Writes, through `writer`, branch metadata of `id` named `name` that `entries` extends, each a
+/// key and its String value, and returns its hash.
+async fn write_branch_metadata(
+    writer: &Arc<RepositoryContext>,
+    id: BranchId,
+    name: &str,
+    entries: &[(&str, &str)],
+) -> Hash {
+    let mut metadata = lore_revision::metadata::Metadata::new();
+    metadata_populate(
+        &mut metadata,
+        id,
+        name,
+        default_category(),
+        "creator",
+        1,
+        vec![branch_point(1, 1)],
+    )
+    .expect("populating the branch's metadata");
+    for (key, value) in entries {
+        metadata.set_string(key, value).expect("setting an entry");
+    }
+    metadata
+        .serialize(writer.clone())
+        .await
+        .expect("storing the branch's metadata")
+}
+
+/// Bringing in a branch whose local metadata records a stopped restore settles it: the name the
+/// restore claimed maps to nothing, the metadata key holds the remote's hash, and the branch's own
+/// name maps to it.
+#[tokio::test]
+async fn bring_in_record_settles_a_stopped_local_restore() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let id = branch_id(7);
+        let stopped =
+            write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[(RESTORING, "bee")]).await;
+        mutable_store_metadata(stores.writer.clone(), id, stopped)
+            .await
+            .expect("storing the branch's local metadata hash");
+        claim_name(stores.writer.clone(), "bee", BranchId::default(), id)
+            .await
+            .expect("the stopped restore claimed its name");
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true)
+            .await
+            .expect("brings the branch in");
+
+        assert_eq!(mapped(&stores.writer, "bee").await, None);
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, Some(id));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(remote)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch whose name another branch with metadata holds fails with
+/// `BranchAlreadyExists`, and sets the metadata key back to the value it held.
+#[tokio::test]
+async fn bring_in_record_sets_its_metadata_back_after_a_lost_claim() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let (id, holder) = (branch_id(7), branch_id(8));
+        create_record(
+            stores.writer.clone(),
+            holder,
+            CLAIMED_NAME,
+            default_category(),
+            "creator",
+            1,
+            Vec::new(),
+            revision(1),
+            BranchLatestStatus::Divergent,
+            BranchId::default(),
+        )
+        .await
+        .expect("another branch holds the name");
+        let before = write_branch_metadata(&stores.writer, id, "elsewhere", &[]).await;
+        mutable_store_metadata(stores.writer.clone(), id, before)
+            .await
+            .expect("storing the branch's local metadata hash");
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        let brought = bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true).await;
+
+        assert!(brought.is_err_and(|err| err.is_branch_already_exists()));
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, Some(holder));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(before)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch without a claim, as of a branch the remote has archived, caches its
+/// metadata and maps no name to it.
+#[tokio::test]
+async fn bring_in_record_without_a_claim_writes_no_name() {
+    with_execution(async {
+        let stores = client_stores().await;
+        let id = branch_id(7);
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+
+        bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, false)
+            .await
+            .expect("brings the branch in");
+
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, None);
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(remote)
+        );
+    })
+    .await;
+}
+
+/// Bringing in a branch whose local metadata key another writer changes after the cache read it
+/// fails with `BranchAlreadyExists`, leaves that writer's value, and claims no name.
+#[tokio::test]
+async fn bring_in_record_keeps_metadata_another_writer_stored_after_its_read() {
+    Box::pin(with_execution(async {
+        let armed = ArmedWrite::default();
+        let stores = crate::paged_remote::answering_client_stores(
+            |_call, _key, _key_type| Ok(()),
+            writing_after_its_load(armed.clone()),
+        )
+        .await;
+        let id = branch_id(7);
+        let before = write_branch_metadata(&stores.writer, id, "elsewhere", &[]).await;
+        mutable_store_metadata(stores.writer.clone(), id, before)
+            .await
+            .expect("storing the branch's local metadata hash");
+        let other = write_branch_metadata(&stores.writer, id, "other", &[]).await;
+        let remote = write_branch_metadata(&stores.writer, id, CLAIMED_NAME, &[]).await;
+        let (key, _key_type) = mutable_key(stores.writer.salt(), METADATA, stores.writer.id, id);
+        *armed.lock().expect("the arming lock") = Some((key, other));
+
+        let brought = bring_in_record(stores.writer.clone(), id, CLAIMED_NAME, remote, true).await;
+
+        assert!(brought.is_err_and(|err| err.is_branch_already_exists()));
+        assert_eq!(
+            mutable_value(stores.writer.clone(), METADATA, id)
+                .await
+                .expect("loads the metadata key"),
+            Some(other)
+        );
+        assert_eq!(mapped(&stores.writer, CLAIMED_NAME).await, None);
+    }))
+    .await;
 }

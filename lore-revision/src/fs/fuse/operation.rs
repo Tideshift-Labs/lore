@@ -9,6 +9,7 @@
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
@@ -16,7 +17,6 @@ use crossbeam_epoch as epoch;
 use crossbeam_epoch::Atomic;
 use crossbeam_epoch::Owned;
 use crossbeam_epoch::Shared;
-use crossbeam_queue::SegQueue;
 use crossbeam_utils::atomic::AtomicCell;
 use dashmap::DashMap;
 use lore_base::error::FileNotFound;
@@ -31,13 +31,17 @@ use lore_storage::ContentSource;
 use smallvec::SmallVec;
 
 use crate::errors::NotSupported;
+use crate::fs::filesystem_provider::CaseLookup;
 use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::ListedEntry;
 use crate::fs::filesystem_provider::StaticDispatchDirectoryListing;
+use crate::fs::fuse::FuseProviderError;
+use crate::fs::fuse::attr::served_file_permissions;
 use crate::fs::fuse::filesystem::CommitReading;
 use crate::fs::fuse::filesystem::FuseFilesystem;
 use crate::fs::fuse::filesystem::LookupCase;
@@ -53,6 +57,8 @@ use crate::fs::fuse::local_tree::LocalKind;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::notifications::Pending;
 use crate::fs::fuse::served::Served;
+use crate::lore::Hash;
+use crate::lore_debug;
 use crate::lore_warn;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
@@ -66,8 +72,10 @@ use crate::state::ChangeStream;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
+use crate::state::PathStop;
 use crate::state::SerializedBlocks;
 use crate::state::State;
+use crate::state::Stop;
 use crate::util::path::RelativePath;
 
 /// How much of a file `infer_is_diffable` reads.
@@ -86,16 +94,51 @@ pub struct FuseOperation {
     revision: tokio::sync::OnceCell<Arc<State>>,
     /// The deletion list as the last write that asked read it.
     deletions_read: ListedDeletions,
-    /// The directories the commit adds or moves, as its walk's parallel tasks hand them over
-    /// ([`Self::hand_directory`]); made by the first, as most operations hand none and the queue
-    /// is two cache lines.
-    handed: std::sync::OnceLock<Box<SegQueue<RelativePath>>>,
+    /// The directories the commit adds or moves, handed over after each walk, in sequence
+    /// ([`Self::hand_directories`]).
+    handed: parking_lot::Mutex<Vec<RelativePath>>,
     /// The committed State's blocks as its serialize wrote them, held until the settle against
     /// that State returns, so the settle reads them from memory.
     serialized: AtomicCell<Option<Box<SerializedBlocks>>>,
     /// The settle the commit owes, from before its revision may become current
     /// ([`Self::owe_settle`]).
     owed: AtomicCell<Option<Box<SettleOwed>>>,
+    /// The time of the files the operation serves from the store again, [`UNREAD`] until read
+    /// ([`Self::restore_time`]).
+    restored_at: AtomicU64,
+    /// The command's context, which holds the write token that writing the records back takes,
+    /// set once the operation serves a file from the store again
+    /// ([`Self::restore_revision_content`], [`Self::serve_unchanged`]), for [`Self::finalize`].
+    restored: parking_lot::Mutex<Option<Arc<RepositoryContext>>>,
+    /// The State the first marking diff under the command's write token walked through the
+    /// operation, with the command's context, set as that diff begins: from then on a comparison
+    /// records each local file it finds holding the content compared, which the operation serves
+    /// from the store as it ends ([`Self::serve_unchanged`]).
+    serving: std::sync::OnceLock<(Arc<Served>, Arc<RepositoryContext>)>,
+    /// The local files comparisons found holding the content compared, each with its address,
+    /// recorded as [`InstanceOperation::content_source`] records a file it serves.
+    matched: parking_lot::Mutex<Vec<(ServedFile, Address)>>,
+    /// The clock of the filesystem holding `write/`, read once, before the operation first
+    /// compares a local file, [`UNREAD`] until then ([`Self::compared_floor`]).
+    compared_floor: AtomicU64,
+}
+
+/// A clock an operation has not read: no filesystem stamps it.
+const UNREAD: u64 = u64::MAX;
+
+/// The time `clock` holds, read with `read` where it is [`UNREAD`]: the first time stored wins, so
+/// every caller sees the one time. The read is boxed: it runs once per operation, and inline it
+/// would grow the future of each caller.
+async fn read_once<F: Future<Output = u64>>(clock: &AtomicU64, read: impl FnOnce() -> F) -> u64 {
+    let held = clock.load(Ordering::Acquire);
+    if held != UNREAD {
+        return held;
+    }
+    let read = Box::pin(read()).await;
+    match clock.compare_exchange(UNREAD, read, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => read,
+        Err(first) => first,
+    }
 }
 
 /// The deletion list as one read parsed it, swapped whole once the list has changed: a lookup
@@ -158,7 +201,7 @@ pub(crate) struct ServedContent(DashMap<Box<str>, ServedFile>);
 /// it, its node and where the node stood, the inode the kernel held for it with that inode's
 /// incarnation and write generation, or where none was held the count incarnations and written
 /// forgets draw from as it stood (`InodeTable::next_incarnation`), and once the caller stored
-/// the content, what it stored.
+/// the content, what it stored and the time the file showed before it was read.
 #[lore_macro::test_pub]
 #[derive(Clone, Debug)]
 pub(crate) struct ServedFile {
@@ -170,6 +213,9 @@ pub(crate) struct ServedFile {
     pub incarnation: u64,
     pub generation: u64,
     pub stored: Option<StoredContent>,
+    /// The time the file showed before it was read, which a commit or a serve records for it; 0
+    /// until known.
+    pub mtime: u64,
 }
 
 /// What a commit stored of a file it read: its address, size and mode.
@@ -186,10 +232,11 @@ impl ServedContent {
         self.0.insert(path.as_str().into(), file);
     }
 
-    /// Records that the content served for `path` was stored as `stored`.
-    pub(crate) fn store(&self, path: &RelativePath, stored: StoredContent) {
+    /// Records that the content served for `path`, as it showed `mtime`, was stored as `stored`.
+    pub(crate) fn store(&self, path: &RelativePath, stored: StoredContent, mtime: u64) {
         if let Some(mut file) = self.0.get_mut(path.as_str()) {
             file.stored = Some(stored);
+            file.mtime = mtime;
         }
     }
 
@@ -203,6 +250,23 @@ impl ServedContent {
     }
 }
 
+impl ServedFile {
+    /// The file `located` names, with `held`, the inode the kernel held for it as read before the
+    /// file was located ([`FuseOperation::held_inode`]).
+    fn found(located: Located, (ino, incarnation, generation): (Option<u64>, u64, u64)) -> Self {
+        Self {
+            spelled: located.spelled,
+            node: located.node,
+            place: (located.dir, located.entry.name_hash),
+            ino,
+            incarnation,
+            generation,
+            stored: None,
+            mtime: 0,
+        }
+    }
+}
+
 impl FuseOperation {
     pub fn new(filesystem: Arc<FuseFilesystem>) -> Self {
         Self {
@@ -211,9 +275,14 @@ impl FuseOperation {
             reading: std::sync::OnceLock::new(),
             revision: tokio::sync::OnceCell::new(),
             deletions_read: ListedDeletions::default(),
-            handed: std::sync::OnceLock::new(),
+            handed: parking_lot::Mutex::new(Vec::new()),
             serialized: AtomicCell::new(None),
             owed: AtomicCell::new(None),
+            restored_at: AtomicU64::new(UNREAD),
+            restored: parking_lot::Mutex::new(None),
+            serving: std::sync::OnceLock::new(),
+            matched: parking_lot::Mutex::new(Vec::new()),
+            compared_floor: AtomicU64::new(UNREAD),
         }
     }
 
@@ -221,19 +290,19 @@ impl FuseOperation {
         &self.filesystem
     }
 
-    /// Collects `path`, a directory the commit adds or moves, for its settle.
-    pub(crate) fn hand_directory(&self, path: &RelativePath) {
-        self.handed
-            .get_or_init(|| Box::new(SegQueue::new()))
-            .push(path.clone());
+    /// Collects `paths`, directories the commit adds or moves, for its settle.
+    pub(crate) fn hand_directories(&self, paths: Vec<RelativePath>) {
+        let mut handed = self.handed.lock();
+        if handed.is_empty() {
+            *handed = paths;
+        } else {
+            handed.extend(paths);
+        }
     }
 
     /// The directories handed over so far, taken.
     fn take_handed(&self) -> Vec<RelativePath> {
-        self.handed
-            .get()
-            .map(|handed| std::iter::from_fn(|| handed.pop()).collect())
-            .unwrap_or_default()
+        std::mem::take(&mut *self.handed.lock())
     }
 
     pub(crate) fn keep_serialized_blocks(&self, blocks: SerializedBlocks) {
@@ -257,6 +326,114 @@ impl FuseOperation {
     pub(crate) fn release_settle_owed(&self) {
         if let Some(owed) = self.owed.take() {
             owed.release();
+        }
+    }
+
+    /// Serves from the store the local files a marking diff under the command's write token found
+    /// unchanged ([`Self::serve_unchanged`]), then writes back the records holding the time of the
+    /// files the operation served from the store again
+    /// ([`RecordedTimes::write_back`](crate::fs::fuse::attr::RecordedTimes::write_back)), synced
+    /// under `--sync-data`. A failure is logged: the files stay served from the store, and a
+    /// remount before the records are written back reports their earlier time. Both are boxed:
+    /// they are the cold path, and inline they would grow the future of every command's
+    /// operation.
+    pub(crate) async fn finalize(&self) {
+        if let Some((served, repository)) = self.serving.get()
+            && !self.matched.lock().is_empty()
+        {
+            Box::pin(self.serve_unchanged(repository, served)).await;
+        }
+        let Some(repository) = self.restored.lock().take() else {
+            return;
+        };
+        if let Err(error) = Box::pin(self.filesystem.recorded_times().write_back(&repository)).await
+        {
+            lore_warn!(
+                "FUSE writing back the time of files served from the store again failed: {error}"
+            );
+        }
+    }
+
+    /// The time the operation records for the files it serves from the store again, read once
+    /// ([`read_once`]), as it first serves one, in the staging directory, as a swap reads its
+    /// time: a write after any of the files reports a later time.
+    async fn restore_time(&self) -> u64 {
+        let staging = self
+            .filesystem
+            .local_files()
+            .map(|local| local.staging_dir());
+        read_once(&self.restored_at, || {
+            crate::state::time_before_next_write(staging)
+        })
+        .await
+    }
+
+    /// The clock of the filesystem holding `write/` as the operation first compared a local file,
+    /// read once then ([`read_once`]), in the staging directory: a time older than it was shown
+    /// before the operation read the file, and a write after the read carries no older one.
+    /// `None` for a mount with no local files.
+    async fn compared_floor(&self) -> Option<u64> {
+        let staging = self.filesystem.local_files()?.staging_dir();
+        Some(
+            read_once(&self.compared_floor, || {
+                crate::state::read_clock_floor_in(staging)
+            })
+            .await,
+        )
+    }
+
+    /// The time the records hold for the local file at `path`, read before a diff compares it, 0
+    /// for none, which spares the diff reading the file where it shows that time; first reads the
+    /// clock the time a match records must be older than ([`Self::record_compared_time`]). `None`
+    /// for a mount with no local files, and for a diff under the command's write token, which
+    /// reads the file, as a stage and a commit do; a marking one serves what it finds unchanged
+    /// from the store ([`Self::serve_unchanged`]).
+    pub(crate) async fn recorded_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+    ) -> Option<u64> {
+        if repository.try_write_token().is_some() {
+            return None;
+        }
+        self.compared_floor().await?;
+        Some(
+            self.filesystem
+                .recorded_times()
+                .mtime_for(repository, path, 0)
+                .await,
+        )
+    }
+
+    /// Records `mtime` for `path`, a local file a diff found holding the content of `revision`,
+    /// the diff's current revision, where `mtime` is older than the clock read before the file was
+    /// read, as a write after the read carries a later time, and the records still hold
+    /// `expected`, the time [`Self::recorded_time`] read. Recorded under the swaps lock, taken
+    /// only where free, and only where the mount still stands at `revision`: a swap and a commit
+    /// set the revision and the times of the files they change under it, so no time is recorded
+    /// for content the mounted revision no longer holds. Written back by the next operation that
+    /// writes the records back. Takes the path rather than the key the lookup hashed: the key
+    /// held across the file's read would grow the future of every comparison, to spare a hash
+    /// only where a read matched.
+    pub(crate) async fn record_compared_time(
+        &self,
+        repository: &RepositoryContext,
+        path: &RelativePath,
+        (expected, mtime): (u64, u64),
+        revision: Hash,
+    ) {
+        let floor = self.compared_floor.load(Ordering::Acquire);
+        if floor == UNREAD || mtime >= floor {
+            return;
+        }
+        let Ok(_swaps) = self.filesystem.swap_plan().try_lock() else {
+            return;
+        };
+        if self.filesystem.served().state.revision() == revision {
+            self.filesystem
+                .recorded_times()
+                .replace(repository, path, expected, mtime)
+                .await;
         }
     }
 
@@ -310,6 +487,22 @@ impl FuseOperation {
                 host,
             }
         }))
+    }
+
+    /// The inode the kernel holds for `path`, with its incarnation and write generation; where
+    /// none is held, the count incarnations and written forgets draw from as it stands
+    /// (`InodeTable::next_incarnation`) and generation 0. Read before the file is located, so a
+    /// write that lands after the read moves them.
+    fn held_inode(&self, path: &RelativePath) -> (Option<u64>, u64, u64) {
+        let next = self.filesystem.inodes().next_incarnation();
+        self.filesystem
+            .live_inode(path)
+            .and_then(|ino| {
+                self.filesystem
+                    .inode_incarnation(ino)
+                    .map(|(incarnation, generation)| (Some(ino), incarnation, generation))
+            })
+            .unwrap_or((None, next, 0))
     }
 
     /// What the local content at `path` is, from its host file; `None` where `path` names
@@ -435,42 +628,12 @@ enum FileSource {
 }
 
 /// What the host entry at `host` holds, read through a symbolic link as a path named on its
-/// own is ([`host_file_info`]).
+/// own is.
 async fn host_info(host: &Path) -> std::io::Result<FileInfo> {
     match lore_io::IoDriver::global().metadata(host).await {
-        Ok(metadata) => Ok(host_file_info(&metadata)),
+        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
         Err(error) => Err(error),
-    }
-}
-
-/// [`FileInfo::from_metadata`], a host file's time the later of its modification and its status
-/// change, in milliseconds. A file renamed onto a name, created at it, or given a time carries
-/// that change's time, so it never matches a time recorded for the file the name held before,
-/// whatever its own modification time. Commits and scans record and compare this time; no
-/// served attribute reads it ([`crate::fs::fuse::attr::RecordedTimes`]).
-fn host_file_info(metadata: &std::fs::Metadata) -> FileInfo {
-    use std::os::unix::fs::MetadataExt as _;
-
-    match FileInfo::from_metadata(metadata) {
-        FileInfo::File {
-            executable,
-            size,
-            mtime,
-        } => {
-            let changed = u64::try_from(metadata.ctime())
-                .unwrap_or_default()
-                .saturating_mul(1000)
-                .saturating_add(
-                    u64::try_from(metadata.ctime_nsec()).unwrap_or_default() / 1_000_000,
-                );
-            FileInfo::File {
-                executable,
-                size,
-                mtime: mtime.max(changed),
-            }
-        }
-        info => info,
     }
 }
 
@@ -846,46 +1009,32 @@ impl FuseOperation {
     /// forced sync overwrites a local file, where the State holds the mounted revision's own node
     /// there and the revision holds that content: nothing is copied, and `write/` keeps nothing of
     /// it. A node made at the path since, by a create or a rename onto it, stands over a deletion
-    /// the list records, which only its local copy survives at the next mount. Answers whether it
-    /// did.
+    /// the list records, which only its local copy survives at the next mount. Answers the time
+    /// the file reports where it did ([`Self::restore_time`]), set in the records before the file
+    /// is served from the store, so an inode made of it meanwhile reports it, and written back as
+    /// the operation ends.
     async fn restore_revision_content(
         &self,
         changed: &mut Invalidations,
+        repository: &Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
-    ) -> Result<bool, FsError> {
+    ) -> Result<Option<u64>, FsError> {
         let Some(located) = self.located(path).await? else {
-            return Ok(false);
+            return Ok(None);
         };
         if is_dir(&located.entry) {
-            return Ok(false);
+            return Ok(None);
         }
         let served = self.filesystem.served();
-        let revision = self
-            .revision
-            .get_or_try_init(|| {
-                crate::fs::fuse::filesystem::load_revision(&served.repository, served.revision())
-            })
-            .await
-            .forward_any::<FsError>("loading the mounted revision")?;
-        if revision.revision() != served.revision() {
-            return Ok(false);
-        }
-        let held = match revision
-            .find_relative_node_link(
-                served.repository.clone(),
-                ROOT_NODE,
-                located.spelled.as_str(),
-            )
-            .await
-        {
-            Ok(link) if link.revision == revision.revision() && link.node == located.node => {
-                revision
-                    .node(served.repository.clone(), link.node)
-                    .await
-                    .forward_any::<FsError>("reading the mounted revision")?
-            }
-            _ => return Ok(false),
+        let Some(revision) = self.mounted_revision(&served).await? else {
+            return Ok(None);
+        };
+        let Some(held) =
+            Self::revision_record(revision, &served.repository, &located.spelled, located.node)
+                .await?
+        else {
+            return Ok(None);
         };
         if !held.is_file()
             || held.address.hash != node.address.hash
@@ -893,28 +1042,201 @@ impl FuseOperation {
             || held.mode != node.mode
             || self.deletion_listed(&located.spelled)
         {
-            return Ok(false);
+            return Ok(None);
         }
         let target = StoredContent {
             address: held.address,
             size: held.size,
             mode: held.mode,
         };
-        let restored = self
+        let Some(mtime) = self
+            .serve_restored(repository, &served, &located, &target)
+            .await
+            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?
+        else {
+            return Ok(None);
+        };
+        if let Some(ino) = self.filesystem.live_inode(&located.spelled) {
+            changed.inodes.push(ino);
+        }
+        self.restored
+            .lock()
+            .get_or_insert_with(|| repository.clone());
+        Ok(Some(mtime))
+    }
+
+    /// The mounted revision, loaded once per operation, where `served` stands at it.
+    async fn mounted_revision(&self, served: &Served) -> Result<Option<&State>, FsError> {
+        let revision = self
+            .revision
+            .get_or_try_init(|| {
+                crate::fs::fuse::filesystem::load_revision(&served.repository, served.revision())
+            })
+            .await
+            .forward_any::<FsError>("loading the mounted revision")?;
+        Ok((revision.revision() == served.revision()).then_some(&**revision))
+    }
+
+    /// The record `revision` holds for `node` at `spelled`, where it holds that node there, found
+    /// as a lookup finds a name, whatever its case.
+    async fn revision_record(
+        revision: &State,
+        repository: &Arc<RepositoryContext>,
+        spelled: &RelativePath,
+        node: NodeID,
+    ) -> Result<Option<Node>, FsError> {
+        match revision
+            .find_relative_node_link(repository.clone(), ROOT_NODE, spelled.as_str())
+            .await
+        {
+            Ok(link) if link.revision == revision.revision() && link.node == node => revision
+                .node(repository.clone(), node)
+                .await
+                .map(Some)
+                .forward_any::<FsError>("reading the mounted revision"),
+            _ => Ok(None),
+        }
+    }
+
+    /// Sets the operation's time ([`Self::restore_time`]) for the file `located` names in the
+    /// records, where a lookup sees it at once, then gives the file `target` over its local content
+    /// ([`FuseFilesystem::overwrite_local_file`]), and answers the time where the file changed. Its
+    /// own future, so [`Self::restore_revision_content`] holds its locals across one await.
+    async fn serve_restored(
+        &self,
+        repository: &RepositoryContext,
+        served: &Served,
+        located: &Located,
+        target: &StoredContent,
+    ) -> Result<Option<u64>, FuseProviderError> {
+        let mtime = self.restore_time().await;
+        self.filesystem
+            .recorded_times()
+            .set(repository, &located.spelled, mtime)
+            .await;
+        let changed = self
             .filesystem
             .overwrite_local_file(
-                &served,
+                served,
                 &located.spelled,
                 located.node,
                 (located.dir, located.entry.name_hash),
-                &target,
+                target,
+                mtime,
             )
-            .await
-            .forward_any_with::<FsError, _>(|| format!("restoring '{path}' to the revision"))?;
-        if restored && let Some(ino) = self.filesystem.live_inode(&located.spelled) {
-            changed.inodes.push(ino);
+            .await?;
+        Ok(changed.then_some(mtime))
+    }
+
+    /// Serves from the store each local file the operation's comparisons found holding the
+    /// content compared ([`Self::file_holds_content`]) since a marking diff under the command's
+    /// write token walked `served`, where that is what the mounted revision holds for its node
+    /// ([`Self::revision_content`]) and `served` is still the State served: the time the file
+    /// showed before the comparison read it is set in the records, where a lookup sees it at
+    /// once, then the file is flipped as
+    /// a commit flips a file it stored ([`FuseFilesystem::serve_unchanged`]), and the records are
+    /// written back as the operation ends. A file a write changed since its read stays local, as
+    /// does one whose check fails, which is logged. Runs once, as the operation ends.
+    async fn serve_unchanged(&self, repository: &Arc<RepositoryContext>, served: &Arc<Served>) {
+        let matched = std::mem::take(&mut *self.matched.lock());
+        if !Arc::ptr_eq(&self.filesystem.served(), served) {
+            return;
         }
-        Ok(restored)
+        let revision = match self.mounted_revision(served).await {
+            Ok(Some(revision)) => revision,
+            Ok(None) => return,
+            Err(error) => {
+                lore_warn!("FUSE serving unchanged local files from the store failed: {error}");
+                return;
+            }
+        };
+        let mut files = Vec::with_capacity(matched.len());
+        for (mut file, address) in matched {
+            match self
+                .revision_content((revision, &served.repository), &file, address)
+                .await
+            {
+                Ok(Some(stored)) => {
+                    self.restored
+                        .lock()
+                        .get_or_insert_with(|| repository.clone());
+                    self.filesystem
+                        .recorded_times()
+                        .set(repository, &file.spelled, file.mtime)
+                        .await;
+                    file.stored = Some(stored);
+                    files.push(file);
+                }
+                Ok(None) => {}
+                Err(error) => lore_warn!(
+                    "FUSE checking '{}' against the mounted revision failed: {error}",
+                    file.spelled
+                ),
+            }
+        }
+        if files.is_empty() {
+            return;
+        }
+        let flipped = self
+            .filesystem
+            .serve_unchanged(&files, served, revision)
+            .await;
+        lore_debug!(
+            "FUSE served {flipped} of {} unchanged local files from the store",
+            files.len()
+        );
+    }
+
+    /// What `revision` holds for the node of `file`, a local file found holding the content at
+    /// `address`: `None` where the revision holds another node at the path, spells the path
+    /// otherwise, or holds other content or size, where the file shows another time than it did
+    /// as it was read or other permissions than a file served from the store reports, or where
+    /// the deletion list holds the path or a directory above it.
+    async fn revision_content(
+        &self,
+        (revision, repository): (&State, &Arc<RepositoryContext>),
+        file: &ServedFile,
+        address: Address,
+    ) -> Result<Option<StoredContent>, FsError> {
+        if self.deletion_listed(&file.spelled) {
+            return Ok(None);
+        }
+        let Some(held) =
+            Self::revision_record(revision, repository, &file.spelled, file.node).await?
+        else {
+            return Ok(None);
+        };
+        if !held.is_file() || held.address.hash != address.hash {
+            return Ok(None);
+        }
+        let spelled = revision
+            .node_path(repository.clone(), file.node)
+            .await
+            .forward_any::<FsError>("reading the mounted revision")?;
+        if spelled != file.spelled.as_str() {
+            return Ok(None);
+        }
+        let Some(host) = self.filesystem.host_file_path(&file.spelled) else {
+            return Ok(None);
+        };
+        let stat = match lore_io::IoDriver::global().metadata(&host).await {
+            Ok(metadata) => lore_io::Stat::from(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(host_error(&file.spelled, &error)),
+        };
+        let executable = held.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+        if stat.kind != lore_io::StatKind::File
+            || stat.len != held.size
+            || stat.mode.map(|mode| mode & 0o7777) != Some(served_file_permissions(executable))
+            || crate::util::fs::modified_millis(stat.modified) != file.mtime
+        {
+            return Ok(None);
+        }
+        Ok(Some(StoredContent {
+            address: held.address,
+            size: held.size,
+            mode: held.mode,
+        }))
     }
 
     /// Whether the deletion list holds `path` or a directory above it, which the next mount
@@ -1110,19 +1432,51 @@ impl InstanceOperation for FuseOperation {
     /// descending only where either side is dirty, and marks `diff.from` only as the intent asks.
     /// The State is read under the filter of `diff.from`'s repository, the command's, as an
     /// ordinary walk lists the working tree under it: the ignore rules a command reads are its
-    /// own, where the provider's context holds those of the last revision it held.
+    /// own, where the provider's context holds those of the last revision it held. After a marking
+    /// diff under the command's write token, the operation serves from the store, as it ends, the
+    /// local files its comparisons found holding the mounted revision's content
+    /// ([`FuseOperation::serve_unchanged`]). Nothing at or below a link is reported, as no write
+    /// changes a link: not a diff of a linked repository, nor one at a path through a link.
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
     ) -> ChangeStream<FilesystemDiffStats> {
+        if diff.from.repository.is_link() {
+            return ChangeStream::nothing();
+        }
+        if diff.intent.marks_dirty()
+            && diff.from.repository.try_write_token().is_some()
+            && !diff.operation.dry_run()
+        {
+            self.serving
+                .get_or_init(|| (self.filesystem.served(), diff.from.repository.clone()));
+        }
         let filesystem = self.filesystem.clone();
         ChangeStream::spawn(async move |changes| {
             let served = filesystem.served();
-            let node = served
+            let node = match served
                 .state
-                .find_node_link(served.repository.clone(), diff.filesystem_path.as_str())
+                .find_to_link::<true>(
+                    &served.repository,
+                    ROOT_NODE,
+                    diff.filesystem_path.as_str(),
+                    true,
+                )
                 .await
-                .map_or(INVALID_NODE, |link| link.node);
+            {
+                Ok(PathStop {
+                    at: Stop::Link(_), ..
+                }) => return Ok(FilesystemDiffStats::default()),
+                Ok(PathStop {
+                    at: Stop::End,
+                    node,
+                    ..
+                }) => node,
+                Ok(PathStop {
+                    at: Stop::Missing, ..
+                })
+                | Err(_) => INVALID_NODE,
+            };
             let spelled = state_spelling(&served, node, &diff).await;
             let to = NodeMapping {
                 node,
@@ -1134,7 +1488,7 @@ impl InstanceOperation for FuseOperation {
             from.path = spelled.clone();
             let mut current = diff.current;
             current.path = spelled.clone();
-            // Boxed: the walk and its settling make a large future, one per diff.
+            // Boxed: the walk makes a large future, one per diff.
             filesystem
                 .scoped(Box::pin(crate::state::diff_states_into(
                     diff.operation,
@@ -1181,6 +1535,11 @@ impl InstanceOperation for FuseOperation {
 
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         Ok(self.local_info(path).await?.unwrap_or(FileInfo::NotExist))
+    }
+
+    /// [`CaseLookup::PerName`]: the served State's index answers for a name.
+    fn case_lookup(&self) -> CaseLookup {
+        CaseLookup::PerName
     }
 
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
@@ -1266,13 +1625,8 @@ impl InstanceOperation for FuseOperation {
             .write_step_allowed(WriteStep::ContentServing);
         self.reading
             .get_or_init(|| self.filesystem.begin_commit_read());
-        let next = self.filesystem.inodes().next_incarnation();
-        let held = self.filesystem.live_inode(path).and_then(|ino| {
-            self.filesystem
-                .inode_incarnation(ino)
-                .map(|(incarnation, generation)| (ino, incarnation, generation))
-        });
-        let Some(located) = self
+        let held = self.held_inode(path);
+        let Some(mut located) = self
             .located(path)
             .await?
             .filter(|located| !is_dir(&located.entry))
@@ -1282,58 +1636,74 @@ impl InstanceOperation for FuseOperation {
             }
             .into());
         };
-        let (ino, incarnation, generation) = match held {
-            Some((ino, incarnation, generation)) => (Some(ino), incarnation, generation),
-            None => (None, next, 0),
-        };
-        self.served.record(
-            path,
-            ServedFile {
-                spelled: located.spelled,
-                node: located.node,
-                place: (located.dir, located.entry.name_hash),
-                ino,
-                incarnation,
-                generation,
-                stored: None,
-            },
-        );
-        Ok(match located.host {
+        let source = match located.host.take() {
             Some(host) => ContentSource::owned_file(host),
             None => ContentSource::virtual_immutable(located.entry.address, located.entry.size),
-        })
+        };
+        self.served.record(path, ServedFile::found(located, held));
+        Ok(source)
     }
 
     /// A local file is measured against the stored object as a real file is; a tracked file
-    /// holds its State address.
+    /// holds its State address. Once a marking diff under the command's write token has begun
+    /// ([`Self::serve_unchanged`]), a local file that matches is recorded with its inode as read
+    /// before the file was located and `mtime`, the time the caller read for its host file before
+    /// asking, where it read one older than the operation's clock ([`Self::compared_floor`]): a
+    /// write after the read carries no older time.
     async fn file_holds_content(
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
-        Ok(match self.file_source(path).await? {
-            Some(FileSource::Local(host)) => {
-                let matched = crate::immutable::file_matches(
-                    repository,
-                    previous,
-                    Some(previous_size as usize),
-                    &ContentSource::owned_file(host),
-                    established,
-                )
+        let read = match self.serving.get() {
+            Some(_) if mtime != 0 => self
+                .compared_floor()
                 .await
-                .forward_any::<FsError>("comparing a local file to stored content")?;
-                crate::state::node_comparison(matched)
-            }
-            Some(FileSource::Tracked(entry))
-                if entry.address.hash == previous.hash && entry.size == previous_size =>
-            {
-                NodeComparison::Matches
-            }
-            _ => NodeComparison::Differs,
-        })
+                .is_some_and(|floor| mtime < floor)
+                .then(|| self.held_inode(path)),
+            _ => None,
+        };
+        let Some(mut located) = self
+            .located(path)
+            .await?
+            .filter(|located| !is_dir(&located.entry))
+        else {
+            return Ok(NodeComparison::Differs);
+        };
+        let Some(host) = located.host.take() else {
+            let entry = &located.entry;
+            return Ok(
+                if entry.address.hash == previous.hash && entry.size == previous_size {
+                    NodeComparison::Matches
+                } else {
+                    NodeComparison::Differs
+                },
+            );
+        };
+        let found = read.map(|held| ServedFile {
+            mtime,
+            ..ServedFile::found(located, held)
+        });
+        let matched = crate::immutable::file_matches(
+            repository,
+            previous,
+            Some(previous_size as usize),
+            &ContentSource::owned_file(host),
+            established,
+        )
+        .await
+        .forward_any::<FsError>("comparing a local file to stored content")?;
+        let comparison = crate::state::node_comparison(matched);
+        if let Some(found) = found
+            && matches!(comparison, NodeComparison::Matches)
+        {
+            self.matched.lock().push((found, previous));
+        }
+        Ok(comparison)
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
@@ -1451,11 +1821,11 @@ impl InstanceOperation for FuseOperation {
         self.writable(ACTION)?;
         let mut changed = self.changes();
         let wrote = Box::pin(async {
-            if self
-                .restore_revision_content(&mut changed.batch, node, path)
+            if let Some(mtime) = self
+                .restore_revision_content(&mut changed.batch, &repository, node, path)
                 .await?
             {
-                return Ok(());
+                return Ok(Some(mtime));
             }
             let (staged, _) = self.stage_stored(repository, node.address, path).await?;
             let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
@@ -1470,11 +1840,14 @@ impl InstanceOperation for FuseOperation {
                 ACTION,
                 path,
             )
+            .map(|()| None)
         })
         .await;
         changed.send().await;
-        wrote?;
-        InstanceOperation::file_info(self, path).await
+        match wrote? {
+            Some(mtime) => Ok(FileInfo::from_node_and_mtime(node, mtime)),
+            None => InstanceOperation::file_info(self, path).await,
+        }
     }
 
     async fn set_file_to_immutable_store_contents(
@@ -1551,7 +1924,7 @@ impl InstanceOperation for FuseOperation {
         copied
     }
 
-    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16, mtime: u64) {
         self.served.store(
             path,
             StoredContent {
@@ -1559,6 +1932,7 @@ impl InstanceOperation for FuseOperation {
                 size,
                 mode,
             },
+            mtime,
         );
     }
 
@@ -1645,19 +2019,33 @@ pub struct FuseDirectoryListing {
 
 impl FuseDirectoryListing {
     pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        loop {
+            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
+            match self.next_with_untracked().await? {
+                Ok(ListedEntry::Tracked(entry)) => return Some(Ok(entry)),
+                Ok(ListedEntry::Untracked(_)) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The next entry as [`next`](Self::next) answers it, a symbolic link included, by its name.
+    pub(crate) async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         while self.index < self.listing.len() {
             let index = self.index;
             self.index += 1;
             let Some(entry) = self.listing.current_entry(index) else {
                 continue;
             };
-            // An ordinary clone's listing skips a symlink too (`crate::fs::os::file_list_item`).
-            if entry.flags & (entry_flags::VIEW_EXCLUDED | entry_flags::SYMLINK) != 0 {
+            if entry.flags & entry_flags::VIEW_EXCLUDED != 0 {
                 continue;
             }
             let Ok(name) = std::str::from_utf8(self.listing.name(index)) else {
                 continue;
             };
+            if entry.flags & entry_flags::SYMLINK != 0 {
+                return Some(Ok(ListedEntry::Untracked(name.to_string())));
+            }
             let info = if entry.flags & entry_flags::LOCAL != 0 && !is_dir(&entry) {
                 let Some(host) = &self.host else {
                     continue;
@@ -1675,11 +2063,11 @@ impl FuseDirectoryListing {
                     .map_or(self.base_time, |mtimes| mtimes[index]);
                 file_info_of(&entry, mtime)
             };
-            return Some(Ok(DirectoryEntry {
+            return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                 name: name.to_string(),
                 info,
                 name_hash: entry.name_hash,
-            }));
+            })));
         }
         None
     }

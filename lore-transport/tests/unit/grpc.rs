@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::AddressNotFound;
+use lore_base::types::Hash;
 use lore_transport::error::ProtocolError;
+use lore_transport::error::branch_push_error;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::Status;
 use tonic::service::Routes;
@@ -14,6 +16,7 @@ use tower::ServiceBuilder;
 
 mod attempt_id_wire_tests;
 mod auth_tests;
+mod branch_push_wire_tests;
 mod call_failure_vs_refusal_wire_tests;
 mod domain_operation_client;
 mod environment_client;
@@ -206,7 +209,7 @@ async fn a_request_does_not_hold_its_rebuild() {
 
     let request = with_reconnect(
         &connection,
-        || async { Ok(()) },
+        || async { Ok::<(), ProtocolError>(()) },
         |_| async {
             let state = [0u8; 4096];
             tokio::task::yield_now().await;
@@ -283,6 +286,19 @@ fn a_refusal_keeps_the_remotes_reason_on_its_trace() {
     }
 }
 
+/// A slow down keeps the remote's reason on its trace, as a refusal does.
+#[test]
+fn a_slow_down_keeps_the_remotes_reason_on_its_trace() {
+    let error = ProtocolError::from(Status::resource_exhausted("use branch info"));
+    assert!(error.is_slow_down(), "{error:?}");
+    assert!(
+        error.trace().locations().iter().any(|location| location
+            .context()
+            .is_some_and(|context| context.contains("use branch info"))),
+        "{error:?}"
+    );
+}
+
 /// A refusal the remote gives no reason for adds no context to the trace.
 #[test]
 fn a_refusal_without_a_reason_adds_no_context() {
@@ -321,6 +337,88 @@ fn a_failed_precondition_without_details_is_not_an_address() {
         "Branch push is not a fast-forward",
     ));
     assert!(error.is_internal(), "{error:?}");
+}
+
+/// A branch push the remote refuses as not a fast-forward, or as a fast-forward merge that
+/// conflicts, and marks so, is `BranchAdvanced`. One it refuses for a missing fragment names the
+/// fragment, and another status maps as any call's does.
+#[test]
+fn a_refused_branch_push_is_branch_advanced() {
+    let refused = branch_push_error(branch_advanced_status(
+        Hash::from([3; 32]),
+        "Branch push is not a fast-forward",
+    ));
+    let missing = branch_push_error(Status::from(ProtocolError::from(missing_address())));
+    let unavailable = branch_push_error(Status::unavailable("restarting"));
+
+    assert!(
+        refused.is_branch_advanced()
+            && missing.is_address_not_found()
+            && unavailable.is_disconnected(),
+        "{refused:?}; {missing:?}; {unavailable:?}"
+    );
+}
+
+/// A branch push refused with `FAILED_PRECONDITION` and no mark, as a pre-push hook or an older
+/// Lore Server refuses it, is no `BranchAdvanced`.
+#[test]
+fn an_unmarked_refusal_of_a_branch_push_is_internal() {
+    let refused = branch_push_error(Status::failed_precondition("refused by a hook"));
+
+    assert!(refused.is_internal(), "{refused:?}");
+}
+
+/// FORK-LOCAL (Tideshift, WP-120): the details of a `BranchAdvanced` refusal do not outrank the
+/// fork's own markers. A `FAILED_PRECONDITION` with 32-byte details that also marks its outcome
+/// unknown is `OutcomeUnknown` (the push may have applied), never a refusal.
+#[test]
+fn an_unknown_outcome_marker_outranks_the_branch_advanced_details() {
+    let mut marked =
+        branch_advanced_status(Hash::from([3; 32]), "Branch push is not a fast-forward");
+    marked.metadata_mut().insert(
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+            .parse()
+            .unwrap(),
+    );
+    let error = branch_push_error(marked);
+    assert!(
+        error.is_outcome_unknown() && !error.is_branch_advanced(),
+        "{error:?}"
+    );
+
+    // Without the marker, the same details are the refusal.
+    let unmarked = branch_push_error(branch_advanced_status(
+        Hash::from([3; 32]),
+        "Branch push is not a fast-forward",
+    ));
+    assert!(
+        unmarked.is_branch_advanced() && !unmarked.is_outcome_unknown(),
+        "{unmarked:?}"
+    );
+}
+
+/// The other fork markers that `ProtocolError`'s mapping reads before any branch on the code also
+/// win over the details: a tonic lost response (the server produced a message this client could
+/// not read) and a client-admission refusal.
+#[test]
+fn a_lost_response_or_an_admission_refusal_outranks_the_branch_advanced_details() {
+    let lost = branch_push_error(Status::with_details(
+        tonic::Code::FailedPrecondition,
+        "Missing response message.",
+        Bytes::copy_from_slice(&[3; 32]),
+    ));
+    assert!(!lost.is_branch_advanced(), "{lost:?}");
+    assert!(lost.is_internal(), "{lost:?}");
+
+    let mut refused = branch_advanced_status(Hash::from([3; 32]), "unsupported client");
+    refused.metadata_mut().insert(
+        "lore-client-admission-v1",
+        "unsupported-client".parse().unwrap(),
+    );
+    let refused = branch_push_error(refused);
+    assert!(!refused.is_branch_advanced(), "{refused:?}");
+    assert!(refused.is_internal(), "{refused:?}");
 }
 
 /// Details of any other length are not guessed at.
@@ -393,4 +491,41 @@ fn grpc_endpoint_refuses_a_remote_it_cannot_dial() {
     for remote in ["", "not a url", "lore://", "lores:///only-a-path"] {
         assert!(grpc_endpoint(remote).is_err(), "must refuse {remote:?}");
     }
+}
+
+fn authorization_header(auth: GRPCAuth) -> Option<String> {
+    let mut interceptor = AuthnInterceptor {
+        auth: std::sync::Arc::new(parking_lot::RwLock::new(auth)),
+    };
+    let request = tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(()))
+        .expect("the interceptor accepts the request");
+    request
+        .metadata()
+        .get("authorization")
+        .map(|value| value.to_str().expect("an ASCII header").to_string())
+}
+
+/// The repository service sends the authentication token, and the authorization token when there
+/// is none: a caller that supplied only an access token presents it.
+#[test]
+fn the_authn_interceptor_falls_back_to_the_authorization_token() {
+    let both = GRPCAuth {
+        authentication_token: "identity".to_string(),
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+    let access_only = GRPCAuth {
+        authorization_token: "access".to_string(),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        authorization_header(both).as_deref(),
+        Some("Bearer identity")
+    );
+    assert_eq!(
+        authorization_header(access_only).as_deref(),
+        Some("Bearer access")
+    );
+    assert_eq!(authorization_header(GRPCAuth::default()), None);
 }

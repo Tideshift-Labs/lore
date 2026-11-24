@@ -76,6 +76,7 @@ use crate::connection::authenticates_server;
 use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptQuery;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::outcome::AttemptId;
 use crate::outcome::GrpcRpc;
@@ -653,6 +654,8 @@ impl Interceptor for CorrelationInterceptor {
     }
 }
 
+/// Sends the authentication token, or the authorization token when there is none, as when the
+/// caller supplied only an access token.
 #[derive(Clone)]
 pub struct AuthnInterceptor {
     pub auth: Arc<parking_lot::RwLock<GRPCAuth>>,
@@ -664,7 +667,15 @@ impl Interceptor for AuthnInterceptor {
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
         inject_correlation_id(&mut request)?;
-        inject_authorization(&mut request, self.auth.read().authentication_token.as_str())?;
+        {
+            let auth = self.auth.read();
+            let token = if auth.authentication_token.is_empty() {
+                auth.authorization_token.as_str()
+            } else {
+                auth.authentication_token.as_str()
+            };
+            inject_authorization(&mut request, token)?;
+        }
         inject_attempt_id(&mut request)?;
         Ok(request)
     }
@@ -1049,12 +1060,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             // engage, but the transport error's detail is kept on the trace
             // rather than collapsed into a bare variant.
             let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
-            disconnected.push_trace(lore_error_set::Location::with_context(
-                file!(),
-                line!(),
-                column!(),
-                Arc::from(format!("gRPC connection to {remote} failed: {err}")),
-            ));
+            disconnected.push_context(format!("gRPC connection to {remote} failed: {err}"));
             return Err(disconnected);
         }
     };
@@ -1318,6 +1324,41 @@ async fn handle_error(retry: &mut RetryBudget, status: Status) -> Result<(), Pro
         _ => return Err(ProtocolError::from(status)),
     }
     Ok(())
+}
+
+/// Encode a refusal of a branch push onto `latest`, the branch latest that refuses it, as
+/// `FAILED_PRECONDITION` carrying `latest` in the status details: a push that isn't a fast-forward
+/// of `latest`, or a fast-forward merge onto it that conflicts.
+///
+/// The details mark the refusal apart from any other `FAILED_PRECONDITION`, such as a hook's, which
+/// carries none. They are 32 bytes, so they never read as the address of
+/// [`address_not_found_status`], which is 48.
+pub fn branch_advanced_status(latest: Hash, message: impl Into<String>) -> Status {
+    Status::with_details(
+        tonic::Code::FailedPrecondition,
+        message,
+        Bytes::copy_from_slice(latest.as_ref()),
+    )
+}
+
+/// Whether `status` carries the details [`branch_advanced_status`] attaches, a 32-byte branch
+/// latest.
+pub(crate) fn carries_branch_advanced(status: &Status) -> bool {
+    status.details().len() == size_of::<Hash>()
+}
+
+/// [`handle_error`] for a branch push, whose statuses map as
+/// [`branch_push_error`](crate::error::branch_push_error) maps them. A `RESOURCE_EXHAUSTED` takes
+/// the fork split in `handle_error`: only the server's own back-pressure is waited out; a lost
+/// answer ends the loop.
+pub(crate) async fn handle_branch_push_error(
+    retry: &mut RetryBudget,
+    status: Status,
+) -> Result<(), BranchPushError> {
+    if status.code() == tonic::Code::ResourceExhausted {
+        return Ok(handle_error(retry, status).await?);
+    }
+    Err(crate::error::branch_push_error(status))
 }
 
 #[allow(clippy::unused_async)]
@@ -1809,26 +1850,47 @@ const MAX_RECONNECTS_PER_OP: usize = 3;
 /// request's future as large as a reconnect. It runs after the match ends, so the future does
 /// not hold an attempt's result across it.
 #[lore_macro::test_pub]
-async fn with_reconnect<T, Op, OpFut, Rebuild, RebuildFut>(
+async fn with_reconnect<T, E, Op, OpFut, Rebuild, RebuildFut>(
     connection: &GRPCConnection,
     op: Op,
     rebuild: Rebuild,
-) -> Result<T, ProtocolError>
+) -> Result<T, E>
 where
+    E: Disconnects + From<ProtocolError>,
     Op: Fn() -> OpFut,
-    OpFut: Future<Output = Result<T, ProtocolError>>,
+    OpFut: Future<Output = Result<T, E>>,
     Rebuild: Fn(u32) -> RebuildFut,
     RebuildFut: Future<Output = Result<(), ProtocolError>>,
 {
     for _ in 0..MAX_RECONNECTS_PER_OP {
         let reconnect_id = connection.reconnect.load(Ordering::Relaxed);
         match op().await {
-            Err(ProtocolError::Disconnected(_)) => {}
+            Err(err) if err.disconnected() => {}
             result => return result,
         }
         Box::pin(rebuild(reconnect_id)).await?;
     }
-    Err(ProtocolError::from(lore_base::error::Disconnected))
+    Err(E::from(ProtocolError::from(lore_base::error::Disconnected)))
+}
+
+/// An error that tells a dropped connection, which a reconnect may clear, from the remote's
+/// answer.
+#[lore_macro::test_pub]
+trait Disconnects {
+    /// Whether the call failed because its connection dropped.
+    fn disconnected(&self) -> bool;
+}
+
+impl Disconnects for ProtocolError {
+    fn disconnected(&self) -> bool {
+        self.is_disconnected()
+    }
+}
+
+impl Disconnects for BranchPushError {
+    fn disconnected(&self) -> bool {
+        self.is_disconnected()
+    }
 }
 
 /// Run one gRPC call under its replay class (WP-120 Phase 3).
@@ -1850,16 +1912,22 @@ where
 ///
 /// The attempt id is minted before the call, not after the failure, so it names the attempt the
 /// server would have recorded rather than the moment this client noticed.
+///
+/// Generic over the call's error, as upstream made [`with_reconnect`], so a branch push keeps its
+/// `BranchPushError` (and `BranchAdvanced`) under the same classification. The classification
+/// reads only `Disconnected` and the typed proofs in the error's source chain, which a strict
+/// forward from `ProtocolError` keeps.
 #[lore_macro::test_pub]
-async fn with_reconnect_classified<T, Op, OpFut, Rebuild, RebuildFut>(
+async fn with_reconnect_classified<T, E, Op, OpFut, Rebuild, RebuildFut>(
     connection: &GRPCConnection,
     rpc: GrpcRpc,
     op: Op,
     rebuild: Rebuild,
-) -> Result<T, ProtocolError>
+) -> Result<T, E>
 where
+    E: Disconnects + From<ProtocolError> + std::error::Error + 'static,
     Op: Fn() -> OpFut,
-    OpFut: Future<Output = Result<T, ProtocolError>>,
+    OpFut: Future<Output = Result<T, E>>,
     Rebuild: Fn(u32) -> RebuildFut,
     RebuildFut: Future<Output = Result<(), ProtocolError>>,
 {
@@ -1868,7 +1936,9 @@ where
             != crate::caller_operation::canonical_endpoint(connection.remote_url.as_str())?
             || grpc_replay_class(rpc) != ReplayClass::ReadRetryable)
     {
-        return Err(ProtocolError::internal("recovery dispatch scope mismatch"));
+        return Err(E::from(ProtocolError::internal(
+            "recovery dispatch scope mismatch",
+        )));
     }
     match grpc_replay_class(rpc) {
         ReplayClass::ReadRetryable => {
@@ -1897,9 +1967,9 @@ where
                         | GrpcRpc::StorageMutableCompareAndSwap
                 )
             {
-                return Err(ProtocolError::internal(
+                return Err(E::from(ProtocolError::internal(
                     "this mutation is not supported by managed caller adoption",
-                ));
+                )));
             }
             // Reuse the attempt this dispatch is already running under, and mint only when there
             // is none. A caller that journaled an id before calling in — which is what a client
@@ -1921,7 +1991,7 @@ where
                     if answer_is_not_settled(&error)
                         || !not_prepared_proof_holds(&error, &attempt) =>
                 {
-                    Err(outcome_unknown(rpc.wire_name(), &attempt))
+                    Err(E::from(outcome_unknown(rpc.wire_name(), &attempt)))
                 }
                 result => result,
             }
@@ -1936,13 +2006,16 @@ where
 /// read as `SlowDown` and [`handle_error`] retried it in place, for reads and mutations alike. It
 /// is now a lost answer, so a mutation is never resent; a read may be, and `Disconnected` is the
 /// one error [`with_reconnect`] reconnects on.
-fn reconnectable_read<T>(result: Result<T, ProtocolError>) -> Result<T, ProtocolError> {
+fn reconnectable_read<T, E>(result: Result<T, E>) -> Result<T, E>
+where
+    E: From<ProtocolError> + std::error::Error + 'static,
+{
     match result {
         Err(error)
             if crate::error::answer_lost_code(&error) == Some(tonic::Code::ResourceExhausted) =>
         {
             lore_debug!("read lost its answer to the connection, reconnecting: {error}");
-            Err(ProtocolError::from(lore_base::error::Disconnected))
+            Err(E::from(ProtocolError::from(lore_base::error::Disconnected)))
         }
         result => result,
     }
@@ -1962,9 +2035,8 @@ fn reconnectable_read<T>(result: Result<T, ProtocolError>) -> Result<T, Protocol
 /// One predicate, consulted once, rather than a second arm on the match above: the classifier
 /// property is orthogonal to which error variant carries it, and this crate has already been
 /// bitten by per-branch guards that later arms forgot to repeat.
-fn answer_is_not_settled(error: &ProtocolError) -> bool {
-    matches!(error, ProtocolError::Disconnected(_))
-        || crate::error::answer_lost_code(error).is_some()
+fn answer_is_not_settled<E: Disconnects + std::error::Error + 'static>(error: &E) -> bool {
+    error.disconnected() || crate::error::answer_lost_code(error).is_some()
 }
 
 /// Whether a server's not-prepared proof, if the error carries one, settles this attempt.
@@ -1975,7 +2047,10 @@ fn answer_is_not_settled(error: &ProtocolError) -> bool {
 /// retry loop, or one id scoped across several dispatches) may have reached another replica and
 /// been prepared there, so the attempt then stays unknown.
 #[lore_macro::test_pub]
-pub(crate) fn not_prepared_proof_holds(error: &ProtocolError, attempt: &AttemptId) -> bool {
+pub(crate) fn not_prepared_proof_holds(
+    error: &(dyn std::error::Error + 'static),
+    attempt: &AttemptId,
+) -> bool {
     match crate::error::not_prepared_attempt(error) {
         None => true,
         Some(marked) => {
@@ -2386,7 +2461,10 @@ impl Revision for GRPCRevision {
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
+        // FORK-LOCAL (Tideshift, WP-120): classified, never plain `with_reconnect`: a dispatched
+        // push whose answer is lost is an unknown outcome, not a resend. Upstream's
+        // `BranchPushError` passes through the generic classifier.
         // boxed: the classified future is over 16 KB on Windows
         Box::pin(with_reconnect_classified(
             &self.connection,

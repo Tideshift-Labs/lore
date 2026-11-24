@@ -436,10 +436,7 @@ fn terminal_ack_response(
             .map(|value| to_u64(value.end_sequence, "prune range end"))
             .transpose()?,
         prune_range_digest: Bytes::from(
-            range
-                .as_ref()
-                .map(|value| value.digest.clone())
-                .unwrap_or_default(),
+            range.as_ref().map_or_default(|value| value.digest.clone()),
         ),
         prune_range_generation: range
             .as_ref()

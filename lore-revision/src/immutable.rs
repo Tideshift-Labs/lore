@@ -11,6 +11,7 @@ use futures::FutureExt;
 use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_storage::ContentSource;
 use lore_transport::AttemptId;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
@@ -34,6 +35,7 @@ use crate::lore::VecBytes;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::lore_warn;
+use crate::node::Node;
 use crate::repository::LocalReads;
 use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
@@ -135,6 +137,19 @@ fn ambient_managed_uploads() -> Option<Arc<lore_storage::managed_uploads::Manage
     crate::runtime::try_execution_context()?.managed_uploads()
 }
 
+/// Sends the statistics event `event` builds from what this call's fragment writes
+/// cost since `baseline`. Outside an execution context nothing is sent.
+///
+/// Call it once the operation has drained its writes; the counters settle only then.
+pub fn send_fragment_stats(
+    baseline: &lore_storage::FragmentWriteCounts,
+    event: impl FnOnce(lore_storage::FragmentWriteCounts) -> crate::event::LoreEvent,
+) {
+    if let Some(context) = crate::runtime::try_execution_context() {
+        event(context.fragment_stats().snapshot().since(baseline)).send();
+    }
+}
+
 /// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
 /// context uploads and the call is not a dry run.
 ///
@@ -142,8 +157,9 @@ fn ambient_managed_uploads() -> Option<Arc<lore_storage::managed_uploads::Manage
 /// SWFS instance's is) keeps the payloads it writes as it keeps those it reads, even one the write
 /// makes durable on the remote. Without it the store keeps the entry and drops the payload, which a
 /// plain instance can afford, as its working tree holds the file, and an SWFS instance cannot: it
-/// serves the file from the store, offline. Kept with [`WriteOptions::with_keep_local`] rather than
-/// `local_cache_priority`, which the fragment records and every store fetching it then honours.
+/// serves the file from the store, and fetches it from the remote only once the store has evicted
+/// it. Kept with [`WriteOptions::with_keep_local`] rather than `local_cache_priority`, which the
+/// fragment records and every store fetching it then honours.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
     let mut flags = WriteOptions::default();
     if !repository.disable_cache() {
@@ -158,9 +174,11 @@ pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> Writ
     }
 }
 
-/// Construct [`ReadOptions`] from a repository context and the command's globals.
+/// Construct [`ReadOptions`] from a repository context and the command's globals. The remote is
+/// trusted as the context says where it says ([`RepositoryContext::with_remote_trust`]), and as
+/// the globals say otherwise.
 pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptions {
-    let (sync_data, trust_remote) =
+    let (sync_data, globals_trust_remote) =
         crate::runtime::try_execution_context().map_or((false, false), |context| {
             let globals = context.globals();
             (globals.sync_data(), globals.trust_remote())
@@ -173,7 +191,7 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
         strict_local: local_reads == LocalReads::Strict,
         direct_write: repository.direct_file_write(),
         sync_data,
-        trust_remote,
+        trust_remote: repository.remote_trust.unwrap_or(globals_trust_remote),
         ..Default::default()
     }
 }
@@ -437,6 +455,22 @@ pub fn read(
         read.map(|(_fragment, bytes)| bytes)
             .forward::<ImmutableError>("reading immutable data")
     })
+}
+
+/// The content of `node`, read from the store `repository` addresses it in.
+pub fn stored_content(repository: &Arc<RepositoryContext>, node: &Node) -> ContentSource<'static> {
+    // The zero hash every empty file carries addresses nothing in the store.
+    if node.size == 0 {
+        return ContentSource::memory(Bytes::new());
+    }
+    ContentSource::stored(
+        repository.immutable_store(),
+        repository.id,
+        node.address,
+        node.size,
+        read_options_from_repository(repository),
+        resolve_session(repository),
+    )
 }
 
 /// Read the given data range into `slice`.
@@ -868,7 +902,7 @@ enum LocalCopy {
 
 /// Whether `resolved` holds a payload locally. An entry without its payload, as eviction leaves
 /// one, holds nothing to serve or walk, so it counts as lacking.
-fn held_locally(resolved: &StoreMatchResult) -> bool {
+pub(crate) fn held_locally(resolved: &StoreMatchResult) -> bool {
     resolved.match_made != StoreMatch::MatchNone && resolved.stored_local
 }
 
@@ -887,12 +921,14 @@ async fn held_flags(
     Ok(if held { metadata.fragment.flags } else { 0 })
 }
 
-/// Pushes the address of every fragment `list` references, in `context`, onto `into`.
+/// Pushes the address of every fragment `list` references, in `context`, onto `into`. A hole
+/// references none.
 fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
     let list = list.to_aligned::<FragmentReference>();
     into.extend(
         list.as_type_slice::<FragmentReference>()
             .iter()
+            .filter(|reference| !reference.is_hole())
             .map(|reference| Address {
                 context,
                 hash: reference.hash,
@@ -1091,6 +1127,14 @@ pub async fn cache_counted(
         start.elapsed().as_secs_f64()
     );
     Ok(cached)
+}
+
+/// Whether `repository` can cache what its local store lacks: it reads the local store, and is not
+/// known to hold no remote. A `false` answer stands for the life of the context; a `true` one says
+/// nothing of whether a connect succeeds.
+#[lore_macro::test_pub]
+pub(crate) fn may_cache(repository: &RepositoryContext) -> bool {
+    repository.local_reads != LocalReads::Skip && !repository.is_offline()
 }
 
 /// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
@@ -1454,6 +1498,90 @@ fn keep_store_failure(
             });
         }
     }
+}
+
+/// `answer` to what the local store of `repository` resolves each of `addresses` to, in order,
+/// from one query of the store; [`held_locally`] tells whether it holds the payload. No addresses
+/// make no query. A failed query is the error, where [`is_stored_local`] reads one as lacking.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn resolved_locally<'a, T>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+    answer: impl FnOnce(&'a [Address], &[StoreMatchResult]) -> T + 'a,
+) -> impl Future<Output = Result<T, ImmutableError>> + 'a {
+    async move {
+        let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
+        if !addresses.is_empty() {
+            repository
+                .immutable_store()
+                .query(repository.id, addresses, &mut resolved)
+                .await
+                .forward::<ImmutableError>("querying the local store for the payloads it holds")?;
+        }
+        Ok(answer(addresses, &resolved))
+    }
+}
+
+/// The first of `addresses` whose payload the local store of `repository` lacks
+/// ([`resolved_locally`]), and `None` where it holds every payload. An entry without its payload,
+/// as eviction leaves one, lacks it.
+pub fn first_not_held_locally<'a>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Option<Address>, ImmutableError>> + 'a {
+    resolved_locally(repository, addresses, |addresses, resolved| {
+        addresses
+            .iter()
+            .zip(resolved)
+            .find(|(_, resolved)| !held_locally(resolved))
+            .map(|(address, _)| *address)
+    })
+}
+
+/// The addresses of `addresses` whose payloads the local store of `repository` lacks, in order
+/// ([`resolved_locally`]). An entry without its payload, as eviction leaves one, lacks it.
+pub(crate) fn not_held_locally<'a>(
+    repository: &'a RepositoryContext,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Vec<Address>, ImmutableError>> + 'a {
+    resolved_locally(repository, addresses, |addresses, resolved| {
+        addresses
+            .iter()
+            .zip(resolved)
+            .filter(|(_, resolved)| !held_locally(resolved))
+            .map(|(address, _)| *address)
+            .collect()
+    })
+}
+
+/// The addresses of `addresses` the remote lacks, in order, from one existence query on
+/// `storage`. An answer whose status count differs from the addresses' fails as internal: its
+/// statuses can't be matched to the addresses.
+///
+/// Returns the query's future mapped to the addresses, without a future of its own.
+pub fn missing_remote<'a>(
+    storage: &'a StorageSession,
+    addresses: &'a [Address],
+) -> impl Future<Output = Result<Vec<Address>, ImmutableError>> + 'a {
+    storage.query(addresses).map(move |status| {
+        let status =
+            status.forward::<ImmutableError>("querying the remote for the addresses it holds")?;
+        if status.len() != addresses.len() {
+            return Err(ImmutableError::internal(format!(
+                "the remote answered {} statuses for {} addresses",
+                status.len(),
+                addresses.len()
+            )));
+        }
+        Ok(addresses
+            .iter()
+            .zip(status.iter())
+            .filter(|(_, lacking)| **lacking != 0)
+            .map(|(address, _)| *address)
+            .collect())
+    })
 }
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {

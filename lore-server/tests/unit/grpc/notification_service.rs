@@ -153,7 +153,6 @@ mod fork_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
-    use lore_notification::NotificationService as _;
     use lore_proto::lore::notification::event::Event as EventPayload;
     use lore_revision::lore::BranchId;
     use lore_revision::lore::RepositoryId;

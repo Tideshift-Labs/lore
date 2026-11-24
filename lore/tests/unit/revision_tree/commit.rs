@@ -1,10 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -17,22 +15,21 @@ use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
 use lore::revision_tree::list_children::list_children;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
 use lore::revision_tree::metadata_set::metadata_set;
 use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
 use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
 use lore::revision_tree::modify::modify;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
+use lore::storage::handle::LoreStore;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
+use lore_base::types::TypedBytes as _;
+use lore_revision::change;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
@@ -44,123 +41,41 @@ use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::MESSAGE;
 use lore_revision::node::Node;
 use lore_revision::node::NodeBlock;
+use lore_revision::node::NodeDelta;
+use lore_revision::node::NodeFileMetadata;
+use lore_revision::node::NodeFileMetadataBlock;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
+use lore_revision::node::node_to_file_metadata;
 use lore_revision::state::Ext;
 use lore_revision::state::Mark;
 use lore_revision::state::State;
 use lore_storage::hash::hash_string;
 
-#[derive(Debug, Clone, PartialEq)]
-enum Captured {
-    Complete(i32),
-    Loaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    DeleteComplete(u64, u64, LoreErrorCode),
-    /// A listed child: its id, staged action, name and kind.
-    Child(NodeID, u32, String, u32),
-    CommitComplete(u64, Hash, Hash, LoreErrorCode),
-    CommitRevision(Hash, Hash, BranchId, u64),
-    CommitBegin,
-    CommitProgress,
-    CommitEnd,
-    Other(u32),
-}
+use crate::call::test_support::Recorded;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::load_tree;
+use crate::revision_tree::support::load_tree_at;
+use crate::revision_tree::support::release;
 
-impl Captured {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => Self::Complete(data.status),
-            LoreEvent::RevisionTreeLoaded(data) => Self::Loaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeDeleteComplete(data) => {
-                Self::DeleteComplete(data.entry_id, data.node_count, data.error_code)
-            }
-            LoreEvent::RevisionTreeChild(data) => Self::Child(
-                data.node_id,
-                data.staged_action,
-                data.name.as_str().to_string(),
-                data.kind,
-            ),
-            LoreEvent::RevisionTreeCommitComplete(data) => Self::CommitComplete(
-                data.id,
-                data.revision_hash,
-                data.new_tip_hash,
-                data.error_code,
-            ),
-            LoreEvent::RevisionCommitRevision(data) => Self::CommitRevision(
+/// The revision, parents, branch and number of every `RevisionCommitRevision` event in `events`.
+fn commit_revisions(events: &[LoreEvent]) -> Vec<(Hash, [Hash; 2], BranchId, u64)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            LoreEvent::RevisionCommitRevision(data) => Some((
                 data.revision,
-                data.parent,
+                [data.parent, data.parent_other],
                 data.branch,
                 data.revision_number,
-            ),
-            LoreEvent::RevisionCommitBegin(_) => Self::CommitBegin,
-            LoreEvent::RevisionCommitProgress(_) => Self::CommitProgress,
-            LoreEvent::RevisionCommitEnd(_) => Self::CommitEnd,
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-type Sink = Arc<Mutex<Vec<Captured>>>;
-
-fn make_sink() -> Sink {
-    Arc::new(Mutex::new(Vec::new()))
-}
-
-fn make_callback(sink: Sink) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(Captured::from_event(event));
-    }))
-}
-
-/// One partition per test. The in-memory store fixtures are process-global, so
-/// two tests sharing a partition race each other's branch pointers and tree
-/// blocks — which is what the rest of the namespace's tests avoid the same way.
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let handle = load_on(store_handle.handle_id, repository).await;
-    (handle, store_handle.handle_id)
-}
-
-/// Load another revision tree against an already-open storage handle, so two
-/// handles share one store and one branch.
-async fn load_on(store_handle_id: u64, repository: Partition) -> LoreRevisionTree {
-    let sink = make_sink();
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: lore::storage::handle::LoreStore {
-                handle_id: store_handle_id,
-            },
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            Captured::Loaded(id) => Some(*id),
+            )),
             _ => None,
         })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    LoreRevisionTree { handle_id: id }
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
+        .collect()
 }
 
 fn handle_state(handle: LoreRevisionTree) -> Arc<State> {
@@ -197,7 +112,7 @@ async fn add_file(
     name: &str,
     content_hash: u64,
 ) -> NodeID {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -217,23 +132,19 @@ async fn add_file(
                 },
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "adding {name} must succeed, got {events:?}");
-    events
-        .iter()
-        .find_map(|event| match event {
-            Captured::AddComplete(id, node_id, _) if *id == entry_id => Some(*node_id),
-            _ => None,
-        })
+    add_outcome(&events, entry_id)
         .unwrap_or_else(|| panic!("adding {name} must report a node id, got {events:?}"))
+        .0
 }
 
 /// Give a leaf a content address, so a tree the rehash refused can be corrected.
 async fn modify_file(handle: LoreRevisionTree, entry_id: u64, node_id: NodeID, content_hash: u64) {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = modify(
         LoreGlobalArgs::default(),
         LoreRevisionTreeModifyArgs {
@@ -250,15 +161,15 @@ async fn modify_file(handle: LoreRevisionTree, entry_id: u64, node_id: NodeID, c
                 },
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "modifying the node must succeed, got {events:?}");
 }
 
 async fn set_message(handle: LoreRevisionTree, message: &str) {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = metadata_set(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMetadataSetArgs {
@@ -270,10 +181,10 @@ async fn set_message(handle: LoreRevisionTree, message: &str) {
                 value: LoreMetadata::String(LoreString::from_str(message)),
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         status, 0,
         "setting the message must succeed, got {events:?}"
@@ -281,7 +192,7 @@ async fn set_message(handle: LoreRevisionTree, message: &str) {
 }
 
 async fn set_branch(handle: LoreRevisionTree, branch: BranchId) {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = metadata_set(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMetadataSetArgs {
@@ -293,14 +204,14 @@ async fn set_branch(handle: LoreRevisionTree, branch: BranchId) {
                 value: LoreMetadata::Context(branch),
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "setting the branch must succeed, got {events:?}");
 }
 
-async fn run_commit(handle: LoreRevisionTree, id: u64) -> (i32, Vec<Captured>) {
+async fn run_commit(handle: LoreRevisionTree, id: u64) -> (i32, Recorded) {
     run_commit_with(
         handle,
         id,
@@ -318,8 +229,8 @@ async fn run_commit_with(
     id: u64,
     globals: LoreGlobalArgs,
     options: LoreRevisionTreeCommitOptions,
-) -> (i32, Vec<Captured>) {
-    let sink = make_sink();
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = commit(
         globals,
         LoreRevisionTreeCommitArgs {
@@ -327,10 +238,10 @@ async fn run_commit_with(
             handle,
             options,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
@@ -344,12 +255,12 @@ fn upload_disabled(handle: LoreRevisionTree) -> bool {
         .disable_upload()
 }
 
-fn commit_outcome(events: &[Captured], id: u64) -> (Hash, Hash, LoreErrorCode) {
+fn commit_outcome(events: &Recorded, id: u64) -> (Hash, Hash, LoreErrorCode) {
     events
         .iter()
         .find_map(|event| match event {
-            Captured::CommitComplete(event_id, revision, new_tip, code) if *event_id == id => {
-                Some((*revision, *new_tip, *code))
+            LoreEvent::RevisionTreeCommitComplete(data) if data.id == id => {
+                Some((data.revision_hash, data.new_tip_hash, data.error_code))
             }
             _ => None,
         })
@@ -380,21 +291,16 @@ async fn commit_publishes_the_tree_and_reports_the_revision() {
         "the handle must be left on the revision it published"
     );
     assert!(
-        events.contains(&Captured::CommitRevision(
-            revision,
-            Hash::default(),
-            branch,
-            1
-        )),
+        commit_revisions(&events).contains(&(revision, [Hash::default(); 2], branch, 1)),
         "the revision event file-system consumers watch must fire, got {events:?}"
     );
     let commit_pos = events
         .iter()
-        .position(|event| matches!(event, Captured::CommitComplete(..)))
+        .position(|event| matches!(event, LoreEvent::RevisionTreeCommitComplete(..)))
         .expect("CommitComplete must fire");
     let complete_pos = events
         .iter()
-        .position(|event| matches!(event, Captured::Complete(_)))
+        .position(|event| matches!(event, LoreEvent::Complete(_)))
         .expect("Complete must fire");
     assert!(
         commit_pos < complete_pos,
@@ -545,7 +451,12 @@ async fn a_commit_the_rehash_refuses_restores_the_pre_commit_state() {
     );
     let (second, _, _) = commit_outcome(&retry_events, 13);
     assert!(
-        retry_events.contains(&Captured::CommitRevision(second, published, branch, 2)),
+        commit_revisions(&retry_events).contains(&(
+            second,
+            [published, Hash::default()],
+            branch,
+            2
+        )),
         "the retry must chain onto the revision the restore came back to, got {retry_events:?}"
     );
 
@@ -631,7 +542,13 @@ async fn a_commit_holds_the_handle_against_every_other_call() {
 async fn commit_reports_the_new_tip_when_the_branch_advanced() {
     let (winner, store_handle_id) =
         load_handle("commit-advanced", Partition::from([0x45u8; 16])).await;
-    let loser = load_on(store_handle_id, Partition::from([0x45u8; 16])).await;
+    let loser = load_tree(
+        LoreStore {
+            handle_id: store_handle_id,
+        },
+        Partition::from([0x45u8; 16]),
+    )
+    .await;
     let branch = Context::from(uuid::Uuid::now_v7());
 
     add_file(winner, 1, "a.bin", 0x44).await;
@@ -718,7 +635,7 @@ async fn a_second_commit_chains_onto_the_first_without_restating_the_branch() {
     let (second, _, code) = commit_outcome(&events, 16);
     assert_eq!(code, LoreErrorCode::None, "got {events:?}");
     assert!(
-        events.contains(&Captured::CommitRevision(second, first, branch, 2)),
+        commit_revisions(&events).contains(&(second, [first, Hash::default()], branch, 2)),
         "the second revision must record the first as its parent on the same branch, \
              got {events:?}"
     );
@@ -746,7 +663,10 @@ async fn commit_with_contradictory_flags_is_rejected_before_any_write() {
         handle,
         17,
         globals,
-        LoreRevisionTreeCommitOptions { remote_write: 1 },
+        LoreRevisionTreeCommitOptions {
+            remote_write: 1,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -791,7 +711,10 @@ async fn remote_write_is_demoted_when_the_call_is_local_only() {
         handle,
         19,
         globals,
-        LoreRevisionTreeCommitOptions { remote_write: 1 },
+        LoreRevisionTreeCommitOptions {
+            remote_write: 1,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -828,18 +751,24 @@ async fn commit_emits_the_revision_commit_telemetry_in_order() {
     let (status, events) = run_commit(handle, 21).await;
     assert_eq!(status, 0, "the commit must succeed, got {events:?}");
 
-    let first = |wanted: &Captured| {
+    let first = |wanted: &str, is_wanted: fn(&LoreEvent) -> bool| {
         events
             .iter()
-            .position(|event| event == wanted)
-            .unwrap_or_else(|| panic!("{wanted:?} must be emitted, got {events:?}"))
+            .position(is_wanted)
+            .unwrap_or_else(|| panic!("{wanted} must be emitted, got {events:?}"))
     };
-    let begin = first(&Captured::CommitBegin);
-    let progress = first(&Captured::CommitProgress);
-    let end = first(&Captured::CommitEnd);
+    let begin = first("CommitBegin", |event| {
+        matches!(event, LoreEvent::RevisionCommitBegin(_))
+    });
+    let progress = first("CommitProgress", |event| {
+        matches!(event, LoreEvent::RevisionCommitProgress(_))
+    });
+    let end = first("CommitEnd", |event| {
+        matches!(event, LoreEvent::RevisionCommitEnd(_))
+    });
     let revision = events
         .iter()
-        .position(|event| matches!(event, Captured::CommitRevision(..)))
+        .position(|event| matches!(event, LoreEvent::RevisionCommitRevision(..)))
         .unwrap_or_else(|| panic!("the revision event must be emitted, got {events:?}"));
 
     assert!(
@@ -865,7 +794,10 @@ async fn remote_write_requests_the_upload_when_nothing_forbids_a_remote() {
         handle,
         20,
         LoreGlobalArgs::default(),
-        LoreRevisionTreeCommitOptions { remote_write: 1 },
+        LoreRevisionTreeCommitOptions {
+            remote_write: 1,
+            ..Default::default()
+        },
     )
     .await;
 
@@ -886,7 +818,7 @@ async fn add_node(
     name: &str,
     kind: LoreNodeType,
 ) -> NodeID {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -906,23 +838,19 @@ async fn add_node(
                 },
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "adding {name} must succeed, got {events:?}");
-    events
-        .iter()
-        .find_map(|event| match event {
-            Captured::AddComplete(id, node_id, _) if *id == entry_id => Some(*node_id),
-            _ => None,
-        })
+    add_outcome(&events, entry_id)
         .unwrap_or_else(|| panic!("adding {name} must report a node id, got {events:?}"))
+        .0
 }
 
 /// Delete `node_id` in a call of its own, which must succeed.
 async fn delete_node(handle: LoreRevisionTree, node_id: NodeID) {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = delete(
         LoreGlobalArgs::default(),
         LoreRevisionTreeDeleteArgs {
@@ -933,10 +861,10 @@ async fn delete_node(handle: LoreRevisionTree, node_id: NodeID) {
                 node_id,
             }]),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "deleting {node_id} must succeed, got {events:?}");
 }
 
@@ -951,7 +879,7 @@ async fn listed(handle: LoreRevisionTree, parent: NodeID) -> Vec<(NodeID, u32)> 
 
 /// The children listed under `parent`, each with its staged action, name and kind.
 async fn listed_named(handle: LoreRevisionTree, parent: NodeID) -> Vec<(NodeID, u32, String, u32)> {
-    let sink = make_sink();
+    let (sink, callback) = recording_callback();
     let status = list_children(
         LoreGlobalArgs::default(),
         LoreRevisionTreeListChildrenArgs {
@@ -959,17 +887,20 @@ async fn listed_named(handle: LoreRevisionTree, parent: NodeID) -> Vec<(NodeID, 
             handle,
             parent_node_id: parent,
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
     assert_eq!(status, 0, "listing must succeed");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     events
         .iter()
         .filter_map(|event| match event {
-            Captured::Child(node_id, staged_action, name, kind) => {
-                Some((*node_id, *staged_action, name.clone(), *kind))
-            }
+            LoreEvent::RevisionTreeChild(data) => Some((
+                data.node_id,
+                data.staged_action,
+                data.name.as_str().to_string(),
+                data.kind,
+            )),
             _ => None,
         })
         .collect()
@@ -1003,7 +934,14 @@ async fn published(
     repository: Partition,
     revision: Hash,
 ) -> std::collections::BTreeSet<String> {
-    let tree = load_at(store_handle_id, repository, revision).await;
+    let tree = load_tree_at(
+        LoreStore {
+            handle_id: store_handle_id,
+        },
+        repository,
+        revision,
+    )
+    .await;
     let mut paths = std::collections::BTreeSet::new();
     let mut pending = vec![(ROOT_NODE, String::new())];
     while let Some((parent, prefix)) = pending.pop() {
@@ -1026,34 +964,6 @@ async fn published(
 /// The set of `paths`.
 fn paths(paths: &[&str]) -> std::collections::BTreeSet<String> {
     paths.iter().map(|path| (*path).to_string()).collect()
-}
-
-/// Load a revision tree at `revision` against an open storage handle.
-async fn load_at(store_handle_id: u64, repository: Partition, revision: Hash) -> LoreRevisionTree {
-    let sink = make_sink();
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: lore::storage::handle::LoreStore {
-                handle_id: store_handle_id,
-            },
-            repository,
-            revision_hash: revision,
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "the load must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            Captured::Loaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("the load must emit RevisionTreeLoaded");
-    LoreRevisionTree { handle_id: id }
 }
 
 /// A delete of an added subtree leaves its slots to the next commit that goes through, which
@@ -1196,7 +1106,14 @@ async fn a_commit_refused_before_the_tree_frees_nothing_and_a_restore_follows() 
     assert_eq!(status, 0, "the first revision must commit, got {events:?}");
     let (published, _, _) = commit_outcome(&events, 51);
 
-    let other = load_at(store_handle_id, partition, published).await;
+    let other = load_tree_at(
+        LoreStore {
+            handle_id: store_handle_id,
+        },
+        partition,
+        published,
+    )
+    .await;
     add_file(other, 2, "b.bin", 0x22).await;
     let (status, events) = run_commit(other, 52).await;
     assert_eq!(
@@ -1342,7 +1259,10 @@ async fn a_commit_after_an_unfinished_change_counts_only_staged_actions() {
     let (status, events) = run_commit(handle, 62).await;
     assert_ne!(status, 0, "marks alone commit nothing, got {events:?}");
     assert!(
-        !events.contains(&Captured::CommitBegin) && Arc::ptr_eq(&marked, &handle_state(handle)),
+        !events
+            .iter()
+            .any(|event| matches!(event, LoreEvent::RevisionCommitBegin(_)))
+            && Arc::ptr_eq(&marked, &handle_state(handle)),
         "the commit is refused as nothing staged, before its freeze, got {events:?}"
     );
     assert!(
@@ -1398,6 +1318,41 @@ async fn marks_alone_commit_with_no_unfinished_change() {
     release(handle, store_handle_id);
 }
 
+/// A commit that fails after its snapshot replaces the State with the snapshot's, which keeps a
+/// move below an added directory the State it replaces noted; the commit that then succeeds clears
+/// it.
+#[tokio::test]
+async fn a_restored_tree_keeps_a_move_below_an_added_directory() {
+    let partition = Partition::from([0xeau8; 16]);
+    let (handle, store_handle_id) = load_handle("commit-restore-below-added", partition).await;
+    let branch = Context::from(uuid::Uuid::now_v7());
+    add_node(handle, 1, ROOT_NODE, "dir", LoreNodeType::Directory).await;
+    set_branch(handle, branch).await;
+    let (status, events) = run_commit(handle, 91).await;
+    assert_eq!(status, 0, "the first revision must commit, got {events:?}");
+
+    handle_state(handle).note_tracked_below_added();
+    let refused = add_file(handle, 2, "b.bin", 0).await;
+    let (status, events) = run_commit(handle, 92).await;
+    assert_eq!(
+        status, -1,
+        "a zero content hash fails the freeze, got {events:?}"
+    );
+    assert!(
+        handle_state(handle).may_hold_tracked_below_added(),
+        "the restored State keeps the note"
+    );
+
+    modify_file(handle, 3, refused, 0x22).await;
+    let (status, events) = run_commit(handle, 93).await;
+    assert_eq!(status, 0, "the corrected tree commits, got {events:?}");
+    assert!(
+        !handle_state(handle).may_hold_tracked_below_added(),
+        "the commit clears the note"
+    );
+    release(handle, store_handle_id);
+}
+
 /// A commit that fails after its snapshot replaces the State with the snapshot's, which keeps an
 /// unfinished change the State it replaces noted; the commit that then succeeds clears it.
 #[tokio::test]
@@ -1435,5 +1390,212 @@ async fn a_restored_tree_keeps_an_unfinished_change() {
         !handle_state(handle).has_unfinished_change(),
         "the commit clears the note"
     );
+    release(handle, store_handle_id);
+}
+
+/// Commits, on a handle of its own over the store `store_handle_id`, the line merging brings in:
+/// an initial revision of `repository` on a branch of its own adding `x.bin`, and on it a revision
+/// adding `theirs.bin`. Returns both revisions, the initial one first.
+async fn commit_other_line(store_handle_id: u64, repository: Partition) -> (Hash, Hash) {
+    let other = load_tree(
+        LoreStore {
+            handle_id: store_handle_id,
+        },
+        repository,
+    )
+    .await;
+    add_file(other, 50, "x.bin", 0x50).await;
+    set_branch(other, Context::from(uuid::Uuid::now_v7())).await;
+    let (status, events) = run_commit(other, 51).await;
+    assert_eq!(
+        status, 0,
+        "committing the other line must succeed, got {events:?}"
+    );
+    let initial = commit_outcome(&events, 51).0;
+    add_file(other, 52, "theirs.bin", 0x55).await;
+    let (status, events) = run_commit(other, 53).await;
+    assert_eq!(
+        status, 0,
+        "committing the other line must succeed, got {events:?}"
+    );
+    rt_handle::unregister(other);
+    (initial, commit_outcome(&events, 53).0)
+}
+
+/// Commits `handle` with `parent_other` as its second parent.
+async fn run_merge_commit(
+    handle: LoreRevisionTree,
+    id: u64,
+    parent_other: Hash,
+) -> (i32, Recorded) {
+    run_commit_with(
+        handle,
+        id,
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeCommitOptions {
+            parent_other,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Loads a handle on a store of its own and commits on a branch of its own the initial revision,
+/// holding `a.bin`, and the other line [`commit_other_line`] commits. Returns the handle, on its
+/// initial revision, the store's handle id, and the other line's two revisions.
+async fn merge_fixture(
+    label: &str,
+    repository: Partition,
+) -> (LoreRevisionTree, u64, (Hash, Hash)) {
+    let (handle, store_handle_id) = load_handle(label, repository).await;
+    add_file(handle, 1, "a.bin", 0x11).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    let (status, events) = run_commit(handle, 2).await;
+    assert_eq!(
+        status, 0,
+        "the initial revision must commit, got {events:?}"
+    );
+    let other = commit_other_line(store_handle_id, repository).await;
+    (handle, store_handle_id, other)
+}
+
+/// The revision the second-parent history of the file at `path` names, in the tree of `handle`.
+async fn second_parent_history(handle: LoreRevisionTree, path: &str) -> Hash {
+    let state = handle_state(handle);
+    let repository = handle_repository(handle);
+    let node = state
+        .find_node_link(repository.clone(), path)
+        .await
+        .expect("the file")
+        .node;
+    let metadata_node = node_to_file_metadata(node);
+    let block = state
+        .block_file_metadata(repository, NodeFileMetadataBlock::index(metadata_node))
+        .await
+        .expect("the file's history");
+    block
+        .read()
+        .node(NodeFileMetadata::index(metadata_node))
+        .revision[1]
+}
+
+/// Committing with a second parent records a merge revision: both parents, the number one above the
+/// higher of theirs, and the handle's edits as its change from the first parent, each marked as
+/// merged. A merged file takes the history the second parent holds for it: `x.bin`, which the other
+/// line's initial revision added, records that revision on the second-parent line, and
+/// `theirs.bin`, which the second parent's own revision added, records the second parent.
+#[tokio::test]
+async fn committing_with_a_second_parent_records_a_merge() {
+    let repository = Partition::from([0x51u8; 16]);
+    let (handle, store_handle_id, (other_initial, other)) =
+        merge_fixture("commit-merge", repository).await;
+    let first = handle_state(handle).revision();
+    add_file(handle, 3, "x.bin", 0x50).await;
+    add_file(handle, 5, "theirs.bin", 0x55).await;
+
+    let (status, events) = run_merge_commit(handle, 4, other).await;
+
+    assert_eq!(status, 0, "the merge revision must commit, got {events:?}");
+    let (revision, _, code) = commit_outcome(&events, 4);
+    assert_eq!(code, LoreErrorCode::None, "got {events:?}");
+    let state = handle_state(handle);
+    assert_eq!(state.revision(), revision);
+    assert_eq!(state.parents(), [first, other]);
+    assert_eq!(state.revision_number(), 3);
+    assert_eq!(
+        commit_revisions(&events)
+            .iter()
+            .map(|(_, parents, _, _)| *parents)
+            .collect::<Vec<_>>(),
+        [[first, other]]
+    );
+
+    let delta = state
+        .delta_block(handle_repository(handle))
+        .await
+        .expect("the merge revision's delta")
+        .to_aligned::<NodeDelta>();
+    let entries = delta.as_type_slice::<NodeDelta>();
+    assert!(!entries.is_empty(), "the merge revision records its change");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.flags & change::Flags::Merge.bits() != 0),
+        "every change of a merge revision is marked merged, got {entries:?}"
+    );
+    assert_eq!(second_parent_history(handle, "x.bin").await, other_initial);
+    assert_eq!(second_parent_history(handle, "theirs.bin").await, other);
+
+    release(handle, store_handle_id);
+}
+
+/// A second parent alone is something to commit: a merge revision that changes no file, with no
+/// metadata set, records its parents.
+#[tokio::test]
+async fn committing_a_second_parent_with_no_edits_records_the_merge() {
+    let repository = Partition::from([0x52u8; 16]);
+    let (handle, store_handle_id, (_, other)) =
+        merge_fixture("commit-merge-no-edits", repository).await;
+    let first = handle_state(handle).revision();
+
+    let (status, events) = run_merge_commit(handle, 5, other).await;
+
+    assert_eq!(status, 0, "the merge revision must commit, got {events:?}");
+    let state = handle_state(handle);
+    assert_eq!(state.revision(), commit_outcome(&events, 5).0);
+    assert_eq!(state.parents(), [first, other]);
+
+    release(handle, store_handle_id);
+}
+
+/// A second parent that is the loaded revision, or one the store doesn't hold, is refused as an
+/// invalid argument before anything is written: the handle stays on its revision, usable.
+#[tokio::test]
+async fn a_second_parent_the_loaded_revision_or_one_the_store_lacks_is_refused() {
+    let repository = Partition::from([0x53u8; 16]);
+    let (handle, store_handle_id, _other) = merge_fixture("commit-merge-refused", repository).await;
+    let first = handle_state(handle).revision();
+    add_file(handle, 6, "b.bin", 0x66).await;
+
+    for (id, parent_other) in [(7, first), (8, Hash::from_u64(0xdead))] {
+        let (status, events) = run_merge_commit(handle, id, parent_other).await;
+
+        assert_eq!(status, InvalidArguments::FFI_CODE, "got {events:?}");
+        let (revision, new_tip, code) = commit_outcome(&events, id);
+        assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
+        assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
+        assert_eq!(handle_state(handle).revision(), first);
+        assert!(!is_poisoned(handle));
+    }
+
+    let (status, events) = run_commit(handle, 9).await;
+    assert_eq!(status, 0, "the handle still commits, got {events:?}");
+
+    release(handle, store_handle_id);
+}
+
+/// A handle loaded from the zero revision takes no second parent, as a merge revision needs a first parent:
+/// the call is refused as an invalid argument before anything is written, and the handle stays
+/// usable.
+#[tokio::test]
+async fn a_second_parent_on_a_handle_loaded_from_no_revision_is_refused() {
+    let repository = Partition::from([0x54u8; 16]);
+    let (handle, store_handle_id) = load_handle("commit-merge-from-zero", repository).await;
+    let (_, other) = commit_other_line(store_handle_id, repository).await;
+    add_file(handle, 1, "a.bin", 0x11).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+
+    let (status, events) = run_merge_commit(handle, 2, other).await;
+
+    assert_eq!(status, InvalidArguments::FFI_CODE, "got {events:?}");
+    let (revision, new_tip, code) = commit_outcome(&events, 2);
+    assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
+    assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
+    assert!(handle_state(handle).revision().is_zero());
+    assert!(!is_poisoned(handle));
+
+    let (status, events) = run_commit(handle, 3).await;
+    assert_eq!(status, 0, "the handle still commits, got {events:?}");
+
     release(handle, store_handle_id);
 }

@@ -17,7 +17,6 @@ blake3 = { workspace = true }
 async-trait = { workspace = true }
 axum = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 config = { workspace = true }
 dashmap = { workspace = true }
@@ -53,6 +52,7 @@ smallvec = { workspace = true }
 socket2 = { workspace = true }
 sysinfo = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 tokio-metrics = { workspace = true }
 tokio-util = { workspace = true }
@@ -60,6 +60,7 @@ tokio-stream = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
+tonic-types = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true, features = ["timeout", "trace"] }
 tracing = { workspace = true }
@@ -105,6 +106,7 @@ ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-credential = { workspace = true }
 lore-storage = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 tempfile = "3.21"
@@ -167,6 +169,10 @@ test = false
 name = "uds-bench"
 path = "examples/uds_bench.rs"
 required-features = ["uds-bench"]
+
+[[example]]
+name = "quic-peer-bench"
+path = "examples/quic_peer_bench.rs"
 
 [lib]
 name = "lore_server"

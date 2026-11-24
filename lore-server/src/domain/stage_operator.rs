@@ -480,8 +480,7 @@ fn print_status(cell_id: &str, rulings: &[stage_loss::LossRulingRecord], as_json
             ruling
                 .evidence
                 .as_deref()
-                .map(|evidence| format!(" (evidence {evidence})"))
-                .unwrap_or_default(),
+                .map_or_default(|evidence| format!(" (evidence {evidence})")),
             ruling.actor,
             ruling.reason
         );

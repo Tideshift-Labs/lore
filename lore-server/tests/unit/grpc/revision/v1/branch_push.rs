@@ -13,6 +13,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::revision::v1::branch_push::*;
@@ -21,8 +22,10 @@ use lore_server::hooks::HookContext;
 use lore_server::hooks::HookDispatcher;
 use lore_server::hooks::HookError;
 use lore_server::hooks::HookPoint;
+use lore_server::hooks::StatusCode;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
+use lore_transport::error::branch_push_error;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Meter;
@@ -44,6 +47,7 @@ use crate::store::test_support::FailingLoadStore;
 use crate::store::test_support::test_store_create;
 use crate::util::hook_recorder::Seen;
 use crate::util::hook_recorder::recording_dispatcher;
+use crate::util::hook_recorder::rejecting_dispatcher;
 
 struct TestInstrumentProvider {}
 
@@ -232,6 +236,7 @@ async fn enforcing_cell_rejects_before_v1_branch_push_body() {
         ),
         crate::grpc::push_protected::allow_all(),
         immutable_store,
+        None,
         mutable_store,
         notification,
         &hooks,
@@ -264,6 +269,7 @@ async fn push_advances_branch_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -273,6 +279,7 @@ async fn push_advances_branch_latest() {
             make_request(repository, main, revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -307,6 +314,7 @@ async fn push_zero_revision_returns_invalid_argument() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
 
@@ -315,6 +323,7 @@ async fn push_zero_revision_returns_invalid_argument() {
             make_request(repository, main, Hash::default(), false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -350,6 +359,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let first = build_revision(&repository_context, Hash::default(), 1).await;
@@ -359,6 +369,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
             make_request(repository, main, first, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -378,6 +389,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
             make_request(repository, main, stale, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -390,6 +402,55 @@ async fn push_with_stale_parent_returns_failed_precondition() {
         .await
         .expect_err("stale parent push should fail");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            branch_push_error(err.clone()).is_branch_advanced(),
+            "the client must read the refusal as BranchAdvanced: {err:?}"
+        );
+    }))
+    .await;
+}
+
+/// A pre-push hook's `FAILED_PRECONDITION` carries no mark of a push onto a moved latest, so the
+/// client doesn't read it as `BranchAdvanced`.
+#[tokio::test]
+async fn a_pre_push_hooks_failed_precondition_is_no_branch_advanced() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+            allow_all_repositories(),
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        let first = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let (hook_dispatcher, _seen) = rejecting_dispatcher(Some(StatusCode::FailedPrecondition));
+        let err = handler(
+            make_request(repository, main, first, false, false),
+            allow_all(),
+            immutable_store.clone(),
+            None,
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the hook refuses the push");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        let read = branch_push_error(err);
+        assert!(read.is_internal(), "{read:?}");
     }))
     .await;
 }
@@ -413,6 +474,7 @@ async fn force_push_overrides_stale_parent() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let first = build_revision(&repository_context, Hash::default(), 1).await;
@@ -422,6 +484,7 @@ async fn force_push_overrides_stale_parent() {
             make_request(repository, main, first, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -439,6 +502,7 @@ async fn force_push_overrides_stale_parent() {
             make_request(repository, main, stale, true, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -478,6 +542,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         // Protect the branch — non-service-account pushes must be denied.
@@ -492,6 +557,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
             make_request(repository, main, revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -533,6 +599,7 @@ async fn push_idempotent_on_current_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -546,6 +613,7 @@ async fn push_idempotent_on_current_latest() {
             make_request(repository, main, revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -571,6 +639,7 @@ async fn push_idempotent_on_current_latest() {
             make_request(repository, main, revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -625,6 +694,7 @@ async fn unknown_branch_returns_not_found() {
             make_request(repository, unknown, revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -662,6 +732,7 @@ async fn push_to_protected_branch(
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         branch::protect(repository_context.clone(), main)
@@ -678,6 +749,7 @@ async fn push_to_protected_branch(
             ),
             tier.authorizer(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -725,6 +797,7 @@ async fn service_account_claim_no_longer_bypasses_protection() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         branch::protect(repository_context.clone(), main)
@@ -750,6 +823,7 @@ async fn service_account_claim_no_longer_bypasses_protection() {
             request,
             Tier::Global.authorizer(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -785,6 +859,7 @@ async fn push_to_deleted_branch_fails_not_found_and_leaves_it_deleted() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -794,6 +869,7 @@ async fn push_to_deleted_branch_fails_not_found_and_leaves_it_deleted() {
             make_request(repository, main, main_latest, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -827,6 +903,7 @@ async fn push_to_deleted_branch_fails_not_found_and_leaves_it_deleted() {
             make_request(repository, child, child_revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -866,6 +943,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -875,6 +953,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
             make_request(repository, main, main_latest, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -900,6 +979,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
             make_request(repository, original, stale_revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -949,6 +1029,7 @@ async fn push_to_deleted_branch_whose_name_is_held(holder: NameHolder) -> (tonic
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -958,6 +1039,7 @@ async fn push_to_deleted_branch_whose_name_is_held(holder: NameHolder) -> (tonic
             make_request(repository, main, main_latest, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1024,6 +1106,7 @@ async fn push_to_deleted_branch_whose_name_is_held(holder: NameHolder) -> (tonic
             make_request(repository, original, stale_revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             push_store,
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1100,6 +1183,7 @@ async fn push_to_deleted_branch_over_a_stale_mapping_fails_not_found() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1109,6 +1193,7 @@ async fn push_to_deleted_branch_over_a_stale_mapping_fails_not_found() {
             make_request(repository, main, main_latest, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1140,6 +1225,7 @@ async fn push_to_deleted_branch_over_a_stale_mapping_fails_not_found() {
             make_request(repository, child, child_revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1180,6 +1266,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
 
@@ -1193,6 +1280,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
                 make_request(repository, main, rev, false, false),
                 allow_all(),
                 immutable_store.clone(),
+                None,
                 mutable_store.clone(),
                 notification_sender.clone(),
                 &hook_dispatcher,
@@ -1217,6 +1305,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
             make_request(repository, main, divergent, false, true),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1285,6 +1374,7 @@ async fn pre_hook_sees_branch_name_and_service_account() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1300,6 +1390,7 @@ async fn pre_hook_sees_branch_name_and_service_account() {
             request,
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1342,6 +1433,7 @@ async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let main = create_root_branch(&repository_context, "main").await;
         let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1349,6 +1441,7 @@ async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
             make_request(repository, main, main_latest, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &HookDispatcher::empty(),
@@ -1372,6 +1465,7 @@ async fn rejected_push_to_deleted_branch_does_not_reinstate_name() {
             make_request(repository, child, child_revision, false, false),
             allow_all(),
             immutable_store.clone(),
+            None,
             mutable_store.clone(),
             notification_sender.clone(),
             &hook_dispatcher,
@@ -1485,6 +1579,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             store_repository_metadata(&repository_context, main).await;
@@ -1500,6 +1595,7 @@ mod handler {
                     make_request(repository, branch, revision, false, false),
                     allow_all(),
                     immutable_store.clone(),
+                    None,
                     mutable_store.clone(),
                     notification_sender.clone(),
                     &hook_dispatcher,
@@ -1549,6 +1645,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             store_repository_metadata(&repository_context, main).await;
@@ -1561,6 +1658,7 @@ mod handler {
                     make_request(repository, main, revision, false, false),
                     allow_all(),
                     immutable_store.clone(),
+                    None,
                     mutable_store.clone(),
                     notification_sender.clone(),
                     &hook_dispatcher,
@@ -1609,6 +1707,7 @@ mod handler {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 repository,
+                allow_all_repositories(),
             ));
             let main = create_root_branch(&repository_context, "main").await;
             let main_latest = build_revision(&repository_context, Hash::default(), 1).await;
@@ -1618,6 +1717,7 @@ mod handler {
                 make_request(repository, main, main_latest, false, false),
                 allow_all(),
                 immutable_store.clone(),
+                None,
                 mutable_store.clone(),
                 notification_sender.clone(),
                 &hook_dispatcher,
@@ -1644,6 +1744,7 @@ mod handler {
                 make_request(repository, feature, feature_revision, false, false),
                 allow_all(),
                 immutable_store.clone(),
+                None,
                 mutable_store.clone(),
                 notification_sender.clone(),
                 &hook_dispatcher,

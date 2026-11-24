@@ -73,6 +73,7 @@ async fn governed_fixture(
             immutable,
             mutable,
             rand::random::<lore_revision::lore::RepositoryId>(),
+            lore_revision::state::allow_all_repositories(),
         ),
     );
     (governed, script, repository)
@@ -182,6 +183,7 @@ async fn authenticated_handler_persists_creator_from_exact_repository_permission
             immutable.clone(),
             mutable.clone(),
             repo,
+            lore_revision::state::allow_all_repositories(),
         ));
         let mut notifications = crate::notification::testing::MockNotificationSender::new();
         notifications

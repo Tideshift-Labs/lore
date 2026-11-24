@@ -17,9 +17,11 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use thiserror::Error;
+use tonic::Status;
 use tracing::warn;
 
 use crate::auth::jwt::TokenVerification;
+use crate::authnz::repository_authorizer::AuthorizationOutcome;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
@@ -126,19 +128,6 @@ pub enum MessageHandleError {
     InvalidArgument(String),
 }
 
-impl MessageHandleError {
-    /// FORK-LOCAL (Tideshift): the error for a failed authorization check:
-    /// [`Self::AuthUnavailable`] when the auth service did not answer in time,
-    /// [`Self::AuthorizationFailure`] for a denial or any other failure.
-    pub fn from_authorization_status(status: &tonic::Status) -> Self {
-        if crate::authnz::auth::is_auth_unavailable(status) {
-            Self::AuthUnavailable(status.message().to_string())
-        } else {
-            Self::AuthorizationFailure(status.message().to_string())
-        }
-    }
-}
-
 impl From<StoreError> for MessageHandleError {
     fn from(value: StoreError) -> Self {
         warn!("Received store error: {value:?}");
@@ -163,6 +152,30 @@ fn error_chain_contains<T: Error + 'static>(error: &(dyn Error + 'static)) -> bo
         current = source.source();
     }
     false
+}
+
+impl MessageHandleError {
+    /// An error from a [`RepositoryAuthorizer`]: a denial as
+    /// `AuthorizationFailure`, a check that failed with `RESOURCE_EXHAUSTED` as
+    /// `SlowDown`, which clients retry, and any other failed check as
+    /// `InternalError`.
+    ///
+    /// FORK-LOCAL (Tideshift): checked first, an auth service that did not
+    /// answer in time ([`crate::authnz::auth::is_auth_unavailable`]) is
+    /// [`Self::AuthUnavailable`], which keeps the timeout's message. Like
+    /// `InternalError` it is a failed check, never a denial.
+    pub fn from_authorization(status: Status) -> Self {
+        if crate::authnz::auth::is_auth_unavailable(&status) {
+            return Self::AuthUnavailable(status.message().to_string());
+        }
+        match AuthorizationOutcome::of(&status) {
+            AuthorizationOutcome::Denied => {
+                MessageHandleError::AuthorizationFailure(status.message().to_string())
+            }
+            AuthorizationOutcome::Retryable => MessageHandleError::SlowDown,
+            AuthorizationOutcome::Failed => MessageHandleError::InternalError,
+        }
+    }
 }
 
 #[async_trait]

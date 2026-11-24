@@ -427,6 +427,57 @@ fn a_push_over_another_users_lock_is_refused_and_sends_nothing() {
     );
 }
 
+/// The CLI's push entry (`lore branch push` calls `push_managed_refusing_others_locks`, pinned in
+/// `lore-client/tests/unit/commands/branch.rs`) runs under a `ManagedPushRunner`: a push that gets
+/// past the lock check opens a durable managed stage in the repository's attempt journal, and
+/// leaves no unresolved attempt behind when the stub refuses it.
+#[test]
+fn the_cli_push_entry_runs_under_the_managed_runner() {
+    // The caller owns the only lock, so the check passes and the push proceeds. The stub models no
+    // storage service, so a push that has fragments to send fails at the server query before any
+    // stage opens. The remote therefore reports the branch tombstoned at exactly this repository's
+    // tip: the push is idempotent and restores the branch with a single BranchCreate, a
+    // dispatch that goes through a stage (the shape live_push_journal uses).
+    let rig = rig(HOLDER);
+    rig.server.set_revision_policy(RevisionPolicy {
+        branch_get: BranchAnswer::Present {
+            latest: <[u8; 32]>::from(rig.fixture.committed_revision).to_vec(),
+            // Any non-zero value: a zero metadata hash takes the initial-branch-creation path.
+            metadata: vec![0x11; 32],
+            deleted: true,
+        },
+        branch_create: RpcOutcome::Grant,
+        branch_push: RpcOutcome::Grant,
+    });
+
+    let (status, log) = push(&rig, true);
+
+    // An idempotent push changes no path, so there is nothing to look up a lock for; the refusal
+    // itself is pinned by the tests above.
+    assert_eq!(status, 0, "log: {log}");
+    use lore_transport::AttemptStore;
+
+    let path = rig.fixture.path.clone();
+    let (parents, unresolved) = rig.runtime.block_on(async move {
+        let guard = lore_revision::repository_fence::RepositoryMutationGuard::acquire(&path)
+            .await
+            .expect("a settled managed push leaves the worktree admissible");
+        (
+            guard.store().managed_parents().await.expect("read parents"),
+            guard.store().unresolved().await.expect("read unresolved"),
+        )
+    });
+    assert!(
+        !parents.is_empty(),
+        "the push must have run as a managed stage (status {status}): {log}"
+    );
+    assert!(
+        parents.iter().all(|parent| parent.complete),
+        "every stage is finished: {parents:?}"
+    );
+    assert!(unresolved.is_empty(), "{unresolved:?}");
+}
+
 /// With the check off the same push is not refused for the lock, and no lock lookup happens.
 #[test]
 fn a_push_without_the_check_is_not_refused_for_a_lock() {

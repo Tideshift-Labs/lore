@@ -137,15 +137,12 @@ impl PostgresFragmentS3Transport {
                         &counter,
                         ProviderAttemptOutcome::Decisive,
                         FragmentTransportResponse::Head {
-                            metadata: output
-                                .metadata()
-                                .map(|metadata| {
-                                    metadata
-                                        .iter()
-                                        .map(|(key, value)| (key.clone(), value.clone()))
-                                        .collect()
-                                })
-                                .unwrap_or_default(),
+                            metadata: output.metadata().map_or_default(|metadata| {
+                                metadata
+                                    .iter()
+                                    .map(|(key, value)| (key.clone(), value.clone()))
+                                    .collect()
+                            }),
                             content_length: output
                                 .content_length()
                                 .and_then(|size| u64::try_from(size).ok())
@@ -334,15 +331,12 @@ impl PostgresFragmentS3Transport {
             .await;
         match result {
             Ok(output) => {
-                let metadata = output
-                    .metadata()
-                    .map(|metadata| {
-                        metadata
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let metadata = output.metadata().map_or_default(|metadata| {
+                    metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect()
+                });
                 match output.body.collect().await {
                     Ok(body) => FragmentGetExchange {
                         outcome: ProviderAttemptOutcome::Decisive,

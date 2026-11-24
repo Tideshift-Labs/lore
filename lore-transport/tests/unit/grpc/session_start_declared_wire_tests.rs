@@ -59,10 +59,9 @@ fn dump(metadata: &MetadataMap) -> Vec<(String, String)> {
             ),
             KeyAndValueRef::Binary(key, value) => (
                 key.as_str().to_string(),
-                value
-                    .to_bytes()
-                    .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-                    .unwrap_or_default(),
+                value.to_bytes().map_or_default(|bytes| {
+                    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+                }),
             ),
         })
         .collect();

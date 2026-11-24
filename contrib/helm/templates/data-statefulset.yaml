@@ -16,7 +16,10 @@ metadata:
     {{- include "lore.labels" . | nindent 4 }}
     app.kubernetes.io/component: data
 spec:
-  replicas: 1
+  replicas: {{ int .Values.data.replicas }}
+  {{- if ne .Values.data.podManagementPolicy "OrderedReady" }}
+  podManagementPolicy: {{ .Values.data.podManagementPolicy }}
+  {{- end }}
   updateStrategy:
     type: RollingUpdate
   serviceName: {{ include "lore.fullname" . }}-headless
@@ -47,6 +50,10 @@ spec:
       {{- with .Values.priorityClassName }}
       priorityClassName: {{ . }}
       {{- end }}
+      {{- if .Values.data.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- include "lore.initContainers" (dict "ctx" . "p" .Values.data.persistence "name" "data") | nindent 6 }}
@@ -61,8 +68,9 @@ spec:
             # cannot write its default base path ($HOME/.config on /). Point it at the
             # writable /tmp emptyDir and use the file-based store (no OS keyring exists
             # in-container). Credentials here are transient cache, so emptyDir is fine.
+            {{- /* An edge's identity lives on its volume instead (lore.edgeIdentityInit). */}}
             - name: LORE_AUTH_PATH
-              value: /tmp/lore-auth
+              value: {{ ternary "/data/auth" "/tmp/lore-auth" (eq (include "lore.edgeIdentity" .) "true") }}
             - name: LORE_AUTH_STORE
               value: fallback
             - name: LORE_CONFIG_PATH
@@ -73,11 +81,17 @@ spec:
             - name: SSL_CERT_FILE
               value: /etc/lore/ca/bundle.crt
             {{- end }}
-            {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+            {{- if or (eq (include "lore.storageType" .Values.data.persistence) "hostPath") (include "lore.statefulsetTopology" .) }}
             - name: POD_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            {{- end }}
+            {{- if include "lore.statefulsetTopology" . }}
+            # Every pod shares one peer list (lore.fixedPeersToml); this drops the
+            # pod's own entry so it does not replicate to itself.
+            - name: LORE__TOPOLOGY__FIXED__SELF_ADDRESS
+              value: "$(POD_NAME).{{ include "lore.dataPodDomain" . }}"
             {{- end }}
             {{- if and .Values.presignedUrl.enabled .Values.presignedUrl.hmacKeySecret.name }}
             - name: LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY
@@ -148,7 +162,7 @@ spec:
               mountPath: /etc/lore/certs
               readOnly: true
             {{- end }}
-            {{- if and .Values.replication.enabled .Values.replication.tls.secretName }}
+            {{- if include "lore.replicationTlsMounted" . }}
             - name: replication-tls
               mountPath: /etc/lore/replication-tls
               readOnly: true
@@ -178,10 +192,16 @@ spec:
           secret:
             secretName: {{ include "lore.tlsSecretName" . }}
         {{- end }}
-        {{- if and .Values.replication.enabled .Values.replication.tls.secretName }}
+        {{- if include "lore.replicationTlsMounted" . }}
         - name: replication-tls
           secret:
             secretName: {{ .Values.replication.tls.secretName }}
+        {{- end }}
+        {{- if include "lore.edgeIdentity" . }}
+        - name: edge-identity
+          secret:
+            secretName: {{ .Values.backend.edge.identity.secretName }}
+            defaultMode: 0440  # readable by the pod user through fsGroup
         {{- end }}
         {{- if include "lore.needsCaBundle" . }}
         - name: ca-bundle
@@ -194,9 +214,17 @@ spec:
       nodeSelector:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- with .Values.affinity }}
+      {{- if .Values.affinity }}
       affinity:
-        {{- toYaml . | nindent 8 }}
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if and (gt (int .Values.data.replicas) 1) .Values.data.spreadAcrossNodes }}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  {{- include "lore.dataSelectorLabels" . | nindent 18 }}
       {{- end }}
       {{- with .Values.tolerations }}
       tolerations:

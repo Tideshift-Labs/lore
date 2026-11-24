@@ -102,8 +102,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::SecondsFormat;
-use chrono::Utc;
 use lore_revision::util::time::RetryPolicy;
 use lore_revision::util::time::RetrySettings;
 use lore_telemetry::InstrumentProvider;
@@ -112,6 +110,7 @@ use opentelemetry::metrics::Counter;
 use ring::hmac;
 use serde_json::Value;
 use serde_json::json;
+use time::UtcDateTime;
 use tracing::debug;
 
 use crate::hooks::Hook;
@@ -200,11 +199,25 @@ struct EventFields {
     lock_hash: Option<String>,
 }
 
+/// `occurred_at` on the wire: RFC 3339 in UTC, whole seconds, `Z`, such as
+/// `2026-06-24T12:34:56Z`. The same text chrono's `to_rfc3339_opts(SecondsFormat::Secs, true)`
+/// wrote before upstream 062069c6 moved the workspace to `time`; the fraction is dropped, not
+/// rounded. `event_id` hashes these bytes, so the form must not change.
+#[lore_macro::test_pub]
+fn occurred_at_text(time: UtcDateTime) -> String {
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        lore_base::timestamp::date(time),
+        time.hour(),
+        time.minute(),
+        time.second()
+    )
+}
 impl EventFields {
     /// Extracts the contract fields from a hook context, stamping `occurred_at`
     /// with the provided time (injected so tests are deterministic).
     #[lore_macro::test_pub]
-    fn from_context(ctx: &HookContext, occurred_at: chrono::DateTime<Utc>) -> Self {
+    fn from_context(ctx: &HookContext, occurred_at: UtcDateTime) -> Self {
         Self {
             event_type: event_type(ctx.hook_point()),
             partition: ctx.repository().to_string(),
@@ -212,7 +225,7 @@ impl EventFields {
             branch: ctx.branch().map(|b| b.to_string()),
             revision_signature: ctx.revision().map(|r| r.to_string()),
             revision_number: ctx.revision_number(),
-            occurred_at: occurred_at.to_rfc3339_opts(SecondsFormat::Secs, true),
+            occurred_at: occurred_at_text(occurred_at),
             client_ip: ctx.get_metadata("client_ip").map(str::to_string),
             lock_hash: ctx.get_metadata("lock_hash").map(str::to_string),
         }
@@ -364,8 +377,8 @@ impl Hook for LorehubNotifyHook {
     }
 
     async fn post_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
-        let now = Utc::now();
-        let timestamp = now.timestamp();
+        let now = UtcDateTime::now();
+        let timestamp = now.unix_timestamp();
         let fields = EventFields::from_context(ctx, now);
         // `&'static str` label; safe as an OTel attribute value.
         let event_type = fields.event_type;

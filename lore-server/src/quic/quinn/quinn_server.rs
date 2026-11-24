@@ -36,6 +36,7 @@ use crate::drain::HandshakeGuard;
 use crate::drain::QuinnConnectionRegistry;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::attribute_map::QuinnConnection;
 use crate::quic::StreamDataHandler;
 use crate::quic::StreamHandlerFactory;
 use crate::quic::initial_cwnd::InitialCwndBytes;
@@ -486,6 +487,7 @@ async fn handle_conn(
     // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): lets a test-build fault close this connection.
     #[cfg(feature = "failure_generator")]
     context.insert(crate::quic::faults::FaultConnection(connection.clone()));
+    context.insert(QuinnConnection(connection.clone()));
 
     let _stats_guard = track_connection_stats(
         service_name,

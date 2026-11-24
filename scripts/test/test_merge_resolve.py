@@ -739,9 +739,6 @@ def test_stage_merge_and_resolve_of_a_deleted_file_find_no_markers(new_lore_repo
     repo.branch_merge_abort(offline=True)
 
 
-@pytest.mark.own_vfs(
-    "stages the deletion of a conflicted file it removes, which a stage on a virtual clone does not see"
-)
 @pytest.mark.smoke
 def test_commit_refuses_an_unresolved_conflict_staged_for_deletion(new_lore_repo):
     """A conflicted file the user deleted and staged for deletion is still an unresolved
@@ -855,3 +852,26 @@ def test_merge_resolve_of_a_deletion_removes_the_directories_only_the_merge_kept
         repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
     )
     assert deltas == [], deltas
+
+
+@pytest.mark.smoke
+def test_merge_abort_after_taking_the_deletion_of_a_file_puts_it_back(new_lore_repo):
+    """A file this branch changed and the incoming branch deleted, resolved as the deletion,
+    is back with this branch's content once the merge is aborted."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base commit", {"a.txt": STAGE_MERGE_BASE}, offline=True)
+    repo.branch_create("incoming", offline=True)
+    repo.remove_file("a.txt")
+    repo.stage(["a.txt"], offline=True)
+    repo.commit("Incoming deletes a.txt", offline=True)
+    repo.branch_switch("main", offline=True)
+    repo.write_commit_push(
+        "Current changes", {"a.txt": STAGE_MERGE_CURRENT}, offline=True
+    )
+    repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
+    repo.branch_merge_resolve_theirs(["a.txt"], offline=True)
+
+    repo.branch_merge_abort(offline=True)
+
+    assert repo.read_files() == {"a.txt": "".join(STAGE_MERGE_CURRENT)}
+    assert not parse_status_json(repo.status(scan=True, json=True, offline=True))

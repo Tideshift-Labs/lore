@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use futures::FutureExt;
 use lore_error_set::prelude::*;
+use smallvec::SmallVec;
 
 use super::Served;
 use super::ServedNodes;
@@ -31,6 +32,7 @@ use super::locks::prepend_locked;
 use super::mark::UnfinishedChange;
 use crate::errors::InvalidArguments;
 use crate::errors::NodeNotFound;
+use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::hash;
 use crate::node::INVALID_NODE;
@@ -184,6 +186,19 @@ const LEFT: Mark = Mark {
     dirty: Some((NodeFlags::Dirty, Ext::Keep, false)),
 };
 
+/// The mark of a directory a staged move takes a node out of, holding `left`: [`LEFT`], or its
+/// dirty half alone where the move stages no such directory ([`Node::stages_when_left`]).
+fn left_mark(left: &Node) -> Mark {
+    if left.stages_when_left() {
+        LEFT
+    } else {
+        Mark {
+            staged: None,
+            ..LEFT
+        }
+    }
+}
+
 /// The holder a reattach replaces, or the absence it checks against, that `check` names.
 fn replacing_or_absent(check: ReattachCheck<'_>) -> (Option<NodeID>, Option<&Absent>) {
     match check {
@@ -196,11 +211,11 @@ fn replacing_or_absent(check: ReattachCheck<'_>) -> (Option<NodeID>, Option<&Abs
 impl State {
     /// The staged and dirty change a move records on `node`.
     ///
-    /// A node staged for addition stays staged for addition: it is in no revision a move
-    /// could be recorded against, and its addition already carries whatever parent and
-    /// name it ends up under.
+    /// A node added, staged or only marked dirty, is staged for addition: it is in no revision a
+    /// move could be recorded against, and its addition already carries whatever parent and name
+    /// it ends up under.
     pub fn staged_move_flags(node: &Node) -> (NodeFlags, NodeFlags) {
-        if node.is_staged_add() {
+        if node.is_added() {
             (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
         } else {
             (NodeFlags::StagedMove, NodeFlags::DirtyMove)
@@ -234,11 +249,13 @@ impl State {
     /// 1. The checks, reading copies. Rejected are the root, an unknown or discarded node, a node
     ///    staged for deletion, a destination that is not a directory or is itself staged for
     ///    deletion, a destination the node already sits under by the name it already has, a name
-    ///    the node name table would refuse or has no room for, and a destination inside the
-    ///    node's own subtree, walked here unless `walked`.
+    ///    the node name table would refuse or has no room for, `Oversized` where the name is over
+    ///    its length bound or the table full, and a destination inside the node's own subtree,
+    ///    walked here unless `walked`.
     /// 2. The directory the node leaves, then the destination, each with its ancestors, marked
     ///    staged and dirty (H8): a commit descends into and rehashes both whatever happens next.
-    ///    Neither where it is the root, whose flags no mark changes.
+    ///    Neither where it is the root, whose flags no mark changes. A directory left that is dirty
+    ///    in its own right is marked dirty alone ([`left_mark`]), and the commit stages it.
     /// 3. The move itself, [`Self::node_move`]'s section: the name stored, the node detached,
     ///    relinked and given its own staged and dirty flags in one critical section, so a failure
     ///    leaves it where it was, under its old name. The node and both parents are refused there
@@ -272,7 +289,10 @@ impl State {
     /// API restore of a node below an added directory, which waits for the permit. A C API delete
     /// holds the permit for its whole batch too, so moves and deletes apply one after the other
     /// (H18). No clear runs alongside: one between a mark and the move could clean a directory the
-    /// move then fills, which the clear's contract excludes (C9).
+    /// move then fills, which the clear's contract excludes (C9). A node not staged for addition
+    /// moving into a directory staged for addition is noted as the destination is checked, before
+    /// any mark ([`Self::note_tracked_below_added`]), under the permit, which a C API delete reads
+    /// it under; a move refused after leaves the note, which costs a delete's check a walk.
     pub async fn node_move_staged(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
@@ -304,18 +324,15 @@ impl State {
                 reason: "destination parent id does not name a node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(dst_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("destination name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(dst_name)
+            .forward::<StateError>("destination name is not storable")?;
 
         // The checks read copies in scopes no await crosses, so the future holds none of them.
         let node_index = Node::index(node_id);
         let block = self
             .block_with_nametable(repository.clone(), NodeBlock::index(node_id))
             .await?;
-        let (source_parent_id, is_directory, own, renamed, fits) = {
+        let (source_parent_id, is_directory, own, renamed, fits, deleted) = {
             // The node, whether the name changes and whether its table has room for it, under
             // one guard. The hash is case-insensitive, so only a matching hash needs the stored
             // name read back to tell a rename that changes the case from one that changes
@@ -352,6 +369,7 @@ impl State {
                 Mark::staged_and_dirty(staged, dirty),
                 renamed,
                 fits,
+                node.is_deleted(),
             )
         };
 
@@ -389,6 +407,9 @@ impl State {
                     reason: "destination parent id does not resolve to a named node".into(),
                 }));
             }
+            if destination.is_staged_add() && own.staged != Some((NodeFlags::StagedAdd, true)) {
+                self.note_tracked_below_added();
+            }
         }
         let reparented = source_parent_id != destination_parent_id;
         if !renamed && !reparented {
@@ -399,8 +420,8 @@ impl State {
         // Refused before any mark, so a full name table leaves nothing marked; one that fills
         // meanwhile fails the move's section instead.
         if renamed && !fits {
-            return Err(StateError::from(InvalidArguments {
-                reason: "the node's name table has no room for the destination name".into(),
+            return Err(StateError::from(Oversized {
+                context: "the node's name table has no room for the destination name".into(),
             }));
         }
         // Walked before any mark, rather than in the section's retry loop: under the permit no
@@ -421,7 +442,8 @@ impl State {
         let marked = marks_source || destination_parent_id != ROOT_NODE;
         let unfinished = UnfinishedChange::armed_if(marked, self);
         if marks_source {
-            self.node_mark(&repository, source_parent_id, LEFT).await?;
+            let left = left_mark(&self.node(repository.clone(), source_parent_id).await?);
+            self.node_mark(&repository, source_parent_id, left).await?;
         }
         self.node_mark_destination(&repository, destination_parent_id, own)
             .await?;
@@ -438,12 +460,14 @@ impl State {
         unfinished.finished();
 
         if is_directory {
-            self.mark_subtree_moved(repository.clone(), node_id).await?;
+            self.mark_subtree_moved(repository.clone(), node_id, deleted)
+                .await?;
         }
         if from != source_parent_id && from != destination_parent_id && from != ROOT_NODE {
             #[cfg(feature = "state-hooks")]
             log::arm(&self.hooks, log::Arm::MoverBeaten);
-            self.node_mark(&repository, from, LEFT).await?;
+            let left = left_mark(&self.node(repository.clone(), from).await?);
+            self.node_mark(&repository, from, left).await?;
         }
         Ok(())
     }
@@ -551,11 +575,8 @@ impl State {
         let renamed = match name {
             NameChange::Keep => None,
             NameChange::Rename(new_name) => {
-                if let Err(error) = validate_node_name_for_store(new_name) {
-                    return Err(StateError::from(InvalidArguments {
-                        reason: format!("new name is not storable: {error}"),
-                    }));
-                }
+                validate_node_name_for_store(new_name)
+                    .forward::<StateError>("new name is not storable")?;
                 Some((new_name, hash::hash_string(new_name)))
             }
         };
@@ -748,11 +769,7 @@ impl State {
                 reason: "node id does not name a renamable node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(new_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("new name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(new_name).forward::<StateError>("new name is not storable")?;
         let block = self
             .block_with_nametable(repository.clone(), NodeBlock::index(node_id))
             .await?;
@@ -1010,11 +1027,7 @@ impl State {
                 reason: "new parent id does not name a node".into(),
             }));
         }
-        if let Err(error) = validate_node_name_for_store(new_name) {
-            return Err(StateError::from(InvalidArguments {
-                reason: format!("new name is not storable: {error}"),
-            }));
-        }
+        validate_node_name_for_store(new_name).forward::<StateError>("new name is not storable")?;
 
         let name_hash = hash::hash_string(new_name);
         let block_index = NodeBlock::index(node_id);
@@ -1456,32 +1469,57 @@ impl State {
         Ok(true)
     }
 
-    /// Record a move on every node under `node_id`.
+    /// Record a move on every node under `node_id`, as the C API's move records it.
     ///
-    /// Each node's flag pair is decided from its own staging state rather than inherited,
-    /// so a node this handle added stays an addition while a node the revision holds
-    /// becomes a move. A node staged for deletion is left as it is and not descended
-    /// into: the action bits hold one change at a time, so recording a move over it would
-    /// take the deletion off it, and its whole subtree is staged for deletion with it.
-    ///
-    /// Descent stops at a link too, whose children belong to the linked repository's tree
-    /// and not to this one.
-    ///
-    /// Walks with [`StateNodeChildrenIterator`], which carries each child's record with
-    /// its id and holds one block across the siblings that share it — so the walk costs
-    /// one read per node and allocates nothing per directory. The pending list holds ids
-    /// rather than records, since it can grow to the directory count of the subtree.
-    ///
-    /// A subtree holding `node_id` itself is a cycle a move into its own subtree made, which the
-    /// move's checks exclude: answered as an internal error rather than walked for good under the
-    /// moves permit. The error reports a tree the move already broke, its node below itself and
-    /// cut off from the root, not a move refused.
+    /// Each node's flag pair is decided from its own change rather than inherited, so a node
+    /// added, staged or only marked dirty, stays an addition while a node the revision holds
+    /// becomes a move ([`Self::staged_move_flags`]). A node deleted, staged or only marked dirty,
+    /// is left as it is and not descended into: the action bits hold one change at a time, so
+    /// recording a move over it would take the deletion off it, and its whole subtree is deleted
+    /// with it. The moves of `lore stage move` and `lore dirty move` keep both the same way. Where
+    /// the move took a deletion off `node_id` itself (`undelete`), every node below carries that
+    /// deletion, and moves with it, as those moves move it.
     pub(in crate::state) async fn mark_subtree_moved(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         node_id: NodeID,
+        undelete: bool,
     ) -> Result<(), StateError> {
-        let mut pending = vec![node_id];
+        self.node_mark_subtree(&repository, node_id, |_, child| {
+            if child.is_deleted() && !undelete {
+                return None;
+            }
+            let (staged, dirty) = Self::staged_move_flags(child);
+            Some(Mark {
+                staged: Some((staged, false)),
+                dirty: Some((dirty, Ext::Set(NodeExtFlags::NoFlags), false)),
+            })
+        })
+        .await
+    }
+
+    /// Marks each node below the directory `node_id` with the mark `mark_of` answers for it, given
+    /// its ID and record, as a move marks the subtree of a directory it moves. A node it answers `None` for,
+    /// and a discarded node, is left as it is and not descended into; a link is marked and not
+    /// descended into, as its children belong to the linked repository's tree.
+    ///
+    /// Walks with [`StateNodeChildrenIterator`], which carries each child's record with its id and
+    /// holds one block across the siblings that share it, so the walk costs one read per node and
+    /// allocates nothing per directory. The pending list holds ids rather than records, since it
+    /// can grow to the directory count of the subtree, and holds the first few on the stack.
+    ///
+    /// A subtree holding `node_id` itself is a cycle a move into its own subtree made, which the
+    /// move's checks exclude: answered as an internal error rather than walked for good. The error
+    /// reports a tree the move already broke, its node below itself and cut off from the root, not
+    /// a move refused.
+    pub(crate) async fn node_mark_subtree(
+        self: &Arc<Self>,
+        repository: &Arc<RepositoryContext>,
+        node_id: NodeID,
+        mut mark_of: impl FnMut(NodeID, &Node) -> Option<Mark>,
+    ) -> Result<(), StateError> {
+        let mut pending: SmallVec<[NodeID; SUBTREE_ON_STACK]> = SmallVec::new();
+        pending.push(node_id);
         while let Some(parent_id) = pending.pop() {
             let mut children =
                 StateNodeChildrenIterator::new(self.clone(), repository.clone(), parent_id).await?;
@@ -1491,15 +1529,13 @@ impl State {
                         "directory {node_id} lies below itself"
                     )));
                 }
-                if child.is_staged_delete() || child.is_discarded() {
+                if child.is_discarded() {
                     continue;
                 }
-                let (staged, dirty) = Self::staged_move_flags(&child);
-                let mark = Mark {
-                    staged: Some((staged, false)),
-                    dirty: Some((dirty, Ext::Set(NodeExtFlags::NoFlags), false)),
+                let Some(mark) = mark_of(child_id, &child) else {
+                    continue;
                 };
-                self.node_mark(&repository, child_id, mark).await?;
+                self.node_mark(repository, child_id, mark).await?;
                 if child.is_directory() {
                     pending.push(child_id);
                 }
@@ -1508,6 +1544,9 @@ impl State {
         Ok(())
     }
 }
+
+/// Most directories [`State::node_mark_subtree`]'s pending list holds on the stack.
+const SUBTREE_ON_STACK: usize = 8;
 
 /// Under `state-hooks`, the arm a reattach's walk to its node took where it found none.
 #[cfg(feature = "state-hooks")]

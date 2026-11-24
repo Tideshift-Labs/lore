@@ -1160,18 +1160,16 @@ async fn an_unserved_mark_keeps_a_clean_directorys_staged_action() {
         assert!(held.is_staged_move(), "the staged move stands");
         assert!(held.is_dirty());
 
-        // A forced base mark of a dirty node replaces its action, as before.
+        // A forced mark keeps it too.
         mark(
             &state,
             &repository,
             t.c,
-            Mark::dirty(NodeFlags::Dirty, Ext::Keep, true),
+            Mark::dirty(NodeFlags::DirtyDelete, Ext::Keep, true),
         )
         .await;
-        assert_eq!(
-            record(&state, &repository, t.c).await.flags & NodeFlags::ActionBits.bits(),
-            0
-        );
+        let held = record(&state, &repository, t.c).await;
+        assert!(held.is_staged_move() && !held.is_staged_delete());
     })
     .await;
 }
@@ -1351,14 +1349,15 @@ async fn a_scan_chain_below_or_at_a_file_or_a_link_adds_nothing() {
 }
 
 /// The scan's directory chain refuses a name no add would store, anywhere in its path, before it
-/// adds anything: a separator in a name, or a name over the length bound.
+/// adds anything: a separator in a name, an invalid argument, or a name over the length bound,
+/// `Oversized`.
 #[tokio::test]
 async fn a_scan_chain_with_an_unstorable_name_adds_nothing() {
     with_state(|repository, state| async move {
         let t = chain(&state, &repository).await;
 
         let long = format!("a/b/new/{}", "n".repeat(MAX_NODE_NAME_LEN + 1));
-        for path in ["a/b/new/x\\y", long.as_str()] {
+        for (path, too_long) in [("a/b/new/x\\y", false), (long.as_str(), true)] {
             let error = lore_revision::state::os_diff::ensure_scan_dir_chain(
                 repository.clone(),
                 state.clone(),
@@ -1367,7 +1366,14 @@ async fn a_scan_chain_with_an_unstorable_name_adds_nothing() {
             )
             .await
             .expect_err("an unstorable name is refused");
-            assert!(!error.is_node_not_found(), "{error}");
+            assert!(
+                if too_long {
+                    error.is_oversized()
+                } else {
+                    error.is_invalid_arguments()
+                },
+                "{error}"
+            );
             assert!(
                 state
                     .find_subnode(repository.clone(), t.b, hash_string("new"))

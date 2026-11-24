@@ -258,10 +258,57 @@ key and silently drop one. Call with (dict "ctx" . "p" <persistence> "name" "dat
 {{- define "lore.initContainers" -}}
 {{- $hostPath := include "lore.hostPathInit" . -}}
 {{- $caBundle := include "lore.caBundleInit" .ctx -}}
-{{- if or (trim $hostPath) (trim $caBundle) }}
+{{- $edgeIdentity := "" -}}
+{{- if eq .name "data" -}}
+{{- $edgeIdentity = include "lore.edgeIdentityInit" .ctx -}}
+{{- end -}}
+{{- if or (trim $hostPath) (trim $caBundle) (trim $edgeIdentity) }}
 initContainers:
 {{- $caBundle }}
 {{- $hostPath }}
+{{- $edgeIdentity }}
+{{- end }}
+{{- end -}}
+
+{{/*
+True when an edge has an identity Secret, seeded into /data/auth. Root context.
+*/}}
+{{- define "lore.edgeIdentity" -}}
+{{- if and (eq .Values.backend.type "edge") .Values.backend.edge.identity.secretName -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Init container that copies the identity Secret to /data/auth unless a token store is
+already there: the server renews the login in place, so the copy on the volume is the
+newer one. Runs after lore.hostPathInit. Root context.
+*/}}
+{{- define "lore.edgeIdentityInit" -}}
+{{- if include "lore.edgeIdentity" . }}
+  - name: init-edge-identity
+    image: {{ include "lore.image" . | quote }}
+    imagePullPolicy: {{ .Values.imagePullPolicy }}
+    command:
+      - sh
+      - -c
+      - 'if [ -e /data/auth/tokenstore.toml ]; then echo "keeping the token store on the volume"; else mkdir -p /data/auth && chmod 700 /data/auth && cp /etc/lore/edge-identity/* /data/auth/ && chmod 600 /data/auth/* && echo "seeded the token store from the identity Secret"; fi'
+    securityContext:
+      {{- toYaml .Values.securityContext | nindent 6 }}
+    volumeMounts:
+      - name: edge-identity
+        mountPath: /etc/lore/edge-identity
+        readOnly: true
+      - name: data
+        mountPath: /data
+        {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+        subPathExpr: $(POD_NAME)
+        {{- end }}
+    {{- if eq (include "lore.storageType" .Values.data.persistence) "hostPath" }}
+    env:
+      - name: POD_NAME
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.name
+    {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -437,11 +484,12 @@ cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
 {{- if ne $r.topology.provider "none" }}
 
 [topology]
-provider = {{ $r.topology.provider | quote }}
-{{- if eq $r.topology.provider "fixed" }}
+{{- /* statefulset is a chart-side provider: the server sees a fixed list. */}}
+provider = {{ ternary "fixed" $r.topology.provider (eq $r.topology.provider "statefulset") | quote }}
+{{- if has $r.topology.provider (list "fixed" "statefulset") }}
 
 [topology.fixed]
-peers = [{{ range $i, $p := $r.topology.fixed.peers }}{{ if $i }}, {{ end }}{ address = {{ $p.address | quote }}, port = {{ $p.port | default $r.port }}, locality = {{ $p.locality | default "SameRegion" | quote }} }{{ end }}]
+peers = {{ include "lore.fixedPeersToml" . }}
 {{- else if eq $r.topology.provider "consul" }}
 {{- with $r.topology.consul }}
 
@@ -450,6 +498,278 @@ peers = [{{ range $i, $p := $r.topology.fixed.peers }}{{ if $i }}, {{ end }}{ ad
 {{ $k }} = {{ $v | quote }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Render-time checks for combinations the server would accept but run wrongly.
+Included from configmap.yaml, which every install renders. Root context.
+*/}}
+{{- define "lore.validate" -}}
+{{- $backend := .Values.backend.type | default "local" -}}
+{{- if not (has $backend (list "local" "aws" "edge")) -}}
+{{- fail (printf "backend.type must be local, aws or edge, got %q" $backend) -}}
+{{- end -}}
+{{- $replicas := int .Values.data.replicas -}}
+{{- if lt $replicas 1 -}}
+{{- fail (printf "data.replicas must be at least 1, got %d" $replicas) -}}
+{{- end -}}
+{{- if and (gt $replicas 1) (eq $backend "local") -}}
+{{- fail (printf "data.replicas=%d needs backend.type=aws or edge. With the local backend every data pod would keep its own copy of the store on its own volume, and the copies would diverge as clients write to different pods." $replicas) -}}
+{{- end -}}
+{{- if eq $backend "aws" -}}
+{{- if ne .Values.topology.mode "single" -}}
+{{- fail "backend.type=aws needs topology.mode=single. The tiered topology is a primary/cache split for the local backend; with the AWS backend the store is already shared, so every data pod serves directly." -}}
+{{- end -}}
+{{- range $key := list "s3Bucket" "fragmentsTable" "fragmentStateTable" "mutableTable" "locksTable" -}}
+{{- if not (index $.Values.backend.aws $key) -}}
+{{- fail (printf "backend.aws.%s is required when backend.type=aws" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $backend "edge" -}}
+{{- if ne .Values.topology.mode "single" -}}
+{{- fail "backend.type=edge needs topology.mode=single. An edge's store is its upstream, so every data pod serves directly; the tiered topology's data pod would go unused." -}}
+{{- end -}}
+{{- range $key := list "upstreamInternalAddress" "upstreamURL" -}}
+{{- if not (index $.Values.backend.edge $key) -}}
+{{- fail (printf "backend.edge.%s is required when backend.type=edge" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if regexFind "://" .Values.backend.edge.upstreamInternalAddress -}}
+{{- fail (printf "backend.edge.upstreamInternalAddress is host:port, without a scheme, got %q: the chart adds quics:// for content and https:// for forwarded requests." .Values.backend.edge.upstreamInternalAddress) -}}
+{{- end -}}
+{{- if not .Values.replication.tls.secretName -}}
+{{- fail "backend.type=edge needs replication.tls.secretName: the edge reaches its upstream's replication endpoint with mutual TLS, presenting that Secret's cert." -}}
+{{- end -}}
+{{- end -}}
+{{- if not (has .Values.data.podManagementPolicy (list "OrderedReady" "Parallel")) -}}
+{{- fail (printf "data.podManagementPolicy must be OrderedReady or Parallel, got %q" .Values.data.podManagementPolicy) -}}
+{{- end -}}
+{{- if eq .Values.replication.topology.provider "statefulset" -}}
+{{- if not .Values.replication.enabled -}}
+{{- fail "replication.topology.provider=statefulset needs replication.enabled=true: peers replicate to each other on the replication port." -}}
+{{- end -}}
+{{- if eq $backend "local" -}}
+{{- fail "replication.topology.provider=statefulset needs backend.type=aws or edge. Only their composite store replicates to peers." -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.replication.enabled .Values.replication.verifyClientCerts (not .Values.replication.tls.secretName) -}}
+{{- fail "replication.enabled=true with replication.verifyClientCerts=true needs replication.tls.secretName: the server refuses to start its replication endpoints without a certificate, key and CA chain for mutual TLS. Set replication.verifyClientCerts=false only on an isolated network, to accept unauthenticated replication." -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+DNS domain of the data pods' per-pod records: <pod>.<this domain> resolves to that
+pod through the headless Service. Root context.
+*/}}
+{{- define "lore.dataPodDomain" -}}
+{{- printf "%s-headless.%s.svc.cluster.local" (include "lore.fullname" .) .Release.Namespace -}}
+{{- end -}}
+
+{{/*
+True when the data pods find each other through the StatefulSet's own DNS names
+(replication.topology.provider=statefulset). Root context.
+*/}}
+{{- define "lore.statefulsetTopology" -}}
+{{- if and .Values.replication.enabled (eq .Values.replication.topology.provider "statefulset") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+True when the composite store needs a replica factory: it is what turns topology
+peers into replication targets, and the server rejects every peer refresh without
+one. Root context.
+*/}}
+{{- define "lore.peersActive" -}}
+{{- if and (has .Values.backend.type (list "aws" "edge")) .Values.replication.enabled (ne .Values.replication.topology.provider "none") -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+True when the pods mount the replication TLS Secret: for replication, and for an edge's
+connection to its upstream. Root context.
+*/}}
+{{- define "lore.replicationTlsMounted" -}}
+{{- if and .Values.replication.tls.secretName (or .Values.replication.enabled (eq .Values.backend.type "edge")) -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The [topology.fixed] peer list as a TOML array. With provider=statefulset it lists
+every data pod by its headless DNS name, then any fixed.peers; each pod drops its
+own entry through LORE__TOPOLOGY__FIXED__SELF_ADDRESS (see data-statefulset.yaml),
+so one list serves every pod. Root context.
+*/}}
+{{- define "lore.fixedPeersToml" -}}
+{{- $r := .Values.replication -}}
+{{- $peers := list -}}
+{{- if include "lore.statefulsetTopology" . -}}
+{{- $fullname := include "lore.fullname" . -}}
+{{- $domain := include "lore.dataPodDomain" . -}}
+{{- range $i := until (int .Values.data.replicas) -}}
+{{- $peers = append $peers (dict "address" (printf "%s-%d.%s" $fullname $i $domain) "port" $r.port "locality" "SameRegion") -}}
+{{- end -}}
+{{- end -}}
+{{- range $p := $r.topology.fixed.peers -}}
+{{- $peers = append $peers (dict "address" $p.address "port" ($p.port | default $r.port) "locality" ($p.locality | default "SameRegion")) -}}
+{{- end -}}
+[{{ range $i, $p := $peers }}{{ if $i }}, {{ end }}{ address = {{ $p.address | quote }}, port = {{ $p.port }}, locality = {{ $p.locality | quote }} }{{ end }}]
+{{- end -}}
+
+{{/*
+Store tables for backend.type=aws: a composite immutable store (the /data cache in
+front of S3), the DynamoDB mutable and lock stores, and their plugin settings.
+Every block here opens its own table, so it can sit anywhere among the other
+table blocks (see the TOML ORDERING INVARIANT on lore.serverHttpToml). Root context.
+*/}}
+{{- define "lore.awsStoreToml" -}}
+{{- $aws := .Values.backend.aws -}}
+[immutable_store]
+mode = "composite"
+
+[immutable_store.composite.local]
+mode = "local"
+
+[immutable_store.composite.local.local]
+path = "/data"
+flush_delay_seconds = {{ int $aws.cacheFlushDelaySeconds }}
+{{- with (include "lore.storeGcToml" .Values.data.store) }}
+{{ . }}
+{{- end }}
+
+[immutable_store.composite.durable]
+mode = "aws"
+{{- include "lore.replicaFactoryToml" . }}
+
+[mutable_store]
+mode = "aws"
+
+[lock_store]
+mode = "aws"
+
+[plugins.aws.immutable_store]
+s3_bucket = {{ $aws.s3Bucket | quote }}
+dynamodb_fragments_table = {{ $aws.fragmentsTable | quote }}
+dynamodb_fragment_state_table = {{ $aws.fragmentStateTable | quote }}
+{{- with $aws.fragmentMetadataTable }}
+dynamodb_fragment_metadata_table = {{ . | quote }}
+{{- end }}
+{{- with $aws.region }}
+s3_region = {{ . | quote }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- if $aws.forceWrite }}
+force_write = true
+{{- end }}
+
+[plugins.aws.mutable_store]
+dynamodb_table = {{ $aws.mutableTable | quote }}
+{{- with $aws.region }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- if $aws.forceWrite }}
+force_write = true
+{{- end }}
+
+[plugins.aws.lock_store]
+dynamodb_table = {{ $aws.locksTable | quote }}
+{{- with $aws.region }}
+dynamodb_region = {{ . | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The composite store's replica factory, for peers. Renders nothing without peers.
+Root context.
+*/}}
+{{- define "lore.replicaFactoryToml" -}}
+{{- $r := .Values.replication -}}
+{{- if include "lore.peersActive" . }}
+
+[immutable_store.composite.replica_factory]
+client_message_buffer = {{ int $r.clientMessageBuffer }}
+{{- if $r.tls.secretName }}
+{{- with $r.tls.serverSni }}
+
+[immutable_store.composite.replica_factory.tls]
+server_sni = {{ . | quote }}
+{{- end }}
+
+[immutable_store.composite.replica_factory.tls.client_certs]
+cert_file = "/etc/lore/replication-tls/{{ $r.tls.certKey }}"
+pkey_file = "/etc/lore/replication-tls/{{ $r.tls.keyKey }}"
+cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
+{{- end }}
+{{- end }}
+{{- end -}}
+
+{{/*
+The replication cert as a client cert block. Root context.
+*/}}
+{{- define "lore.replicationClientCertsToml" -}}
+{{- $r := .Values.replication -}}
+cert_file = "/etc/lore/replication-tls/{{ $r.tls.certKey }}"
+pkey_file = "/etc/lore/replication-tls/{{ $r.tls.keyKey }}"
+cert_chain = "/etc/lore/replication-tls/{{ $r.tls.caKey }}"
+{{- end -}}
+
+{{/*
+Store tables for backend.type=edge: /data/cache in front of the upstream's replication
+endpoint, the upstream as the mutable store, a local lock store, and forwarded requests.
+Every block opens its own table (see the TOML ORDERING INVARIANT). Root context.
+*/}}
+{{- define "lore.edgeStoreToml" -}}
+{{- $edge := .Values.backend.edge -}}
+[immutable_store]
+mode = "composite"
+
+[immutable_store.composite.local]
+mode = "local"
+
+[immutable_store.composite.local.local]
+path = "/data/cache"
+flush_delay_seconds = {{ int $edge.cacheFlushDelaySeconds }}
+{{- with (include "lore.storeGcToml" .Values.data.store) }}
+{{ . }}
+{{- end }}
+
+[immutable_store.composite.durable]
+mode = "replicated"
+
+[immutable_store.composite.durable.replicated]
+remote_url = {{ printf "quics://%s" $edge.upstreamInternalAddress | quote }}
+periodic_client_refresh_secs = {{ int $edge.periodicClientRefreshSeconds }}
+{{- with $edge.expectedRttMs }}
+expected_rtt_ms = {{ int . }}
+{{- end }}
+
+[immutable_store.composite.durable.replicated.regenerate_retry]
+initial_backoff_ms = {{ int $edge.regenerateRetry.initialBackoffMs }}
+max_backoff_ms = {{ int $edge.regenerateRetry.maxBackoffMs }}
+max_attempts = {{ int $edge.regenerateRetry.maxAttempts }}
+
+[immutable_store.composite.durable.replicated.certs]
+{{ include "lore.replicationClientCertsToml" . }}
+{{- include "lore.replicaFactoryToml" . }}
+
+[mutable_store]
+mode = "remote"
+
+[mutable_store.remote]
+remote_url = {{ $edge.upstreamURL | quote }}
+
+[lock_store]
+mode = "local"
+
+[server.grpc_public_services.forwarded_requests.client]
+url = {{ printf "https://%s" $edge.upstreamInternalAddress | quote }}
+
+[server.grpc_public_services.forwarded_requests.client.certs]
+{{ include "lore.replicationClientCertsToml" . }}
+{{- with $edge.forwardedRpcs }}
+
+[server.grpc_public_services.forwarded_requests.enabled_rpcs]
+{{- range $rpc := . }}
+{{ $rpc }} = true
 {{- end }}
 {{- end }}
 {{- end -}}

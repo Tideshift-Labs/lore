@@ -288,7 +288,11 @@ mod support {
         let (sink, callback) = make_sink();
         let status = close(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeCloseArgs { id: 1, handle },
+            LoreRevisionTreeCloseArgs {
+                id: 1,
+                handle,
+                ..Default::default()
+            },
             callback,
         )
         .await;
@@ -316,6 +320,7 @@ mod add_tests {
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
     use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreNodeType;
     use lore_revision::interface::LoreString;
@@ -894,7 +899,9 @@ mod add_tests {
     /// under a parent the same batch creates.
     ///
     /// The rest are names the node name table refuses, among them the
-    /// repository's own directory in any ASCII case. They are checked
+    /// repository's own directory in any ASCII case, and a name over the
+    /// length bound, which rejects its batch as oversized rather than as an
+    /// invalid argument. They are checked
     /// here rather than at write time, so they fail as a rejection with nothing
     /// created — including when the offending entry sits between valid ones,
     /// which is the case that would otherwise apply part of the batch.
@@ -953,10 +960,6 @@ mod add_tests {
             (16, vec![entry(16, ROOT_NODE, "a\\b", LoreNodeType::File)]),
             (17, vec![entry(17, ROOT_NODE, "\0lead", LoreNodeType::File)]),
             (
-                18,
-                vec![entry(18, ROOT_NODE, &oversize, LoreNodeType::File)],
-            ),
-            (
                 22,
                 vec![entry(22, ROOT_NODE, ".urc", LoreNodeType::Directory)],
             ),
@@ -990,6 +993,22 @@ mod add_tests {
                 "got {events:?}"
             );
         }
+
+        let (status, events) = run_add(
+            handle,
+            vec![entry(18, ROOT_NODE, &oversize, LoreNodeType::File)],
+        )
+        .await;
+        assert_eq!(
+            status,
+            LoreError::Oversized as i32,
+            "a name over the length bound must reject its batch, got {events:?}"
+        );
+        assert_eq!(
+            add_completes(&events),
+            vec![(18, INVALID_NODE, LoreErrorCode::Oversized)],
+            "got {events:?}"
+        );
 
         assert!(
             child_names(handle, ROOT_NODE).await.is_empty(),
@@ -3449,6 +3468,7 @@ mod lifecycle_tests {
                 handle: lore::storage::handle::LoreStore {
                     handle_id: store_handle_id,
                 },
+                ..Default::default()
             },
             callback,
         )
@@ -3615,6 +3635,7 @@ mod interop_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 }]),
             },

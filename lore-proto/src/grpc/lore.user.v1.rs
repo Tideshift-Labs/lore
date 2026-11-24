@@ -625,6 +625,13 @@ pub mod repository_registry_service_client {
     /// repository on create, unregisters it on delete, and asks it which
     /// repositories a caller may list. Every RPC is called with the token in the
     /// gRPC metadata as `authorization: Bearer <token>`.
+    ///
+    /// The registry answers each rejection with the status code the RPC
+    /// documents. A rejection the RPC documents with a reason carries a
+    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, as
+    /// `lore/error/v1/error.proto` defines it: `domain` `lore.error.v1`, `reason`
+    /// the name of a `lore.error.v1.ErrorReason` value, and `metadata["field"]`
+    /// the request field the reason is about.
     #[derive(Debug, Clone)]
     pub struct RepositoryRegistryServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -709,7 +716,9 @@ pub mod repository_registry_service_client {
         }
         /// Stream the repositories the bearer holds permissions on, one per
         /// message, with the permissions held on each. Repositories the bearer
-        /// holds no permission on are not listed.
+        /// holds no permission on are not listed. The registry refuses with
+        /// `PERMISSION_DENIED` when the caller may not list repositories, and with
+        /// `UNAUTHENTICATED` when the token is missing, invalid or expired.
         pub async fn repository_list(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryListRequest>,
@@ -742,6 +751,13 @@ pub mod repository_registry_service_client {
         /// Register a repository the Lore server is creating, with the caller as
         /// its owner, so that `RepositoryList` lists it. The Lore server calls this
         /// before it stores the repository and refuses the create when this fails.
+        /// The registry refuses with:
+        ///
+        /// * `ALREADY_EXISTS` when the repository is registered under another name. See `RepositoryRegisterResponse`.
+        /// * `PERMISSION_DENIED` when the caller may not create the repository.
+        /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
+        /// * `NOT_FOUND` when an entity the registry requires for the registration does not exist. The registry defines which entities it requires.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
         pub async fn repository_register(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryRegisterRequest>,
@@ -773,7 +789,9 @@ pub mod repository_registry_service_client {
         }
         /// Unregister a repository the Lore server is deleting. The Lore server
         /// refuses the delete when this fails, so the registry authorizes the
-        /// delete.
+        /// delete. The registry refuses with `PERMISSION_DENIED` when the caller may
+        /// not delete the repository, and with `UNAUTHENTICATED` when the token is
+        /// missing, invalid or expired.
         pub async fn repository_unregister(
             &mut self,
             request: impl tonic::IntoRequest<super::RepositoryUnregisterRequest>,
@@ -826,7 +844,9 @@ pub mod repository_registry_service_server {
             + 'static;
         /// Stream the repositories the bearer holds permissions on, one per
         /// message, with the permissions held on each. Repositories the bearer
-        /// holds no permission on are not listed.
+        /// holds no permission on are not listed. The registry refuses with
+        /// `PERMISSION_DENIED` when the caller may not list repositories, and with
+        /// `UNAUTHENTICATED` when the token is missing, invalid or expired.
         async fn repository_list(
             &self,
             request: tonic::Request<super::RepositoryListRequest>,
@@ -837,6 +857,13 @@ pub mod repository_registry_service_server {
         /// Register a repository the Lore server is creating, with the caller as
         /// its owner, so that `RepositoryList` lists it. The Lore server calls this
         /// before it stores the repository and refuses the create when this fails.
+        /// The registry refuses with:
+        ///
+        /// * `ALREADY_EXISTS` when the repository is registered under another name. See `RepositoryRegisterResponse`.
+        /// * `PERMISSION_DENIED` when the caller may not create the repository.
+        /// * `UNAUTHENTICATED` when the token is missing, invalid or expired.
+        /// * `NOT_FOUND` when an entity the registry requires for the registration does not exist. The registry defines which entities it requires.
+        /// * `INVALID_ARGUMENT` with an `ErrorInfo` field of `name` and a reason of `ERROR_REASON_INVALID_FORMAT`, `ERROR_REASON_MISSING_REQUIRED_FIELD` or `ERROR_REASON_UNSPECIFIED` when the registry rejects the name.
         async fn repository_register(
             &self,
             request: tonic::Request<super::RepositoryRegisterRequest>,
@@ -846,7 +873,9 @@ pub mod repository_registry_service_server {
         >;
         /// Unregister a repository the Lore server is deleting. The Lore server
         /// refuses the delete when this fails, so the registry authorizes the
-        /// delete.
+        /// delete. The registry refuses with `PERMISSION_DENIED` when the caller may
+        /// not delete the repository, and with `UNAUTHENTICATED` when the token is
+        /// missing, invalid or expired.
         async fn repository_unregister(
             &self,
             request: tonic::Request<super::RepositoryUnregisterRequest>,
@@ -860,6 +889,13 @@ pub mod repository_registry_service_server {
     /// repository on create, unregisters it on delete, and asks it which
     /// repositories a caller may list. Every RPC is called with the token in the
     /// gRPC metadata as `authorization: Bearer <token>`.
+    ///
+    /// The registry answers each rejection with the status code the RPC
+    /// documents. A rejection the RPC documents with a reason carries a
+    /// `google.rpc.ErrorInfo` (AIP-193) in the status details, as
+    /// `lore/error/v1/error.proto` defines it: `domain` `lore.error.v1`, `reason`
+    /// the name of a `lore.error.v1.ErrorReason` value, and `metadata["field"]`
+    /// the request field the reason is about.
     #[derive(Debug)]
     pub struct RepositoryRegistryServiceServer<T> {
         inner: Arc<T>,

@@ -90,8 +90,8 @@ async fn list_path_yields_a_directory_listing() {
         panic!("a directory must list");
     };
     let mut names = Vec::new();
-    while let Some(entry) = listing.next().await {
-        if let Some(item) = file_list_item(entry).expect("entry name") {
+    while let Some(item) = listing.next().await {
+        if let Some(item) = item.expect("entry name") {
             names.push(item.name);
         }
     }
@@ -114,8 +114,8 @@ async fn a_listing_skips_a_link_to_a_file_it_would_otherwise_track() {
         panic!("a directory must list");
     };
     let mut names = Vec::new();
-    while let Some(entry) = listing.next().await {
-        if let Some(item) = file_list_item(entry).expect("entry name") {
+    while let Some(item) = listing.next().await {
+        if let Some(item) = item.expect("entry name") {
             names.push(item.name);
         }
     }
@@ -181,7 +181,7 @@ async fn list_path_describes_a_file_by_its_own_name() {
         panic!("a file must be described, not listed");
     };
     assert_eq!(item.name, "lonely.txt");
-    assert_eq!(item.metadata.len, 4);
+    assert_eq!(item.info.size(), 4);
 }
 
 #[tokio::test]
@@ -604,6 +604,34 @@ async fn rename_merges_a_directory_into_the_one_at_the_destination() {
     assert!(!from.exists(), "the source must be gone");
 }
 
+/// A rename into a directory the file system lacks is refused for a directory as for a file: the
+/// source keeps what it holds, and nothing is created at the destination.
+#[tokio::test]
+async fn rename_refuses_a_destination_whose_directory_is_missing() {
+    let dir = temp_dir();
+    std::fs::create_dir(dir.path().join("from")).expect("create source");
+    std::fs::write(dir.path().join("from").join("child"), b"kept").expect("write child");
+    std::fs::write(dir.path().join("file"), b"kept").expect("write file");
+    let operation = os_operation(dir.path()).await;
+
+    for source in ["from", "file"] {
+        operation
+            .rename(&relative(source), &relative(&format!("missing/{source}")))
+            .await
+            .expect_err("the destination's directory is missing");
+    }
+
+    assert!(!dir.path().join("missing").exists());
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(dir.path().join("from").join("child")).ok()
+    );
+    assert_eq!(
+        Some(b"kept".to_vec()),
+        std::fs::read(dir.path().join("file")).ok()
+    );
+}
+
 /// A file and a directory are not two spellings of one thing, so there is no move that leaves
 /// one of them.
 #[tokio::test]
@@ -1011,4 +1039,104 @@ async fn an_operation_touches_nothing_at_a_path_that_leaves_its_root() {
             }
         })
         .await;
+}
+
+/// A batched read of whether paths hold directories answers each in order, in its own spelling:
+/// a directory holds one, and nothing, a file or a path through a file none, as the trait's
+/// default, one file-information read a path, answers too. The paths span more of the blocking
+/// tasks the read takes than run at once, which answer in order.
+#[tokio::test]
+async fn directories_held_answers_each_path_in_order_as_one_read_a_path_does() {
+    let dir = temp_dir();
+    for index in 0..650 {
+        std::fs::create_dir_all(dir.path().join(format!("d{index}/inner"))).expect("mkdir");
+    }
+    std::fs::write(dir.path().join("file"), b"data").expect("write file");
+    let mut spelled = vec![
+        "d0".to_string(),
+        "d0/inner".to_string(),
+        "gone".to_string(),
+        "file".to_string(),
+        "file/below".to_string(),
+        "D1".to_string(),
+    ];
+    spelled.extend((0..1300).map(|index| format!("d{index}")));
+    let paths: Arc<[RelativePath]> = spelled
+        .iter()
+        .map(|spelled| crate::helper::relative_path(spelled))
+        .collect();
+    let mut expected = vec![
+        true,
+        true,
+        false,
+        false,
+        false,
+        case_insensitive(dir.path()),
+    ];
+    expected.extend((0..1300).map(|index| index < 650));
+
+    let root = dir.path().to_path_buf();
+    let (batched, one_by_one) = LORE_CONTEXT
+        .scope(setup_test_execution(), async move {
+            let mut batched = Vec::new();
+            os_operation(&root)
+                .await
+                .directories_held(paths.clone(), &mut batched)
+                .await
+                .expect("the batched read");
+            let reading = crate::fs::filesystem_provider::TestFilesystemProvider::reading(&root);
+            let operation = FilesystemProvider::begin_operation(&reading)
+                .await
+                .expect("an operation of the test provider");
+            let mut one_by_one = Vec::new();
+            operation
+                .directories_held(paths, &mut one_by_one)
+                .await
+                .expect("the read a path at a time");
+            (batched, one_by_one)
+        })
+        .await;
+    assert_eq!(batched, expected);
+    assert_eq!(one_by_one, expected);
+}
+
+/// A path a stat is refused permission for holds a directory in a batched read: it may be one the
+/// user may not search, which no deletion took.
+#[cfg(target_family = "unix")]
+#[tokio::test]
+async fn directories_held_takes_a_path_refused_permission_as_held() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Safety: `geteuid` takes no arguments and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: no permission refuses root a stat");
+        return;
+    }
+    let dir = temp_dir();
+    std::fs::create_dir_all(dir.path().join("locked/inner")).expect("mkdir");
+    std::fs::set_permissions(
+        dir.path().join("locked"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("lock the directory");
+    let root = dir.path().to_path_buf();
+    let held = LORE_CONTEXT
+        .scope(setup_test_execution(), async move {
+            let mut held = Vec::new();
+            let read = os_operation(&root)
+                .await
+                .directories_held(
+                    Arc::from([crate::helper::relative_path("locked/inner")]),
+                    &mut held,
+                )
+                .await;
+            (read.map(|()| held), root)
+        })
+        .await;
+    std::fs::set_permissions(
+        dir.path().join("locked"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("unlock the directory");
+    assert_eq!(held.0.expect("the batched read"), [true]);
 }

@@ -424,6 +424,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let metadata = RepositoryMetadata {
                 name: name.clone(),
@@ -661,6 +662,7 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 immutable_store,
                 mutable_store,
                 repository_id,
+                lore_revision::state::allow_all_repositories(),
             ));
             let write_token = lore_server::grpc::get_write_token();
 
@@ -692,6 +694,7 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 .expect("serialize main state");
             let head = lore_server::grpc::handlers::branch_push::push(
                 repo.clone(),
+                None,
                 main,
                 state_hash,
                 lore_server::grpc::handlers::branch_push::PushAccess {

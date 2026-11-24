@@ -1683,8 +1683,7 @@ fn neither_module_logs_a_parameter_a_diagnostic_or_an_identifier() {
             let call = &tail[..end];
             let arguments = call
                 .split_once('(')
-                .map(|(_, rest)| rest.trim_end_matches(");").trim())
-                .unwrap_or_default();
+                .map_or_default(|(_, rest)| rest.trim_end_matches(");").trim());
             assert!(
                 arguments.starts_with('"') && arguments.ends_with('"'),
                 "{label}: a tracing call takes something other than one string literal: {call}"

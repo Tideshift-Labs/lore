@@ -18,6 +18,7 @@ async fn caller_required_revision_lists_preserve_history_without_mutable_backfil
                     immutable.clone(),
                     mutable.clone(),
                     repository,
+                    lore_revision::state::allow_all_repositories(),
                 ));
                 // v1 needs latest two bands above the page. Upstream 7b1eeab8 answers a page
                 // whose successor shares latest's band from that band alone, with no descent

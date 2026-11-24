@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
 use lore_telemetry::tracing::fields::USER_ID;
+use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
@@ -18,6 +19,7 @@ use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::permits_with;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
@@ -109,7 +111,7 @@ impl Message for Connect {
                     let grants = repository_authorizer
                         .granted_access(Some(&token), self.repository)
                         .await
-                        .map_err(|status| MessageHandleError::from_authorization_status(&status))?;
+                        .map_err(MessageHandleError::from_authorization)?;
                     if let Some(grants) = grants {
                         context.insert(PartitionGrants {
                             repository_id: self.repository,
@@ -142,9 +144,7 @@ impl Message for Connect {
             if let Some(grants) = repository_authorizer
                 .granted_access(None, self.repository)
                 .await
-                .map_err(|status| {
-                    MessageHandleError::AuthorizationFailure(status.message().to_string())
-                })?
+                .map_err(MessageHandleError::from_authorization)?
             {
                 // Enumerated without a token too, so each command is a set lookup
                 // rather than an authorizer call.
@@ -173,18 +173,21 @@ impl Response for ConnectResponse {
 
 /// [`RepositoryAuthorizer::permits`] for a urc/0.2 connection: answered from
 /// the grants connect stored, asked of the authorizer with the connection's
-/// token otherwise. `None` before connect, when no partition is named.
+/// token otherwise. `Ok(None)` before connect, when no partition is named.
+/// `Err` when the check failed rather than denied.
 pub async fn connection_permits(
     context: &AttributeMap,
     authorizer: &dyn RepositoryAuthorizer,
     action: Action,
-) -> Option<bool> {
-    let repository = *context.get::<RepositoryId>()?;
+) -> Result<Option<bool>, Status> {
+    let Some(repository) = context.get::<RepositoryId>().map(|repository| *repository) else {
+        return Ok(None);
+    };
     if let Some(grants) = context
         .get::<PartitionGrants>()
         .filter(|grants| grants.repository_id == repository)
     {
-        return Some(grants.grants.permits(action));
+        return Ok(Some(grants.grants.permits(action)));
     }
     let raw = context.get::<RawToken>();
     let claims = context.get::<AuthorizationToken>();
@@ -195,10 +198,7 @@ pub async fn connection_permits(
         }),
         _ => None,
     };
-    Some(
-        authorizer
-            .check_repository_access(token.as_ref(), repository, action)
-            .await
-            .is_ok(),
-    )
+    permits_with(authorizer, None, token.as_ref(), repository, action)
+        .await
+        .map(Some)
 }

@@ -26,6 +26,7 @@ use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
+use crate::state::allow_all_repositories;
 use crate::store::StoreMatch;
 use crate::store::remote::RemoteImmutableStore;
 use crate::store::remote::RemoteMutableStore;
@@ -111,6 +112,7 @@ async fn children(
         .forward::<ObliterateError>("validating fragment dependencies")?;
     Ok(references
         .iter()
+        .filter(|reference| !reference.is_hole())
         .map(|reference| Address {
             hash: reference.hash,
             context: address.context,
@@ -349,6 +351,7 @@ async fn check(repository: &Arc<RepositoryContext>, target: Address) {
                         Arc::new(RemoteImmutableStore::new(remote.remote_url(), identity)),
                         Arc::new(RemoteMutableStore::new(remote.remote_url(), identity)),
                         repository.id,
+                        allow_all_repositories(),
                     ));
                     let branches: Vec<_> = branches
                         .iter()

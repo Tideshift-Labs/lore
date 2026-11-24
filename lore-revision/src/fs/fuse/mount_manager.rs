@@ -4,15 +4,19 @@
 //! and the stops that release them.
 
 use std::any::Any;
+use std::collections::BTreeSet;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use dashmap::DashMap;
 use lore_base::error::InvalidPath;
 use lore_base::error::MountsBusy;
+use lore_base::fs::lock::FSLock;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::ForwardAny;
 use lore_error_set::ForwardStrict;
@@ -20,13 +24,24 @@ use lore_error_set::WrapInternal;
 
 use crate::fs::fuse::mount::FuseMount;
 use crate::fs::mount_manager::MountManagerError;
+use crate::fs::mount_manager::MountRecord;
 use crate::fs::mount_manager::PendingFuseMount;
+use crate::fs::mount_manager::external_dir_of;
 use crate::fs::swfs::paths::MountPath;
+use crate::global::external_dir::access::resolve_shared;
+use crate::global::external_dir::canonical_global_data_dir;
 use crate::global::external_dir::external_dir_for_instance;
+use crate::global::external_dir::external_dirs_root;
+use crate::global::external_dir::resolve::RootState;
+use crate::global::external_dir::resolve::resolve;
+use crate::instance::CLONE_IN_PROGRESS_MARK;
 use crate::instance::InstanceId;
 use crate::instance::InstanceMetadata;
 use crate::instance::InstanceStaleness;
+use crate::instance::REMOVING_SUFFIX;
 use crate::instance::instance_staleness;
+use crate::instance::is_present;
+use crate::instance::removing_path;
 use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_warn;
@@ -89,14 +104,20 @@ async fn remove_made_mount_point(path: &Path, made: bool) {
 
 /// Removes the external directory of a FUSE instance whose mount point was deleted, so the
 /// instance is not mounted again; the next prune of its store retires the registration. Reports
-/// whether the mount point was deleted. A path that cannot be reached is not deleted.
-pub(crate) async fn remove_deleted_instance(instance: &InstanceMetadata) -> bool {
-    if instance_staleness(&instance.path, instance.instance_id).await
+/// whether the mount point was deleted. A path that cannot be reached is not deleted. The
+/// instance's staleness is judged in the external root `state`, where its Lore directory is
+/// `dot_lore`.
+pub(crate) async fn remove_deleted_instance(
+    state: &RootState,
+    instance: &InstanceMetadata,
+    dot_lore: &Path,
+) -> bool {
+    if instance_staleness(state, &instance.path, instance.instance_id).await
         != InstanceStaleness::PathMissing
     {
         return false;
     }
-    match external_dir_for_instance(instance.instance_id) {
+    match external_dir_of(dot_lore) {
         Ok(external) => match lore_io::IoDriver::global().remove_dir_all(&external).await {
             Ok(()) => lore_info!(
                 "Removed FUSE instance {} whose mount point {} was deleted",
@@ -115,6 +136,187 @@ pub(crate) async fn remove_deleted_instance(instance: &InstanceMetadata) -> bool
         ),
     }
     true
+}
+
+/// The FUSE instance `instance_id`, whose Lore directory is `dot_lore`, resolved in the global
+/// data directory whose canonical path is `global`, mounted read-write at `mount_path` at the
+/// revision its anchors name, over `repository`'s stores, with its config `config`. The
+/// instance's context is built in the context this runs in, which decides how the mount reaches
+/// its remote.
+async fn mount_at_current(
+    repository: &RepositoryContext,
+    mount_path: &MountPath,
+    (instance_id, dot_lore, global): (InstanceId, &Path, Arc<Path>),
+    config: &RepositoryConfig,
+) -> Result<Arc<FuseMount>, MountManagerError> {
+    let instance_repository = Arc::new(
+        repository
+            .mounted_instance_context(mount_path.as_ref(), dot_lore, instance_id, config)
+            .forward_any::<MountManagerError>("Failed to open the mounted instance")?,
+    );
+    let (state, _branch) = State::deserialize_current(instance_repository.clone())
+        .await
+        .forward_any::<MountManagerError>("Failed to load the mounted revision")?;
+    let external = Arc::new(MountRecord {
+        external_dir: external_dir_of(dot_lore)?,
+        global,
+    });
+    let remote = instance_repository.serving_remote();
+    FuseMount::mount_writable(
+        (instance_repository, remote),
+        state,
+        mount_path.as_ref(),
+        instance_id,
+        config.vfs_base_time(),
+        external,
+    )
+    .await
+    .forward_any::<MountManagerError>("Failed to mount FUSE instance")
+}
+
+/// Removes what cloning virtual clones left among the external directories where it stopped part
+/// way, as a crash of the service stops it, passing over any whose lock is held:
+///
+/// - a directory a removal renamed aside, which is known by its name alone;
+/// - an external directory marked as being cloned whose instance is not in `registered`,
+///   the instances of every shared store the service knows, with the empty mount point its mark
+///   names. A marked one whose instance is registered was registered before cloning stopped,
+///   so only its mark is removed, and the start mounts it as it mounts any registered instance.
+///   With `registered` `None`, as where a store could not be listed, no marked directory is
+///   removed;
+/// - a lock file that cloning left with no marked directory.
+///
+/// The external directories are those in the external root `state` found available. Cold: runs
+/// once as a service starts, and once as recovery in the background finishes.
+#[lore_macro::test_pub]
+pub(crate) async fn remove_interrupted_clones(
+    state: &RootState,
+    registered: Option<&BTreeSet<InstanceId>>,
+) {
+    let Ok(root) = external_dirs_root(state) else {
+        return;
+    };
+    let io = lore_io::IoDriver::global();
+    let Ok(mut entries) = io.read_dir(&root).await else {
+        return;
+    };
+    let mut names = Vec::new();
+    loop {
+        match entries.next().await {
+            Some(Ok(entry)) => names.push(entry.file_name),
+            Some(Err(_)) => {}
+            None => break,
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for name in &names {
+        let Some(text) = name.to_str() else {
+            continue;
+        };
+        let instance = text
+            .strip_suffix(REMOVING_SUFFIX)
+            .or_else(|| text.strip_suffix(FSLock::FILE_LOCK_SUFFIX))
+            .unwrap_or(text);
+        let Some(instance_id) = InstanceId::from_hex(instance) else {
+            continue;
+        };
+        if seen.insert(instance_id) {
+            remove_interrupted_clone(&root.join(instance), instance_id, registered).await;
+        }
+    }
+}
+
+/// [`remove_interrupted_clones`] for the new instance `instance_id` whose external directory would
+/// be `external`.
+async fn remove_interrupted_clone(
+    external: &Path,
+    instance_id: InstanceId,
+    registered: Option<&BTreeSet<InstanceId>>,
+) {
+    let io = lore_io::IoDriver::global();
+    let removing = removing_path(external);
+    let mark = external.join(DOT_LORE).join(CLONE_IN_PROGRESS_MARK);
+    let aside = is_present(&removing).await;
+    let marked = io.metadata(&mark).await.is_ok();
+    let named = external.to_path_buf();
+    let has_lock_file =
+        match lore_base::lore_spawn_blocking!(move || FSLock::lock_file_of(&named)).await {
+            Ok(Ok(file)) => io.metadata(file).await.is_ok(),
+            _ => false,
+        };
+    // Locked only where something is left to remove, so a live instance's directory gets no lock
+    // file.
+    if !aside && !marked && !has_lock_file {
+        return;
+    }
+    let locking = external.to_path_buf();
+    let Ok(Ok(Some(lock))) =
+        lore_base::lore_spawn_blocking!(move || FSLock::try_acquire_file_lock(&locking)).await
+    else {
+        return;
+    };
+    let removed = if aside {
+        remove_left_by_a_clone(&removing).await
+    } else if !marked {
+        true
+    } else if registered.is_some_and(|registered| registered.contains(&instance_id)) {
+        if let Err(error) = io.remove_file(&mark).await {
+            lore_warn!(
+                "Unable to remove the mark of an instance being cloned from {}: {error}",
+                external.display()
+            );
+        }
+        true
+    } else if registered.is_some() {
+        if let Ok(named) = io.read_file_bytes(&mark).await
+            && !named.is_empty()
+        {
+            remove_empty_mount_point(Path::new(std::ffi::OsStr::from_bytes(&named))).await;
+        }
+        remove_left_by_a_clone(external).await
+    } else {
+        false
+    };
+    if removed {
+        crate::instance::release_in_progress_lock(external, lock).await;
+    }
+}
+
+/// Removes the directory at `path` where it is empty, as the mount point cloning made and never
+/// mounted on is. Anything else there stays.
+async fn remove_empty_mount_point(path: &Path) {
+    match lore_io::IoDriver::global().remove_dir(path).await {
+        Ok(()) => lore_info!(
+            "Removed {}, a mount point a crash left while cloning",
+            path.display()
+        ),
+        Err(error) => lore_debug!(
+            "Left {}, which a crash left while cloning: {error}",
+            path.display()
+        ),
+    }
+}
+
+/// Removes `path`, which cloning a FUSE instance left, warning where it cannot, and says
+/// whether it is gone.
+async fn remove_left_by_a_clone(path: &Path) -> bool {
+    match lore_io::IoDriver::global().remove_dir_all(path).await {
+        Ok(()) => {
+            lore_info!(
+                "Removed {}, which cloning a FUSE instance left",
+                path.display()
+            );
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            lore_warn!(
+                "Unable to remove {}, which cloning a FUSE instance left: {error}",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 /// The service's FUSE mounts.
@@ -156,7 +358,7 @@ impl FuseMountManager {
                 .remount_instance(
                     fuse.repository,
                     &fuse.instance,
-                    &fuse.dot_lore,
+                    (&fuse.dot_lore, fuse.global),
                     &fuse.config,
                 )
                 .await
@@ -169,13 +371,14 @@ impl FuseMountManager {
         }
     }
 
-    /// Mounts a fresh FUSE instance at `repository_path`, empty until its first swap.
+    /// Mounts a fresh FUSE instance at `repository_path`, empty until its first swap, over the
+    /// external directory `external` records.
     pub async fn create_mount(
         &self,
         repository: Arc<RepositoryContext>,
         repository_path: &Path,
         repository_config: &RepositoryConfig,
-        instance_id: InstanceId,
+        (instance_id, external): (InstanceId, Arc<MountRecord>),
     ) -> Result<(), MountManagerError> {
         let mount_path = MountPath::new(repository_path)
             .forward::<MountManagerError>("Failed to make mount path")?;
@@ -186,8 +389,6 @@ impl FuseMountManager {
             )));
         }
         let base_time = repository_config.vfs_base_time();
-        let external_dir = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("Unable to get external directory")?;
         // Made in the caller's context, as the external directory is: its connect authenticates
         // as the caller, with the credentials the call supplied, and the mount serving that
         // caller's instance holds the connection for its life.
@@ -200,7 +401,7 @@ impl FuseMountManager {
                 mount_path.as_ref(),
                 instance_id,
                 base_time,
-                external_dir,
+                external,
             )))
             .await
             .forward_any::<MountManagerError>("Failed to mount FUSE instance")?;
@@ -237,12 +438,14 @@ impl FuseMountManager {
 
     /// Mounts an existing FUSE instance at its current revision, first detaching a stale
     /// endpoint a crashed service left at its path. Inode numbers derive from paths, so a
-    /// remounted instance answers with the numbers it had before.
+    /// remounted instance answers with the numbers it had before. Its Lore directory is
+    /// `dot_lore`, which the caller resolved in the global data directory whose canonical path is
+    /// `global`.
     pub async fn remount_instance(
         &self,
         repository: Arc<RepositoryContext>,
         instance: &InstanceMetadata,
-        dot_lore: &Path,
+        (dot_lore, global): (&Path, Arc<Path>),
         config: &RepositoryConfig,
     ) -> Result<(), MountManagerError> {
         let mount_path = MountPath::new(Path::new(&instance.path))
@@ -265,36 +468,47 @@ impl FuseMountManager {
         .internal("stale mount probe panicked")?
         .internal("Failed to detach a stale mount")?;
 
-        let instance_repository = Arc::new(
-            repository
-                .mounted_instance_context(
-                    mount_path.as_ref(),
-                    dot_lore,
-                    instance.instance_id,
-                    config,
-                )
-                .forward_any::<MountManagerError>("Failed to open the mounted instance")?,
-        );
-        let base_time = config.vfs_base_time();
         // Boxed: loading the revision and starting a session make a large future.
-        let mount = Box::pin(self.in_service_context(async {
-            let (state, _branch) = State::deserialize_current(instance_repository.clone())
-                .await
-                .forward_any::<MountManagerError>("Failed to load the mounted revision")?;
-            let external_dir = external_dir_for_instance(instance.instance_id)
-                .forward::<MountManagerError>("Unable to get external directory")?;
-            let remote = instance_repository.serving_remote();
-            FuseMount::mount_writable(
-                (instance_repository, remote),
-                state,
-                mount_path.as_ref(),
-                instance.instance_id,
-                base_time,
-                external_dir,
-            )
-            .await
-            .forward_any::<MountManagerError>("Failed to mount FUSE instance")
-        }))
+        let mount = Box::pin(self.in_service_context(mount_at_current(
+            &repository,
+            &mount_path,
+            (instance.instance_id, dot_lore, global),
+            config,
+        )))
+        .await?;
+        self.mounts.insert(mount_path.clone(), mount);
+        self.refuse_while_stopping(&mount_path).await
+    }
+
+    /// Mounts the virtual clone `instance_id`, whose external directory cloning another instance
+    /// has just written and whose Lore directory is `dot_lore`, at the revision its anchors name,
+    /// on the empty mount point the caller made at `path`, over `repository`'s stores. Built in
+    /// the context of the call making it, as [`Self::create_mount`] builds a fresh instance's
+    /// mount, so the mount reads the configuration and credentials its caller reads.
+    pub async fn mount_clone(
+        &self,
+        repository: &RepositoryContext,
+        path: &Path,
+        (instance_id, dot_lore): (InstanceId, &Path),
+        config: &RepositoryConfig,
+    ) -> Result<(), MountManagerError> {
+        let mount_path =
+            MountPath::new(path).forward::<MountManagerError>("Failed to make mount path")?;
+        if self.mounts.contains_key(&mount_path) {
+            return Err(MountManagerError::internal(format!(
+                "Mount already exists for path {}",
+                path.display()
+            )));
+        }
+        let global = canonical_global_data_dir()
+            .forward::<MountManagerError>("Unable to get the global data directory")?;
+        // Boxed: loading the revision and starting a session make a large future.
+        let mount = Box::pin(self.in_serving_context(mount_at_current(
+            repository,
+            &mount_path,
+            (instance_id, dot_lore, global),
+            config,
+        )))
         .await?;
         self.mounts.insert(mount_path.clone(), mount);
         self.refuse_while_stopping(&mount_path).await
@@ -336,8 +550,12 @@ impl FuseMountManager {
                 to.display()
             )));
         }
-        let dot_lore = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("locating the instance's external directory")?
+        let dot_lore = mount
+            .record()
+            .ok_or_else(|| {
+                MountManagerError::internal(format!("{} is mounted read-only", from.display()))
+            })?
+            .external_dir
             .join(DOT_LORE);
         let config = load_repository_config_from_dot_dir(&dot_lore)
             .forward_any::<MountManagerError>("loading the instance's config")?;
@@ -496,29 +714,42 @@ impl FuseMountManager {
 
     /// Undoes a FUSE clone that failed: unmounts lazily whatever the manager still tracks there,
     /// removes the instance's external directory, and removes an empty mount point this created.
+    /// The external directory is the one the clone's mount recorded, or, where nothing is mounted
+    /// there, the instance's in the external root a resolution finds.
     pub async fn abandon_clone(
         &self,
         repository_path: &Path,
         instance_id: InstanceId,
         created_mount_point: bool,
     ) -> Result<(), MountManagerError> {
-        if let Some(mount) = self.mounted(repository_path)
+        let mounted = self.mounted(repository_path);
+        let recorded = mounted
+            .as_ref()
+            .and_then(|mount| mount.record())
+            .map(|record| record.external_dir.clone());
+        if let Some(mount) = mounted
             && let Ok(mount_path) = MountPath::new(repository_path)
             && let Err(error) = self.unmount_tracked(&mount_path, &mount, true).await
         {
             lore_warn!(
-                "Lazy unmount failed while abandoning FUSE clone at {}: {error}",
+                "Lazy unmount failed while abandoning the FUSE instance at {}: {error}",
                 repository_path.display()
             );
             // Forgets only the clone's own mount, not one made at the path since.
             self.mounts
                 .remove_if(&mount_path, |_, entry| Arc::ptr_eq(entry, &mount));
         }
-        let external = external_dir_for_instance(instance_id)
-            .forward::<MountManagerError>("Locating the abandoned clone's external directory")?;
+        let external = match recorded {
+            Some(external) => external,
+            None => resolve_shared()
+                .and_then(|state| external_dir_for_instance(&state, instance_id))
+                .forward::<MountManagerError>(
+                    "Locating the abandoned FUSE instance's external directory",
+                )?,
+        };
         if let Err(error) = lore_io::IoDriver::global().remove_dir_all(&external).await {
             lore_warn!(
-                "Failed to remove external directory {} left after an abandoned FUSE clone: {error}",
+                "Failed to remove external directory {} left after an abandoned FUSE instance: {error}",
                 external.display()
             );
         }
@@ -529,7 +760,7 @@ impl FuseMountManager {
             && error.kind() != std::io::ErrorKind::DirectoryNotEmpty
         {
             lore_warn!(
-                "Unable to remove mount point {} left after an abandoned FUSE clone: {error}",
+                "Unable to remove mount point {} left after an abandoned FUSE instance: {error}",
                 repository_path.display()
             );
         }
@@ -539,18 +770,21 @@ impl FuseMountManager {
     /// Unmounts every FUSE instance, as the service does when it stops.
     ///
     /// Without `force`, each mount gets a plain unmount, which the kernel refuses while anything
-    /// holds the mount. If any is refused, the ones this call already unmounted are mounted
-    /// again at the revision they served, so a refused stop leaves every instance mounted and
-    /// served; derived inode numbers make the remount invisible to anything that looks up paths
-    /// afresh. Busy paths are reported in `MountsBusy`. Asking first is not an option:
-    /// `umount2(MNT_EXPIRE)` needs `CAP_SYS_ADMIN`, and a `/proc` scan cannot see other users'
-    /// or root's processes and still races the unmount. With `force`, every mount is detached
-    /// lazily and forgotten; nothing is remounted, and a path that stays attached is named in a
-    /// warning while the stop goes ahead. From the snapshot of the mounts on, a mount another
-    /// command makes is detached and fails, unless the stop is refused; once a stop goes ahead,
-    /// always. A mount someone else unmounted or abandoned meanwhile is never mounted again, nor
-    /// is one whose mount point a start would find missing (`InstanceStaleness::PathMissing`),
-    /// which is forgotten rather than its mount point made again.
+    /// holds the mount. A refused one is retried until one busy window after the stop began, as
+    /// [`FuseMount::unmount_retrying_busy_since`] does, so the stop waits one window in all rather
+    /// than one per busy mount. If any is still refused, the ones this call already unmounted,
+    /// which stay unmounted while it retries, are mounted again at the revision they served, so a
+    /// refused stop leaves every instance mounted and served; derived inode numbers make the
+    /// remount invisible to anything that looks up paths afresh. Busy paths are reported in
+    /// `MountsBusy`. Asking first is not an option: `umount2(MNT_EXPIRE)` needs `CAP_SYS_ADMIN`,
+    /// and a `/proc` scan cannot see other users' or root's processes and still races the unmount.
+    /// With `force`, every mount is detached lazily and forgotten; nothing is remounted, and a path
+    /// that stays attached is named in a warning while the stop goes ahead. From the snapshot of
+    /// the mounts on, a mount another command makes is detached and fails, unless the stop is
+    /// refused; once a stop goes ahead, always. A mount someone else unmounted or abandoned
+    /// meanwhile is never mounted again, nor is one whose mount point a start would find missing
+    /// (`InstanceStaleness::PathMissing`), which is forgotten rather than its mount point made
+    /// again.
     ///
     /// SWFS mounts are not this manager's:
     /// [`SwfsMountManager::close_all`](crate::fs::swfs::mount_manager::SwfsMountManager::close_all)
@@ -573,13 +807,14 @@ impl FuseMountManager {
         let mut busy = Vec::new();
         let mut attached = Vec::new();
         let mut failure = None;
+        let started = Instant::now();
         for (mount_path, mount) in fuse_mounts {
             // A mount the map no longer holds was unmounted by someone else, as a move or another
             // stop does; its path may hold another mount now, which detaching by path would take.
             if !self.tracks_at(&mount_path, &mount) {
                 continue;
             }
-            match mount.unmount(force).await {
+            match mount.unmount_retrying_busy_since(force, started).await {
                 Ok(()) => unmounted.push((mount_path, mount)),
                 Err(error) if error.is_mounts_busy() => busy.push(mount.path.display().to_string()),
                 // One the map dropped meanwhile counts as unmounted too: gone from its path is
@@ -617,6 +852,7 @@ impl FuseMountManager {
         self.stop_step(StopStep::Unmounted).await;
 
         let refused = !force && (!busy.is_empty() || failure.is_some());
+        let state = if refused { resolve().ok() } else { None };
         for (mount_path, mount) in unmounted {
             if !refused {
                 self.mounts
@@ -628,7 +864,8 @@ impl FuseMountManager {
             }
             // Forgotten by the test a start applies, rather than its mount point made again.
             if let Some(path) = mount.path.to_str()
-                && instance_staleness(path, mount.instance_id).await
+                && let Some(state) = &state
+                && instance_staleness(state, path, mount.instance_id).await
                     == InstanceStaleness::PathMissing
             {
                 lore_info!(
@@ -736,7 +973,8 @@ impl FuseMountManager {
         });
         match (service, environment) {
             (Some(service), Some(environment)) => {
-                let serving: Arc<dyn Any + Send + Sync> = Arc::new(service.serving(environment));
+                let serving: Arc<dyn Any + Send + Sync> =
+                    Arc::new(service.serving(service.globals().clone(), Some(environment)));
                 LORE_CONTEXT.scope(serving, work).await
             }
             _ => self.in_service_context(work).await,

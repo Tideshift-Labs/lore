@@ -12,6 +12,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::error::MountsBusy;
+use lore_base::error::NotSupported;
 use lore_error_set::prelude::*;
 use lore_fuse::FuseError;
 use lore_fuse::init::InitConfig;
@@ -25,8 +26,11 @@ use lore_fuse::transport::device::DeviceTransport;
 use lore_storage::FlushOptions;
 use parking_lot::Mutex;
 
+use crate::fs::filesystem_provider::CloneAnswer;
+use crate::fs::filesystem_provider::CloneRun;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
+use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::fs::fuse::access_recorder::AccessRecorder;
@@ -36,6 +40,8 @@ use crate::fs::fuse::inode::Name;
 use crate::fs::fuse::inode::ROOT_INO;
 use crate::fs::fuse::notifications::Invalidations;
 use crate::fs::fuse::operation::FuseOperation;
+use crate::fs::mount_manager::MountRecord;
+use crate::fs::walk::CloneStats;
 use crate::instance::InstanceId;
 use crate::lore_debug;
 use crate::lore_warn;
@@ -51,7 +57,7 @@ const MAX_READ: u32 = 1 << 20;
 const DRAIN_WAIT: Duration = Duration::from_secs(2);
 
 /// How long an unmount checking for leaks waits for the kernel's FORGETs before it invalidates
-/// the root's children again.
+/// again.
 const DRAIN_RESEND: Duration = Duration::from_millis(50);
 
 /// How long the inode table must count no lookups before an unmount checking for leaks goes on.
@@ -74,8 +80,9 @@ pub struct FuseMount {
     _mount: Arc<Mount>,
     /// Inodes still holding lookups after the last plain unmount; with debug assertions only.
     leaked: Mutex<Option<Vec<u64>>>,
-    /// The instance's external directory; `None` for a read-only mount.
-    external_dir: Option<PathBuf>,
+    /// The instance's external directory, with the global data directory it was resolved for;
+    /// `None` for a read-only mount.
+    external: Option<Arc<MountRecord>>,
 }
 
 impl FuseMount {
@@ -91,8 +98,8 @@ impl FuseMount {
         Self::mount_with(repository, state, path, instance_id, base_time, None).await
     }
 
-    /// [`Self::mount`] read-write, over the local changes held in `external_dir`, the
-    /// instance's `external_dir_for_instance` ([`FuseFilesystem::new_writable`]), reaching the
+    /// [`Self::mount`] read-write, over the local changes held in the instance's external
+    /// directory, which `external` records ([`FuseFilesystem::new_writable`]), reaching the
     /// remote through `remote`, the instance's [`RepositoryContext::serving_remote`]. Make
     /// `remote` under the execution context of the call the mount serves, so its connect finds
     /// that caller's credentials, not the service's.
@@ -102,7 +109,7 @@ impl FuseMount {
         path: &Path,
         instance_id: InstanceId,
         base_time: u64,
-        external_dir: PathBuf,
+        external: Arc<MountRecord>,
     ) -> Result<Arc<Self>, FuseMountError> {
         Self::mount_with(
             repository,
@@ -110,7 +117,7 @@ impl FuseMount {
             path,
             instance_id,
             base_time,
-            Some((external_dir, remote)),
+            Some((external, remote)),
         )
         .await
     }
@@ -121,13 +128,19 @@ impl FuseMount {
         path: &Path,
         instance_id: InstanceId,
         base_time: u64,
-        writable: Option<(PathBuf, SharedRemote)>,
+        writable: Option<(Arc<MountRecord>, SharedRemote)>,
     ) -> Result<Arc<Self>, FuseMountError> {
         let attr = AttrContext::for_mounting_user(MAX_READ, base_time);
-        let (filesystem, external_dir) = match writable {
-            Some((dir, remote)) => (
-                FuseFilesystem::new_writable_over((repository, remote), state, attr, &dir).await,
-                Some(dir),
+        let (filesystem, external) = match writable {
+            Some((record, remote)) => (
+                FuseFilesystem::new_writable_over(
+                    (repository, remote),
+                    state,
+                    attr,
+                    &record.external_dir,
+                )
+                .await,
+                Some(record),
             ),
             None => (FuseFilesystem::new(repository, state, attr).await, None),
         };
@@ -136,7 +149,7 @@ impl FuseMount {
             filesystem.start_access_recording(recorder);
         }
 
-        let (access, init) = match external_dir {
+        let (access, init) = match external {
             Some(_) => (MountAccess::ReadWrite, InitConfig::read_write()),
             None => (MountAccess::ReadOnly, InitConfig::default()),
         };
@@ -175,14 +188,14 @@ impl FuseMount {
                 Ok(()) => session,
                 Err(error) => {
                     session.shutdown().await;
-                    let _ = unmount_blocking(path.to_path_buf(), true).await;
+                    let _ = lore_fuse::mount::unmount_path_on_blocking_thread(path, true).await;
                     return Err(FuseMountError::internal(format!(
                         "starting the notification thread: {error}"
                     )));
                 }
             },
             Err(error) => {
-                let _ = unmount_blocking(path.to_path_buf(), true).await;
+                let _ = lore_fuse::mount::unmount_path_on_blocking_thread(path, true).await;
                 return Err(FuseMountError::internal_with_context(
                     error,
                     "starting the FUSE session",
@@ -197,26 +210,46 @@ impl FuseMount {
             session,
             _mount: mount,
             leaked: Mutex::new(None),
-            external_dir,
+            external,
         }))
     }
 
-    /// Unmounts and stops serving. A plain unmount of a busy mount fails with `MountsBusy` and
-    /// leaves it mounted and served; a lazy one detaches it whatever holds it. A mount already
-    /// gone from the mount table, detached by someone else, counts as unmounted. Once the session
-    /// has stopped, the background prefetch is cancelled; nothing is left to record, as every
-    /// request changed the filesystem State and `write/` before it was answered, and the
-    /// notification thread sends what is queued and ends. With debug assertions a plain unmount
-    /// first drains the kernel's lookups, then records and warns about any the table still counts.
-    pub async fn unmount(&self, lazy: bool) -> Result<(), FuseMountError> {
+    /// Unmounts and stops serving, as [`Self::unmount_retrying_busy_since`] does with the busy
+    /// window starting now.
+    pub fn unmount(&self, lazy: bool) -> impl Future<Output = Result<(), FuseMountError>> + '_ {
+        self.unmount_retrying_busy_since(lazy, Instant::now())
+    }
+
+    /// Unmounts and stops serving. A plain unmount retries a busy mount until its busy window
+    /// after `since` ends, as [`lore_fuse::mount::unmount_path_retrying_busy`] does; a mount still
+    /// busy then fails with `MountsBusy` and stays mounted and served. A lazy unmount detaches the
+    /// mount whatever holds it. A mount already gone from the mount table, detached by someone
+    /// else, counts as unmounted. Once the session has stopped, the background prefetch is
+    /// cancelled; nothing is left to record, as every request changed the filesystem State and
+    /// `write/` before it was answered, and the notification thread sends what is queued and ends.
+    /// With debug assertions a plain unmount first drains the kernel's lookups, which its busy
+    /// window does not count, then records and warns about any the table still counts.
+    pub async fn unmount_retrying_busy_since(
+        &self,
+        lazy: bool,
+        since: Instant,
+    ) -> Result<(), FuseMountError> {
         let check_leaks = cfg!(debug_assertions) && !lazy;
-        if check_leaks {
+        let since = if check_leaks {
+            let draining = Instant::now();
             self.drain_kernel_lookups().await;
-        }
-        match unmount_blocking(self.path.clone(), lazy).await {
+            since + draining.elapsed()
+        } else {
+            since
+        };
+        let unmounted = if lazy {
+            lore_fuse::mount::unmount_path_on_blocking_thread(&self.path, true).await
+        } else {
+            lore_fuse::mount::unmount_path_retrying_busy(&self.path, since).await
+        };
+        match unmounted {
             Ok(()) => {}
-            // fusermount3 reports only text; EBUSY reads "Device or resource busy".
-            Err(FuseError::UnmountFailed(reason)) if !lazy && reason.contains("busy") => {
+            Err(FuseError::UnmountBusy(_)) if !lazy => {
                 return Err(MountsBusy {
                     paths: self.path.display().to_string(),
                 }
@@ -269,17 +302,20 @@ impl FuseMount {
 
     /// Makes the kernel forget every inode it holds, so the table can be checked against it:
     /// once the superblock is torn down the kernel sends no FORGET for what it still holds.
-    /// Invalidating the root's children, by every spelling the kernel may cache them under,
-    /// prunes every dentry beneath them. Another process, such as a desktop's file monitor, can
-    /// look a name up again after that, so the invalidations go out again every [`DRAIN_RESEND`]
-    /// while the table counts lookups. The drain ends once the table has counted none for
-    /// [`DRAIN_SETTLE`], or [`DRAIN_WAIT`] after its first invalidations. A lookup made after it
-    /// ends and before the umount still counts as leaked.
+    /// Invalidating the root's children prunes every dentry the kernel reaches through them. Two
+    /// kinds outlast that: another process, such as a desktop's file monitor, can look a name up
+    /// again, and the kernel keeps the dentries below a directory whose name it dropped while a
+    /// file below it was open, which no path from the root reaches. So while the table counts
+    /// lookups, the invalidations go out again every [`DRAIN_RESEND`], with the children of every
+    /// directory that holds a looked-up inode ([`Self::drain_names`]). The drain ends once the
+    /// table has counted none for [`DRAIN_SETTLE`], or [`DRAIN_WAIT`] after its first
+    /// invalidations. A lookup made after it ends and before the umount still counts as leaked.
+    #[lore_macro::test_pub]
     async fn drain_kernel_lookups(&self) {
         let Some(queue) = self.filesystem.notifications() else {
             return;
         };
-        let (mut entries, mut names, mut live) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut entries, mut live) = (Vec::new(), Vec::new());
         let mut deadline = None;
         let mut resend = Instant::now();
         let mut drained_since = None;
@@ -300,7 +336,7 @@ impl FuseMount {
                 return;
             }
             if drained_since.is_none() && now >= resend {
-                self.root_child_names(&mut entries, &mut names, &mut live);
+                self.drain_names(deadline.is_some(), &mut entries, &mut live);
                 entries = queue
                     .send(Invalidations {
                         entries,
@@ -315,32 +351,32 @@ impl FuseMount {
         }
     }
 
-    /// Fills `entries` with the root's children by every spelling the kernel may cache them
-    /// under, each paired with the root. `names` and `live` are scratch.
-    fn root_child_names(
-        &self,
-        entries: &mut Vec<(u64, Name)>,
-        names: &mut Vec<Name>,
-        live: &mut Vec<u64>,
-    ) {
-        names.clear();
-        self.filesystem
-            .spellings()
-            .copy_children_of(ROOT_INO, names);
+    /// Fills `entries` with the names the drain invalidates, each paired with its directory: the
+    /// root's children, and with `below_root` the children of every directory that holds an
+    /// inode the table counts lookups of, each by every spelling the kernel may cache it under.
+    /// The kernel finds a child's dentry through its directory's inode rather than its name, so
+    /// the names below the root reach the dentries below a directory whose name it dropped.
+    /// `live` is scratch.
+    fn drain_names(&self, below_root: bool, entries: &mut Vec<(u64, Name)>, live: &mut Vec<u64>) {
+        entries.clear();
         live.clear();
         self.filesystem.inodes().live(live);
         for &ino in live.iter() {
             if let Some(entry) = self.filesystem.inodes().get(ino)
                 && entry.ino != ROOT_INO
-                && entry.parent == ROOT_INO
+                && (below_root || entry.parent == ROOT_INO)
             {
-                names.push(entry.name.clone());
+                entries.push((entry.parent, entry.name.clone()));
             }
         }
-        names.sort_unstable();
-        names.dedup();
-        entries.clear();
-        entries.extend(names.drain(..).map(|name| (ROOT_INO, name)));
+        live.clear();
+        live.push(ROOT_INO);
+        live.extend(entries.iter().map(|&(parent, _)| parent));
+        live.sort_unstable();
+        live.dedup();
+        self.filesystem.spellings().copy_children_of(live, entries);
+        entries.sort_unstable();
+        entries.dedup();
     }
 
     fn check_leaks(&self) {
@@ -387,10 +423,16 @@ impl FuseMount {
     /// The external directory of a read-write mount, with the remote it reaches, which mounting
     /// the instance again keeps: made for the call that first mounted it, it holds that caller's
     /// credentials. `None` for a read-only mount.
-    fn writable(&self) -> Option<(PathBuf, SharedRemote)> {
-        self.external_dir
+    fn writable(&self) -> Option<(Arc<MountRecord>, SharedRemote)> {
+        self.external
             .clone()
-            .map(|dir| (dir, self.filesystem.remote()))
+            .map(|record| (record, self.filesystem.remote()))
+    }
+
+    /// The external directory of a read-write mount, with the global data directory it was
+    /// resolved for. `None` for a read-only mount.
+    pub fn record(&self) -> Option<&Arc<MountRecord>> {
+        self.external.as_ref()
     }
 
     /// Mounts this instance again, after it was unmounted, at the revision it last served and
@@ -416,16 +458,6 @@ impl FuseMount {
 /// The source an instance's mount carries in the mount table.
 fn fsname(instance_id: InstanceId) -> String {
     format!("lore:{}", instance_id.text_encoding())
-}
-
-async fn unmount_blocking(path: PathBuf, lazy: bool) -> Result<(), FuseError> {
-    lore_base::lore_spawn_blocking!(move || lore_fuse::mount::unmount_path(&path, lazy))
-        .await
-        .unwrap_or_else(|panicked| {
-            Err(FuseError::Internal(format!(
-                "unmount task panicked: {panicked}"
-            )))
-        })
 }
 
 pub struct FuseFilesystemProvider {
@@ -459,5 +491,47 @@ impl FilesystemProvider for FuseFilesystemProvider {
             .read_held_file(path)
             .await
             .forward_any::<FsError>("reading a file the mount serves")
+    }
+
+    /// What cloning the mount's instance does: its external directory is cloned beside it, as
+    /// [`crate::fs::fuse::clone::answer`] probes, whatever the destination, which only takes the
+    /// new instance's mount. A read-only mount, which has no external directory, cannot be cloned.
+    async fn clone_answer(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        _destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        match &self.mount.external {
+            Some(external) => crate::fs::fuse::clone::answer(&external.external_dir).await,
+            None => Ok(CloneAnswer::Unsupported {
+                reason: "a read-only mount cannot be cloned".to_string(),
+            }),
+        }
+    }
+
+    /// Clones the mount's external directory into `destination`, the new instance's external
+    /// directory, as [`crate::fs::fuse::clone::clone`] does.
+    async fn clone_instance(
+        &self,
+        _source: &Path,
+        _dot_path: &Path,
+        destination: &Path,
+        answer: &CloneAnswer,
+        copy_unclonable: bool,
+        run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        let Some(external) = self
+            .mount
+            .external
+            .as_ref()
+            .map(|record| &record.external_dir)
+        else {
+            return Err(NotSupported {
+                operation: "cloning a read-only mount".to_string(),
+            }
+            .into());
+        };
+        crate::fs::fuse::clone::clone(external, destination, answer, copy_unclonable, run).await
     }
 }

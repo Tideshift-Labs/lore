@@ -44,6 +44,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::lore_debug;
@@ -61,7 +62,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::store::StoreInternal;
 
 /// One copy item — relocate content from `(source_partition, source_address)` to
@@ -97,12 +97,12 @@ pub struct LoreStorageCopyArgs {
 }
 
 /// Copy content between partitions for one or more items.
-pub async fn copy(
+pub fn copy(
     globals: LoreGlobalArgs,
     args: LoreStorageCopyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, copy_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, copy_local)
 }
 
 async fn copy_local(
@@ -388,7 +388,7 @@ fn emit_complete(
         target_partition: item.target_partition,
         source_address,
         target_context: item.target_context,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result

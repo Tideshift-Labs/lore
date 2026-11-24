@@ -529,17 +529,17 @@ try {
     # imported by lock.proto) ship in that package's /usr/include, and without it the build fails
     # at `protoc failed: google/protobuf/timestamp.proto: File not found` (measured 2026-09-18).
     $dockerfile = @(
-        'FROM rust:1.95.0-slim-trixie',
-        'LABEL com.tideshift.rust-version="1.95.0"',
+        'FROM rust:1.100.0-slim-trixie',
+        'LABEL com.tideshift.rust-version="1.100.0"',
         'RUN apt-get update && apt-get install -y --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config && rm -rf /var/lib/apt/lists/*',
         # `rust:slim-*` ships no clippy component, so `-Clippy` fails with "'cargo-clippy' is not
         # installed for the toolchain" unless it is added here (measured 2026-09-18).
         'RUN rustup component add clippy'
     ) -join "`n"
     Set-Content -Path (Join-Path $imageContext 'Dockerfile') -Value $dockerfile -NoNewline
-    $imageTag = 'lore-write-behind-linux:rust-1.95.0-v4'
+    $imageTag = 'lore-write-behind-linux:rust-1.100.0-v5'
     $cachedRustVersion = (& docker image inspect --format '{{index .Config.Labels "com.tideshift.rust-version"}}' $imageTag 2>$null | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0 -or $cachedRustVersion -ne '1.95.0') {
+    if ($LASTEXITCODE -ne 0 -or $cachedRustVersion -ne '1.100.0') {
         Write-Host "Building $imageTag ..."
         Invoke-Checked docker @('build', '--tag', $imageTag, $imageContext)
     }
@@ -573,8 +573,8 @@ try {
     $createdContainers.Add($buildContainer)
 
     $compilerRun = Invoke-InContainer -Command @('rustc', '--version')
-    if ($compilerRun.ExitCode -ne 0 -or $compilerRun.Output.Trim() -notmatch '^rustc 1\.95\.0(?:\s|$)') {
-        throw "Linux runner requires rustc 1.95.0; found: $($compilerRun.Output)"
+    if ($compilerRun.ExitCode -ne 0 -or $compilerRun.Output.Trim() -notmatch '^rustc 1\.100\.0(?:\s|$)') {
+        throw "Linux runner requires rustc 1.100.0; found: $($compilerRun.Output)"
     }
 
     if ($Clippy) {

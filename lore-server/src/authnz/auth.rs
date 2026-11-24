@@ -106,6 +106,20 @@ pub fn is_auth_unavailable(status: &Status) -> bool {
     std::error::Error::source(status).is_some_and(|source| source.is::<AuthUnavailable>())
 }
 
+/// FORK-LOCAL (Tideshift): the source that marks a [`Status`] as "the dial to
+/// the auth service failed fast" (refused, unreachable), as opposed to timing
+/// out or failing to build its endpoint. A permission check maps it as
+/// upstream maps its `UNAVAILABLE` dial failure: a failure that can clear.
+/// Set only by this module; a source never crosses the wire.
+#[derive(Debug, thiserror::Error)]
+#[error("lore auth service dial failed")]
+pub struct AuthDialFailed;
+
+/// Whether `status` is a dial to the auth service that failed fast.
+pub fn is_auth_dial_failure(status: &Status) -> bool {
+    std::error::Error::source(status).is_some_and(|source| source.is::<AuthDialFailed>())
+}
+
 tokio::task_local! {
     /// Auth time one request has spent so far, across all its auth calls.
     static AUTH_SPENT: Cell<Duration>;
@@ -184,8 +198,11 @@ async fn connect_auth_channel(auth_url: String) -> Result<Channel, Status> {
     let channel = match tokio::time::timeout(AUTH_CONNECT_TIMEOUT, endpoint.connect()).await {
         Ok(Ok(channel)) => channel,
         Ok(Err(error)) if started.elapsed() < AUTH_CONNECT_TIMEOUT => {
-            return Err(error)
-                .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"));
+            return Err(error).warn_map_err(|_| {
+                let mut status = Status::internal("Failed to connect to lore auth service");
+                status.set_source(Arc::new(AuthDialFailed));
+                status
+            });
         }
         Ok(Err(_)) | Err(_) => return Err(timed_out()),
     };
@@ -583,18 +600,23 @@ impl AuthClient<'_> {
         self.settle(result)
     }
 }
-/// Dials `url` once for one call. Upstream's per-call dial, kept for the
-/// `lore.user.v1` user directory client (the auth service itself uses the
-/// fork's shared [`AuthChannel`]). The endpoint carries the fork's
-/// [`AUTH_CONNECT_TIMEOUT`] TCP connect bound from [`auth_endpoint`].
-async fn connect(url: &str, service: &str) -> Result<Channel, Status> {
+/// Dials `url` once for one call. A dial that fails answers `dial_failure`
+/// with its message. Upstream's per-call dial, kept for the `lore.user.v1`
+/// user directory client (the auth service itself uses the fork's shared
+/// [`AuthChannel`]). The endpoint carries the fork's [`AUTH_CONNECT_TIMEOUT`]
+/// TCP connect bound from [`auth_endpoint`].
+async fn connect(
+    url: &str,
+    service: &str,
+    dial_failure: fn(String) -> Status,
+) -> Result<Channel, Status> {
     let endpoint = auth_endpoint(url)?;
     // Connect from net so the hyper/h2 driver tasks this spawns bind there
     // rather than to the core runtime the caller runs on.
     lore_spawn_net!(async move { endpoint.connect().await })
         .await
         .warn_map_err(|_| Status::internal(format!("{service} connection task failed")))?
-        .warn_map_err(|_| Status::internal(format!("Failed to connect to {service}")))
+        .warn_map_err(|_| dial_failure(format!("Failed to connect to {service}")))
 }
 
 impl LoreAuthClientHelper {
@@ -636,7 +658,7 @@ pub async fn grpc_get_repository_registry_client(
     RepositoryRegistryServiceClient<InterceptedService<Channel, CorrelationInterceptor>>,
     Status,
 > {
-    let channel = connect(user_url, "repository registry").await?;
+    let channel = connect(user_url, "repository registry", Status::internal).await?;
     Ok(RepositoryRegistryServiceClient::with_interceptor(
         channel,
         CorrelationInterceptor,

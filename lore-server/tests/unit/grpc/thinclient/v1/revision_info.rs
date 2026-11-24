@@ -14,6 +14,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
+use lore_revision::state::allow_all_repositories;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
@@ -80,6 +81,7 @@ async fn create_branch_with_history(
             .expect("serialize state");
         let pushed = branch_push::push(
             repository.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -136,6 +138,7 @@ async fn identifier_query_with_concrete_number_returns_revision() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 3).await;
 
@@ -174,6 +177,7 @@ async fn identifier_query_with_zero_number_resolves_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 5).await;
 
@@ -213,6 +217,7 @@ async fn root_revision_has_no_parent_self() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signatures) = create_branch_with_history(&repository_context, 1).await;
         // Single revision: it is the root, parent_self is zero hash.
@@ -248,6 +253,7 @@ async fn merge_revision_includes_parent_other() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 3).await;
         // Build a merge revision whose parent_self = revision 3, parent_other = revision 1.
@@ -272,6 +278,7 @@ async fn merge_revision_includes_parent_other() {
             .expect("serialize state");
         let merge_signature = branch_push::push(
             repository_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -321,6 +328,7 @@ async fn metadata_fields_are_extracted() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
@@ -366,6 +374,7 @@ async fn metadata_fields_are_extracted() {
             .expect("serialize state");
         let signature = branch_push::push(
             repository_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -496,6 +505,7 @@ async fn signature_query_echoes_resolved_identifier() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signatures) = create_branch_with_history(&repository_context, 3).await;
         // signatures[0] = revision 3 (latest), signatures[2] = revision 1 (root).
@@ -547,6 +557,7 @@ async fn empty_revision_has_zero_total_size_bytes() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         // `create_branch_with_history` never adds any tree nodes, so
         // the tree is genuinely empty (hash_tree stays zero).
@@ -600,6 +611,7 @@ async fn total_size_bytes_is_present_for_revision_with_files() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         let write_token = get_write_token();
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
@@ -652,6 +664,7 @@ async fn total_size_bytes_is_present_for_revision_with_files() {
             .expect("serialize state");
         let signature = branch_push::push(
             repository_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,

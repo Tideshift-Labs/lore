@@ -16,6 +16,7 @@ use lore_revision::metadata::MetadataType;
 use lore_revision::metadata::repository::READ_ONLY_KEYS;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash;
 use tonic::Request;
 use tonic::Response;
@@ -131,6 +132,25 @@ pub async fn handler(
         return Err(Status::invalid_argument("Missing repository ID"));
     }
 
+    // FORK-LOCAL (Tideshift): repository settings are an admin act, as the
+    // platform's own rail rates them. Any grant is not enough. Without a
+    // verified token (a server with no auth) there is no identity to hold
+    // `admin`; upstream's administration rule
+    // (`RepositoryAdministration::Permitted`) then accepts `write`.
+    //
+    // After admission (R-BLOCK-2) and before the governed prepare write: a
+    // refused or failed check leaves no receipt.
+    {
+        let token = get_verified_token(&extensions);
+        let action = if token.is_some() {
+            Action::Admin
+        } else {
+            Action::Write
+        };
+        authorizer
+            .require_action(token.as_ref(), repository_id.into(), action)
+            .await?;
+    }
     // The digest is recomputed here from the exact validated wire values, never
     // taken from the body: CR-029's canonical-intent contract makes Lore the
     // second independent computation of the platform's 32 bytes, and a
@@ -170,25 +190,11 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id.into(),
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // FORK-LOCAL (Tideshift): repository settings are an admin act,
-            // as the platform's own rail rates them. Any grant is not enough.
-            // Without a verified token (a server with no auth) there is no
-            // identity to hold `admin`; upstream's administration rule
-            // (`RepositoryAdministration::Permitted`) then accepts `write`.
-            let token = get_verified_token(&extensions);
-            let action = if token.is_some() {
-                Action::Admin
-            } else {
-                Action::Write
-            };
-            authorizer
-                .require_action(token.as_ref(), repository_id.into(), action)
-                .await?;
-
             // Deserialize current and proposed blobs for validation
             let current_metadata = if !expected_hash.is_zero() {
                 Metadata::deserialize(repository.clone(), expected_hash)

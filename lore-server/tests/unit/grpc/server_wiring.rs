@@ -41,7 +41,7 @@ async fn the_builder_binds_the_v0_repository_service_to_the_domain_context() {
     let server = GrpcServerBuilder::new()
         .with_environment(EnvironmentConfig::default())
         .with_feature(FeatureSettings::default())
-        .with_immutable_store(immutable.clone(), immutable)
+        .with_immutable_store(immutable.clone(), immutable, None)
         .with_mutable_store(mutable)
         .with_lock_store(None)
         .with_domain_context(None)

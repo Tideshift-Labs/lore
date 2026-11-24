@@ -107,6 +107,7 @@ fn start_public_quic(
             inflight_limit: 800,
             handler_timeout: None,
             permit_timeout: None,
+            slow_send_threshold: None,
         },
         Arc::new(UserAgentFilter::default()),
         policy,
@@ -138,6 +139,7 @@ async fn put_v4(
         partition,
         &Arc::new(SuppliedCredentials::default()),
         None,
+        lore_transport::quic::client::CongestionAlgorithm::default(),
     )
     .await
     .expect("connect lore-storage/0.4");

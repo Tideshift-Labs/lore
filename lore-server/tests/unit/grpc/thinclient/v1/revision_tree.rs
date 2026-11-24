@@ -21,6 +21,7 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_revision::state::allow_all_repositories;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -138,6 +139,7 @@ async fn push_branch_with_revisions(
             .expect("serialize state");
         let signature = branch_push::push(
             repository.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -213,6 +215,7 @@ async fn push_branch_with_subdir(repository: &Arc<RepositoryContext>) -> (Branch
         .expect("serialize state");
     let signature = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -303,6 +306,7 @@ async fn push_branch_with_link(
         .expect("serialize state");
     let signature = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -384,6 +388,7 @@ async fn push_branch_with_sized_files(
         .expect("serialize state");
     let signature = branch_push::push(
         repository.clone(),
+        None,
         branch_id,
         serialized,
         crate::util::test_support::PUSH_ANY,
@@ -448,6 +453,7 @@ async fn signature_query_emits_header_then_nodes() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signature) =
             push_branch_with_files(&repository_context, &["a.txt", "b.txt"]).await;
@@ -511,6 +517,7 @@ async fn identifier_query_with_zero_resolves_latest() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (branch_id, signature) =
             push_branch_with_files(&repository_context, &["only.txt"]).await;
@@ -560,6 +567,7 @@ async fn empty_revision_emits_header_only() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_files(&repository_context, &[]).await;
 
@@ -654,6 +662,7 @@ async fn path_prefix_pointing_at_file_returns_invalid_argument_on_stream() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_files(&repository_context, &["file.txt"]).await;
 
@@ -696,6 +705,7 @@ async fn path_prefix_pointing_at_missing_returns_not_found_on_stream() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_files(&repository_context, &[]).await;
 
@@ -737,6 +747,7 @@ async fn identifier_query_with_concrete_number_returns_that_revision() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         // Two revisions: rev 1 with "first.txt", rev 2 with both files.
         let (branch_id, signatures) = push_branch_with_revisions(
@@ -793,6 +804,7 @@ async fn path_prefix_at_subdirectory_emits_descendants() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
 
@@ -847,6 +859,7 @@ async fn max_depth_one_excludes_grandchildren() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
 
@@ -911,6 +924,7 @@ async fn unreachable_link_emits_link_node_then_skips_subtree() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_link(
             &repository_context,
@@ -983,6 +997,7 @@ async fn link_emits_linked_repository_contents() {
             immutable_store.clone(),
             mutable_store.clone(),
             linked,
+            allow_all_repositories(),
         ));
         let (_branch, linked_signature) =
             push_branch_with_files(&linked_context, &["inner.txt"]).await;
@@ -991,6 +1006,7 @@ async fn link_emits_linked_repository_contents() {
             immutable_store.clone(),
             mutable_store.clone(),
             originating,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_link(
             &originating_context,
@@ -1092,6 +1108,7 @@ async fn link_tree_node(
         immutable_store.clone(),
         mutable_store.clone(),
         repository,
+        allow_all_repositories(),
     ));
     let (_branch, signature) = push_branch_with_link(
         &repository_context,
@@ -1217,6 +1234,7 @@ async fn unauthorized_link_emits_link_only() {
             immutable_store.clone(),
             mutable_store.clone(),
             linked,
+            allow_all_repositories(),
         ));
         let (_branch, linked_signature) =
             push_branch_with_files(&linked_context, &["inner.txt"]).await;
@@ -1225,6 +1243,7 @@ async fn unauthorized_link_emits_link_only() {
             immutable_store.clone(),
             mutable_store.clone(),
             originating,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_link(
             &originating_context,
@@ -1292,6 +1311,7 @@ async fn nested_links_emit_contents_from_every_repository() {
             immutable_store.clone(),
             mutable_store.clone(),
             c,
+            allow_all_repositories(),
         ));
         let (_branch_c, c_sig) = push_branch_with_files(&c_context, &["c_file.txt"]).await;
 
@@ -1300,6 +1320,7 @@ async fn nested_links_emit_contents_from_every_repository() {
             immutable_store.clone(),
             mutable_store.clone(),
             b,
+            allow_all_repositories(),
         ));
         let (_branch_b, b_sig) =
             push_branch_with_link(&b_context, "link_to_c", c, c_sig, ROOT_NODE, None).await;
@@ -1309,6 +1330,7 @@ async fn nested_links_emit_contents_from_every_repository() {
             immutable_store.clone(),
             mutable_store.clone(),
             a,
+            allow_all_repositories(),
         ));
         let (_branch_a, a_sig) =
             push_branch_with_link(&a_context, "link_to_b", b, b_sig, ROOT_NODE, None).await;
@@ -1378,6 +1400,7 @@ async fn distinct_links_to_same_repository_both_walked() {
             immutable_store.clone(),
             mutable_store.clone(),
             b,
+            allow_all_repositories(),
         ));
         let (_branch_b, b_sig) = push_branch_with_files(&b_context, &["shared.txt"]).await;
 
@@ -1386,6 +1409,7 @@ async fn distinct_links_to_same_repository_both_walked() {
             immutable_store.clone(),
             mutable_store.clone(),
             a,
+            allow_all_repositories(),
         ));
         let write_token = get_write_token();
         let branch_id = create_branch(&a_context).await;
@@ -1425,6 +1449,7 @@ async fn distinct_links_to_same_repository_both_walked() {
             .expect("serialize state");
         let a_sig = branch_push::push(
             a_context.clone(),
+            None,
             branch_id,
             serialized,
             crate::util::test_support::PUSH_ANY,
@@ -1494,6 +1519,7 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
             immutable_store.clone(),
             mutable_store.clone(),
             linked,
+            allow_all_repositories(),
         ));
         let (_branch, linked_signature) =
             push_branch_with_files(&linked_context, &["inner.txt"]).await;
@@ -1502,6 +1528,7 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
             immutable_store.clone(),
             mutable_store.clone(),
             originating,
+            allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_link(
             &originating_context,
@@ -1549,6 +1576,72 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
     .await;
 }
 
+#[tokio::test]
+async fn path_prefix_through_unauthorized_intermediate_link_returns_not_found() {
+    let a = random::<RepositoryId>();
+    let b = random::<RepositoryId>();
+    let c = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let context = |id| {
+            Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+                allow_all_repositories(),
+            ))
+        };
+        let (_branch, c_sig) = push_branch_with_subdir(&context(c)).await;
+        let (_branch, b_sig) =
+            push_branch_with_link(&context(b), "link_to_c", c, c_sig, ROOT_NODE, None).await;
+        let (_branch, a_sig) =
+            push_branch_with_link(&context(a), "link_to_b", b, b_sig, ROOT_NODE, None).await;
+
+        let walk = |authorized: &[RepositoryId]| {
+            let mut request = make_request(
+                a,
+                Query::Signature(a_sig.into()),
+                Some("link_to_b/link_to_c/subdir".into()),
+                None,
+            );
+            request
+                .extensions_mut()
+                .insert(token_authorized_for(authorized));
+            request
+                .extensions_mut()
+                .insert(RawToken("raw.jwt".to_string()));
+            handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                resource_grants(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+        };
+
+        let items = collect(walk(&[a, b, c]).await.expect("unary part succeeds")).await;
+        let paths: Vec<String> = items
+            .into_iter()
+            .filter_map(|item| match item.expect("stream item").payload {
+                Some(Payload::Node(node)) => Some(node.path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["link_to_b/link_to_c/subdir/inner.txt".to_string()]
+        );
+
+        let items = collect(walk(&[a, c]).await.expect("unary part succeeds")).await;
+        let err = items[1].as_ref().expect_err("expected error item");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }))
+    .await;
+}
+
 /// Commits `names` as files at the root of the first revision of a new branch, through the commit
 /// path that records each entry's history, and answers the revision.
 async fn commit_files(repository: &Arc<RepositoryContext>, names: &[&str]) -> Hash {
@@ -1582,6 +1675,7 @@ async fn commit_files(repository: &Arc<RepositoryContext>, names: &[&str]) -> Ha
         state,
         metadata,
         Hash::default(),
+        Hash::default(),
         branch_id,
     )
     .await
@@ -1602,6 +1696,7 @@ async fn last_revision_is_gated_by_the_request_flag() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            allow_all_repositories(),
         ));
         let revision = commit_files(&repository_context, &["a.txt", "b.txt"]).await;
 
@@ -1708,6 +1803,7 @@ mod emission {
             immutable_store,
             mutable_store,
             random::<RepositoryId>(),
+            allow_all_repositories(),
         ));
         Box::pin(LORE_CONTEXT.scope(execution, test(repository))).await;
     }
@@ -2084,6 +2180,7 @@ async fn load_attributed_revision_reads_the_revision_record() {
             immutable_store,
             mutable_store,
             repository,
+            allow_all_repositories(),
         ));
         let (branch, signatures) =
             push_branch_with_revisions(&repository_context, &[&["a.txt"], &["b.txt"]]).await;
@@ -2122,6 +2219,7 @@ async fn file_size_reflects_node_content_size() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         let (_branch, signature) =
             push_branch_with_sized_files(&repository_context, &[("a.txt", 123), ("empty.txt", 0)])
@@ -2181,6 +2279,7 @@ async fn directory_size_is_unset_for_lorehub_clients() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
 
@@ -2230,6 +2329,7 @@ async fn link_size_is_unset_for_lorehub_clients() {
             immutable_store.clone(),
             mutable_store.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ));
         let (_branch, signature) = push_branch_with_link(
             &repository_context,

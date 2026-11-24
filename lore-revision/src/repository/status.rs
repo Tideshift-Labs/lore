@@ -102,6 +102,10 @@ pub struct LoreRepositoryStatusRevisionEventData {
     pub remote_authorized: u8,
     /// Branch exists on the remote and the query returned a latest revisoin (possibly zero if branch does not exist on remote)
     pub remote_branch_exist: u8,
+    /// No valid login reached the remote: none is stored for its server, it expired and could not
+    /// be refreshed, or the remote rejected the token presented. Set where `remote_available` is
+    /// zero too, since a login refused at the connect leaves the remote unreachable.
+    pub remote_unauthenticated: u8,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,6 +129,7 @@ impl LoreRepositoryStatusRevisionEventData {
         remote_available: bool,
         remote_authorized: bool,
         remote_branch_exist: bool,
+        remote_unauthenticated: bool,
     ) -> Self {
         LoreRepositoryStatusRevisionEventData {
             repository,
@@ -144,6 +149,7 @@ impl LoreRepositoryStatusRevisionEventData {
             remote_available: remote_available.into(),
             remote_authorized: remote_authorized.into(),
             remote_branch_exist: remote_branch_exist.into(),
+            remote_unauthenticated: remote_unauthenticated.into(),
         }
     }
 }
@@ -346,6 +352,7 @@ impl StatusSummaryStats {
 
 #[error_set]
 pub enum StatusError {
+    LinkPinsDiverge,
     NodeNotFound,
     LinkNotFound,
     NotFound,
@@ -470,9 +477,7 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
     } else {
         let size = change
             .to
-            .mapping
-            .state
-            .node(change.to.mapping.repository.clone(), change.to.mapping.node)
+            .get_node()
             .await
             .forward::<StatusError>("accessing node path")?
             .size;
@@ -1318,35 +1323,6 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
     Ok((directories, files))
 }
 
-/// Resolve the remote's latest revision for a branch, degrading to the existing
-/// `NoRemote` state when the remote is unavailable so an unreachable remote never
-/// stalls a local status read; transport connect timeouts bound the wait.
-///
-/// Returns `(latest, authorized, available)`, where `available` reflects
-/// connectivity, not query success — a reachable remote that errors is still available.
-#[lore_macro::test_pub]
-async fn resolve_remote_latest(
-    repository: &Arc<RepositoryContext>,
-    branch_id: BranchId,
-) -> (Option<Hash>, bool, bool) {
-    let remote = match repository.remote().await {
-        Ok(r) => r,
-        Err(err) => {
-            lore_debug!("Remote unavailable for status: {err}");
-            return (None, false, false);
-        }
-    };
-
-    match branch::load_remote(remote, repository.id, branch_id).await {
-        Ok(status) => (Some(status.latest), true, true),
-        Err(err) if err.is_branch_not_found() => (None, true, true),
-        Err(err) => {
-            lore_debug!("Remote branch query failed: {err}");
-            (None, false, true)
-        }
-    }
-}
-
 /// Whether a branch has revisions the remote latest does not, and whether the remote latest has
 /// revisions the branch does not, answered as `(local_ahead, remote_ahead)` for `local_state`, the
 /// branch's local latest, and `remote_state`, a different remote latest.
@@ -1431,12 +1407,13 @@ async fn on_first_parent_history(
 /// create exist. No scan starts after the first failure, which is the one returned once the
 /// scans in flight have finished.
 ///
-/// What the scans find stale is discarded once all of them have drained, since a discard clears
-/// marks other scans may still be carrying up through the directories they share. It is discarded
-/// whether or not a scan failed: a node a scan found stale is stale whatever stopped another scan,
-/// and left in the tree it would carry marks no file backs. A scan's failure is the error
-/// returned. Discarding is boxed as the cold path: most scans find nothing stale. Answers whether
-/// anything was discarded.
+/// What the scans find stale is discarded, and the unstaged dirty moves they find removed are
+/// returned, once all of them have drained, since a discard clears marks other scans may still be
+/// carrying up through the directories they share. It is discarded whether or not a scan failed: a
+/// node a scan found stale is stale whatever stopped another scan, and left in the tree it would
+/// carry marks no file backs. A scan's failure is the error returned. Discarding is boxed as the
+/// cold path: most scans find nothing stale. Answers whether a scan held a node to discard or
+/// return.
 pub(crate) async fn scan_paths(
     operation: Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
@@ -1577,7 +1554,9 @@ async fn resolve_scan_targets(
 }
 
 /// Where `path` stands before it is scanned, or `None` where neither the tree nor the working
-/// tree holds it, which is reported ignored here where `report_ignored` asks.
+/// tree holds it, which is reported ignored here where `report_ignored` asks. Only whether the
+/// tree holds the path is asked, so its last name stops at the first node of it
+/// ([`state::State::find_to_link`]).
 ///
 /// The filter verdict is the one [`state::diff_filesystem`] reaches for the path, asked without
 /// reporting it: the scan reports it, and only a path the scan keeps creates directory nodes.
@@ -1593,7 +1572,7 @@ fn resolve_scan_target(
 ) -> impl Future<Output = Option<ScanTarget>> + Send {
     async move {
         let (tracked, missing_below) = match state
-            .find_to_link(&repository, ROOT_NODE, path.as_str(), false)
+            .find_to_link::<false>(&repository, ROOT_NODE, path.as_str(), false)
             .await
         {
             Ok(state::PathStop {
@@ -1690,7 +1669,8 @@ async fn create_shared_untracked_ancestors(
 
     fan_out::create_shared_ancestors(
         &ancestors,
-        |ancestor, nodes| {
+        |_, _| std::future::ready(Ok(std::iter::repeat(()))),
+        |ancestor, nodes, ()| {
             let (start, below) = match fan_out::longest_ancestor(ancestor, nodes) {
                 Some((prefix, node)) => (*node, &ancestor[prefix.len() + 1..]),
                 None => (ROOT_NODE, ancestor),
@@ -1967,10 +1947,13 @@ pub(crate) async fn status(
         .await
         .forward::<StatusError>("deserializing local state")?;
 
-    // Authorized only on an authoritative answer — a latest revision
-    // or branch not found; proving the identity is authorized and has access
-    let (remote_latest, remote_authorized, remote_available) =
-        resolve_remote_latest(&repository, branch.id).await;
+    let branch::RemoteLatest {
+        latest: remote_latest,
+        connected: remote_connected,
+        authorized: remote_authorized,
+        unauthenticated: remote_unauthenticated,
+        ..
+    } = branch::resolve_remote_latest(&repository, branch.id).await;
 
     let remote_state = if let Some(remote_latest) = remote_latest {
         state::State::deserialize(repository.clone(), remote_latest)
@@ -1980,14 +1963,10 @@ pub(crate) async fn status(
         None
     };
 
-    let branch_parent = branch_stack
-        .first()
-        .map(|parent| parent.branch)
-        .unwrap_or_default();
+    let branch_parent = branch_stack.first().map_or_default(|parent| parent.branch);
     let branch_point = branch_stack
         .first()
-        .map(|parent| parent.revision)
-        .unwrap_or_default();
+        .map_or_default(|parent| parent.revision);
 
     let revision_merged_parent_branch = if options.sync_point {
         if branch_point.is_zero() {
@@ -2124,9 +2103,10 @@ pub(crate) async fn status(
             },
             local_ahead,
             remote_ahead,
-            remote_available,
+            remote_connected,
             remote_authorized,
             remote_latest.is_some(),
+            remote_unauthenticated,
         );
         lore_debug!("Repository status: {data:?}");
         event::LoreEvent::RepositoryStatusRevision(data).send();

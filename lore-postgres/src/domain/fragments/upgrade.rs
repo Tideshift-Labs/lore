@@ -279,9 +279,7 @@ fn pg(context: &'static str) -> impl FnOnce(tokio_postgres::Error) -> DomainErro
             "{context}: SQLSTATE {} {}{}",
             db.code().code(),
             db.message(),
-            db.detail()
-                .map(|detail| format!(" ({detail})"))
-                .unwrap_or_default()
+            db.detail().map_or_default(|detail| format!(" ({detail})"))
         )),
         None => DomainError::from_pg(context, error),
     }

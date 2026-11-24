@@ -9,6 +9,7 @@ use std::time::Instant;
 use lore_base::env::CallEnvironment;
 use lore_base::error::InvalidArguments;
 use lore_base::error::RepositoryNotFound;
+use lore_base::error::ServiceUnavailable;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
@@ -30,6 +31,8 @@ use lore_transport::outcome::AttemptId;
 use uuid::Uuid;
 
 use crate::interface::LoreEventCallback;
+use crate::remote::call::EXTERNAL_ROOT_MOVING;
+use crate::remote::call::ServiceCallError;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
@@ -110,10 +113,20 @@ where
 tokio::task_local! {
     /// The environment of the process a call running in this task was relayed from.
     static RELAYED_ENVIRONMENT: CallEnvironment;
+    /// Set for a call the service socket answered with a move of the external root, which runs in
+    /// this process instead.
+    static EXTERNAL_ROOT_MOVE: ();
+}
+
+/// Runs `call`, handed back by the move reply, here: an open that finds no Lore directory fails
+/// with the move's `ServiceUnavailable`, as the stopped service has unmounted its instances.
+pub(crate) fn during_external_root_move<F: Future>(call: F) -> impl Future<Output = F::Output> {
+    EXTERNAL_ROOT_MOVE.scope((), call)
 }
 
 /// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
 /// up reads that environment in place of this process's.
+#[lore_macro::test_pub]
 pub(crate) fn with_relayed_environment<F: Future>(
     environment: CallEnvironment,
     call: F,
@@ -236,7 +249,7 @@ where
                         Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                     };
                     let detail = LoreErrorDetail::from_result(
-                        lore_transport::with_optional_caller_operation(
+                        &lore_transport::with_optional_caller_operation(
                             lore_transport::caller_operation_for_repository(repository.id),
                             command(repository.clone(), args),
                         )
@@ -317,7 +330,7 @@ where
                         Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                     };
                     let detail = LoreErrorDetail::from_result(
-                        lore_transport::with_optional_caller_operation(
+                        &lore_transport::with_optional_caller_operation(
                             lore_transport::caller_operation_for_repository(repository.id),
                             command(repository.clone(), token, args),
                         )
@@ -532,7 +545,7 @@ where
                             }
                         };
                         let detail = LoreErrorDetail::from_result(
-                            lore_transport::with_optional_caller_operation(
+                            &lore_transport::with_optional_caller_operation(
                                 lore_transport::caller_operation_for_repository(repository.id),
                                 command(repository.clone(), token, &plan),
                             )
@@ -594,7 +607,7 @@ where
                         Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                     };
                     let detail = LoreErrorDetail::from_result(
-                        lore_transport::with_optional_caller_operation(
+                        &lore_transport::with_optional_caller_operation(
                             lore_transport::caller_operation_for_repository(repository.id),
                             command(repository.clone(), args),
                         )
@@ -658,38 +671,51 @@ async fn prepare_repository_call(
         }
     };
 
-    // Inside the call's scope, so the metadata of an instance kept in the global directory, as an
-    // SWFS instance's is, is looked for in the directory the call carries: a service relaying
-    // calls for another global directory would otherwise look in its own.
-    let dotpath = LORE_CONTEXT
+    // Inside the call's scope, so the external root of a virtual instance is the one of the global
+    // data directory the call carries: a service relaying calls for another global data directory
+    // would otherwise look in its own.
+    let found = LORE_CONTEXT
         .scope(execution.clone(), async {
             get_dot_lore_path(&repository_path)
         })
-        .await
-        .map_err(|err| err.ffi_code())?;
-    if !dotpath.is_dir() {
-        let err = RepositoryError::from(RepositoryNotFound {
+        .await;
+    let failure = match found {
+        Ok(dotpath) if dotpath.is_dir() => return Ok((repository_path, execution, attempt)),
+        Ok(_) if EXTERNAL_ROOT_MOVE.try_with(|()| ()).is_ok() => {
+            LoreErrorDetail::from_error(&ServiceCallError::from(ServiceUnavailable {
+                reason: format!(
+                    "{} holds no Lore directory, and {EXTERNAL_ROOT_MOVING}",
+                    repository_path.display()
+                ),
+            }))
+        }
+        Ok(_) => LoreErrorDetail::from_error(&RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
-        });
-        // A pre-command failure reports the same status, return value, and
-        // detail as a command failure. Complete inside the execution scope so
-        // the failure log routes to the dispatcher.
-        let status = LORE_CONTEXT
-            .scope(execution, async move {
-                execution_context()
-                    .dispatcher
-                    .complete(LoreErrorDetail::from_error(&err))
-                    .await
-            })
-            .await;
-        return Err(status);
-    }
-
-    Ok((repository_path, execution, attempt))
+        })),
+        Err(err) => LoreErrorDetail::from_error(&err),
+    };
+    // A pre-command failure reports the same status, return value, and
+    // detail as a command failure. Complete inside the execution scope so
+    // the failure log routes to the dispatcher.
+    let status = LORE_CONTEXT
+        .scope(execution, async move {
+            execution_context().dispatcher.complete(failure).await
+        })
+        .await;
+    Err(status)
 }
 
 /// Typed counterpart to [`prepare_repository_call`]. On failure it dispatches
 /// the normal terminal events before returning the structured repository error.
+/// FORK-LOCAL (Tideshift): upstream's Lore-directory lookup answers its own one-variant set
+/// (`InvalidPath`); the typed path below reports it as the `RepositoryError` it always did.
+fn dot_lore_path_failure(invalid: lore_revision::repository::DotLorePathError) -> RepositoryError {
+    use lore_error_set::prelude::*;
+    let Err(err) = Err::<std::convert::Infallible, _>(invalid)
+        .forward::<RepositoryError>("finding the Lore directory");
+    err
+}
+
 async fn prepare_repository_call_result<ErrT>(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
@@ -718,12 +744,18 @@ where
         }
     };
 
-    // Upstream's mount-aware lookup, as the untyped path uses. Its refusal is dispatched here
-    // like every other pre-command failure on this path, rather than returned bare.
-    let dotpath = match get_dot_lore_path(&repository_path) {
+    // Upstream's mount-aware lookup, as the untyped path uses, inside the call's scope for the
+    // same reason. Its refusal is dispatched here like every other pre-command failure on this
+    // path, rather than returned bare.
+    let found = LORE_CONTEXT
+        .scope(execution.clone(), async {
+            get_dot_lore_path(&repository_path)
+        })
+        .await;
+    let dotpath = match found {
         Ok(dotpath) => dotpath,
         Err(invalid) => {
-            let err = ErrT::from(RepositoryError::from(invalid));
+            let err = ErrT::from(dot_lore_path_failure(invalid));
             let detail = LoreErrorDetail::from_error(&err);
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -794,7 +826,7 @@ where
 
             let time_start = Instant::now();
 
-            let detail = LoreErrorDetail::from_result(command(args).await);
+            let detail = LoreErrorDetail::from_result(&command(args).await);
 
             log_command_done(&caller, time_start);
             execution_context().dispatcher.complete(detail).await

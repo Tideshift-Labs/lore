@@ -8,6 +8,7 @@ use lore_proto::BranchProtectResponse;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
@@ -19,7 +20,7 @@ use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::require_repository_administration;
+use crate::grpc::require_branch_protection_administration;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchProtect::handle", skip_all)]
@@ -44,12 +45,18 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
-            require_repository_administration(authorizer, &extensions, repository.clone(), &user_id)
-                .await?;
+            require_branch_protection_administration(
+                authorizer,
+                &extensions,
+                repository.clone(),
+                &user_id,
+            )
+            .await?;
             match branch::protect(repository, branch).await.filter_slow_down()? {
                 Ok(_) => {
                     info!("Branch protected in repository {repository_id}: branch {branch}");

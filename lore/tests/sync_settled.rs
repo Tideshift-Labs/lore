@@ -248,10 +248,10 @@ async fn a_failed_clone_with_a_failing_branch_get_is_an_error_not_settled() {
 
         let verdict = sync_settled(globals, no_callback(), None).await;
 
-        assert_eq!(
-            verdict,
-            Err(SyncSettledError::RemoteTipUnknown),
-            "{refusal:?} must not read as an empty remote"
+        // The dry-run push fails on the lookup before it reports a tip, so the read is an error.
+        assert!(
+            matches!(verdict, Err(SyncSettledError::RemoteReadFailed { .. })),
+            "{refusal:?} must not read as an empty remote, got {verdict:?}"
         );
         assert_no_mutation_reached(&server);
     }
@@ -271,8 +271,11 @@ async fn a_failing_branch_get_on_a_committed_tree_is_an_error() {
 
     let verdict = sync_settled(fixture.globals(), no_callback(), None).await;
 
-    // The ahead check runs before the direct read.
-    assert_eq!(verdict, Err(SyncSettledError::EmptyRemoteWithLocalHistory));
+    // The dry-run push fails on the lookup before it reports a tip, so the read is an error.
+    assert!(
+        matches!(verdict, Err(SyncSettledError::RemoteReadFailed { .. })),
+        "a failing lookup must not read as settled, got {verdict:?}"
+    );
     assert_no_mutation_reached(&server);
 }
 

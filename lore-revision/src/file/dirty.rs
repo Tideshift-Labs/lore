@@ -4,15 +4,20 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use futures::future::Either;
 use lore_error_set::prelude::*;
+use smallvec::SmallVec;
 
 use crate::errors::*;
+use crate::event::LoreEvent;
 use crate::file::node_outside_links;
 use crate::file::parent_outside_links;
 use crate::file::stage::is_path_under_layer_mask;
 use crate::file::stage::route_layer_paths;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -30,7 +35,6 @@ use crate::lore_trace;
 use crate::lore_warn;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
-use crate::node::NodeBlock;
 use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
@@ -41,15 +45,30 @@ use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::is_reserved_node_name;
+use crate::stage::DirectoryChildren;
+use crate::stage::KnownChild;
+use crate::stage::LoreFileStageBeginEventData;
+use crate::stage::LoreFileStageCountData;
+use crate::stage::LoreFileStageEndEventData;
+use crate::stage::NameHashIndex;
+use crate::stage::StageStats;
+use crate::stage::claim_child;
+use crate::stage::directory_children;
+use crate::stage::find_from_listing;
+use crate::state::Clear;
 use crate::state::Ext;
 use crate::state::LinkReference;
 use crate::state::Mark;
 use crate::state::NameChange;
+use crate::state::Return;
+use crate::state::ReturnOptions;
 use crate::state::State;
+use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum DirtyError {
+    LinkPinsDiverge,
     AddressNotFound,
     InvalidArguments,
     InvalidNodeHierarchy,
@@ -161,30 +180,64 @@ pub(crate) async fn dirty_relative_paths(
 }
 
 /// What a commit marks dirty again past it beside the dirty paths it replays: the moves it left
-/// out, and each node the revision holds where the staged tree did, with the dirty marks it
-/// carried.
+/// out, each node the revision holds where the staged tree did, with the dirty marks it carried,
+/// each node marked deleted beside a node marked added under its name, and the adds to make again:
+/// those beside, and the staged adds it left out below a directory that went back.
 pub(crate) struct CarriedMarks {
     pub moves: Vec<MovedNode>,
     pub marks: Vec<(NodeID, NodeFlags)>,
+    pub deleted: Vec<DeletedNode>,
+    pub added: Vec<AddedNode>,
+}
+
+impl CarriedMarks {
+    /// Whether it carries nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.moves.is_empty()
+            && self.marks.is_empty()
+            && self.deleted.is_empty()
+            && self.added.is_empty()
+    }
+}
+
+/// A node to mark dirty as deleted again at `path`, a path from the root of the tree marked, beside
+/// the node an [`AddedNode`] adds under its name there ([`delete_carried`]).
+#[lore_macro::test_pub]
+pub(crate) struct DeletedNode {
+    pub node: NodeID,
+    pub directory: bool,
+    pub path: RelativePath,
+}
+
+/// A node to add again at `path`, a path from the root of the tree marked, marked dirty as added:
+/// a staged add a commit left out, as the directory holding it went back to its committed place,
+/// or a node marked added beside one marked deleted under its name ([`add_carried`]). A copy is
+/// staged as an add, so it comes back as one.
+#[lore_macro::test_pub]
+pub(crate) struct AddedNode {
+    pub path: RelativePath,
+    pub directory: bool,
 }
 
 /// A node of kind `node_type` to mark dirty as moved again to `path`, a path from the root of the
-/// tree marked.
+/// tree marked; `below_deleted` where a node marked dirty as deleted and not staged held it there,
+/// so its path runs through that node rather than one added beside it ([`mark_moved_again`]).
 #[lore_macro::test_pub]
 pub(crate) struct MovedNode {
     pub node: NodeID,
     pub node_type: LoreNodeType,
     pub path: RelativePath,
+    pub below_deleted: bool,
 }
 
 /// [`dirty_relative_paths`] against `operation`, which covers the parent's whole working tree
 /// and every layer and link mounted in it, so one call reads through one operation however many
 /// trees it marks. For a caller that already holds one.
 ///
-/// The moves `carried` holds are marked in the parent's tree first, as [`mark_moved_again`] marks
-/// them, then its marks, each on its node as it was ([`mark_carried`]), and saved with the paths'
-/// marks in one save: a path replayed first would add a node at the path a move then takes its
-/// node to. The path of each move that cannot be marked again is replayed with the paths.
+/// What `carried` holds is marked in the parent's tree first ([`replay_carried`]), and saved with
+/// the paths' marks in one save: a path replayed first would add a node at the path a move then
+/// takes its node to. The path of each move that cannot be marked again is replayed with the
+/// paths, and the path of a node a move marked again replaced is not.
 pub(crate) async fn dirty_relative_paths_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -212,31 +265,32 @@ pub(crate) async fn dirty_relative_paths_in_operation(
     let current_revision = state_current.revision();
     let state_staged = match state_staged {
         Some(state_staged) => state_staged,
-        None if !moves.is_empty() => staged_apart(&repository, current_revision).await?,
+        None if !moves.is_empty() || carried.is_some_and(|carried| !carried.added.is_empty()) => {
+            staged_apart(&repository, current_revision).await?
+        }
         None => state_current.clone(),
     };
     let staged_revision = state_staged.revision();
-    let skipped = if moves.is_empty() {
-        Vec::new()
-    } else {
-        Box::pin(mark_moved_again(
-            &repository,
-            &state_current,
-            &state_staged,
-            moves,
-        ))
-        .await?
+    let (skipped, mut replaced, changed) = match carried {
+        Some(carried) if !carried.is_empty() => {
+            Box::pin(replay_carried(
+                &repository,
+                &state_current,
+                &state_staged,
+                carried,
+            ))
+            .await?
+        }
+        _ => (Vec::new(), Vec::new(), false),
     };
-    let carried_marks = carried.map_or(&[][..], |carried| &carried.marks[..]);
-    let marked = !carried_marks.is_empty()
-        && Box::pin(mark_carried(
-            &repository,
-            &state_staged,
-            carried_marks,
-            &skipped,
-        ))
-        .await?;
-    let changed = moves.len() > skipped.len() || marked;
+    if !replaced.is_empty() {
+        replaced.sort_unstable_by(|one, other| one.as_str().cmp(other.as_str()));
+        paths.retain(|path| {
+            replaced
+                .binary_search_by(|held| held.as_str().cmp(path.as_str()))
+                .is_err()
+        });
+    }
     paths.extend(skipped.into_iter().map(|moved| moved.path.clone()));
 
     let layers = layer::list(repository.clone())
@@ -288,6 +342,156 @@ pub(crate) async fn dirty_relative_paths_in_operation(
     Ok(signature)
 }
 
+/// Marks again in `state_staged`, staged on `state_current`, what a commit carries past it beside
+/// the paths it replays, and answers the moves it skipped, the paths of those that replaced a
+/// node, and whether it changed the tree. The moves come first ([`mark_moved_again`]), then the
+/// marks, each on its node as it was ([`mark_carried`]), before the deletions and the adds make or
+/// free a node whose slot a mark could meet ([`delete_carried`], [`add_carried`]), and last the
+/// moves below a deletion carried beside an add, which then reach the added node, with the adds
+/// below such a deletion ([`mark_moved_later`]). Boxed by its caller, once for a commit.
+async fn replay_carried<'a>(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    carried: &'a CarriedMarks,
+) -> Result<(Vec<&'a MovedNode>, Vec<&'a RelativePath>, bool), DirtyError> {
+    let mut pairs: Vec<&RelativePath> = carried
+        .deleted
+        .iter()
+        .map(|deleted| &deleted.path)
+        .collect();
+    pairs.sort_unstable_by(|one, other| one.as_str().cmp(other.as_str()));
+    let mut again = if carried.moves.is_empty() {
+        MovedAgain::default()
+    } else {
+        mark_moved_again(
+            repository,
+            state_current,
+            state_staged,
+            &carried.moves,
+            &pairs,
+        )
+        .await?
+    };
+    let marked = !carried.marks.is_empty()
+        && mark_carried(repository, state_staged, &carried.marks, &again.skipped).await?;
+    let deleted = !carried.deleted.is_empty()
+        && delete_carried(repository, state_current, state_staged, &carried.deleted).await?;
+    let (held_back, now): (Vec<&AddedNode>, Vec<&AddedNode>) = carried
+        .added
+        .iter()
+        .partition(|added| runs_below_any(&added.path, &pairs));
+    let mut added = !now.is_empty() && add_carried(repository, state_staged, &now).await?;
+    if !again.later.is_empty() || !held_back.is_empty() {
+        added |= mark_moved_later(
+            repository,
+            state_current,
+            state_staged,
+            &mut again,
+            held_back,
+        )
+        .await?;
+    }
+    warn_moves_not_kept(&again.skipped);
+    let changed = carried.moves.len() > again.skipped.len() || marked || deleted || added;
+    Ok((again.skipped, again.replaced, changed))
+}
+
+/// Marks each of `deleted` deleted again in `state_staged`, staged on `state_current`, where it
+/// holds the node with its kind, as a move marks the node it replaces ([`mark_replaced_deleted`]):
+/// a commit carries past it a node marked deleted beside one marked added under its name, whose add
+/// follows. The tree is the one the commit left, which stages nothing, so one walk marking
+/// deletions takes every node. Answers whether it marked any.
+async fn delete_carried(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    deleted: &[DeletedNode],
+) -> Result<bool, DirtyError> {
+    let walk = DirtyWalk::marking_deletions(
+        repository.clone(),
+        state_current.clone(),
+        state_staged.clone(),
+    );
+    let mut name = String::new();
+    let mut any = false;
+    for deleted in deleted {
+        let node_type = if deleted.directory {
+            LoreNodeType::Directory
+        } else {
+            LoreNodeType::File
+        };
+        let Some(record) = state_staged
+            .held_node(repository, deleted.node, node_type)
+            .await
+            .forward::<DirtyError>("Failed to read a node to mark deleted again")?
+        else {
+            continue;
+        };
+        let returned = if Replaced::of(deleted.node, &record).moved {
+            Box::pin(returned_beside(&walk, deleted.node)).await?
+        } else {
+            None
+        };
+        let path = returned.as_ref().unwrap_or(&deleted.path);
+        let states = repository.filter.exclusion_states(path);
+        dirty_delete(&walk, deleted.node, path, states, &mut name, false).await?;
+        any = true;
+    }
+    Ok(any)
+}
+
+/// Adds each of `added` to `state` again, marked dirty as added and not staged, parents first, as a
+/// commit carries past it a staged add it left out below a directory that went back, or a node
+/// marked added beside one marked deleted under its name. One whose parent `state` holds as no
+/// directory is passed over. Nothing of the working tree is read. Answers whether it added any.
+async fn add_carried(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    added: &[&AddedNode],
+) -> Result<bool, DirtyError> {
+    let mut any = false;
+    for added in added {
+        let Ok(parent) = state
+            .find_node_link(repository.clone(), added.path.parent().unwrap_or(""))
+            .await
+        else {
+            continue;
+        };
+        if !state
+            .is_live_directory(repository, parent.node)
+            .await
+            .forward::<DirtyError>("Failed to read the parent of an add carried past a commit")?
+        {
+            continue;
+        }
+        let name = added.path.name();
+        let node = Node {
+            flags: if added.directory {
+                NodeFlags::NoFlags.bits()
+            } else {
+                NodeFlags::File.bits()
+            },
+            name_hash: crate::hash::hash_string(name),
+            ..Default::default()
+        };
+        let node_id = state
+            .node_add(repository.clone(), parent.node, node, name)
+            .await
+            .forward::<DirtyError>("Failed to add again an add carried past a commit")?;
+        state
+            .node_mark(
+                repository,
+                node_id,
+                Mark::dirty(NodeFlags::DirtyAdd, Ext::Set(NodeExtFlags::NoFlags), true),
+            )
+            .await
+            .forward::<DirtyError>("Failed to mark an add carried past a commit")?;
+        any = true;
+    }
+    Ok(any)
+}
+
 /// A staged tree of its own on top of `current_revision`, for moves to be marked in: a walk that
 /// shares one State for the current and the staged tree reads a node moved in it at its new path
 /// in both. Boxed: only a walk with moves to mark takes it.
@@ -325,7 +529,7 @@ async fn dirty_into_layer(
 
     let current_revision = layer_state.state_current.revision();
 
-    let walk = DirtyWalk::new(
+    let mut walk = DirtyWalk::new(
         operation.clone(),
         layer_state.repository.clone(),
         layer_state.state_current.clone(),
@@ -334,6 +538,10 @@ async fn dirty_into_layer(
         None,
     )
     .await?;
+    walk.mount = Some(Box::new(Mount {
+        at: mount_path.clone(),
+        source: source_path.clone(),
+    }));
     let source_root = dirty_nodes_below(
         &walk,
         DirtyNodes {
@@ -440,7 +648,7 @@ async fn dirty_relative_paths_in_masked(
         repository,
         state_current,
         state_staged,
-        &RelativePath::default(),
+        (&RelativePath::default(), &RelativePath::default()),
         &paths
             .into_iter()
             .map(|path| (path.clone(), path))
@@ -451,8 +659,8 @@ async fn dirty_relative_paths_in_masked(
     .await
 }
 
-/// [`dirty_relative_paths_in_masked`] for a tree drawn from `source_path`, each of `paths` pairing
-/// the names below `source_path` with the working-tree path that holds them.
+/// [`dirty_relative_paths_in_masked`] for a tree drawn from `source_path` to `mount_path`, each of
+/// `paths` pairing the names below `source_path` with the working-tree path that holds them.
 ///
 /// `compare` marks a file the working tree and the current revision both hold only where its
 /// content differs, for a caller whose recorded modified times speak for the current revision.
@@ -464,7 +672,7 @@ pub(crate) async fn dirty_drawn_paths_in(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
-    source_path: &RelativePath,
+    (mount_path, source_path): (&RelativePath, &RelativePath),
     paths: &[(RelativePath, RelativePath)],
     mask: Option<Arc<Vec<String>>>,
     compare: bool,
@@ -481,6 +689,12 @@ pub(crate) async fn dirty_drawn_paths_in(
     )
     .await?;
     walk.compare = compare;
+    if !mount_path.is_empty() || !source_path.is_empty() {
+        walk.mount = Some(Box::new(Mount {
+            at: mount_path.clone(),
+            source: source_path.clone(),
+        }));
+    }
     let root = DirtyNodes {
         current: ROOT_NODE,
         staged: ROOT_NODE,
@@ -530,8 +744,9 @@ pub(crate) async fn dirty_drawn_paths_in(
 struct DirtyWalk {
     /// The operation the whole call reads the working tree through. A layer's or link's walk
     /// marks its own trees while its paths and its filesystem are the parent's, so this is the
-    /// parent's operation whatever `repository` names.
-    operation: Arc<InstanceOperationImpl>,
+    /// parent's operation whatever `repository` names. `None` for a walk that marks deletions
+    /// alone, which reads nothing of the working tree ([`Self::marking_deletions`]).
+    operation: Option<Arc<InstanceOperationImpl>>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
@@ -542,9 +757,22 @@ struct DirtyWalk {
     /// Whether a file both the working tree and the current revision hold is marked only where it
     /// differs.
     compare: bool,
+    /// Where a layer's or link's walk mounts its tree, `None` for the instance's own, whose paths
+    /// the walk spells as the tree holds them.
+    mount: Option<Box<Mount>>,
+}
+
+/// Where a layer's or link's walk mounts its tree: the path the walk spells for the node its paths
+/// start below, and that node's path in the tree.
+#[lore_macro::test_pub]
+struct Mount {
+    at: RelativePath,
+    source: RelativePath,
 }
 
 impl DirtyWalk {
+    /// A walk marking `state_staged` against `state_current`, which it holds as the staged tree's
+    /// base ([`State::hold_base`]), so a node's return to its committed place reads it once.
     #[lore_macro::test_pub]
     async fn new(
         operation: Arc<InstanceOperationImpl>,
@@ -558,8 +786,11 @@ impl DirtyWalk {
             .link_list(repository.clone())
             .await
             .forward::<DirtyError>("Failed to read link registry")?;
+        if !Arc::ptr_eq(&state_staged, &state_current) {
+            state_staged.hold_base(state_current.clone());
+        }
         Ok(DirtyWalk {
-            operation,
+            operation: Some(operation),
             repository,
             state_current,
             state_staged,
@@ -568,7 +799,41 @@ impl DirtyWalk {
             link_references,
             linked: Default::default(),
             compare: false,
+            mount: None,
         })
+    }
+
+    /// A walk marking deletions alone in `state_staged` against `state_current`, as
+    /// [`dirty_delete`] marks them: it reads nothing of the working tree, so it takes no
+    /// operation, which would freeze a virtual filesystem, and no link registry.
+    fn marking_deletions(
+        repository: Arc<RepositoryContext>,
+        state_current: Arc<State>,
+        state_staged: Arc<State>,
+    ) -> Self {
+        if !Arc::ptr_eq(&state_staged, &state_current) {
+            state_staged.hold_base(state_current.clone());
+        }
+        DirtyWalk {
+            operation: None,
+            repository,
+            state_current,
+            state_staged,
+            stats: Arc::new(DirtyStats::default()),
+            mask: None,
+            link_references: Vec::new(),
+            linked: Default::default(),
+            compare: false,
+            mount: None,
+        }
+    }
+
+    /// The operation the walk reads the working tree through, which a walk marking deletions alone
+    /// lacks.
+    fn operation(&self) -> Result<&Arc<InstanceOperationImpl>, DirtyError> {
+        self.operation
+            .as_ref()
+            .ok_or_else(|| DirtyError::internal("A walk marking deletions read the working tree"))
     }
 
     fn link_reference(&self, node: NodeID) -> Option<&LinkReference> {
@@ -606,10 +871,15 @@ impl DirtyNodes {
                 staged: current,
             };
         }
-        DirtyNodes {
-            current,
-            staged: subnode(&walk.state_staged, &walk.repository, self.staged, name_hash).await,
-        }
+        let staged = if self.staged.is_valid_or_root_node_id() {
+            walk.state_staged
+                .find_live_subnode(walk.repository.clone(), self.staged, name_hash)
+                .await
+                .map_or(INVALID_NODE, |(found, _)| found)
+        } else {
+            INVALID_NODE
+        };
+        DirtyNodes { current, staged }
     }
 }
 
@@ -657,7 +927,9 @@ async fn staged_node(walk: &DirtyWalk, nodes: DirtyNodes) -> Option<Node> {
 /// the working tree holds there, else as the node the staged tree holds, a link as a directory, and
 /// as a directory where neither holds anything. A path the trees track is past the ignore slot. A
 /// path the working tree lacks is asked about as a deletion, which asks the view where the walk is
-/// forced too ([`FilterMode::absence`]). A path the filter leaves out whatever it holds is answered
+/// forced too ([`FilterMode::absence`]). Where the filter leaves out what the working tree holds
+/// and the trees hold a node of the other kind, that node is asked about as what it is
+/// ([`dirty_replaced_node`]). A path the filter leaves out whatever it holds is answered
 /// before the working tree is read where the trees do not track it. A path the operation cannot
 /// describe is an error and not an absent path: reading it as absent would mark a file that is
 /// there as deleted.
@@ -696,7 +968,9 @@ async fn dirty_resolved_path(
             && let Some(&reference) = walk.link_reference(nodes.staged)
             && let Some(link) = staged_node(walk, nodes).await
         {
-            let (linked, base) = linked_walk(walk, reference, link.linked_node()).await?;
+            let depth = path.as_str().split('/').count() - remaining.as_str().split('/').count();
+            let at = leading_names(path.as_str(), depth);
+            let (linked, base) = linked_walk(walk, reference, link.linked_node(), at).await?;
             return Box::pin(dirty_resolved_path(
                 &linked, base, &remaining, path, parent, force, pruned,
             ))
@@ -715,7 +989,7 @@ async fn dirty_resolved_path(
     // A block of its own, so the future marking the path does not hold the staged node beside it.
     let marking = {
         let info = walk
-            .operation
+            .operation()?
             .file_info(path)
             .await
             .forward_any::<DirtyError>("Failed to describe a path in the working tree")?;
@@ -725,40 +999,125 @@ async fn dirty_resolved_path(
         } else {
             Node::asked_as_directory(staged.as_ref())
         };
-        let filter = &walk.repository.filter;
-        let tracked = !force
-            && filter
-                .child_excludes_tree(parent, path, is_directory, FilterMode::Full)
-                .1
-            && tracks(walk, nodes, Some(is_directory)).await?;
-        let mode = FilterMode::TRACKED.at(tracked);
-        let (states, excluded) = if info.exists() {
-            filter.child_emit_unless_forced(
-                force,
+        let (states, excluded) = if !force {
+            let (states, mut reason, asks) = walk.repository.filter.child_untracked_reason(
+                parent,
+                path,
+                is_directory,
+                FilterMode::TRACKED,
+            );
+            if asks && tracks(walk, nodes, Some(is_directory)).await? {
+                reason = walk.repository.filter.tracked_reason(
+                    states,
+                    path,
+                    is_directory,
+                    FilterMode::TRACKED,
+                );
+            }
+            (states, Filter::emit(path, reason))
+        } else if info.exists() {
+            walk.repository.filter.child_emit_unless_forced(
+                true,
                 FilterMode::View,
                 parent,
                 path,
                 is_directory,
-                mode,
+                FilterMode::TRACKED,
             )
         } else {
-            filter.child_emit_excludes(parent, path, is_directory, mode.absence(force))
+            walk.repository.filter.child_emit_excludes(
+                parent,
+                path,
+                is_directory,
+                FilterMode::TRACKED.absence(true),
+            )
         };
+        let staged_parent = StagedParent::below(base.staged, names.parent());
         if excluded {
             lore_trace!("Path excluded by filter: {}", path.as_str());
-            return Ok(());
+            if !info.exists() || !holds_any(nodes) {
+                return Ok(());
+            }
+            Either::Right(Box::pin(dirty_replaced_node(
+                walk,
+                (nodes, staged),
+                staged_parent,
+                path,
+                is_directory,
+                parent,
+            )))
+        } else {
+            Either::Left(dirty_path(
+                walk,
+                nodes,
+                staged,
+                staged_parent,
+                path,
+                info,
+                states,
+            ))
         }
-        dirty_path(
-            walk,
-            nodes,
-            staged,
-            StagedParent::below(base.staged, names.parent()),
-            path,
-            info,
-            states,
-        )
     };
-    marking.await
+    marking.await.map(drop)
+}
+
+/// Whether either tree holds a node where `nodes` names one.
+fn holds_any(nodes: DirtyNodes) -> bool {
+    nodes.current.is_valid_node_id() || nodes.staged.is_valid_node_id()
+}
+
+/// Marks the node `nodes` names at `path` as one the working tree lacks, where the filter leaves
+/// out what the working tree holds there, a directory where `is_directory` says, and the node is
+/// of the other kind: the node is asked about as what it is, by the view alone, as a child the
+/// working tree lacks is ([`absent_child_states`]), `states` being the verdict at the directory
+/// `parent` reaches. `staged` is the node `nodes` names in the staged tree, as the caller read it.
+/// A node of the current revision the staged tree holds elsewhere, as a dirty move leaves it, is
+/// no replaced node ([`held_elsewhere`]). Answers false, as [`dirty_path`] does for a path it adds
+/// nothing for.
+///
+/// A cold path, which its callers box: a walk meets it only for an entry the filter leaves out
+/// where the trees hold a node.
+async fn dirty_replaced_node(
+    walk: &DirtyWalk,
+    (nodes, staged): (DirtyNodes, Option<Node>),
+    parent: StagedParent<'_>,
+    path: &RelativePath,
+    is_directory: bool,
+    states: FilterStates,
+) -> Result<bool, DirtyError> {
+    let replaced = match staged {
+        Some(node) => node,
+        None if nodes.current.is_valid_node_id() => {
+            let current = walk
+                .state_current
+                .node(walk.repository.clone(), nodes.current)
+                .await
+                .forward::<DirtyError>("Failed to read the node a type change replaced")?;
+            if !nodes.staged.is_valid_or_root_node_id()
+                && held_elsewhere(walk, nodes.current, current.node_type()).await?
+            {
+                return Ok(false);
+            }
+            current
+        }
+        None => return Ok(false),
+    };
+    if Node::asked_as_directory(Some(&replaced)) == is_directory {
+        return Ok(false);
+    }
+    let Some(replaced_states) = absent_child_states(walk, states, path, &replaced) else {
+        return Ok(false);
+    };
+    dirty_path(
+        walk,
+        nodes,
+        staged,
+        parent,
+        path,
+        FileInfo::NotExist,
+        replaced_states,
+    )
+    .await
 }
 
 /// Whether the trees track what `nodes` names as a directory where `is_directory` says, or as either
@@ -797,12 +1156,13 @@ async fn tracks(
         .forward::<DirtyError>("Failed to read the revision the staged tree was built on")
 }
 
-/// The walk marking the trees of the link `reference` names, pinned at `pin`, opened once per
-/// call, and the nodes it starts from.
+/// The walk marking the trees of the link `reference` names, pinned at `pin` and mounted at `at`,
+/// opened once per call, and the nodes it starts from.
 async fn linked_walk(
     walk: &DirtyWalk,
     reference: LinkReference,
     pin: NodeLink,
+    at: &str,
 ) -> Result<(Arc<DirtyWalk>, DirtyNodes), DirtyError> {
     let cached = walk
         .linked
@@ -813,29 +1173,7 @@ async fn linked_walk(
     let linked = if let Some(linked) = cached {
         linked
     } else {
-        let (repository, state_staged) = pin
-            .open(&walk.repository)
-            .await
-            .forward::<DirtyError>("Failed to deserialize linked staged state")?;
-        let committed = state_staged.committed_revision();
-        let state_current = if committed == pin.revision {
-            state_staged.clone()
-        } else {
-            State::deserialize(repository.clone(), committed)
-                .await
-                .forward::<DirtyError>("Failed to deserialize linked state")?
-        };
-        let mut linked = DirtyWalk::new(
-            walk.operation.clone(),
-            repository,
-            state_current,
-            state_staged,
-            walk.stats.clone(),
-            None,
-        )
-        .await?;
-        linked.compare = walk.compare;
-        let linked = Arc::new(linked);
+        let linked = Arc::new(Box::pin(open_linked_walk(walk, pin, at)).await?);
         walk.linked.lock().push((reference, linked.clone()));
         linked
     };
@@ -845,6 +1183,47 @@ async fn linked_walk(
         staged: pin.node,
     };
     Ok((linked, base))
+}
+
+/// The walk marking the trees of the link pinned at `pin` and mounted at `at`, opened for
+/// [`linked_walk`]. Boxed there, as each link opens one walk a call.
+async fn open_linked_walk(
+    walk: &DirtyWalk,
+    pin: NodeLink,
+    at: &str,
+) -> Result<DirtyWalk, DirtyError> {
+    let (repository, state_staged) = pin
+        .open(&walk.repository)
+        .await
+        .forward::<DirtyError>("Failed to deserialize linked staged state")?;
+    let committed = state_staged.committed_revision();
+    let state_current = if committed == pin.revision {
+        state_staged.clone()
+    } else {
+        State::deserialize(repository.clone(), committed)
+            .await
+            .forward::<DirtyError>("Failed to deserialize linked state")?
+    };
+    let source = state_staged
+        .node_path_below(repository.clone(), pin.node, ROOT_NODE)
+        .await
+        .forward::<DirtyError>("Failed to read the path a link mounts")?
+        .unwrap_or_default();
+    let mut linked = DirtyWalk::new(
+        walk.operation()?.clone(),
+        repository,
+        state_current,
+        state_staged,
+        walk.stats.clone(),
+        None,
+    )
+    .await?;
+    linked.compare = walk.compare;
+    linked.mount = Some(Box::new(Mount {
+        at: RelativePath::new_from_clean_parts(at, ""),
+        source,
+    }));
+    Ok(linked)
 }
 
 /// Pin each link the walk marked inside to its linked staged state, innermost first.
@@ -918,6 +1297,50 @@ impl<'a> StagedParent<'a> {
     }
 }
 
+/// Replaces `file`, the node a dirty add's chain of directories stops at with `below` of its names
+/// below it, with a directory: the walk adds what the working tree holds at `path`, below the
+/// file's path, so the working tree holds a directory there. The file is marked as one the working
+/// tree lacks ([`dirty_delete_node`]) and a directory added beside it, as [`dirty_path_beside`]
+/// does for an entry of another kind, with the rest of the chain below it. A link, which a walk
+/// enters rather than adds below, is left as [`ParentChain::Through`] says. Boxed by its callers,
+/// as only a type change takes it.
+async fn replace_file_on_chain(
+    walk: &DirtyWalk,
+    file: NodeID,
+    below: usize,
+    path: &RelativePath,
+) -> Result<ParentChain, DirtyError> {
+    let parent = {
+        let node = walk
+            .state_staged
+            .node(walk.repository.clone(), file)
+            .await
+            .forward::<DirtyError>("Failed to read a file on the chain of a dirty add")?;
+        if !node.is_file() {
+            return Ok(ParentChain::Through { node: file, below });
+        }
+        node.parent
+    };
+    let directory_path = path.parent().unwrap_or_default();
+    let file_path = RelativePath::new_from_clean_parts(
+        leading_names(
+            directory_path,
+            names_in(directory_path).saturating_sub(below),
+        ),
+        "",
+    );
+    lore_trace!("Dirty delete of a file a directory replaced: {file_path}");
+    dirty_delete_node(walk, file, &file_path, None, &mut String::new()).await?;
+    let directory = dirty_add_directory(walk, parent, file_path.name(), file_path.as_str()).await?;
+    ensure_dirty_parent_dirs(
+        &walk.repository,
+        &walk.state_staged,
+        directory,
+        trailing_names(directory_path, below),
+    )
+    .await
+}
+
 /// Counts `path`, a working-tree path, as a path the walk leaves unmarked, as it runs through a
 /// node of the staged tree that is no directory, with `below` of its names below that node
 /// ([`ParentChain::Through`]), and words the first such path, naming both by their working-tree
@@ -978,9 +1401,13 @@ async fn dirty_directory_node(
         return Ok(None);
     }
 
-    let parent = match parent.resolve(walk).await? {
+    let mut chain = parent.resolve(walk).await?;
+    if let ParentChain::Through { node, below } = chain {
+        chain = Box::pin(replace_file_on_chain(walk, node, below, relative_path)).await?;
+    }
+    let parent = match chain {
         ParentChain::Reached(parent) => parent,
-        ParentChain::Through(below) => {
+        ParentChain::Through { below, .. } => {
             skip_through_no_directory(walk, relative_path, below + 1);
             return Ok(None);
         }
@@ -1002,6 +1429,8 @@ async fn dirty_directory_node(
 ///
 /// `states` is the filter verdict the caller reached for `relative_path`, which
 /// the recursions below inherit instead of folding the path again per node.
+///
+/// Answers whether it added a node to the staged directory `parent` reaches, prepending it there.
 #[allow(clippy::too_many_arguments)]
 async fn dirty_path(
     walk: &DirtyWalk,
@@ -1011,11 +1440,10 @@ async fn dirty_path(
     relative_path: &RelativePath,
     info: FileInfo,
     states: FilterStates,
-) -> Result<(), DirtyError> {
+) -> Result<bool, DirtyError> {
     let DirtyWalk {
         repository,
         state_staged,
-        stats,
         mask,
         ..
     } = walk;
@@ -1024,7 +1452,7 @@ async fn dirty_path(
         && is_path_under_layer_mask(relative_path.as_str(), mask)
     {
         lore_trace!("Path inside layer mount, not a parent path: {relative_path}");
-        return Ok(());
+        return Ok(false);
     }
 
     let (exists_on_disk, is_dir) = (info.exists(), info.is_dir());
@@ -1034,10 +1462,11 @@ async fn dirty_path(
     {
         if !exists_on_disk {
             lore_trace!("Link mount absent from the working tree, not marked: {relative_path}");
-            return Ok(());
+            return Ok(false);
         }
-        let (linked, base) = linked_walk(walk, reference, link.linked_node()).await?;
-        return Box::pin(dirty_path(
+        let (linked, base) =
+            linked_walk(walk, reference, link.linked_node(), relative_path.as_str()).await?;
+        Box::pin(dirty_path(
             &linked,
             base,
             staged_node(&linked, base).await,
@@ -1046,15 +1475,34 @@ async fn dirty_path(
             info,
             states,
         ))
+        .await?;
+        return Ok(false);
+    }
+
+    if exists_on_disk && staged.is_some_and(|node| !holds_name_for(&node, is_dir)) {
+        return Box::pin(dirty_path_beside(
+            walk,
+            nodes,
+            staged,
+            parent,
+            relative_path,
+            info,
+            states,
+        ))
         .await;
     }
 
-    let nodes = apart_from_moved(nodes, staged.is_some_and(|node| node.is_dirty_move()));
+    let marks = StagedMarks::of(staged);
+    let nodes = if nodes.current.is_valid_node_id() && !nodes.staged.is_valid_or_root_node_id() {
+        Box::pin(apart_from_moved_away(walk, nodes)).await?
+    } else {
+        apart_from_moved(nodes, marks.moved)
+    };
     let staged_node = nodes
         .staged
         .is_valid_or_root_node_id()
         .then_some(nodes.staged);
-    let staged_pending_add = staged.is_some_and(|node| node.is_dirty_add());
+    let staged_pending_add = marks.added;
 
     // A pending add is never committed, but when the staged tree has no anchor
     // yet it shares storage with `state_current` and resolves there too; exclude
@@ -1063,13 +1511,15 @@ async fn dirty_path(
     let in_current_revision = !staged_pending_add && nodes.current.is_valid_or_root_node_id();
 
     if exists_on_disk && is_dir {
+        let moved_here = !nodes.current.is_valid_or_root_node_id() && marks.moved_directory;
         // A new directory is itself an add; mark it so an empty one is tracked
         // even though the child recursion finds no files to anchor it.
         let Some(staged_node) =
             dirty_directory_node(walk, nodes, parent, in_current_revision, relative_path).await?
         else {
-            return Ok(());
+            return Ok(false);
         };
+        let added = !nodes.staged.is_valid_or_root_node_id();
         // Directory on disk -> recurse children
         lore_trace!("Dirty directory recurse: {}", relative_path.as_str());
         dirty_directory(
@@ -1079,16 +1529,14 @@ async fn dirty_path(
                 staged: staged_node,
             },
             relative_path,
-            states,
+            (states, moved_here),
         )
         .await?;
+        return Ok(added);
     } else if exists_on_disk && in_current_revision {
-        let Some(action) = content_change(staged) else {
-            lore_trace!("Dirty move kept: {}", relative_path.as_str());
-            return Ok(());
-        };
+        let action = marks.change;
         if walk.compare && file_matches_current(walk, nodes.current, relative_path, &info).await? {
-            return Ok(());
+            return Ok(false);
         }
 
         // File on disk + in revision -> Modify
@@ -1097,9 +1545,7 @@ async fn dirty_path(
     } else if exists_on_disk {
         // Skip when already tracked so a repeated dirty doesn't duplicate the node.
         if let Some(staged_node) = staged_node {
-            if let Some(moved) = staged.filter(|node| node.is_file() && !node.is_staged())
-                && moved.is_dirty_move()
-            {
+            if marks.moved_file {
                 lore_trace!("Dirty modify of a move: {}", relative_path.as_str());
                 mark_modified(
                     walk,
@@ -1110,11 +1556,16 @@ async fn dirty_path(
             }
         } else {
             lore_trace!("Dirty add: {}", relative_path.as_str());
-            match parent.resolve(walk).await? {
+            let mut chain = parent.resolve(walk).await?;
+            if let ParentChain::Through { node, below } = chain {
+                chain = Box::pin(replace_file_on_chain(walk, node, below, relative_path)).await?;
+            }
+            match chain {
                 ParentChain::Reached(parent) => {
                     dirty_add(walk, parent, relative_path.name()).await?;
+                    return Ok(true);
                 }
-                ParentChain::Through(below) => {
+                ParentChain::Through { below, .. } => {
                     skip_through_no_directory(walk, relative_path, below + 1);
                 }
             }
@@ -1123,36 +1574,53 @@ async fn dirty_path(
         // Not on disk + in revision -> Delete
         lore_trace!("Dirty delete: {}", relative_path.as_str());
         dirty_delete(
-            repository.clone(),
-            state_staged.clone(),
+            walk,
             staged_node.unwrap_or(nodes.current),
             relative_path,
-            stats.clone(),
             states,
+            &mut String::new(),
+            true,
         )
         .await?;
     } else if let Some(staged_node) = staged_node {
-        // Not on disk + not in revision + exists in staged tree. The flag and the parent alone, so
-        // the record is not held across the awaits below.
-        let (dirty_add, parent) = state_staged
+        // Not on disk + not in revision at this path + exists in staged tree: a reverted add, or a
+        // node the revision holds at another path, which a dirty move took here.
+        let (dirty_add, added, parent, is_directory, flags) = state_staged
             .node(repository.clone(), staged_node)
             .await
             .forward::<DirtyError>("Failed to get staged node")
-            .map(|node| (node.is_dirty_add(), node.parent))?;
+            .map(|node| {
+                (
+                    node.reverts_as_add(),
+                    node.is_added(),
+                    node.parent,
+                    node.is_directory(),
+                    node.flags,
+                )
+            })?;
         if dirty_add {
             lore_trace!(
                 "Dirty reverted add, discarding node: {}",
                 relative_path.as_str()
             );
-            crate::state::node_discard_fused(state_staged.clone(), repository.clone(), staged_node)
-                .await
-                .forward::<DirtyError>("Failed to discard reverted dirty add node")?;
-
-            crate::state::clear_propagation(state_staged, repository, parent)
-                .await
-                .forward::<DirtyError>("Failed to clear the marks above a reverted add")?;
-
-            stats.delete_count.fetch_add(1, Ordering::Relaxed);
+            let added = Added {
+                node: staged_node,
+                parent,
+                is_directory,
+                flags,
+            };
+            discard_dirty_add(walk, added, true, &mut String::new()).await?;
+        } else if !added {
+            lore_trace!("Dirty delete of a moved node: {}", relative_path.as_str());
+            dirty_delete(
+                walk,
+                staged_node,
+                relative_path,
+                states,
+                &mut String::new(),
+                false,
+            )
+            .await?;
         } else {
             lore_trace!(
                 "Dirty ignore (not on disk, not in revision): {}",
@@ -1167,18 +1635,98 @@ async fn dirty_path(
         );
     }
 
-    Ok(())
+    Ok(false)
+}
+
+/// What [`dirty_path`] reads of the staged node at its path, taken before the walk awaits anything,
+/// so the node is not held across the awaits.
+#[derive(Clone, Copy)]
+struct StagedMarks {
+    /// Marked dirty as moved.
+    moved: bool,
+    /// Marked dirty as added.
+    added: bool,
+    /// A directory marked dirty as moved and not staged.
+    moved_directory: bool,
+    /// A file marked dirty as moved and not staged.
+    moved_file: bool,
+    /// The dirty action a change to its content marks ([`content_change`]).
+    change: NodeFlags,
+}
+
+impl StagedMarks {
+    fn of(staged: Option<Node>) -> Self {
+        let unstaged_move = staged.filter(|node| node.is_dirty_move() && !node.is_staged());
+        StagedMarks {
+            moved: staged.is_some_and(|node| node.is_dirty_move()),
+            added: staged.is_some_and(|node| node.is_dirty_add()),
+            moved_directory: unstaged_move.is_some_and(|node| node.is_directory()),
+            moved_file: unstaged_move.is_some_and(|node| node.is_file()),
+            change: content_change(staged),
+        }
+    }
+}
+
+/// Whether `staged`, the node the staged tree holds at a path whose working-tree entry is a
+/// directory where `is_dir`, holds the path's name for that entry: not where it is staged for
+/// deletion, or of the other kind, a link counting as either.
+fn holds_name_for(staged: &Node, is_dir: bool) -> bool {
+    !staged.is_staged_delete() && (staged.is_link() || staged.is_file() != is_dir)
+}
+
+/// Whether [`dirty_path`] of an entry the working tree holds, a directory where `is_dir`, marks
+/// `staged`, the staged node at its path, deleted before it adds the entry beside it
+/// ([`dirty_path_beside`]): a node of the other kind not staged for deletion, which the mark may
+/// free where it was only marked added.
+fn deletes_beside(staged: &Node, is_dir: bool) -> bool {
+    !staged.is_staged_delete() && !holds_name_for(staged, is_dir)
+}
+
+/// [`dirty_path`] of an entry the working tree holds where the staged tree's node `nodes` names,
+/// `staged`, does not hold the name for it ([`holds_name_for`]): the entry is added beside that
+/// node, as a stage adds a node of another kind beside it, and lookups take it
+/// ([`State::find_live_subnode`]). A node of the other kind not staged for deletion is marked
+/// deleted first, as the working tree no longer holds it ([`deletes_beside`]). Boxed by its
+/// caller, as only such an entry takes it. Answers whether it added the entry's node, as
+/// [`dirty_path`] does.
+#[allow(clippy::too_many_arguments)]
+async fn dirty_path_beside(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    staged: Option<Node>,
+    parent: StagedParent<'_>,
+    relative_path: &RelativePath,
+    info: FileInfo,
+    states: FilterStates,
+) -> Result<bool, DirtyError> {
+    if staged.is_some_and(|node| !node.is_staged_delete()) {
+        lore_trace!("Dirty delete of a node of another kind: {relative_path}");
+        dirty_delete(
+            walk,
+            nodes.staged,
+            relative_path,
+            states,
+            &mut String::new(),
+            false,
+        )
+        .await?;
+    }
+    let apart = DirtyNodes {
+        current: INVALID_NODE,
+        staged: INVALID_NODE,
+    };
+    dirty_path(walk, apart, None, parent, relative_path, info, states).await
 }
 
 /// The dirty action that marks a change to the content of the file the staged tree holds as
-/// `staged`: modified, and moved as well where it is marked moved, the move standing beside the
-/// edit. `None` for a move that is staged, whose staged action the dirty mark shares and would
-/// replace.
-fn content_change(staged: Option<Node>) -> Option<NodeFlags> {
+/// `staged`: modified, and moved as well where it is marked moved and not staged, the move
+/// standing beside the edit. A staged action stands beside the mark ([`State::node_mark`]).
+fn content_change(staged: Option<Node>) -> NodeFlags {
     match staged {
-        Some(node) if node.is_dirty_move() && node.is_staged() => None,
-        Some(node) if node.is_dirty_move() => Some(NodeFlags::DirtyModify | NodeFlags::DirtyMove),
-        _ => Some(NodeFlags::DirtyModify),
+        Some(node) if node.is_dirty_move() && !node.is_staged() => {
+            NodeFlags::DirtyModify | NodeFlags::DirtyMove
+        }
+        _ => NodeFlags::DirtyModify,
     }
 }
 
@@ -1214,6 +1762,30 @@ fn apart_from_moved(nodes: DirtyNodes, moved: bool) -> DirtyNodes {
     }
 }
 
+/// `nodes`, which name no node of the staged tree, with no node of the current revision where the
+/// staged tree holds the revision's node elsewhere, moved away ([`held_elsewhere`]): the path is
+/// new to the staged tree, and what the working tree holds there is no change of the moved node.
+/// Boxed by its caller, which takes it only for such a path.
+async fn apart_from_moved_away(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+) -> Result<DirtyNodes, DirtyError> {
+    let node_type = walk
+        .state_current
+        .node(walk.repository.clone(), nodes.current)
+        .await
+        .forward::<DirtyError>("Failed to read the current revision's node at a path")?
+        .node_type();
+    if held_elsewhere(walk, nodes.current, node_type).await? {
+        Ok(DirtyNodes {
+            current: INVALID_NODE,
+            staged: INVALID_NODE,
+        })
+    } else {
+        Ok(nodes)
+    }
+}
+
 /// Whether the file at `path`, which `info` describes, holds what the current revision's node
 /// `current` holds, as `status --scan` would answer.
 ///
@@ -1240,7 +1812,7 @@ async fn file_matches_current(
         info.size(),
         path,
         true,
-        &walk.operation,
+        walk.operation()?,
         &lore_storage::ContentHashes::default(),
     ))
     .await
@@ -1250,74 +1822,222 @@ async fn file_matches_current(
 
 /// Mark a node as Dirty+Delete, recursing into directory children.
 ///
-/// View-filtered descendants are pruned (not marked): a dirty-delete
-/// directory whose contents are excluded — e.g. a view-only path like
-/// `Templates` where `/Templates/*` filters the contents but not the directory
-/// node itself — must not re-mark its entire filtered subtree as deleted. The
-/// directory node passed in is always marked; only the children the view
-/// excludes are skipped, forced or not: the working tree lacks what the view
-/// excludes without its having been deleted. The non-emitting
-/// `child_excludes_tree` is used so a large pruned subtree does not produce a
-/// `FilterExclude` event per node. The ignore slot is not asked: every
-/// descendant is a node the tree holds, which is past it.
+/// View-filtered descendants are pruned (not marked): a dirty-delete directory whose contents the
+/// view excludes, such as `Templates` under `!/Templates/` and `/Templates/*`, must not re-mark its
+/// filtered subtree as deleted. The children the view excludes are skipped, forced or not: the
+/// working tree lacks what the view excludes without its having been deleted. The non-emitting
+/// `child_excludes_tree` is used so a large pruned subtree does not produce a `FilterExclude` event
+/// per node. The ignore slot is not asked: every descendant is a node the tree holds, which is past
+/// it.
+///
+/// A node below marked dirty as added or copied and not staged leaves the tree
+/// ([`discard_dirty_add`]); a staged one stays staged, marked dirty alone. A node `lore dirty move`
+/// took away from the place the current revision holds it at goes back there to be marked deleted,
+/// where that place is free, and the view filters its children at that place; where another node
+/// holds it, the node keeps its move, for the commit to return it once the place frees
+/// ([`State::node_return_unstaged_move`]). `name` is a buffer the walk keeps across nodes.
+///
+/// A directory below, and with `absent` the node itself, that the view does not create
+/// ([`FilterStates::creates_directory`]) stands in the working tree only for what is
+/// created below it, so it is marked only where something below it is.
 async fn dirty_delete(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+    walk: &DirtyWalk,
     node_id: NodeID,
     path: &RelativePath,
-    stats: Arc<DirtyStats>,
     states: FilterStates,
+    name: &mut String,
+    absent: bool,
 ) -> Result<(), DirtyError> {
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-    let block = state
-        .block(repository.clone(), block_index)
-        .await
-        .forward::<DirtyError>("Failed deserializing state node block")?;
+    let creates = absent.then(|| Creation::of(states));
+    if let (_, Some(below)) = dirty_delete_node(walk, node_id, path, creates, name).await? {
+        dirty_delete_below(walk, below, path, states, name).await?;
+    }
+    Ok(())
+}
 
-    let node = block.node(node_index);
-    if node.is_dirty_delete() {
-        return Ok(());
+/// Whether the view creates a directory ([`FilterStates::creates_directory`]) where the repository
+/// holds it empty, and where it holds children: what [`dirty_delete_node`] keeps of the view's
+/// states at a node the working tree lacks.
+#[derive(Clone, Copy)]
+struct Creation {
+    empty: bool,
+    holding: bool,
+}
+
+impl Creation {
+    fn of(states: FilterStates) -> Self {
+        Self {
+            empty: states.creates_directory(true),
+            holding: states.creates_directory(false),
+        }
+    }
+
+    /// Whether the view creates the directory, which the repository holds `empty` or not.
+    fn of_directory(self, empty: bool) -> bool {
+        if empty { self.empty } else { self.holding }
+    }
+}
+
+/// A directory [`dirty_delete_node`] marked deleted, or left to mark once something below it is,
+/// whose children its walk marks next: the directory, its first child, its path where it went back
+/// to the place the current revision holds it at, and whether it is still to mark.
+struct DeletedDirectory {
+    directory: NodeID,
+    first_child: NodeID,
+    returned_to: Option<RelativePath>,
+    deferred: bool,
+}
+
+/// [`dirty_delete`] of `node_id`, which stands at `path`, without its children: answers whether the
+/// node is marked, or was already, and the directory to walk below where it holds children to mark.
+///
+/// With `absent`, what the view creates of a node the working tree lacks, a directory the view does
+/// not create is not marked: one holding children is answered deferred, for its walk to mark once
+/// it marks something below it.
+async fn dirty_delete_node(
+    walk: &DirtyWalk,
+    node_id: NodeID,
+    path: &RelativePath,
+    absent: Option<Creation>,
+    name: &mut String,
+) -> Result<(bool, Option<DeletedDirectory>), DirtyError> {
+    let DirtyWalk {
+        repository,
+        state_staged: state,
+        state_current: current,
+        stats,
+        ..
+    } = walk;
+    let (added, first_child, moved, is_directory) = {
+        let node = state
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<DirtyError>("Failed deserializing state node block")?;
+        if node.is_dirty_delete() {
+            return Ok((true, None));
+        }
+        let added = (node.reverts_as_add() && !node.is_staged()).then_some(Added {
+            node: node_id,
+            parent: node.parent,
+            is_directory: node.is_directory(),
+            flags: node.flags,
+        });
+        let first_child = if node.is_directory() {
+            node.child()
+        } else {
+            None
+        };
+        (
+            added,
+            first_child,
+            node.is_dirty_move() && !node.is_staged(),
+            node.is_directory(),
+        )
+    };
+    if let Some(added) = added {
+        // Boxed: only a reverted add takes it.
+        Box::pin(discard_dirty_add(walk, added, false, name)).await?;
+        return Ok((false, None));
+    }
+    if !moved
+        && is_directory
+        && absent.is_some_and(|creates| !creates.of_directory(first_child.is_none()))
+    {
+        return Ok((
+            false,
+            first_child.map(|first_child| DeletedDirectory {
+                directory: node_id,
+                first_child,
+                returned_to: None,
+                deferred: true,
+            }),
+        ));
     }
 
     lore_trace!("Dirty delete of node {} ({})", node_id, path.as_str());
-    stats.delete_count.fetch_add(1, Ordering::Relaxed);
 
-    state
-        .node_mark(
-            &repository,
-            node_id,
-            Mark::dirty(
-                NodeFlags::DirtyDelete,
-                Ext::Set(NodeExtFlags::NoFlags),
-                true,
-            ),
-        )
-        .await
-        .forward::<DirtyError>("Failed to mark node as dirty delete")?;
+    // Boxed: only a node a dirty move took from the place the current revision holds it at goes
+    // back, and inline the return would sit in the future of every node the walk marks.
+    let returned = if moved {
+        Box::pin(state.node_return_removed_move(repository, current, node_id, name))
+            .await
+            .forward::<DirtyError>("Failed to return a moved node marked deleted")?
+    } else {
+        state
+            .node_mark(repository, node_id, Mark::DIRTY_DELETE)
+            .await
+            .forward::<DirtyError>("Failed to mark node as dirty delete")?;
+        Return::Stays
+    };
+    match returned {
+        Return::Gone => return Ok((false, None)),
+        Return::Stays | Return::Back => {
+            stats.delete_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Return::Held | Return::Parked | Return::Displaced => {}
+    }
+    let Some(first_child) = first_child else {
+        return Ok((true, None));
+    };
+    let returned_to = match returned {
+        Return::Back => Box::pin(returned_path(walk, node_id)).await?,
+        _ => None,
+    };
+    Ok((
+        true,
+        Some(DeletedDirectory {
+            directory: node_id,
+            first_child,
+            returned_to,
+            deferred: false,
+        }),
+    ))
+}
 
-    // Recurse into directory children
-    if node.is_directory() {
-        let mut child_node_iter = node.child();
-        let mut cycle = SiblingCycleGuard::new(node_id);
+/// Marks the children of `deleted` deleted as [`dirty_delete`] does, each the view keeps, the
+/// directory standing at `path`, where the view answers `states`, unless it went back elsewhere,
+/// and then a deferred directory where it marked a child. Answers whether the directory is marked.
+/// Only a directory below takes another box.
+fn dirty_delete_below<'a>(
+    walk: &'a DirtyWalk,
+    deleted: DeletedDirectory,
+    path: &'a RelativePath,
+    states: FilterStates,
+    name: &'a mut String,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<bool, DirtyError>> + Send + 'a>> {
+    Box::pin(async move {
+        let DirtyWalk {
+            repository,
+            state_staged: state,
+            ..
+        } = walk;
+        let (path, states) = match &deleted.returned_to {
+            Some(returned) => (returned, repository.filter.exclusion_states(returned)),
+            None => (path, states),
+        };
+        let mut child_node_iter = Some(deleted.first_child);
+        let mut cycle = SiblingCycleGuard::new(deleted.directory);
+        let mut marked = false;
         while let Some(child_node_id) = child_node_iter {
             let child_node = state
                 .node(repository.clone(), child_node_id)
                 .await
                 .forward::<DirtyError>("Failed deserializing state node block")?;
             child_node
-                .walk_step(child_node_id, node_id, &mut cycle)
+                .walk_step(child_node_id, deleted.directory, &mut cycle)
                 .forward::<DirtyError>("Invalid node hierarchy in dirty delete walk")?;
             child_node_iter = child_node.sibling();
 
-            let Some(child_name) = state
-                .node_name_clone_or_skip(repository.clone(), child_node_id)
-                .await
-                .forward::<DirtyError>("Failed to get child name")?
-            else {
-                continue;
+            let child_path = {
+                let Some(child_name) = state
+                    .node_name_ref_or_skip(repository.clone(), child_node_id)
+                    .await
+                    .forward::<DirtyError>("Failed to get child name")?
+                else {
+                    continue;
+                };
+                path.join(&*child_name)
             };
-            let child_path = path.push_into_buf(&child_name).freeze();
 
             let (child_states, excluded) = repository.filter.child_excludes_tree(
                 states,
@@ -1325,37 +2045,254 @@ async fn dirty_delete(
                 child_node.is_directory(),
                 FilterMode::View,
             );
-            if !excluded {
-                dirty_delete_recurse(
-                    repository.clone(),
-                    state.clone(),
-                    child_node_id,
-                    child_path,
-                    stats.clone(),
-                    child_states,
-                )
-                .await?;
-            } else {
+            if excluded {
                 lore_trace!(
                     "Dirty delete skipping filtered child: {}",
                     child_path.as_str()
                 );
+                continue;
             }
+            marked |= match dirty_delete_node(
+                walk,
+                child_node_id,
+                &child_path,
+                Some(Creation::of(child_states)),
+                name,
+            )
+            .await?
+            {
+                (_, Some(below)) => {
+                    dirty_delete_below(walk, below, &child_path, child_states, name).await?
+                }
+                (child_marked, None) => child_marked,
+            };
         }
-    }
+        if !deleted.deferred {
+            return Ok(true);
+        }
+        if marked {
+            lore_trace!("Dirty delete of node {} ({})", deleted.directory, path);
+            state
+                .node_mark(repository, deleted.directory, Mark::DIRTY_DELETE)
+                .await
+                .forward::<DirtyError>("Failed to mark node as dirty delete")?;
+            walk.stats.delete_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(marked)
+    })
+}
 
+/// The path the walk spells for `node`, which went back to the place the current revision holds
+/// it at ([`spelled_as_walked`]). `None` where the node lies outside the walk's mount, or the tree
+/// holds it nowhere.
+async fn returned_path(walk: &DirtyWalk, node: NodeID) -> Result<Option<RelativePath>, DirtyError> {
+    let Some(tree) = walk
+        .state_staged
+        .node_path_below(walk.repository.clone(), node, ROOT_NODE)
+        .await
+        .forward::<DirtyError>("Failed to read the path of a node that went back")?
+    else {
+        return Ok(None);
+    };
+    Ok(spelled_as_walked(walk.mount.as_deref(), tree.as_str()))
+}
+
+/// The path a walk mounted at `mount` spells for the node the staged tree holds at `tree`: the
+/// tree's path as it stands for the instance's own tree, and below the mount where it lies below
+/// its source. `None` where it lies outside the source. The source's names compare without ASCII
+/// case.
+#[lore_macro::test_pub]
+fn spelled_as_walked(mount: Option<&Mount>, tree: &str) -> Option<RelativePath> {
+    let (at, source) = mount.map_or(("", ""), |mount| (mount.at.as_str(), mount.source.as_str()));
+    let below = if source.is_empty() {
+        tree
+    } else {
+        let below = tree.get(source.len()..)?;
+        if !tree[..source.len()].eq_ignore_ascii_case(source) {
+            return None;
+        }
+        match below.strip_prefix('/') {
+            Some(below) => below,
+            None if below.is_empty() => below,
+            None => return None,
+        }
+    };
+    Some(RelativePath::new_from_clean_parts(at, below))
+}
+
+/// The first `count` names of `path`, without a separator after them.
+fn leading_names(path: &str, count: usize) -> &str {
+    if count == 0 {
+        return "";
+    }
+    path.match_indices('/')
+        .nth(count - 1)
+        .map_or(path, |(at, _)| &path[..at])
+}
+
+/// A node the working tree no longer holds that leaves the tree as a reverted add, as
+/// [`discard_dirty_add`] takes it: one marked dirty as added or copied and not staged, and a staged
+/// add [`dirty_path`] finds so ([`Node::reverts_as_add`]). Its ID, its parent, whether it is a
+/// directory, and its flags.
+struct Added {
+    node: NodeID,
+    parent: NodeID,
+    is_directory: bool,
+    flags: u16,
+}
+
+/// Discards `added`, a node marked dirty as added that the working tree no longer holds, with its
+/// subtree, and where `clear_above`, the marks above it nothing else needs. A directory's
+/// committed nodes leave first ([`leave_added_directory`]), where it holds one
+/// ([`holds_committed_below`]); one that holds a node that cannot leave yet stays, marked as it is,
+/// for the commit to return the node and drop the directory. `name` is a buffer the walk keeps
+/// across nodes.
+async fn discard_dirty_add(
+    walk: &DirtyWalk,
+    added: Added,
+    clear_above: bool,
+    name: &mut String,
+) -> Result<(), DirtyError> {
+    let DirtyWalk {
+        repository,
+        state_staged: state,
+        stats,
+        ..
+    } = walk;
+    if added.is_directory
+        && holds_committed_below(walk, added.node).await?
+        && !Box::pin(leave_added_directory(walk, added.node, name)).await?
+    {
+        return Ok(());
+    }
+    crate::state::node_discard_fused(state.clone(), repository.clone(), added.node)
+        .await
+        .forward::<DirtyError>("Failed to discard reverted dirty add node")?;
+    if clear_above {
+        crate::state::clear_propagation(state, repository, added.parent, added.flags)
+            .await
+            .forward::<DirtyError>("Failed to clear the marks above a reverted add")?;
+    }
+    stats.delete_count.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 
-fn dirty_delete_recurse(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-    path: RelativePath,
-    stats: Arc<DirtyStats>,
-    states: FilterStates,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send>> {
-    Box::pin(async move { dirty_delete(repository, state, node_id, &path, stats, states).await })
+/// Most directories marked added that [`leave_added_directory`]'s worklist holds on the stack.
+const ADDED_ON_STACK: usize = 8;
+
+/// Whether `directory`, a directory marked dirty as added, holds a node neither added nor staged,
+/// below it or below a directory marked added in it, which [`leave_added_directory`] takes out
+/// before the discard. Read from the children's records alone, its worklist on the stack, so a
+/// subtree all added costs no allocation.
+async fn holds_committed_below(walk: &DirtyWalk, directory: NodeID) -> Result<bool, DirtyError> {
+    let mut added: SmallVec<[NodeID; ADDED_ON_STACK]> = SmallVec::from_elem(directory, 1);
+    while let Some(below) = added.pop() {
+        let mut children = StateNodeChildrenIterator::new(
+            walk.state_staged.clone(),
+            walk.repository.clone(),
+            below,
+        )
+        .await
+        .forward::<DirtyError>("Failed to read the children of a reverted add")?;
+        while let Some((child, record)) = children
+            .next()
+            .await
+            .forward::<DirtyError>("Failed to read a node below a reverted add")?
+        {
+            if record.is_added() {
+                if record.is_directory() {
+                    added.push(child);
+                }
+            } else if !record.is_staged() {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Takes each committed node out of `directory`, a directory marked dirty as added that the
+/// working tree no longer holds, before its discard, and answers whether every one left.
+/// A node `lore dirty move` took there goes back to the place the current revision holds it at, to
+/// be marked deleted there as [`dirty_delete`] marks it, as the working tree holds it nowhere
+/// ([`State::node_return_unstaged_move`]). One another node not staged holds that place for stays
+/// with its move, which the commit returns once the place frees, and keeps the directory. One a
+/// staged node keeps out, one the current revision does not hold, such as a copy, and one staged,
+/// which only a directory staged as added holds, leave the tree with the directory, as a commit of
+/// the directory gone takes them. A worklist of the directories marked added below, so the walk
+/// takes no recursion.
+async fn leave_added_directory(
+    walk: &DirtyWalk,
+    directory: NodeID,
+    name: &mut String,
+) -> Result<bool, DirtyError> {
+    let DirtyWalk {
+        repository,
+        state_staged: state,
+        state_current: current,
+        ..
+    } = walk;
+    let mut added: SmallVec<[NodeID; ADDED_ON_STACK]> = SmallVec::from_elem(directory, 1);
+    let mut left = true;
+    while let Some(below) = added.pop() {
+        let children = state
+            .node_children(repository.clone(), below)
+            .await
+            .forward::<DirtyError>("Failed to read the children of a reverted add")?;
+        for child in children {
+            let record = state
+                .node(repository.clone(), child)
+                .await
+                .forward::<DirtyError>("Failed to read a node below a reverted add")?;
+            if record.is_added() {
+                if record.is_directory() {
+                    added.push(child);
+                }
+                continue;
+            }
+            if record.is_staged() {
+                continue;
+            }
+            let (returned, _) = state
+                .node_return_unstaged_move(
+                    repository,
+                    current.revision(),
+                    child,
+                    name,
+                    ReturnOptions::default(),
+                )
+                .await
+                .forward::<DirtyError>("Failed to return a node below a reverted add")?;
+            match returned {
+                Return::Back => {}
+                Return::Held | Return::Parked => {
+                    left = false;
+                    continue;
+                }
+                Return::Stays | Return::Displaced | Return::Gone => continue,
+            }
+            let Some(child_path) = returned_path(walk, child).await? else {
+                continue;
+            };
+            let states = repository.filter.exclusion_states(&child_path);
+            dirty_delete(walk, child, &child_path, states, name, false).await?;
+        }
+    }
+    Ok(left)
+}
+
+/// [`leave_added_directory`] of `directory`, a directory of `staged` marked dirty as added that
+/// the working tree no longer holds, staged on `current`, through a walk marking deletions alone:
+/// a removal another walk found takes the committed nodes out as `lore file dirty` takes them.
+pub(crate) async fn leave_removed_added_directory(
+    repository: &Arc<RepositoryContext>,
+    current: &Arc<State>,
+    staged: &Arc<State>,
+    directory: NodeID,
+) -> Result<bool, DirtyError> {
+    let walk = DirtyWalk::marking_deletions(repository.clone(), current.clone(), staged.clone());
+    let mut name = String::new();
+    leave_added_directory(&walk, directory, &mut name).await
 }
 
 /// Add a new file node named `name` under `parent_staged` with Dirty+Add.
@@ -1438,7 +2375,8 @@ async fn dirty_add_directory(
 ///
 /// Stops, adding nothing, at a node that is no directory, where the first name missing would be
 /// added below it, as on a path through a file, which holds no child to find, or where the path
-/// ends there ([`ParentChain::Through`]).
+/// ends there ([`ParentChain::Through`]). A node staged for deletion holds no name: a directory is
+/// added beside it, and lookups take that one ([`State::find_live_subnode`]).
 #[lore_macro::test_pub]
 async fn ensure_dirty_parent_dirs(
     repository: &Arc<RepositoryContext>,
@@ -1460,12 +2398,13 @@ async fn ensure_dirty_parent_dirs(
         }
         let name_hash = crate::hash::hash_string(segment);
         // Only a name the directory lacks is added: a find that failed otherwise, as on a block
-        // that did not load, says nothing of the name, and the add checks none.
+        // that did not load, says nothing of the name, and the add checks none. A node staged for
+        // deletion holds no name, and the directory is added beside it.
         match state
-            .find_subnode(repository.clone(), current_node, name_hash)
+            .find_live_subnode(repository.clone(), current_node, name_hash)
             .await
         {
-            Ok(child_id) => {
+            Ok((child_id, false)) => {
                 current_node = child_id;
                 continue;
             }
@@ -1473,7 +2412,7 @@ async fn ensure_dirty_parent_dirs(
                 return Err(error)
                     .forward::<DirtyError>("finding a parent directory of a dirty add");
             }
-            Err(_) => {}
+            Ok((_, true)) | Err(_) => {}
         }
         if !added
             && !state
@@ -1482,7 +2421,10 @@ async fn ensure_dirty_parent_dirs(
                 .forward::<DirtyError>("Failed to read a parent directory of a dirty add")?
                 .is_directory()
         {
-            return Ok(ParentChain::Through(names_in(rest) + 1));
+            return Ok(ParentChain::Through {
+                node: current_node,
+                below: names_in(rest) + 1,
+            });
         }
         added = true;
         // A directory node carries no File or Link flag. Mark it with
@@ -1515,7 +2457,10 @@ async fn ensure_dirty_parent_dirs(
             .forward::<DirtyError>("Failed to read the parent directory of a dirty add")?
             .is_directory()
     {
-        return Ok(ParentChain::Through(0));
+        return Ok(ParentChain::Through {
+            node: current_node,
+            below: 0,
+        });
     }
     Ok(ParentChain::Reached(current_node))
 }
@@ -1525,15 +2470,25 @@ fn names_in(path: &str) -> usize {
     path.split('/').filter(|name| !name.is_empty()).count()
 }
 
+/// The last `count` names of `path`, without a separator before them.
+fn trailing_names(path: &str, count: usize) -> &str {
+    if count == 0 {
+        return "";
+    }
+    path.rmatch_indices('/')
+        .nth(count - 1)
+        .map_or(path, |(at, _)| &path[at + 1..])
+}
+
 /// Where [`ensure_dirty_parent_dirs`] took a path.
 #[lore_macro::test_pub]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ParentChain {
     /// To the directory node its last name reaches.
     Reached(NodeID),
-    /// To a node that is no directory, below which its first missing name would be added, or which
-    /// its last name reaches, with how many of its names lie below that node.
-    Through(usize),
+    /// To `node`, which is no directory, below which its first missing name would be added, or
+    /// which its last name reaches, with how many of its names lie `below` that node.
+    Through { node: NodeID, below: usize },
 }
 
 /// The dirty mark of a move of `node`: an add where it is added, and otherwise a move, beside the
@@ -1553,198 +2508,507 @@ fn dirty_move_mark(node: &Node) -> NodeFlags {
 /// is left as it is, unless the moved directory was deleted itself (`undelete`). Any other node is
 /// marked moved below an added directory too, as only a move of its own put it there, so a commit
 /// returns it rather than discarding it with the directory; a file marked modified stays modified
-/// as well ([`dirty_move_mark`]).
+/// as well ([`dirty_move_mark`]). One walk of the subtree ([`State::node_mark_subtree`]), boxed by
+/// this function, as only a directory's move takes it.
 async fn mark_children_dirty_moved(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
     parent_node: NodeID,
     undelete: bool,
 ) -> Result<(), crate::state::StateError> {
-    fn mark_children_dirty_moved_recursive(
-        repository: Arc<RepositoryContext>,
-        state: Arc<State>,
-        parent_node: NodeID,
-        undelete: bool,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(), crate::state::StateError>> + Send>,
-    > {
-        Box::pin(async move {
-            let children = state.node_children(repository.clone(), parent_node).await?;
-
-            for child_id in children {
-                let (deleted, child_flag, is_directory) = {
-                    let child = state.node(repository.clone(), child_id).await?;
-                    (
-                        child.is_deleted(),
-                        dirty_move_mark(&child),
-                        child.is_directory(),
-                    )
-                };
-                if !undelete && deleted {
-                    continue;
-                }
-
-                state
-                    .node_mark(
-                        &repository,
-                        child_id,
-                        Mark::dirty(child_flag, Ext::Set(NodeExtFlags::NoFlags), false),
-                    )
-                    .await?;
-
-                if is_directory {
-                    mark_children_dirty_moved_recursive(
-                        repository.clone(),
-                        state.clone(),
-                        child_id,
-                        undelete,
-                    )
-                    .await?;
-                }
-            }
-
-            Ok(())
-        })
-    }
-
-    mark_children_dirty_moved_recursive(repository, state, parent_node, undelete).await
+    Box::pin(
+        state.node_mark_subtree(repository, parent_node, |_, child| {
+            (undelete || !child.is_deleted()).then(|| {
+                Mark::dirty(
+                    dirty_move_mark(child),
+                    Ext::Set(NodeExtFlags::NoFlags),
+                    false,
+                )
+            })
+        }),
+    )
+    .await
 }
+
+/// Most entries of a working tree's directory whose children a dirty walk finds by a search of
+/// each tree's chain, and most children the working tree lacks there whose staged side it finds so:
+/// a few searches cost less than a listing, and allocate nothing. Past either, the walk lists the
+/// directory once.
+#[lore_macro::test_pub]
+const SEARCHED_CHILDREN: usize = 8;
 
 /// Recursively process a directory, marking each child as dirty based on filesystem state.
 ///
 /// `nodes` names the directory in each tree, and every child is reached from it rather than
 /// resolved from `dir_path`, which is the working-tree path the filter and the listing answer for.
 ///
-/// `states` is the filter verdict for `dir_path`, which each child steps from.
+/// `states` is the filter verdict for `dir_path`, which each child steps from. `moved_here` says
+/// whether the staged directory is one `lore dirty move` moved to `dir_path`, not staged, where the
+/// current revision holds none, which holds its committed children.
 ///
-/// The listing names everything the working tree holds here, so the pass that follows settles
-/// which of the current revision's children are deletes from those names rather than by reading
-/// the working tree a second time. The names are collected ahead of the filter, a child the
-/// filter leaves out standing on disk all the same. A child the staged tree holds elsewhere is
-/// no delete ([`held_elsewhere`]).
+/// Each entry of the working tree's directory takes its child in each tree from one listing of
+/// the directory in each tree ([`ListedChildren`]), or by a search of each tree's chain where the
+/// directory holds no more than [`SEARCHED_CHILDREN`] entries.
+///
+/// The entries name everything the working tree holds here, so the pass that follows settles
+/// which of the current revision's children are deletes from those names, rather than by reading
+/// the working tree a second time. The names count ahead of the filter, a child the filter leaves
+/// out standing on disk all the same, but for a node of the other kind, which such an entry marks
+/// as one the working tree lacks ([`dirty_replaced_node`]). A child the staged tree holds
+/// elsewhere is no delete ([`held_elsewhere`]). Where `moved_here`, the children the working tree
+/// lacks are marked after that pass ([`mark_moved_children_absent`]).
+///
+/// No slot of the staged listing's chain is freed while its mark lives: an entry whose staged
+/// node the walk marks deleted before adding the entry beside it ([`deletes_beside`]), or whose
+/// replaced node it marks, drops the mark first, as the mark may free a node only marked added.
 #[lore_macro::test_pub]
 fn dirty_directory<'a>(
     walk: &'a DirtyWalk,
     nodes: DirtyNodes,
     dir_path: &'a RelativePath,
-    states: FilterStates,
+    (states, moved_here): (FilterStates, bool),
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = walk
-            .operation
-            .read_directory(dir_path)
-            .await
-            .forward_with::<DirtyError, _>(|| format!("Failed to read directory {dir_path}"))?;
+        let entries = directory_entries(walk, dir_path).await?;
+        let mut listed = if entries.len() > SEARCHED_CHILDREN {
+            Some(ListedChildren::list(walk, nodes).await?)
+        } else {
+            None
+        };
 
-        let deletes_to_find = nodes.current.is_valid_or_root_node_id();
-        let mut present = Vec::new();
         let force = execution_context().globals().force();
-        while let Some(entry) = entries.next().await {
-            let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
-            if is_reserved_node_name(&entry.name) {
-                continue;
-            }
-            if deletes_to_find {
-                present.push(entry.name_hash);
-            }
+        for entry in &entries {
             let child_path = dir_path.push_into_buf(&entry.name).freeze();
 
             // Looked up before the filter is asked: a node the tree tracks as the kind the entry is
             // is past the ignore slot. The trees are searched only where the filter would drop it.
-            let child_nodes = nodes.child(walk, entry.name_hash).await;
+            let child_nodes = match listed.as_mut() {
+                Some(listed) => listed.child(walk, &entries, entry.name_hash).await?,
+                None => nodes.child(walk, entry.name_hash).await,
+            };
             let is_directory = entry.info.is_dir();
-            let tracked = !force
-                && walk
+            let mut tracked = None;
+            let (child_states, excluded) = if force {
+                walk.repository.filter.child_emit_unless_forced(
+                    true,
+                    FilterMode::View,
+                    states,
+                    &child_path,
+                    is_directory,
+                    FilterMode::TRACKED,
+                )
+            } else {
+                let (child_states, mut reason, asks) = walk
                     .repository
                     .filter
-                    .child_excludes_tree(states, &child_path, is_directory, FilterMode::Full)
-                    .1
-                && tracks(walk, child_nodes, Some(is_directory)).await?;
-            let (child_states, excluded) = walk.repository.filter.child_emit_unless_forced(
-                force,
-                FilterMode::View,
-                states,
-                &child_path,
-                is_directory,
-                FilterMode::TRACKED.at(tracked),
-            );
+                    .child_untracked_reason(states, &child_path, is_directory, FilterMode::TRACKED);
+                if asks {
+                    let answer = tracks(walk, child_nodes, Some(is_directory)).await?;
+                    tracked = Some(answer);
+                    if answer {
+                        reason = walk.repository.filter.tracked_reason(
+                            child_states,
+                            &child_path,
+                            is_directory,
+                            FilterMode::TRACKED,
+                        );
+                    }
+                }
+                (child_states, Filter::emit(&child_path, reason))
+            };
             if excluded {
+                let replaced = holds_any(child_nodes)
+                    && !match tracked {
+                        Some(tracked) => tracked,
+                        None => tracks(walk, child_nodes, Some(is_directory)).await?,
+                    };
+                if replaced {
+                    if let Some(listed) = listed.as_mut() {
+                        listed.staged.drop_mark();
+                    }
+                    let staged = staged_node(walk, child_nodes).await;
+                    Box::pin(dirty_replaced_node(
+                        walk,
+                        (child_nodes, staged),
+                        StagedParent::node(nodes.staged),
+                        &child_path,
+                        is_directory,
+                        states,
+                    ))
+                    .await?;
+                }
                 continue;
             }
 
-            dirty_path(
+            let staged = staged_node(walk, child_nodes).await;
+            if let Some(listed) = listed.as_mut()
+                && staged.is_some_and(|node| deletes_beside(&node, is_directory))
+            {
+                listed.staged.drop_mark();
+            }
+            if dirty_path(
                 walk,
                 child_nodes,
-                staged_node(walk, child_nodes).await,
+                staged,
                 StagedParent::node(nodes.staged),
                 &child_path,
                 entry.info,
                 child_states,
             )
-            .await?;
-        }
-
-        if deletes_to_find {
-            present.sort_unstable();
-            let children = walk
-                .state_current
-                .node_children(walk.repository.clone(), nodes.current)
-                .await
-                .forward::<DirtyError>("Failed to get directory children")?;
-
-            for &child_id in &children {
-                let Some((current, child_name)) = walk
-                    .state_current
-                    .node_and_name_or_skip(walk.repository.clone(), child_id)
-                    .await
-                    .forward::<DirtyError>("Failed to get child name")?
-                else {
-                    continue;
-                };
-                let name_hash = crate::hash::hash_string(&child_name);
-                if present.binary_search(&name_hash).is_ok() {
-                    continue;
-                }
-                let child_rel = dir_path.push_into_buf(&child_name).freeze();
-                drop(child_name);
-
-                let Some(child_states) = absent_child_states(walk, states, &child_rel, &current)
-                else {
-                    continue;
-                };
-                // The current side is the child being enumerated, so only the staged side
-                // is looked up.
-                let staged = subnode(
-                    &walk.state_staged,
-                    &walk.repository,
-                    nodes.staged,
-                    name_hash,
-                )
-                .await;
-                if !staged.is_valid_or_root_node_id()
-                    && held_elsewhere(walk, child_id, current.node_type()).await?
-                {
-                    continue;
-                }
-                let child_nodes = DirtyNodes {
-                    current: child_id,
-                    staged,
-                };
-                dirty_path(
-                    walk,
-                    child_nodes,
-                    staged_node(walk, child_nodes).await,
-                    StagedParent::node(nodes.staged),
-                    &child_rel,
-                    FileInfo::NotExist,
-                    child_states,
-                )
-                .await?;
+            .await?
+                && let Some(listed) = listed.as_mut()
+            {
+                listed.staged.count_own_add();
             }
         }
 
+        match listed.as_mut() {
+            Some(listed) => dirty_unclaimed(walk, nodes, dir_path, states, listed).await?,
+            None => dirty_unnamed(walk, nodes, dir_path, states, &entries).await?,
+        }
+        if moved_here {
+            let mut present: Vec<u64> = entries.iter().map(|entry| entry.name_hash).collect();
+            present.sort_unstable();
+            Box::pin(mark_moved_children_absent(
+                walk,
+                nodes.staged,
+                (dir_path, &present),
+                states,
+            ))
+            .await?;
+        }
         Ok(())
     })
+}
+
+/// Marks the children of the current directory `nodes` names that no entry of the working tree's
+/// directory `dir_path` claimed in `listed`, the listings the entries took their children from.
+/// Each one's staged side comes from the staged listing alone, a child not staged for deletion
+/// taken before one that is ([`live_in_listing`]): no entry carries its name hash, so no node the
+/// walk added does. The staged listing's mark is dropped first, since the pass may discard a child
+/// ([`DirectoryChildren::drop_mark`]).
+async fn dirty_unclaimed(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    listed: &mut ListedChildren,
+) -> Result<(), DirtyError> {
+    listed.staged.drop_mark();
+    let Some(current) = listed.current() else {
+        return Ok(());
+    };
+    for (child, name_hash) in current.unclaimed_by_name_hash() {
+        let carrying = listed.staged.carrying(name_hash);
+        let found = carrying.clone().next().unwrap_or(INVALID_NODE);
+        let staged = live_in_listing(walk, carrying, found).await?;
+        dirty_absent_child(walk, nodes.staged, dir_path, states, child, staged).await?;
+    }
+    Ok(())
+}
+
+/// Marks the children of the current directory `nodes` names that no entry of `entries`, the
+/// working tree's directory `dir_path`, carries the name hash of, where the walk listed neither
+/// tree: from a listing of the current directory, with each one's staged side found by a search
+/// of the staged chain, or from a listing of the staged directory for more than
+/// [`SEARCHED_CHILDREN`] of them, a child not marked deleted taken before one that is
+/// ([`State::find_live_subnode`], [`live_in_listing`]).
+async fn dirty_unnamed(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    entries: &[DirectoryEntry],
+) -> Result<(), DirtyError> {
+    if !nodes.current.is_valid_or_root_node_id() {
+        return Ok(());
+    }
+    let Some((mut absent, _)) =
+        directory_children(&walk.repository, &walk.state_current, nodes.current)
+            .await
+            .forward::<DirtyError>("Failed to list the current directory's children")?
+    else {
+        return Ok(());
+    };
+    absent.retain(|&(_, name_hash)| entries.iter().all(|entry| entry.name_hash != name_hash));
+    let staged = if absent.len() > SEARCHED_CHILDREN {
+        let listed = directory_children(&walk.repository, &walk.state_staged, nodes.staged)
+            .await
+            .forward::<DirtyError>("Failed to list the staged directory's children")?
+            .map_or_else(Vec::new, |(listed, _)| listed);
+        Some(NameHashIndex::new(listed))
+    } else {
+        None
+    };
+    for &(child, name_hash) in &absent {
+        let staged = match &staged {
+            Some(listed) => {
+                let carrying = listed.carrying(name_hash);
+                let found = carrying.clone().next().unwrap_or(INVALID_NODE);
+                live_in_listing(walk, carrying, found).await?
+            }
+            None if nodes.staged.is_valid_or_root_node_id() => walk
+                .state_staged
+                .find_live_subnode(walk.repository.clone(), nodes.staged, name_hash)
+                .await
+                .map_or(INVALID_NODE, |(found, _)| found),
+            None => INVALID_NODE,
+        };
+        dirty_absent_child(walk, nodes.staged, dir_path, states, child, staged).await?;
+    }
+    Ok(())
+}
+
+/// Marks `child`, a child of the current directory that the working tree lacks below `dir_path`,
+/// whose verdict is `states`, with `staged` the child of the staged directory `parent` carrying
+/// its name: deleted, unless the filter leaves it out or the staged tree holds it elsewhere
+/// ([`held_elsewhere`]).
+///
+/// A function of its own, so the child's path sits in the directory's future only while it runs.
+/// The child's node is read in a block of its own, so the future holds only its type across the
+/// marking.
+async fn dirty_absent_child(
+    walk: &DirtyWalk,
+    parent: NodeID,
+    dir_path: &RelativePath,
+    states: FilterStates,
+    child: NodeID,
+    staged: NodeID,
+) -> Result<(), DirtyError> {
+    let (child_rel, child_states, node_type) = {
+        let Some((current, child_name)) = walk
+            .state_current
+            .node_and_name_or_skip(walk.repository.clone(), child)
+            .await
+            .forward::<DirtyError>("Failed to get child name")?
+        else {
+            return Ok(());
+        };
+        let child_rel = dir_path.push_into_buf(&child_name).freeze();
+        drop(child_name);
+        let Some(child_states) = absent_child_states(walk, states, &child_rel, &current) else {
+            return Ok(());
+        };
+        (child_rel, child_states, current.node_type())
+    };
+    if !staged.is_valid_or_root_node_id() && held_elsewhere(walk, child, node_type).await? {
+        return Ok(());
+    }
+    let child_nodes = DirtyNodes {
+        current: child,
+        staged,
+    };
+    dirty_path(
+        walk,
+        child_nodes,
+        staged_node(walk, child_nodes).await,
+        StagedParent::node(parent),
+        &child_rel,
+        FileInfo::NotExist,
+        child_states,
+    )
+    .await
+    .map(drop)
+}
+
+/// The entries of the working tree's directory `dir_path`, leaving out the repository's own
+/// directory.
+async fn directory_entries(
+    walk: &DirtyWalk,
+    dir_path: &RelativePath,
+) -> Result<Vec<DirectoryEntry>, DirtyError> {
+    let mut listing = walk
+        .operation()?
+        .read_directory(dir_path)
+        .await
+        .forward_with::<DirtyError, _>(|| format!("Failed to read directory {dir_path}"))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = listing.next().await {
+        let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
+        if !is_reserved_node_name(&entry.name) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+/// What the current tree holds of a directory a dirty walk descends.
+enum CurrentChildren {
+    /// The staged directory, in the one State the trees share, which answers for both.
+    Shared,
+    /// The directory's children, listed once.
+    Listed(DirectoryChildren),
+    /// No directory.
+    Absent,
+}
+
+/// The children of a directory a dirty walk descends, listed once in each tree, from which each
+/// entry of the working tree's directory takes its child by name hash ([`find_from_listing`]).
+struct ListedChildren {
+    /// The staged directory's children, with the mark of the chain their listing began from.
+    staged: DirectoryChildren,
+    /// The staged directory.
+    staged_directory: NodeID,
+    current: CurrentChildren,
+}
+
+impl ListedChildren {
+    /// The children of the directory `nodes` names, in each tree, the staged one holding it. A node
+    /// that is not a directory, a link included, lists none.
+    async fn list(walk: &DirtyWalk, nodes: DirtyNodes) -> Result<Self, DirtyError> {
+        let staged = match directory_children(&walk.repository, &walk.state_staged, nodes.staged)
+            .await
+            .forward::<DirtyError>("Failed to list the staged directory's children")?
+        {
+            Some((listed, mark)) => DirectoryChildren::new(listed, Some(mark)),
+            None => DirectoryChildren::new(Vec::new(), None),
+        };
+        let current = if nodes.current == nodes.staged
+            && Arc::ptr_eq(&walk.state_current, &walk.state_staged)
+        {
+            CurrentChildren::Shared
+        } else if nodes.current.is_valid_or_root_node_id() {
+            let listed = directory_children(&walk.repository, &walk.state_current, nodes.current)
+                .await
+                .forward::<DirtyError>("Failed to list the current directory's children")?
+                .map_or_else(Vec::new, |(listed, _)| listed);
+            CurrentChildren::Listed(DirectoryChildren::new(listed, None))
+        } else {
+            CurrentChildren::Absent
+        };
+        Ok(Self {
+            staged,
+            staged_directory: nodes.staged,
+            current,
+        })
+    }
+
+    /// The child the entry of `entries` carrying `name_hash` names in each tree, as
+    /// [`DirtyNodes::child`] finds it.
+    async fn child(
+        &mut self,
+        walk: &DirtyWalk,
+        entries: &[DirectoryEntry],
+        name_hash: u64,
+    ) -> Result<DirtyNodes, DirtyError> {
+        let found =
+            match find_from_listing(&mut self.staged, &walk.state_staged, entries, name_hash) {
+                KnownChild::Resolved(found) => found,
+                KnownChild::Unresolved => claim_child(
+                    &walk.repository,
+                    &walk.state_staged,
+                    self.staged_directory,
+                    &mut self.staged,
+                    name_hash,
+                )
+                .await
+                .forward_any::<DirtyError>("Failed to search the staged directory's children")?,
+            };
+        let (found, start) = found.map_or((INVALID_NODE, None), |found| (found.node, found.start));
+        let start = start.unwrap_or_else(|| self.staged.start_of(name_hash));
+        let carrying = self.staged.carrying_from(start, name_hash);
+        let staged = live_in_listing(walk, carrying, found).await?;
+        let current = match &mut self.current {
+            CurrentChildren::Shared => staged,
+            CurrentChildren::Listed(children) => {
+                match find_from_listing(children, &walk.state_current, entries, name_hash) {
+                    KnownChild::Resolved(Some(found)) => found.node,
+                    KnownChild::Resolved(None) | KnownChild::Unresolved => INVALID_NODE,
+                }
+            }
+            CurrentChildren::Absent => INVALID_NODE,
+        };
+        Ok(DirtyNodes { current, staged })
+    }
+
+    /// The current directory's children, which the staged listing holds where the trees share
+    /// their State; `None` where the current tree holds no directory.
+    fn current(&self) -> Option<&DirectoryChildren> {
+        match &self.current {
+            CurrentChildren::Shared => Some(&self.staged),
+            CurrentChildren::Listed(children) => Some(children),
+            CurrentChildren::Absent => None,
+        }
+    }
+}
+
+/// [`State::live_among`] of the staged tree.
+async fn live_in_listing(
+    walk: &DirtyWalk,
+    carrying: impl Iterator<Item = NodeID> + Clone,
+    found: NodeID,
+) -> Result<NodeID, DirtyError> {
+    walk.state_staged
+        .live_among(&walk.repository, carrying, found)
+        .await
+        .forward::<DirtyError>("Failed to read a staged child of a listed name")
+}
+
+/// Marks each child of `directory`, a directory `lore dirty move` moved to `dir_path`, that the
+/// working tree lacks there, its name hash not among `present`, as a walk marks a child the
+/// current revision holds and the working tree lacks; one staged for deletion is left as it is.
+/// Boxed by its caller, which takes it only for such a directory.
+async fn mark_moved_children_absent(
+    walk: &DirtyWalk,
+    directory: NodeID,
+    (dir_path, present): (&RelativePath, &[u64]),
+    states: FilterStates,
+) -> Result<(), DirtyError> {
+    let children = walk
+        .state_staged
+        .node_children(walk.repository.clone(), directory)
+        .await
+        .forward::<DirtyError>("Failed to get directory children")?;
+    for child_id in children {
+        let Some((staged, child_name)) = walk
+            .state_staged
+            .node_and_name_or_skip(walk.repository.clone(), child_id)
+            .await
+            .forward::<DirtyError>("Failed to get child name")?
+        else {
+            continue;
+        };
+        if staged.is_staged_delete() || present.binary_search(&staged.name_hash).is_ok() {
+            continue;
+        }
+        let child_rel = dir_path.push_into_buf(&child_name).freeze();
+        drop(child_name);
+        let Some(child_states) = absent_child_states(walk, states, &child_rel, &staged) else {
+            continue;
+        };
+        let current = if held_in_current(walk, child_id, staged.node_type()).await? {
+            child_id
+        } else {
+            INVALID_NODE
+        };
+        let child_nodes = DirtyNodes {
+            current,
+            staged: child_id,
+        };
+        dirty_path(
+            walk,
+            child_nodes,
+            Some(staged),
+            StagedParent::node(directory),
+            &child_rel,
+            FileInfo::NotExist,
+            child_states,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Whether the current revision holds `node`, of `node_type`.
+async fn held_in_current(
+    walk: &DirtyWalk,
+    node: NodeID,
+    node_type: LoreNodeType,
+) -> Result<bool, DirtyError> {
+    walk.state_current
+        .holds_node(&walk.repository, node, node_type)
+        .await
+        .forward::<DirtyError>("Failed to read a node the current revision may hold")
 }
 
 /// Whether the staged tree holds `node`, of `node_type`, a child of the current revision's
@@ -1783,6 +3047,9 @@ fn absent_child_states(
 /// Mark a file as dirty-moved. Relocates the node in the staged tree from source to destination.
 /// No filesystem checks — fully caller-trusted.
 /// Propagates Dirty to both source parent (child removed) and destination parent (child added).
+/// A live node the destination holds is marked deleted, with what it holds, and the moved node
+/// stands beside it under the same name ([`replaced_by_move`], [`mark_replaced_deleted`]); a move
+/// that would leave it live there is refused ([`refuse_kept`]).
 pub async fn dirty_move(
     repository: Arc<RepositoryContext>,
     from_path: String,
@@ -1818,16 +3085,261 @@ pub async fn dirty_move(
     let to_parent_id = parent_outside_links(&state, &repository, &to_path)
         .await
         .forward_with::<DirtyError, _>(|| format!("looking up the parent of {to_path}"))?;
+    let to_parent_id = destination_parent(&repository, &state, &to_path, to_parent_id).await?;
 
     let to_name = to_path.name();
+    let replaced = replaced_by_move(&repository, &state, to_parent_id, &to_path, from_node).await?;
     let name = if from_path.name() != to_name {
         NameChange::Rename(to_name)
     } else {
         NameChange::Keep
     };
-    mark_moved(&repository, &state, from_node, to_parent_id, name).await?;
+    mark_moved(
+        &repository,
+        &state,
+        current_revision,
+        from_node,
+        to_parent_id,
+        name,
+    )
+    .await?;
+    if let Some(replaced) = replaced {
+        let walk =
+            DirtyWalk::marking_deletions(repository.clone(), state_current.clone(), state.clone());
+        Box::pin(replace_or_refuse(&walk, replaced, &to_path)).await?;
+    }
 
     save_staged(&repository, &state, current_revision).await
+}
+
+/// Marks `replaced` deleted as [`mark_replaced_deleted`] does, and refuses the move to `to_path`
+/// where that leaves it live ([`refuse_kept`]). Boxed by its caller, as only a move onto a held
+/// name takes it.
+async fn replace_or_refuse(
+    walk: &DirtyWalk,
+    replaced: Replaced,
+    to_path: &RelativePath,
+) -> Result<(), DirtyError> {
+    mark_replaced_deleted(walk, replaced, to_path).await?;
+    if replaced.may_stay {
+        return refuse_kept(walk, replaced, to_path).await;
+    }
+    Ok(())
+}
+
+/// Refuses the move to `to_path` where `replaced`, the node it replaces, stands live once marked,
+/// beside the moved node under one name, so the staged tree is not saved. It refuses a move onto a
+/// directory a dirty move put there whose committed parent now lies inside it, or onto a node one
+/// put there whose committed parent is no live directory, and onto a directory only marked added
+/// holding a committed node whose committed place another unstaged node holds: none can leave the
+/// name. `lore stage move` takes such a move.
+async fn refuse_kept(
+    walk: &DirtyWalk,
+    replaced: Replaced,
+    to_path: &RelativePath,
+) -> Result<(), DirtyError> {
+    let node_type = if replaced.directory {
+        LoreNodeType::Directory
+    } else {
+        LoreNodeType::File
+    };
+    let kept = walk
+        .state_staged
+        .held_node(&walk.repository, replaced.node, node_type)
+        .await
+        .forward::<DirtyError>("Failed to read the node a move replaces")?
+        .is_some_and(|record| !record.is_deleted());
+    if kept {
+        return Err(DirtyError::internal(format!(
+            "Cannot mark the move to {to_path} dirty: the node it replaces there, or one inside \
+             it, cannot go back to its committed path to be marked deleted. Stage the move \
+             instead, with lore stage move"
+        )));
+    }
+    Ok(())
+}
+
+/// A live node a move replaces, as [`replaced_by_move`] finds it.
+#[derive(Clone, Copy)]
+struct Replaced {
+    node: NodeID,
+    /// Whether it holds a staged change, of its own or below it.
+    staged: bool,
+    /// Whether it is marked dirty as moved and not staged, so it goes back to its committed place
+    /// to be marked deleted there ([`returned_beside`]).
+    moved: bool,
+    /// Whether it is a directory; otherwise a file, as a link's mount is refused
+    /// ([`replaced_by_move`]).
+    directory: bool,
+    /// Whether its marking may leave it live ([`refuse_kept`]): it is marked dirty as moved, or
+    /// is a directory leaving as a reverted add, and is not staged.
+    may_stay: bool,
+}
+
+impl Replaced {
+    fn of(node: NodeID, record: &Node) -> Self {
+        let moved = record.is_dirty_move() && !record.is_staged();
+        let directory = record.is_directory();
+        Replaced {
+            node,
+            staged: record.is_staged(),
+            moved,
+            directory,
+            may_stay: moved || (directory && record.reverts_as_add() && !record.is_staged()),
+        }
+    }
+}
+
+/// The live node a move of `node` to `to_path`, whose directory is `parent`, replaces: the one
+/// [`State::find_live_subnode_if_present`] answers there, other than `node` itself, as a rename of
+/// the case alone finds. `None` where no node holds the name or only a deleted one does. A link's
+/// mount is refused, as `lore stage move` refuses a move onto one.
+async fn replaced_by_move(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    parent: NodeID,
+    to_path: &RelativePath,
+    node: NodeID,
+) -> Result<Option<Replaced>, DirtyError> {
+    let name_hash = crate::hash::hash_string(to_path.name());
+    let found = match state
+        .find_live_subnode_if_present(repository.clone(), parent, name_hash)
+        .await
+        .forward::<DirtyError>("Failed to look up a move's destination")?
+    {
+        Some((found, _)) if found != node => found,
+        _ => return Ok(None),
+    };
+    let held = state
+        .node(repository.clone(), found)
+        .await
+        .forward::<DirtyError>("Failed to read the node a move's destination holds")?;
+    if held.is_link() {
+        return Err(NotSupported {
+            operation: format!("Moving a path onto a link's mount, at {to_path}"),
+        }
+        .into());
+    }
+    Ok((!held.is_deleted()).then(|| Replaced::of(found, &held)))
+}
+
+/// Marks `replaced`, the node the move to `to_path` replaces, deleted as a dirty mark of a path the
+/// working tree no longer holds marks it ([`dirty_delete`]), with its subtree. One `lore dirty
+/// move` put there goes back to its committed place to be marked deleted there, beside a node that
+/// holds that place where one does, as no other place holds it ([`returned_beside`]). Taken once
+/// the moved node stands at `to_path`: a directory moved onto the one holding it was below it
+/// until then. `walk` marks deletions alone, reading nothing of the working tree
+/// ([`DirtyWalk::marking_deletions`]). `lore dirty move` takes it boxed, as only a move onto a
+/// held name takes it, and a commit's replay inside the box it takes once ([`replay_carried`]).
+///
+/// One that is staged, by a change of its own or one below it, is staged for deletion instead,
+/// with its subtree, by the stage's own deletion ([`crate::stage::stage_delete`]), as `lore stage
+/// move` stages the node it replaces. This is the one exception to a dirty mark leaving a staged
+/// change standing: the move replaced the node on disk, and a dirty deletion beside the staged
+/// change would leave two live nodes under one name.
+async fn mark_replaced_deleted(
+    walk: &DirtyWalk,
+    replaced: Replaced,
+    to_path: &RelativePath,
+) -> Result<(), DirtyError> {
+    if replaced.staged {
+        return stage_replaced(&walk.repository, &walk.state_staged, replaced.node, to_path).await;
+    }
+    let returned = if replaced.moved {
+        Box::pin(returned_beside(walk, replaced.node)).await?
+    } else {
+        None
+    };
+    let path = returned.as_ref().unwrap_or(to_path);
+    let states = walk.repository.filter.exclusion_states(path);
+    dirty_delete(walk, replaced.node, path, states, &mut String::new(), false).await
+}
+
+/// Stages the deletion of `replaced`, which a move to `to_path` replaces, with its subtree, as one
+/// stage of one path, between the events that open and close a stage.
+async fn stage_replaced(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    replaced: NodeID,
+    to_path: &RelativePath,
+) -> Result<(), DirtyError> {
+    LoreEvent::FileStageBegin(LoreFileStageBeginEventData { path_count: 1 }).send();
+    let stats = Arc::new(StageStats::default());
+    crate::stage::stage_delete(
+        repository.clone(),
+        state.clone(),
+        to_path.clone(),
+        replaced,
+        NodeFlags::NoFlags,
+        stats.clone(),
+        None,
+    )
+    .await
+    .forward_any::<DirtyError>("Failed to stage the deletion of a node a move replaces")?;
+    let count = LoreFileStageCountData::new(stats);
+    LoreEvent::FileStageEnd(LoreFileStageEndEventData { count }).send();
+    Ok(())
+}
+
+/// Returns `node`, which a move replaces, marked dirty as moved and not staged, to the place the
+/// current revision holds it at, beside a node holding that place where one does, and answers the
+/// path the walk spells for it there ([`returned_path`]); `None` where it stays. Boxed by its
+/// caller, as only a moved node a move replaces takes it.
+async fn returned_beside(
+    walk: &DirtyWalk,
+    node: NodeID,
+) -> Result<Option<RelativePath>, DirtyError> {
+    let options = ReturnOptions {
+        beside: true,
+        ..ReturnOptions::default()
+    };
+    let (returned, _) = walk
+        .state_staged
+        .node_return_unstaged_move(
+            &walk.repository,
+            walk.state_current.revision(),
+            node,
+            &mut String::new(),
+            options,
+        )
+        .await
+        .forward::<DirtyError>("Failed to return the node a move replaces")?;
+    match returned {
+        Return::Back => returned_path(walk, node).await,
+        _ => Ok(None),
+    }
+}
+
+/// The directory a move or a copy to `to_path` lands in, where `found` is the node a lookup of its
+/// parent path found: that node where it is a directory not staged for deletion, a directory added
+/// beside one staged for deletion, as the dirty walk adds one ([`ensure_dirty_parent_dirs`]), and
+/// refused where the parent is no directory.
+async fn destination_parent(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    to_path: &RelativePath,
+    found: NodeID,
+) -> Result<NodeID, DirtyError> {
+    let node = state
+        .node(repository.clone(), found)
+        .await
+        .forward::<DirtyError>("Failed to read the parent of a move's destination")?;
+    if node.is_directory() && !node.is_staged_delete() {
+        return Ok(found);
+    }
+    let refused = || {
+        DirtyError::from(InvalidArguments {
+            reason: format!("the parent of {to_path} is not a directory"),
+        })
+    };
+    if !node.is_staged_delete() {
+        return Err(refused());
+    }
+    let parent_path = to_path.parent().unwrap_or_default();
+    match ensure_dirty_parent_dirs(repository, state, ROOT_NODE, parent_path).await? {
+        ParentChain::Reached(parent) => Ok(parent),
+        ParentChain::Through { .. } => Err(refused()),
+    }
 }
 
 /// Marks each of `moves` dirty as moved again in `state_staged`, which holds each node where
@@ -1840,17 +3352,26 @@ pub async fn dirty_move(
 /// A move that cannot be marked is skipped: one the tree no longer holds with its kind, such as
 /// one a staged change displaced, and one whose path runs through or ends below something other
 /// than a live directory, or ends inside the node's own subtree, which then takes its committed
-/// name again. One warning names how many were skipped and one of them; the path replay marks
+/// name again. The caller warns of them once ([`warn_moves_not_kept`]); the path replay marks
 /// what the working tree holds at their paths. Every node is checked before any is marked, as a
-/// directory added on a path may take a slot such a node left. Boxed by its caller, which takes it
-/// only where there are moves to mark.
+/// directory added on a path may take a slot such a node left.
+///
+/// A move onto a path another node holds marks that node deleted, as `lore dirty move` does
+/// ([`mark_moved_to`]); answered beside the skipped moves are the paths of such moves, which the
+/// moved node now stands for.
+///
+/// A move whose path runs below one of `pairs`, sorted, the paths of the deletions a commit carries
+/// beside an add under their name, is left parked for [`mark_moved_later`] unless a deleted node
+/// held it ([`MovedNode::below_deleted`]): until the add is made, the name there resolves to the
+/// node to be marked deleted, where only such a move belongs.
 #[lore_macro::test_pub]
 async fn mark_moved_again<'a>(
     repository: &Arc<RepositoryContext>,
-    state_current: &State,
+    state_current: &Arc<State>,
     state_staged: &Arc<State>,
     moves: &'a [MovedNode],
-) -> Result<Vec<&'a MovedNode>, DirtyError> {
+    pairs: &[&RelativePath],
+) -> Result<MovedAgain<'a>, DirtyError> {
     let mut held = Vec::with_capacity(moves.len());
     for moved in moves {
         let holds = state_staged
@@ -1865,18 +3386,107 @@ async fn mark_moved_again<'a>(
         }
         held.push(holds);
     }
-    let mut skipped = Vec::new();
+    let walk = DirtyWalk::marking_deletions(
+        repository.clone(),
+        state_current.clone(),
+        state_staged.clone(),
+    );
+    let mut again = MovedAgain::default();
     for (moved, held) in moves.iter().zip(held).rev() {
-        if held && mark_moved_to(repository, state_staged, moved).await? {
-            continue;
+        if !held {
+            lore_debug!("Move to {} not marked again", moved.path);
+            again.skipped.push(moved);
+        } else if !moved.below_deleted && runs_below_any(&moved.path, pairs) {
+            again.later.push(moved);
+        } else {
+            mark_or_unpark(&walk, moved, &mut again).await?;
         }
-        if held {
-            Box::pin(unpark(repository, state_current, state_staged, moved.node)).await?;
-        }
-        lore_debug!("Move to {} not marked again", moved.path);
-        skipped.push(moved);
     }
-    match &skipped[..] {
+    Ok(again)
+}
+
+/// What [`mark_moved_again`] did with the moves it was given: those it skipped, the paths of those
+/// that replaced a node, and those it left parked, in the order to mark them.
+#[lore_macro::test_pub]
+#[derive(Default)]
+pub(crate) struct MovedAgain<'a> {
+    pub skipped: Vec<&'a MovedNode>,
+    pub replaced: Vec<&'a RelativePath>,
+    pub later: Vec<&'a MovedNode>,
+}
+
+/// Marks the moves [`mark_moved_again`] left parked in `again`, once the adds beside the deletions
+/// they run below are made, so their paths reach the added nodes, as [`mark_moved_again`] marks
+/// the others, and makes `held_back`, the adds below such a deletion, as [`add_carried`] does: an
+/// add a move's path runs below before that move, the others once every move is marked, as one
+/// may lie below a moved node. Answers whether it added any.
+async fn mark_moved_later<'a>(
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    again: &mut MovedAgain<'a>,
+    mut held_back: Vec<&AddedNode>,
+) -> Result<bool, DirtyError> {
+    let walk = DirtyWalk::marking_deletions(
+        repository.clone(),
+        state_current.clone(),
+        state_staged.clone(),
+    );
+    let mut added = false;
+    for moved in std::mem::take(&mut again.later) {
+        let on_path: Vec<&AddedNode> = held_back
+            .extract_if(.., |held| runs_below(&moved.path, &held.path))
+            .collect();
+        added |= !on_path.is_empty() && add_carried(repository, state_staged, &on_path).await?;
+        mark_or_unpark(&walk, moved, again).await?;
+    }
+    added |= !held_back.is_empty() && add_carried(repository, state_staged, &held_back).await?;
+    Ok(added)
+}
+
+/// Marks `moved`, which [`mark_moved_again`] parked, moved again ([`mark_moved_to`]), or gives it
+/// its committed name again and adds it to the skipped moves of `again`.
+async fn mark_or_unpark<'a>(
+    walk: &DirtyWalk,
+    moved: &'a MovedNode,
+    again: &mut MovedAgain<'a>,
+) -> Result<(), DirtyError> {
+    if mark_moved_to(walk, moved, &mut again.replaced).await? {
+        return Ok(());
+    }
+    Box::pin(unpark(
+        &walk.repository,
+        &walk.state_current,
+        &walk.state_staged,
+        moved.node,
+    ))
+    .await?;
+    lore_debug!("Move to {} not marked again", moved.path);
+    again.skipped.push(moved);
+    Ok(())
+}
+
+/// Whether `path` runs below `ancestor`, as spelled.
+fn runs_below(path: &RelativePath, ancestor: &RelativePath) -> bool {
+    path.below(ancestor).is_some_and(|rest| !rest.is_empty())
+}
+
+/// Whether `path` runs below one of `pairs`, sorted by their spelling.
+fn runs_below_any(path: &RelativePath, pairs: &[&RelativePath]) -> bool {
+    let path = path.as_str();
+    !pairs.is_empty()
+        && path.match_indices('/').any(|(at, _)| {
+            pairs
+                .binary_search_by(|pair| pair.as_str().cmp(&path[..at]))
+                .is_ok()
+        })
+}
+
+/// Warns once of `skipped`, the moves a commit could not mark again past it, naming how many and
+/// one of them.
+#[lore_macro::test_pub]
+fn warn_moves_not_kept(skipped: &[&MovedNode]) {
+    match skipped {
         [] => {}
         [moved] => lore_warn!(
             "The move to {}, marked dirty and not staged, is not kept past the commit; its path is \
@@ -1890,14 +3500,13 @@ async fn mark_moved_again<'a>(
             moved.path
         ),
     }
-    Ok(skipped)
 }
 
 /// Marks each node of `marks` in `state_staged` with the dirty marks it carries, where the tree
 /// holds it and it is none of `skipped`, moves that could not be marked again; answers whether it
 /// marked any. A move mark goes where a move marked again put one, as on a node below a directory
 /// whose move the commit left out; elsewhere the revision took the move, so the node keeps its
-/// other marks alone. Boxed by its caller, which takes it only where there are marks to carry.
+/// other marks alone.
 async fn mark_carried(
     repository: &Arc<RepositoryContext>,
     state_staged: &State,
@@ -1955,16 +3564,24 @@ async fn unpark(
         .forward::<DirtyError>("Failed to rename a node back to its committed name")
 }
 
-/// Marks `moved`, which [`mark_moved_again`] renamed, dirty as moved again to its path, adding the
-/// directories on it the tree lacks; answers `false`, having moved nothing, where the path runs
-/// through or ends below something other than a live directory, or ends inside the node's own
-/// subtree. A directory's path through the name it waits under runs into its own subtree, which is
-/// answered before anything is added.
-async fn mark_moved_to(
-    repository: &Arc<RepositoryContext>,
-    state_staged: &Arc<State>,
-    moved: &MovedNode,
+/// Marks `moved`, which [`mark_moved_again`] renamed, dirty as moved again to its path in the
+/// staged tree of `walk`, a walk marking deletions alone, adding the directories on it the tree
+/// lacks; answers `false`, having moved nothing, where the path runs through or ends below
+/// something other than a live directory, ends inside the node's own subtree, or ends at a link's
+/// mount. A directory's path through the name it waits under runs into its own subtree, which is
+/// answered before anything is added. A live node holding the path is marked deleted as `lore
+/// dirty move` marks it ([`mark_replaced_deleted`]), and the path joins `replaced`.
+async fn mark_moved_to<'a>(
+    walk: &DirtyWalk,
+    moved: &'a MovedNode,
+    replaced: &mut Vec<&'a RelativePath>,
 ) -> Result<bool, DirtyError> {
+    let DirtyWalk {
+        repository,
+        state_current,
+        state_staged,
+        ..
+    } = walk;
     let is_directory = moved.node_type == LoreNodeType::Directory;
     let parent_path = moved.path.parent().unwrap_or_default();
     if is_directory
@@ -1986,32 +3603,65 @@ async fn mark_moved_to(
     {
         return Ok(false);
     }
+    let occupant =
+        match replaced_by_move(repository, state_staged, parent, &moved.path, moved.node).await {
+            Ok(occupant) => occupant,
+            Err(error) if error.is_not_supported() => return Ok(false),
+            Err(error) => return Err(error),
+        };
     let name = NameChange::Rename(moved.path.name());
-    mark_moved(repository, state_staged, moved.node, parent, name).await?;
+    let base = state_current.revision();
+    mark_moved(repository, state_staged, base, moved.node, parent, name).await?;
+    if let Some(occupant) = occupant {
+        mark_replaced_deleted(walk, occupant, &moved.path).await?;
+        replaced.push(&moved.path);
+    }
     Ok(true)
 }
 
 /// Moves `node` to its new name, as `name` says, under `parent`, and marks the move dirty: the
 /// node, as [`dirty_move_mark`] marks it, its subtree, and both directories with their ancestors.
+///
+/// A node holding staged content, a staged change of its own or a node staged in its own right
+/// below it, takes the move staged, as `lore stage move` records it: the commit takes it where the
+/// staged tree holds it, and the destination and its ancestors are staged with it, as a stage
+/// there stages them, a directory marked dirty as added becoming a staged add and one marked dirty
+/// as moved taking its whole move staged ([`crate::file::stage::stage_promoted_moves`]). A
+/// deletion staged on the node stands. Such a directory's move is staged whole, with each node
+/// below it that moves with it alone ([`crate::file::stage::stage_directory_move`]), against
+/// `base`, the revision `state` is staged on. A directory holding no staged content first loses a
+/// bare staged bit, which would read its dirty move as staged.
 async fn mark_moved(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
+    base: Hash,
     node: NodeID,
     parent: NodeID,
     name: NameChange<'_>,
 ) -> Result<(), DirtyError> {
-    let (is_directory, deleted, dirty_move_flag) = {
-        let node = state
+    let (is_directory, deleted, dirty_own, staged) = {
+        let record = state
             .node(repository.clone(), node)
             .await
             .forward::<DirtyError>("Failed deserializing state node block")?;
-        (
-            node.is_directory(),
-            node.is_deleted(),
-            dirty_move_mark(&node),
-        )
+        let dirty_own = Mark::dirty(
+            dirty_move_mark(&record),
+            Ext::Set(NodeExtFlags::NoFlags),
+            true,
+        );
+        let (is_directory, deleted) = (record.is_directory(), record.is_deleted());
+        let staged = (record.is_staged() && !record.is_staged_delete())
+            .then(|| Box::pin(moves_staged(repository, state, node, record)));
+        (is_directory, deleted, dirty_own, staged)
     };
-    let own = Mark::dirty(dirty_move_flag, Ext::Set(NodeExtFlags::NoFlags), true);
+    let staged = match staged {
+        Some(staged) => staged.await?,
+        None => None,
+    };
+    let own = match staged {
+        Some((staged, dirty, _)) => Mark::staged_and_dirty(staged, dirty),
+        None => dirty_own,
+    };
     let left = state
         .node_move(repository.clone(), node, parent, name, own)
         .await
@@ -2022,9 +3672,19 @@ async fn mark_moved(
         .forward::<DirtyError>("Failed to mark node as dirty move")?;
 
     if is_directory {
-        mark_children_dirty_moved(repository.clone(), state.clone(), node, deleted)
+        mark_children_dirty_moved(repository, state, node, deleted)
             .await
             .forward::<DirtyError>("Failed to mark children as dirty moved")?;
+        if staged.is_some_and(|(_, _, by_content)| by_content) {
+            Box::pin(stage_moved_directory(repository, state, base, node)).await?;
+        }
+    }
+    if staged.is_some() && state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves(
+            repository, base, state,
+        ))
+        .await
+        .forward_any::<DirtyError>("Failed to stage the move of a directory moved into")?;
     }
 
     state
@@ -2035,6 +3695,50 @@ async fn mark_moved(
         )
         .await
         .forward::<DirtyError>("Failed to propagate dirty to source parent")
+}
+
+/// The staged and dirty flags a move of `node`, which `record` holds staged and not for deletion,
+/// takes where it holds staged content, as [`State::staged_move_flags`] gives them, and whether a
+/// node staged in its own right below a directory with a bare staged bit, rather than a staged
+/// change of the directory's own, makes it so. `None` otherwise, a bare bit nothing below the
+/// directory needs cleared first. Boxed by its caller, which takes it only for a staged node.
+async fn moves_staged(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node: NodeID,
+    record: Node,
+) -> Result<Option<(NodeFlags, NodeFlags, bool)>, DirtyError> {
+    let own = (NodeFlags::ActionBits | NodeFlags::MergeBits).bits();
+    if record.flags & own != 0 || record.is_link() || !record.is_directory() {
+        let (staged, dirty) = State::staged_move_flags(&record);
+        return Ok(Some((staged, dirty, false)));
+    }
+    if state
+        .holds_staged_content(repository.clone(), node)
+        .await
+        .forward::<DirtyError>("Failed to read the nodes below a moved directory")?
+    {
+        return Ok(Some((NodeFlags::StagedMove, NodeFlags::DirtyMove, true)));
+    }
+    state
+        .node_clear(repository, node, Clear::Staged)
+        .await
+        .forward::<DirtyError>("Failed to clear the staged bit of a moved directory")?;
+    Ok(None)
+}
+
+/// Stages the move of `directory`, which a dirty move took and a staged node below it stages, as a
+/// stage inside it does ([`crate::file::stage::stage_directory_move`]), against `base`. Boxed by
+/// its caller, as only a move of a directory holding staged content takes it.
+async fn stage_moved_directory(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    base: Hash,
+    directory: NodeID,
+) -> Result<(), DirtyError> {
+    crate::file::stage::stage_directory_move(repository, base, state, directory, &mut String::new())
+        .await
+        .forward_any::<DirtyError>("Failed to stage the move of a directory holding staged content")
 }
 
 /// Saves `state` as the staged tree on top of `current_revision`, storing the staged anchor
@@ -2104,6 +3808,7 @@ pub async fn dirty_copy(
     let to_parent_id = parent_outside_links(&state, &repository, &to_path)
         .await
         .forward_with::<DirtyError, _>(|| format!("looking up the parent of {to_path}"))?;
+    let to_parent_id = destination_parent(&repository, &state, &to_path, to_parent_id).await?;
 
     // Create destination node with Dirty+Copy
     let node = Node {

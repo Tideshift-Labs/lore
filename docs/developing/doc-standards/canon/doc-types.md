@@ -50,7 +50,7 @@ A new feature doesn't usually imply one doc. Walk this list:
 - **New CLI command, flag, config key, or API surface?** Write a **Reference** page (or update an existing one) cataloging the surface. Almost always required.
 - **New model, concept, or behavior the reader needs to understand?** Write an **Explanation** page describing the model. Required when the reader can't use the feature productively without understanding it.
 - **A discrete goal the feature unlocks ("set up X," "recover from Y")?** Write a **How-To** page. Optional. Add one when there is a real goal-oriented procedure that crosses two or more commands.
-- **Architectural decision worth recording for future contributors?** Write an **ADR** in `docs/developing/decisions/`. Optional. Add one when the decision involved a real trade-off and discarded alternatives need to outlive the discussion.
+- **Decision that is hard to reverse, or that establishes a pattern later code should follow?** Write an **ADR** in `docs/developing/decisions/`. Required when either holds.
 - **Implementation detail (byte layouts, internal protocols, struct shapes) other contributors will need?** Write an **Internals** page. Optional. Add one when contributors have to reason about the format from another tool or module.
 - **New coding rule the feature establishes for future code?** Write a **Code-Standard** page. Rare from a single feature, but possible.
 
@@ -353,25 +353,26 @@ which other Lore subsystems consume it.>
 
 ### Definition
 
-An ADR — Architectural Decision Record — is the durable record of a single architectural decision the Lore project has made. It captures the **context** the decision was made in, the **decision** itself, and the **consequences** the project lives with as a result. ADRs are append-only history: once accepted, they aren't edited substantively. A change of mind produces a new ADR that supersedes the old one and links back.
+An ADR — Architectural Decision Record — is the durable record of a single architectural decision the Lore project has made. It captures the **context** the decision was made in, the **decision** itself, and the **consequences** the project lives with as a result. A new ADR is retrospective: it's written with the code that makes the decision concrete, or after it, and never as a proposal. Alignment before a change merges belongs in an LEP. ADRs are append-only history: once accepted, they aren't edited substantively, and they bind new code. A change that departs from an accepted ADR, or any other change of mind, comes with a new ADR that supersedes the old one and links back, in the same change.
 
 ### When to use it
 
-- A decision shapes the project's architecture in a way that future contributors will need to understand to avoid relitigating.
-- A decision involves a trade-off where the discarded alternatives were plausible, and the rationale needs to outlive the discussion that produced it.
-- A decision constrains how downstream code or other decisions are made.
+- The decision is hard to reverse.
+- The decision establishes a pattern that later code should follow.
+
+When either holds, the ADR is required. Don't skip it, and don't let a ticket, spec, PR description or commit message stand in for it. A pattern that also becomes a coding rule gets both: the ADR records the decision, and the Code-Standard cites it.
 
 ### When not to use it
 
 - The "decision" is a routine implementation choice with no real trade-off. Document it in code or an Internals doc, not an ADR.
-- The decision is provisional and the team expects to revisit it within weeks. Use an RFC or a tracked issue until it stabilizes.
+- The decision isn't made yet. Align on it in an LEP or a tracked issue, and write the ADR with the code that makes it concrete.
 - The page would primarily explain a subsystem rather than record a choice. Use an Internals doc or a user-facing Explanation.
 
 ### Header block
 
 ADRs begin with a YAML header block. Required fields:
 
-- `status` — one of `proposed`, `rejected`, `accepted`, `deprecated`, `superseded by ADR-NNNNN`. Use lowercase only. Status is the only field that changes after acceptance.
+- `status` — one of `accepted`, `deprecated`, `superseded by [ADR-NNNNN](NNNNN-slug.md)`. Use lowercase only. An ADR starts as `accepted`, because it records a decision already made; `status` and `date` are the only fields that change after that.
 - `date` — `YYYY-MM-DD` of the last status update.
 
 Optional fields (omit when not relevant):
@@ -391,7 +392,7 @@ Optional fields (omit when not relevant):
 Optional sections (use when the content warrants):
 
 - **Pros and Cons of the Options** — between *Decision Outcome* and *More Information*. One H3 per option, with bulleted *Good, because …*, *Neutral, because …*, *Bad, because …* arguments.
-- **More Information** — at the end. Additional evidence, team agreement, links to other decisions, or notes on when the decision should be revisited.
+- **More Information** — at the end. Additional evidence, team agreement, the change that implemented the decision, links to other decisions, or notes on when the decision should be revisited.
 
 ### Filename pattern
 
@@ -407,7 +408,7 @@ Numbering is monotonic across the project. A new ADR claims the next available n
 
 ### Immutability and supersession
 
-Once an ADR moves from `proposed` to `accepted`, the body is **immutable** except for the `status` and `date` header fields. To change a decision, write a new ADR, set its `status` to `accepted` with today's `date`, link to the prior ADR from *More Information*, and edit the prior ADR's `status` to `superseded by ADR-NNNNN`. The prior body stays unchanged so the original record remains readable.
+Once an ADR is accepted, the body is **immutable** except for the `status` and `date` header fields. To change a decision, write a new ADR, set its `status` to `accepted` with today's `date`, link to the prior ADR from *More Information*, and edit the prior ADR's `status` to `superseded by [ADR-NNNNN](NNNNN-slug.md)`. The prior body stays unchanged so the original record remains readable.
 
 ### Template
 

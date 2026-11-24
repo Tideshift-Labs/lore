@@ -7,6 +7,7 @@ pub mod notification;
 
 pub mod domain;
 pub mod environment;
+pub mod error;
 pub mod model;
 pub mod object_dispatch;
 pub mod repository;

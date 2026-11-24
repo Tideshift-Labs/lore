@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+/// Held by each test from setting the process-wide log callback until it restores it, so that
+/// two tests running at once don't take each other's messages or callback.
+#[allow(dead_code)]
+pub static LOG_CAPTURE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[allow(dead_code)]
 pub async fn test_store_create() -> Result<
     (
@@ -389,6 +394,41 @@ pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
         .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
 }
 
+/// Every path under `root` but the control directory, with a file's content and `None` for a
+/// directory.
+#[allow(dead_code)]
+pub fn working_tree(root: &std::path::Path) -> std::collections::BTreeMap<String, Option<Vec<u8>>> {
+    fn walk(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        tree: &mut std::collections::BTreeMap<String, Option<Vec<u8>>>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("Failed to list directory") {
+            let path = entry.expect("Failed to read directory entry").path();
+            let relative = path
+                .strip_prefix(root)
+                .expect("Entry outside the root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == ".lore" {
+                continue;
+            }
+            if path.is_dir() {
+                tree.insert(relative, None);
+                walk(root, &path, tree);
+            } else {
+                // Test fixture reads; not subject to repository write-token discipline.
+                #[allow(clippy::disallowed_methods)]
+                let content = std::fs::read(&path).expect("Failed to read file");
+                tree.insert(relative, Some(content));
+            }
+        }
+    }
+    let mut tree = std::collections::BTreeMap::new();
+    walk(root, root, &mut tree);
+    tree
+}
+
 /// Whether the file system holding `dir` holds one spelling of a name and answers lookups in any
 /// other. Windows and macOS do by default and Linux does not, but a mount can be either on any of
 /// them, so a test asks rather than assumes.
@@ -456,6 +496,28 @@ pub async fn test_scan_path_result(
     path: Option<lore_revision::util::path::RelativePath>,
     intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
 ) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
+    test_scan_mounting(
+        repository,
+        state_staged,
+        state_current,
+        path,
+        intent,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+}
+
+/// [`test_scan_path_result`] in an instance mounting `layer_mounts`, whose content the walk leaves
+/// to each layer, as a status of the instance does.
+#[allow(dead_code)]
+pub async fn test_scan_mounting(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+    layer_mounts: std::sync::Arc<Vec<lore_revision::state::LayerMountInfo>>,
+) -> Result<Vec<lore_revision::change::NodeChange>, lore_revision::state::StateError> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
@@ -474,7 +536,7 @@ pub async fn test_scan_path_result(
         path,
         lore_revision::filter::FilterMode::Full,
         intent,
-        std::sync::Arc::new(Vec::new()),
+        layer_mounts,
     )
     .await
     {
@@ -496,14 +558,31 @@ pub async fn test_status_files_at(
     paths: Option<Vec<lore_revision::util::path::RelativePath>>,
     scan: bool,
 ) -> std::collections::BTreeMap<String, (lore_revision::interface::LoreFileAction, bool)> {
-    let files = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+    test_status_events_at(repository, paths, scan)
+        .await
+        .into_iter()
+        .map(|(path, action, dirty)| (path, (action, dirty)))
+        .collect()
+}
+
+/// Each change `status` reports of `paths`, or of the whole repository for `None`, in the order it
+/// reports them, two of one path among them: its path, its action and whether it is dirty. `scan`
+/// asks for `--scan`.
+#[allow(dead_code)]
+pub async fn test_status_events_at(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    paths: Option<Vec<lore_revision::util::path::RelativePath>>,
+    scan: bool,
+) -> Vec<(String, lore_revision::interface::LoreFileAction, bool)> {
+    let files = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = files.clone();
     let callback: lore_revision::interface::LoreEventCallback = Some(Box::new(move |event| {
         if let lore_revision::event::LoreEvent::RepositoryStatusFile(data) = event {
-            captured.lock().expect("status files").insert(
+            captured.lock().expect("status files").push((
                 data.path.as_str().to_string(),
-                (data.action, data.flag_dirty != 0),
-            );
+                data.action,
+                data.flag_dirty != 0,
+            ));
         }
     }));
     let execution = std::sync::Arc::new(
@@ -533,7 +612,7 @@ pub async fn test_status_files_at(
         .await
         .expect("status");
     execution.dispatcher.drain().await;
-    files.lock().expect("status files").clone()
+    std::mem::take(&mut *files.lock().expect("status files"))
 }
 
 /// Each path's action in `reported`, as status lists it.
@@ -611,6 +690,33 @@ pub async fn test_anchor_states(
         .await
         .expect("Failed to deserialize staged state");
     (current, staged)
+}
+
+/// A call whose global data directory is `global`, so no test touches the real one.
+#[allow(dead_code)]
+pub fn execution_in(
+    global: &std::path::Path,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    execution_in_with(global, lore_revision::interface::LoreGlobalArgs::default())
+}
+
+/// A call as [`execution_in`] makes it, with `globals`.
+#[allow(dead_code)]
+pub fn execution_in_with(
+    global: &std::path::Path,
+    globals: lore_revision::interface::LoreGlobalArgs,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    let environment = lore_base::env::CallEnvironment {
+        values: [Some(global.display().to_string()), None, None],
+    };
+    std::sync::Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            globals,
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+            "test-user".to_string(),
+        )
+        .with_environment(environment),
+    )
 }
 
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
@@ -921,6 +1027,19 @@ pub async fn mount_intermediate(
     mount: &str,
     linked_id: lore_revision::lore::RepositoryId,
 ) {
+    mount_intermediate_at(repository, mount, linked_id, false).await;
+}
+
+/// [`mount_intermediate`] at `mount` in the root or in a directory the staged tree holds, the link
+/// staged for the next commit where `staged` says so. The tree is stored as staged on the revision
+/// the instance is on.
+#[allow(dead_code)]
+pub async fn mount_intermediate_at(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    mount: &str,
+    linked_id: lore_revision::lore::RepositoryId,
+    staged: bool,
+) {
     let linked = repository.to_link_context(linked_id).await;
     let token = repository
         .try_write_token()
@@ -957,37 +1076,46 @@ pub async fn mount_intermediate(
         .await
         .expect("Serializing the linked tree failed");
 
-    let staged = next_tree(repository).await;
-    let link = staged
-        .node_add(
-            repository.clone(),
-            lore_revision::node::ROOT_NODE,
-            lore_revision::node::Node {
-                flags: lore_revision::node::NodeFlags::Link.bits(),
-                name_hash: lore_storage::hash::hash_string(mount),
-                child: lore_revision::node::ROOT_NODE,
-                address: lore_base::types::Address {
-                    hash: revision,
-                    context: linked_id.into(),
-                },
-                ..Default::default()
-            },
-            mount,
-        )
+    let tree = next_tree(repository).await;
+    let (directory, name) = mount.rsplit_once('/').unwrap_or(("", mount));
+    let directory = tree
+        .find_node_link(repository.clone(), directory)
         .await
-        .expect("Adding the link failed");
-    staged
-        .link_add(
-            repository.clone(),
-            linked_id,
-            lore_revision::lore::BranchId::default(),
-            revision,
-            link,
-            lore_revision::link::LinkFlags::NoFlags,
-        )
+        .expect("Finding the link's directory failed")
+        .node;
+    let node = lore_revision::node::Node {
+        flags: lore_revision::node::NodeFlags::Link.bits(),
+        name_hash: lore_storage::hash::hash_string(name),
+        child: lore_revision::node::ROOT_NODE,
+        address: lore_base::types::Address {
+            hash: revision,
+            context: linked_id.into(),
+        },
+        ..Default::default()
+    };
+    let link = if staged {
+        tree.node_add_staged(repository.clone(), directory, node, name)
+            .await
+    } else {
+        tree.node_add(repository.clone(), directory, node, name)
+            .await
+    }
+    .expect("Adding the link failed");
+    tree.link_add(
+        repository.clone(),
+        linked_id,
+        lore_revision::lore::BranchId::default(),
+        revision,
+        link,
+        lore_revision::link::LinkFlags::NoFlags,
+    )
+    .await
+    .expect("Registering the link failed");
+    let (current, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
-        .expect("Registering the link failed");
-    let signature = staged
+        .expect("Failed to load current anchor");
+    tree.reparent_onto(current);
+    let signature = tree
         .serialize(repository.clone(), token)
         .await
         .expect("Serializing the staged tree failed");
@@ -1123,12 +1251,15 @@ pub mod in_memory {
     use lore_base::types::BranchId;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_base::types::TypedBytes as _;
     use lore_revision::commit::BasedOn;
     use lore_revision::commit::commit_in_memory_revision;
-    use lore_revision::commit::weave_history;
+    use lore_revision::commit::weave_changes;
+    use lore_revision::link::LinkFlags;
     use lore_revision::lore::RepositoryId;
     use lore_revision::metadata::Metadata;
     use lore_revision::node::Node;
+    use lore_revision::node::NodeDelta;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::NodeID;
     use lore_revision::node::ROOT_NODE;
@@ -1220,9 +1351,20 @@ pub mod in_memory {
         repository: &Arc<RepositoryContext>,
         link_repository: RepositoryId,
     ) -> Hash {
+        linked_revision_holding(repository, link_repository, &["l.txt"]).await
+    }
+
+    /// A revision of the repository `link_repository` holding a file at each of `names`.
+    pub async fn linked_revision_holding(
+        repository: &Arc<RepositoryContext>,
+        link_repository: RepositoryId,
+        names: &[&str],
+    ) -> Hash {
         let linked = repository.to_link_context(link_repository).await;
         let state = State::new();
-        add(&state, linked.clone(), ROOT_NODE, file("l.txt"), "l.txt").await;
+        for name in names {
+            add(&state, linked.clone(), ROOT_NODE, file(name), name).await;
+        }
         commit(&linked, &state, Hash::default(), branch_id()).await
     }
 
@@ -1285,10 +1427,45 @@ pub mod in_memory {
             state.clone(),
             metadata_on(branch),
             current,
+            Hash::default(),
             branch,
         )
         .await
         .expect("committing the revision must succeed")
+    }
+
+    /// A State linking a new repository at `a` and `b`, both pinned at `pin`, with that repository
+    /// and the nodes of the two mounts.
+    pub async fn linking_twice(
+        repository: &Arc<RepositoryContext>,
+        pin: Hash,
+    ) -> (Arc<State>, RepositoryId, NodeID, NodeID) {
+        let linked = RepositoryId::from(uuid::Uuid::now_v7());
+        let state = State::new();
+        let mut mounts = Vec::new();
+        for name in ["a", "b"] {
+            let node = add(
+                &state,
+                repository.clone(),
+                ROOT_NODE,
+                link_node(name, linked, pin),
+                name,
+            )
+            .await;
+            state
+                .link_add(
+                    repository.clone(),
+                    linked,
+                    BranchId::default(),
+                    pin,
+                    node,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the mount");
+            mounts.push(node);
+        }
+        (state, linked, mounts[0], mounts[1])
     }
 
     pub async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {
@@ -1339,10 +1516,30 @@ pub mod in_memory {
         let state = revision_state(repository, merged).await;
         state.set_parent_self(remote_latest);
         state.set_parent_other(local_latest);
-        weave_history(repository.clone(), state.clone(), BasedOn::Other)
-            .await
-            .expect("weaving the merge history");
+        weave_recorded_delta(repository, &state, BasedOn::Other).await;
         state
+    }
+
+    /// Weaves the history of `state` as committing it does, from the node delta it records.
+    pub async fn weave_recorded_delta(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        based_on: BasedOn,
+    ) {
+        let delta = state
+            .delta_block(repository.clone())
+            .await
+            .expect("reading the delta")
+            .to_aligned::<NodeDelta>();
+        weave_changes(
+            repository.clone(),
+            state.clone(),
+            based_on,
+            delta.as_type_slice::<NodeDelta>(),
+            None,
+        )
+        .await
+        .expect("weaving the history");
     }
 }
 
@@ -1397,4 +1594,14 @@ pub async fn test_leaked_slots(
         }
     }
     leaked
+}
+
+/// A scratch directory named for `prefix` in the base [`lore_io::test_util::verified_scratch_base`]
+/// finds for the build's temp directory, as a move of the external root needs.
+#[allow(dead_code)]
+pub fn verified_temp_dir(prefix: &str) -> lore_base::test_util::TempDir {
+    static BASE: std::sync::LazyLock<std::path::PathBuf> = std::sync::LazyLock::new(|| {
+        lore_io::test_util::verified_scratch_base(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")))
+    });
+    lore_base::test_util::TempDir::new_in(&BASE, prefix)
 }

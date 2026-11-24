@@ -21,6 +21,7 @@ pub mod recovery;
 pub mod remote;
 pub mod repository;
 pub mod revision;
+pub mod revision_graph;
 pub mod revision_tree;
 pub mod service;
 pub mod shared_store;
@@ -67,7 +68,7 @@ pub fn shutdown() -> bool {
 
     // Garbage collection stops alongside the drains rather than before them, so neither
     // takes the other's share of the budget. A tree writes through the stores its parent
-    // owns, so trees drain before storage handles. The storage close sequence (mark
+    // owns, so trees drain before storage handles. The storage drain sequence (mark
     // invalid, drain in-flight, spawn flush) must run inside an async context
     // to await the per-handle drains, and this function is synchronous wherever it is called
     // from — see `shutdown_block_on` for the three cases and why a `current_thread` caller

@@ -9,7 +9,7 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
-use std::path::PathBuf;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::str;
 use std::str::FromStr;
@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicUsize;
 
 use dashmap::DashMap;
 use dashmap::Entry;
+use futures::FutureExt;
 use futures::StreamExt;
 use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
@@ -32,6 +33,7 @@ use lore_transport::ProtocolError;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::try_join;
@@ -72,10 +74,7 @@ use crate::metadata;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
 use crate::metadata::MetadataType;
-use crate::node::Node;
-use crate::node::NodeBlock;
 use crate::node::NodeFlags;
-use crate::node::NodeIDExt;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -83,7 +82,6 @@ use crate::revision;
 use crate::revision::Diff3Summary;
 use crate::revision::DiffItem;
 use crate::revision::DiffResult;
-use crate::revision::sync;
 use crate::state;
 use crate::state::State;
 use crate::state::StateData;
@@ -224,8 +222,7 @@ impl LoreBranchDiffNodeData {
             automerged: node_change.flags.is_conflict_automerged().into(),
             from_path: node_change
                 .move_source()
-                .map(|path| display_path(path.as_str()))
-                .unwrap_or_default(),
+                .map_or_default(|path| display_path(path.as_str())),
         }
     }
 }
@@ -315,6 +312,7 @@ pub struct LoreBranchUnprotectEventData {
 
 #[error_set]
 pub enum BranchError {
+    LinkPinsDiverge,
     BranchNotFound,
     BranchAlreadyExists,
     DeleteProtected,
@@ -504,20 +502,39 @@ fn mutable_key_type(function: &str) -> KeyType {
     }
 }
 
+/// The key of the `function` value of `branch` in the mutable store of `repository`, hashed with
+/// `salt`, and the key type `function` takes.
 pub fn mutable_key(
     salt: &[u8],
     function: &str,
     repository: RepositoryId,
     branch: BranchId,
 ) -> (Hash, KeyType) {
-    let key = hash::hash_function_args(
-        salt,
-        function,
-        hex::encode(repository.data()).as_str(),
-        hex::encode(branch.data()).as_str(),
-    );
+    let key = hash_branch_function(salt, function, repository, branch, "");
     let key_type = mutable_key_type(function);
     (key, key_type)
+}
+
+/// Hashes `salt`, `function`, the lower-case hex of `repository` and of `branch`, then `suffix`,
+/// encoding the hex on the stack.
+fn hash_branch_function(
+    salt: &[u8],
+    function: &str,
+    repository: RepositoryId,
+    branch: BranchId,
+    suffix: &str,
+) -> Hash {
+    let mut repository_digits = [0u8; 32];
+    let mut branch_digits = [0u8; 32];
+    hash::hash_function_strs_slice(
+        salt,
+        function,
+        &[
+            util::to_hex_str(repository.data(), &mut repository_digits),
+            util::to_hex_str(branch.data(), &mut branch_digits),
+            suffix,
+        ],
+    )
 }
 
 fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) {
@@ -526,6 +543,8 @@ fn mutable_name_key(salt: &[u8], function: &str, name: &str) -> (Hash, KeyType) 
     (key, key_type)
 }
 
+/// Key for the revision skip pointer at the step boundary that contains `revision_number`, as
+/// [`step_key`] gives it. The pointer names a revision numbered at most the boundary.
 pub fn revision_step_key(
     salt: &[u8],
     repository: RepositoryId,
@@ -533,28 +552,19 @@ pub fn revision_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
-    // clamped bucket is a key that never matches rather than an overflow panic on a
-    // number taken straight from a request.
-    let key_revision_number = revision_number
-        .div_ceil(step_size)
-        .saturating_mul(step_size);
-    let key_type = mutable_key_type(REVISION_NUMBER_STEP);
-    let key = hash::hash_function_strs_slice(
+    step_key(
         salt,
         REVISION_NUMBER_STEP,
-        &[
-            hex::encode(repository.data()).as_str(),
-            hex::encode(branch.data()).as_str(),
-            key_revision_number.to_string().as_str(),
-        ],
-    );
-    (key, key_type)
+        repository,
+        branch,
+        revision_number,
+        step_size,
+    )
 }
 
-/// Key for the cached revision list at the step boundary that contains
-/// `revision_number`. Boundary `B = revision_number.div_ceil(step_size) * step_size`.
-/// The cached list contains up to `step_size` items in segment `(B - step, B]`.
+/// Key for the cached revision list at the step boundary `B` that contains `revision_number`, as
+/// [`step_key`] gives it. The cached list contains up to `step_size` items in segment
+/// `(B - step_size, B]`.
 pub fn revision_list_step_key(
     salt: &[u8],
     repository: RepositoryId,
@@ -562,23 +572,43 @@ pub fn revision_list_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
-    // clamped bucket is a key that never matches rather than an overflow panic on a
-    // number taken straight from a request.
-    let key_revision_number = revision_number
-        .div_ceil(step_size)
-        .saturating_mul(step_size);
-    let key_type = mutable_key_type(REVISION_LIST_STEP);
-    let key = hash::hash_function_strs_slice(
+    step_key(
         salt,
         REVISION_LIST_STEP,
-        &[
-            hex::encode(repository.data()).as_str(),
-            hex::encode(branch.data()).as_str(),
-            key_revision_number.to_string().as_str(),
-        ],
+        repository,
+        branch,
+        revision_number,
+        step_size,
+    )
+}
+
+/// The key of the `function` value of `branch` at the step boundary that contains
+/// `revision_number`, `B = revision_number.div_ceil(step_size) * step_size`, and its key type: the
+/// boundary's decimal digits follow the ids in the hash, encoded on the stack.
+///
+/// The boundary saturates: a revision number within a step of `u64::MAX` cannot exist, so the
+/// clamped boundary is a key that never matches rather than an overflow panic on a number taken
+/// straight from a request.
+fn step_key(
+    salt: &[u8],
+    function: &str,
+    repository: RepositoryId,
+    branch: BranchId,
+    revision_number: u64,
+    step_size: u64,
+) -> (Hash, KeyType) {
+    let boundary = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
+    let mut digits = [0u8; 20];
+    let key = hash_branch_function(
+        salt,
+        function,
+        repository,
+        branch,
+        util::to_decimal_str(boundary, &mut digits),
     );
-    (key, key_type)
+    (key, mutable_key_type(function))
 }
 
 /// The branch id derived from `name`: the first 16 bytes of the hash of `name` as given. The
@@ -591,31 +621,64 @@ fn fallback_id(name: &str) -> Context {
     Context::from(data)
 }
 
-async fn mutable_load(
+/// The `function` value of `branch` in the mutable store of `repository`, reporting an absent
+/// value, or one that holds zero, as [`BranchNotFound`].
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn mutable_load(
     repository: Arc<RepositoryContext>,
     function: &str,
     branch: BranchId,
-) -> Result<Hash, BranchError> {
+) -> impl Future<Output = Result<Hash, BranchError>> {
+    load_branch_key(repository, function, branch, |value, branch| {
+        value.ok_or_else(|| {
+            BranchError::from(BranchNotFound {
+                branch: branch.to_string(),
+            })
+        })
+    })
+}
+
+/// The `function` value of `branch` in the mutable store of `repository`: `None` where the key is
+/// absent or holds zero, read from the store's answer, so an absence builds no [`BranchError`].
+#[inline]
+pub fn mutable_value(
+    repository: Arc<RepositoryContext>,
+    function: &str,
+    branch: BranchId,
+) -> impl Future<Output = Result<Option<Hash>, BranchError>> {
+    load_branch_key(repository, function, branch, |value, _| Ok(value))
+}
+
+/// What `answer` makes of `branch` and its `function` value in the mutable store of `repository`:
+/// the value, or `None` where the key is absent or holds zero, read from the store's answer, so the
+/// store's absence reaches `answer` as `None`.
+///
+/// `answer` captures nothing at its callers, so it adds nothing to the future.
+async fn load_branch_key<T>(
+    repository: Arc<RepositoryContext>,
+    function: &str,
+    branch: BranchId,
+    answer: impl FnOnce(Option<Hash>, BranchId) -> Result<T, BranchError>,
+) -> Result<T, BranchError> {
     let repository_id = repository.id;
     let (key, key_type) = mutable_key(repository.salt(), function, repository_id, branch);
-
-    // Do not emit the error here, mutable load failures are mostly
-    // benign, and in the cases where it's not it's better if the
-    // call site emits the appropriate error
-    let value = repository
+    let value = match repository
         .read_mutable_store()
         .load(repository_id, key, key_type)
         .await
-        .map_matched_err("Failed to load data from mutable store", |m| match m {
-            MatchedStoreError::AddressNotFound(_) | MatchedStoreError::PayloadNotFound(_) => {
-                BranchError::from(BranchNotFound {
-                    branch: branch.to_string(),
-                })
-            }
-            other => other.forward::<BranchError>("Failed to load data from mutable store"),
-        })?;
-    lore_debug!("Load {function} for branch {branch} repository {repository_id}: {value}");
-    Ok(value)
+    {
+        Ok(value) if value.is_zero() => None,
+        Ok(value) => {
+            lore_debug!("Load {function} for branch {branch} repository {repository_id}: {value}");
+            Some(value)
+        }
+        Err(err) if err.is_address_not_found() || err.is_payload_not_found() => None,
+        Err(err) => {
+            return Err(err).forward::<BranchError>("Failed to load data from mutable store");
+        }
+    };
+    answer(value, branch)
 }
 
 async fn mutable_store(
@@ -813,9 +876,11 @@ fn swap_name_to_id(
 
 /// The id `name` maps to: `name` itself when it parses as a non-zero id, else the mapping in the
 /// local store, then the remote's, then the id derived from `name` when the local store holds a
-/// latest revision for it. A failed read of the local mapping counts as none. A remote that refuses
-/// the caller fails the lookup, and a name found nowhere answers `BranchNotFound`. A mapping found
-/// at the remote, or a derived one, is cached as `load_name_to_id_unmapped` describes.
+/// latest revision for it and no metadata that says it is archived or names it otherwise. A failed
+/// read of the local mapping counts as none. A remote that refuses the caller fails the lookup, as
+/// does a failed read of the derived id's latest, metadata key or metadata blob, and a name found
+/// nowhere answers `BranchNotFound`. A mapping found at the remote, or a derived one, is cached as
+/// `load_name_to_id_unmapped` describes.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
@@ -839,8 +904,10 @@ pub fn load_name_to_id(
 }
 
 /// The id `name` maps to where the local store holds no mapping for it: the remote's mapping, then
-/// the id derived from `name` when the local store holds a latest revision for it. A remote that
-/// refuses the caller fails the lookup, and a name found at neither answers `BranchNotFound`.
+/// the id derived from `name` when the local store holds a latest revision for it and no metadata
+/// that says it is archived or names it otherwise. A remote that refuses the caller fails the
+/// lookup, as does a failed read of the derived id's latest, metadata key or metadata blob, and a
+/// name found at neither answers `BranchNotFound`.
 ///
 /// A mapping found at the remote, or a derived one, is cached in the local store with a claim from
 /// none, so a mapping another writer made after the caller's read stays. The remote's mapping is
@@ -880,11 +947,7 @@ fn load_name_to_id_unmapped(
             return Ok(branch);
         }
 
-        if let Some(id) = live_fallback_id(repository.clone(), name)
-            .await
-            .ok()
-            .flatten()
-        {
+        if let Some(id) = live_fallback_id(repository.clone(), name).await? {
             let _ = claim_name(repository.clone(), name, Context::default(), id).await;
             return Ok(id);
         }
@@ -912,20 +975,52 @@ pub(crate) async fn cache_name_mapping(
     }
 }
 
-/// The id derived from `name`, when the local store holds a latest revision for that id.
-async fn live_fallback_id(
+/// The id derived from `name`, where the local store holds a latest revision for that id and no
+/// metadata of the id that says the branch has left `name` ([`leaves_name`]). An archive keeps a
+/// branch's latest and metadata and removes only its name's mapping, and a restore under another
+/// name keeps the id, so only the metadata tells whether the branch still holds `name`. A branch
+/// without a metadata key, or whose blob the local store doesn't hold, reads as live, as does one
+/// an older version archived, whose metadata doesn't say so.
+///
+/// A failed read of the latest, the metadata key or the blob fails: unread metadata can't tell
+/// whether the branch holds `name`.
+///
+/// The blob is read from the local store alone ([`local_metadata_blob`]), and only that read is
+/// boxed: a cold path that only a legacy derived id with a latest and a metadata key takes. Inline,
+/// it would make every future awaiting a name lookup as large as the read's.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn live_fallback_id(
     repository: Arc<RepositoryContext>,
     name: &str,
-) -> Result<Option<BranchId>, BranchError> {
+) -> impl Future<Output = Result<Option<BranchId>, BranchError>> + '_ {
     let id = fallback_id(name);
-    if id.is_zero() {
-        return Ok(None);
+    async move {
+        if id.is_zero()
+            || mutable_value(repository.clone(), LATEST, id)
+                .await?
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let Some(metadata_hash) = mutable_value(repository.clone(), METADATA, id).await? else {
+            return Ok(Some(id));
+        };
+        let metadata = Box::pin(local_metadata_blob(repository, metadata_hash)).await?;
+        Ok(match metadata {
+            Some(metadata) if leaves_name(&metadata, name) => None,
+            _ => Some(id),
+        })
     }
-    match load_latest_local(repository, id).await {
-        Ok(_) => Ok(Some(id)),
-        Err(err) if err.is_branch_not_found() => Ok(None),
-        Err(err) => Err(err),
-    }
+}
+
+/// Whether `metadata`, the metadata of the id derived from `name`, says the branch has left `name`:
+/// it is archived ([`is_archived`]), or it names the branch otherwise, as a restore under another
+/// name leaves it, compared regardless of case, as the name's mapping key is ([`fold_eq`]).
+/// Metadata without a name says neither.
+fn leaves_name(metadata: &Metadata, name: &str) -> bool {
+    is_archived(metadata) || branch::name(metadata).is_ok_and(|held| !fold_eq(held, name))
 }
 
 /// The branch a name names in the local store, by its mapping or by the id derived from it.
@@ -934,7 +1029,8 @@ pub enum NamedBranch {
     /// The name's mapping holds the id.
     Mapped(BranchId),
     /// The name has no mapping, or an entry holding zero that an older version wrote, and the id
-    /// derived from the name has a latest revision.
+    /// derived from the name has a latest revision and no metadata that says it is archived or
+    /// names it otherwise.
     Derived(BranchId),
 }
 
@@ -958,8 +1054,8 @@ impl NamedBranch {
 
 /// Looks up the branch `name` names in the local store alone, writing nothing: the id the name's
 /// mapping holds or, for a name with no mapping (an archived name included), the id derived from
-/// the name when that id has a latest revision. `None` when neither names a branch. A failed read
-/// is an error, not `None`.
+/// the name when that id has a latest revision and no metadata that says it is archived or names
+/// it otherwise. `None` when neither names a branch. A failed read is an error, not `None`.
 pub async fn lookup_name_local_unwritten(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -974,6 +1070,40 @@ pub async fn lookup_name_local_unwritten(
     Ok(live_fallback_id(repository, name)
         .await?
         .map(NamedBranch::Derived))
+}
+
+/// The value a claim of `name` for `claimant` swaps from, as the name's mapping holds it in the
+/// local store alone, zero for none ([`lookup_name_local_unwritten`]). The name is held where its
+/// mapping, or for a name without one the id derived from it, names a branch other than
+/// `claimant` that has a metadata key, whatever its metadata says, and is stale where that branch
+/// has none. `claimant` is zero for a branch with a new id.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// [`BranchAlreadyExists`] naming `name` where another branch holds it, and a failed read.
+#[allow(clippy::manual_async_fn)]
+pub fn local_claim_expected(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    claimant: BranchId,
+) -> impl Future<Output = Result<Context, BranchError>> {
+    async move {
+        let Some(named) = lookup_name_local_unwritten(repository.clone(), name).await? else {
+            return Ok(Context::default());
+        };
+        if named.branch() != claimant
+            && mutable_value(repository, METADATA, named.branch())
+                .await?
+                .is_some()
+        {
+            return Err(BranchError::from(BranchAlreadyExists {
+                branch: name.to_string(),
+            }));
+        }
+        Ok(named.mapping())
+    }
 }
 
 /// The value the mapping of `name` holds in the local store, zero for none. A read that fails other
@@ -1039,6 +1169,61 @@ pub async fn load_remote(
     })
 }
 
+/// What the remote answered for a branch's latest revision.
+#[lore_macro::test_pub]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RemoteLatest {
+    /// The remote latest revision, `None` where the branch isn't on the remote or the query failed.
+    pub latest: Option<Hash>,
+    /// The repository has a remote and the command isn't offline.
+    pub configured: bool,
+    /// The connection to the remote succeeded.
+    pub connected: bool,
+    /// The remote answered the query, which proves the caller may read the repository.
+    pub authorized: bool,
+    /// No valid login reached the remote, at the connect or at the query.
+    pub unauthenticated: bool,
+}
+
+/// The remote's latest revision for a branch. A failure to reach the remote or to query it is
+/// reported in the result, never returned, so a remote that can't answer never fails a local
+/// read; transport connect timeouts bound the wait.
+#[lore_macro::test_pub]
+pub(crate) async fn resolve_remote_latest(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> RemoteLatest {
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(err) if err.is_no_remote() => return RemoteLatest::default(),
+        Err(err) => {
+            lore_debug!("Remote connection failed: {err}");
+            return RemoteLatest {
+                configured: true,
+                unauthenticated: err.is_not_authenticated(),
+                ..RemoteLatest::default()
+            };
+        }
+    };
+
+    let (latest, authorized, unauthenticated) =
+        match load_remote(remote, repository.id, branch).await {
+            Ok(status) => (Some(status.latest), true, false),
+            Err(err) if err.is_branch_not_found() => (None, true, false),
+            Err(err) => {
+                lore_debug!("Remote branch query failed: {err}");
+                (None, false, err.is_not_authenticated())
+            }
+        };
+    RemoteLatest {
+        latest,
+        configured: true,
+        connected: true,
+        authorized,
+        unauthenticated,
+    }
+}
+
 pub async fn load_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -1076,11 +1261,17 @@ pub async fn load_latest_divergent(
     if branch.is_zero() {
         return Ok(false);
     }
-    match mutable_load(repository.clone(), LATEST_STATUS, branch).await {
-        Ok(head) => Ok(!head.is_zero()),
-        Err(err) if err.is_branch_not_found() => Ok(false),
-        Err(err) => Err(err),
-    }
+    Ok(mutable_value(repository, LATEST_STATUS, branch)
+        .await?
+        .is_some())
+}
+
+/// The last synchronized revision stored for `branch`, without the branch point [`load_last_sync`]
+/// answers where none is stored. Zero where none is stored or it cannot be read.
+pub async fn load_stored_last_sync(repository: Arc<RepositoryContext>, branch: BranchId) -> Hash {
+    mutable_load(repository, LAST_SYNC, branch)
+        .await
+        .unwrap_or_default()
 }
 
 pub async fn load_last_sync(
@@ -1126,13 +1317,35 @@ pub async fn load_remote_latest(
         })
 }
 
+/// The latest revision of `branch` on the remote where it holds the branch, even where the local
+/// history is ahead of it, and the local latest otherwise. Zero where neither holds the branch.
+/// The remote's refusal of the caller is returned rather than read as no branch.
+pub async fn load_latest_preferring_remote(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<Hash, BranchError> {
+    if let Some(remote) = absent_unless_refused::<_, _, BranchError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? && let Some(latest) = absent_unless_refused::<_, _, BranchError>(
+        load_remote_latest(remote, repository.id, branch).await,
+        "loading the remote branch latest",
+    )? {
+        return Ok(latest);
+    }
+    Ok(load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default())
+}
+
+/// Whether a branch's local latest is known to be on the remote's history line for the branch: the
+/// remote latest, or a revision the remote latest reaches along first parents.
 #[derive(PartialEq)]
 pub enum BranchLatestStatus {
-    /// The latest revision is not guaranteed to be in sync with remote branch history.
-    /// When syncing to a new revision a divergence check has to be performed.
+    /// The local latest isn't known to be on the remote's history line for the branch, as after a
+    /// commit the remote doesn't have yet.
     Divergent,
-    /// The latest revision is guaranteed to be in sync with remote branch history.
-    /// When syncing to a new revision it is safe to avoid doing a divergence check.
+    /// The local latest is known to be on the remote's history line for the branch.
     Convergent,
 }
 
@@ -1143,6 +1356,11 @@ pub enum BranchLatestStatus {
 /// [`BranchError::BranchAdvanced`] is returned having written nothing. Creating
 /// a branch passes `Hash::default()`. A caller deliberately overwriting a tip it
 /// has not tracked reads it with [`load_latest`] and passes that.
+///
+/// On a client, the latest status is then stored: `latest` where `status` is
+/// divergent, and where it is convergent the status is cleared with a
+/// compare-and-swap from `previous`, so a status another writer stores for its
+/// own latest after the pointer write stays.
 pub async fn store_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -1163,17 +1381,14 @@ pub async fn store_latest(
         return Ok(());
     }
 
-    let _ = mutable_store(
-        repository.clone(),
-        LATEST_STATUS,
-        branch,
-        if status == BranchLatestStatus::Divergent {
-            latest
-        } else {
-            Hash::default()
-        },
-    )
-    .await;
+    let _ = match status {
+        BranchLatestStatus::Divergent => {
+            mutable_store(repository.clone(), LATEST_STATUS, branch, latest).await
+        }
+        BranchLatestStatus::Convergent => {
+            clear_divergent_status(repository.clone(), branch, previous).await
+        }
+    };
     store_latest_history(repository, branch, latest).await
 }
 
@@ -1215,6 +1430,19 @@ pub async fn store_last_sync(repository: Arc<RepositoryContext>, branch: BranchI
     let _ = mutable_store(repository, LAST_SYNC, branch, revision).await;
 }
 
+/// Swaps the stored last synchronized revision of `branch` from `expected` to `revision`, an
+/// absent one holding zero. Answers whether it held `expected`.
+pub async fn swap_last_sync(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    expected: Hash,
+    revision: Hash,
+) -> Result<bool, BranchError> {
+    mutable_try_store(repository, LAST_SYNC, branch, expected, revision)
+        .await
+        .map(|held| held == expected)
+}
+
 /// Stores `latest`, a revision on the history the remote holds for `branch`, as the branch's local
 /// latest in place of `previous`, convergent, and as its last synchronized revision: what a sync, a
 /// clone and a push record once the remote answers for a revision.
@@ -1237,6 +1465,39 @@ pub fn store_synced_latest(
         )
         .await?;
         store_last_sync(repository.clone(), branch, latest).await;
+        Ok(())
+    }
+}
+
+/// Clears the divergent latest status of `branch` with a compare-and-swap from `latest`, the local
+/// latest the caller read, so a status another writer stores for its own latest after that read
+/// stays.
+pub fn clear_divergent_status(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+) -> impl Future<Output = Result<(), BranchError>> + use<> {
+    mutable_try_store(repository, LATEST_STATUS, branch, latest, Hash::default())
+        .map(|stored| stored.map(drop))
+}
+
+/// Records `branch`, whose local latest the caller read as `latest`, the remote latest, in sync
+/// with the remote: stores `latest` as its last synchronized revision and, where its latest status
+/// is `divergent`, clears the status ([`clear_divergent_status`]).
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn record_in_sync(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    latest: Hash,
+    divergent: bool,
+) -> impl Future<Output = Result<(), BranchError>> + '_ {
+    async move {
+        store_last_sync(repository.clone(), branch, latest).await;
+        if divergent {
+            clear_divergent_status(repository.clone(), branch, latest).await?;
+        }
         Ok(())
     }
 }
@@ -1544,7 +1805,9 @@ fn queried_status(
     }
 }
 
-/// Default branch resolution: prefer local, fall back to remote.
+/// Default branch resolution: prefer local, fall back to remote. A name lookup that fails other
+/// than as not found fails the resolution, as a refusal or a failed read of the derived id's latest
+/// or metadata does ([`load_name_to_id`]).
 ///
 /// `load_name_to_id` opportunistically writes the discovered name->id and
 /// metadata mappings to the local mutable store via `try_write_mutable_store`;
@@ -1558,8 +1821,9 @@ async fn resolve_default(
 ) -> Result<BranchStatus, BranchError> {
     let id = if let Ok(id) = Context::from_str(branch) {
         id
-    } else if let Some(id) = absent_unless_refused::<_, _, BranchError>(
+    } else if let Some(id) = absent_unless::<_, _, BranchError>(
         branch::load_name_to_id(repository.clone(), branch).await,
+        |err| !err.is_branch_not_found(),
         "looking up the branch name",
     )? {
         id
@@ -1617,6 +1881,56 @@ pub async fn load_metadata(
     Metadata::deserialize(repository, hash)
         .await
         .forward::<BranchError>("Failed to deserialize branch metadata")
+}
+
+/// The metadata of `branch`, read through `repository` from the local store alone: the value of its
+/// metadata key, and the blob that value names. `None` where the key is absent or holds zero, as
+/// after a create that lost its name claim, or names a blob the local store doesn't hold.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+#[allow(clippy::manual_async_fn)]
+pub fn local_metadata(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<Option<(Hash, Metadata)>, BranchError>> {
+    async move {
+        let Some(metadata_hash) = mutable_value(repository.clone(), METADATA, branch).await? else {
+            return Ok(None);
+        };
+        Ok(local_metadata_blob(repository, metadata_hash)
+            .await?
+            .map(|metadata| (metadata_hash, metadata)))
+    }
+}
+
+/// The branch metadata blob `metadata_hash`, read through `repository` from the local store alone.
+/// `None` where the local store doesn't hold it.
+///
+/// Returns the read's future with the answer mapped onto its output, without a future of its own.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+#[inline]
+pub fn local_metadata_blob(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> impl Future<Output = Result<Option<Metadata>, BranchError>> {
+    let options = immutable::read_options_from_repository(&repository)
+        .no_remote()
+        .with_strict_local();
+    futures::FutureExt::map(
+        Metadata::deserialize_with(repository, metadata_hash, options),
+        |read| match read {
+            Ok(metadata) => Ok(Some(metadata)),
+            Err(err) if err.is_address_not_found() => Ok(None),
+            Err(err) => Err(err).forward::<BranchError>("reading the branch metadata"),
+        },
+    )
 }
 
 /// The metadata of `branch`, read locally, or on the remote where the instance holds none it can
@@ -1780,10 +2094,26 @@ pub fn personal_category() -> &'static str {
     CATEGORY_PERSONAL
 }
 
+/// The id of the branch `metadata` describes.
+pub fn id(metadata: &Metadata) -> Result<BranchId, BranchError> {
+    metadata
+        .get_binary(ID)
+        .map(BranchId::from)
+        .forward::<BranchError>("reading branch id from metadata")
+}
+
 pub fn name(metadata: &Metadata) -> Result<&str, BranchError> {
     metadata
         .get_string(NAME)
         .forward::<BranchError>("reading branch name from metadata")
+}
+
+/// The name of `branch` for a message, or its id where its name cannot be read.
+pub async fn display_name(repository: Arc<RepositoryContext>, branch: BranchId) -> String {
+    match metadata(repository, branch).await {
+        Ok(metadata) => name(&metadata).map_or_else(|_| branch.to_string(), str::to_owned),
+        Err(_) => branch.to_string(),
+    }
 }
 
 pub fn category(metadata: &Metadata) -> Result<&str, BranchError> {
@@ -1810,6 +2140,14 @@ pub fn stack(metadata: &Metadata) -> Vec<BranchPoint> {
         branch: parent,
         revision: branch_point,
     }]
+}
+
+/// The stack of a branch created at `branch_point` on the branch `parent` describes:
+/// `branch_point`, then the stack of `parent`.
+pub fn child_stack(branch_point: BranchPoint, parent: &Metadata) -> Vec<BranchPoint> {
+    let mut stack = stack(parent);
+    stack.insert(0, branch_point);
+    stack
 }
 
 #[allow(clippy::uninit_vec)]
@@ -1839,13 +2177,25 @@ pub fn creator(metadata: &Metadata) -> Result<&str, BranchError> {
         .forward::<BranchError>("reading branch creator from metadata")
 }
 
+/// Whether the creator filter `filter` keeps a branch created by `creator`: with no filter, every
+/// branch, and otherwise those whose creator equals it exactly, compared case-sensitively.
+pub fn creator_matches(filter: Option<&str>, creator: &str) -> bool {
+    filter.is_none_or(|filter| filter == creator)
+}
+
+/// Whether the creator filter `filter` keeps the branch `metadata` describes, as
+/// [`creator_matches`] compares, with an empty creator for a blob without one, as older clients
+/// wrote. Reads the creator only where `filter` names one, since a read of an entry the blob
+/// doesn't hold builds an error.
+pub fn metadata_creator_matches(filter: Option<&str>, metadata: &Metadata) -> bool {
+    filter.is_none_or(|filter| creator_matches(Some(filter), creator(metadata).unwrap_or_default()))
+}
+
 pub fn created(metadata: &Metadata) -> u64 {
     metadata.get_u64(CREATED).unwrap_or_default()
 }
 
-/// Read the branch's PROTECT bit from its metadata blob. A branch with no
-/// `protect` key (legacy / partial blob) reports `false`. Mirrors the
-/// delete-guard read in `branch::delete`.
+/// Whether `metadata` marks its branch protected.
 pub fn protected(metadata: &Metadata) -> bool {
     metadata.get_bool(PROTECT).unwrap_or_default()
 }
@@ -1948,6 +2298,8 @@ pub struct CreatedBranch {
     pub head: Hash,
     /// The staged state based on `head`, where linked branches repinned or rebased it.
     pub staged: Option<Hash>,
+    /// Set where an existing branch was restored rather than created.
+    pub restored: bool,
 }
 
 /// [`create`], reporting the head it stored and the staged state rebased onto it.
@@ -1958,8 +2310,9 @@ pub struct CreatedBranch {
 ///    release a name its metadata marks released, before a check refuses it.
 /// 2. Otherwise find the value the claim of `name` swaps from (`name_claim_expected`). A branch the
 ///    name names with metadata refuses the create.
-/// 3. Check the parent and, outside a dry run, create the linked branches and write the record
-///    (`create_record`), claiming the name from that value.
+/// 3. Check the parent, create the linked branches (`create_linked_branches`), and outside a dry
+///    run write the record (`create_record`), claiming the name from that value. A record that
+///    fails to write deletes the linked branches.
 ///
 /// A name that isn't valid, or a zero `branch`, fails with [`InvalidArguments`] before anything is
 /// written. In step 3, a parent that is zero, the branch itself, or a personal branch, or a zero
@@ -2000,6 +2353,7 @@ pub async fn create_at(
             branch,
             head: Hash::default(),
             staged: None,
+            restored: true,
         });
     }
 
@@ -2007,10 +2361,7 @@ pub async fn create_at(
     #[cfg(feature = "test-util")]
     crate::test_util::branch_step(crate::test_util::BranchStep::CreateNameRead).await;
 
-    let mut head = stack
-        .first()
-        .map(|parent| parent.revision)
-        .unwrap_or_default();
+    let mut head = stack.first().map_or_default(|parent| parent.revision);
 
     let mut tasks = JoinSet::new();
 
@@ -2108,39 +2459,47 @@ pub async fn create_at(
     let mut is_commit = false;
     let mut staged = None;
 
+    let mut linked = None;
+    if !head.is_zero()
+        && create_linked
+        && let Ok((state_current, state_staged, current_branch)) =
+            State::deserialize_current_and_staged(repository.clone())
+                .await
+                .forward::<BranchError>("Failed to deserialize current revision anchor")
+    {
+        let cascade = LinkCascade {
+            token,
+            branch,
+            name,
+            category,
+            dry_run,
+        };
+        let created_linked = create_linked_branches(
+            &cascade,
+            &repository,
+            &state_current,
+            state_staged.as_ref(),
+            current_branch,
+            head,
+        )
+        .await?;
+        lore_debug!(
+            "Created linked branches, new latest {}",
+            created_linked.head
+        );
+
+        is_commit = created_linked.head != head;
+        head = created_linked.head;
+        staged = created_linked.staged;
+        linked = Some(created_linked);
+    }
+
     if !dry_run {
         lore_debug!("Creating branch {name} {branch} with stack {stack:?} at signature {head}");
-
-        if !head.is_zero() && create_linked {
-            if let Ok((state_current, state_staged, current_branch)) =
-                State::deserialize_current_and_staged(repository.clone())
-                    .await
-                    .forward::<BranchError>("Failed to deserialize current revision anchor")
-            {
-                let (serialized_latest, rebased_staged) = create_linked_branches(
-                    repository.clone(),
-                    token,
-                    state_current,
-                    state_staged,
-                    branch,
-                    current_branch,
-                    head,
-                    name.into(),
-                    category.into(),
-                )
-                .await?;
-
-                is_commit = serialized_latest != head;
-                head = serialized_latest;
-                staged = rebased_staged;
-            }
-
-            lore_debug!("Created linked branches, new latest {head}");
-        }
         #[cfg(feature = "test-util")]
         crate::test_util::branch_step(crate::test_util::BranchStep::CreateUnrestored).await;
 
-        create_record(
+        let recorded = create_record(
             repository.clone(),
             branch,
             name,
@@ -2152,7 +2511,16 @@ pub async fn create_at(
             BranchLatestStatus::Divergent,
             name_expected,
         )
-        .await?;
+        .await;
+
+        if let Some(linked) = linked {
+            if recorded.is_ok() {
+                linked.report(branch);
+            } else {
+                delete_linked_branches(linked.created, branch).await;
+            }
+        }
+        recorded?;
     }
 
     if !head.is_zero() {
@@ -2168,6 +2536,7 @@ pub async fn create_at(
         branch,
         head,
         staged,
+        restored: false,
     })
 }
 
@@ -2188,10 +2557,10 @@ fn check_new_branch_id(branch: BranchId, name: &str) -> Result<(), BranchError> 
 ///
 /// The mapping is read once, and a read that fails other than as not found fails. Where it holds
 /// none, the name is looked up at the remote, then as the derived id (`load_name_to_id_unmapped`).
-/// A lookup that finds no branch answers zero, and a refusal fails. A lookup that finds a branch
-/// caches it, which may change the mapping, so the mapping is then read again
-/// (`unclaimed_name_mapping`). The claim's compare-and-swap refuses a mapping made after the value
-/// is read.
+/// A lookup that finds no branch answers zero, and a refusal or a failed read of the derived id's
+/// latest or metadata fails. A lookup that finds a branch caches it, which may change the mapping,
+/// so the mapping is then read again (`unclaimed_name_mapping`). The claim's compare-and-swap
+/// refuses a mapping made after the value is read.
 async fn name_claim_expected(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -2560,7 +2929,7 @@ fn finish_restore(
             stamp_time(&mut metadata, RESTORED)?;
             let finished = serialize_metadata(repository.clone(), &metadata).await?;
             match swap_metadata_key(repository.clone(), branch, recorded, finished).await {
-                Ok(()) => return Ok(()),
+                Ok(_) => return Ok(()),
                 Err(err) if err.is_branch_already_exists() => {
                     let Some((current, current_metadata)) =
                         restore_record(repository.clone(), branch, name, archived).await?
@@ -2651,7 +3020,8 @@ async fn settle_pending_restore(
     Ok(Some((settled, released)))
 }
 
-/// Caches `remote`, the remote's metadata hash of `branch`, in the local metadata key.
+/// Caches `remote`, the remote's metadata hash of `branch`, in the local metadata key, and answers
+/// the value the cache replaced there, zero for none.
 ///
 /// Where the local store holds metadata, the cache first settles a restore it records
 /// ([`RESTORING`]), or releases the name it marks [`RELEASED`], as a restore or an archive does.
@@ -2666,13 +3036,52 @@ pub(crate) async fn cache_remote_metadata(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     remote: Hash,
-) -> Result<(), BranchError> {
+) -> Result<Hash, BranchError> {
     let local = match mutable_load(repository.clone(), METADATA, branch).await {
         Ok(read) => Box::pin(settle_local_restore(repository.clone(), branch, read)).await?,
         Err(err) if err.is_branch_not_found() => Hash::default(),
         Err(err) => return Err(err),
     };
     swap_metadata_key(repository, branch, local, remote).await
+}
+
+/// Writes the local record of `branch` that a sync brings in from the remote: `metadata`, the
+/// remote's metadata hash, whose blob the local store holds, cached in the local metadata key as
+/// [`cache_remote_metadata`] caches it, then, with `claim`, the mapping of `name` to `branch`,
+/// claimed from the value [`local_claim_expected`] reads after the cache, whose settle may release
+/// the name. Sends no event and writes no latest revision.
+///
+/// A claim that fails sets the metadata key back from `metadata` to the value the cache replaced,
+/// zero where there was none, which removes the key, as a create that loses its claim does.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+///
+/// # Errors
+///
+/// [`BranchAlreadyExists`] naming `branch` where another writer changed the metadata key after the
+/// cache read it, and naming `name` where another branch holds it; a failed read or write.
+#[allow(clippy::manual_async_fn)]
+pub fn bring_in_record(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    name: &str,
+    metadata: Hash,
+    claim: bool,
+) -> impl Future<Output = Result<(), BranchError>> {
+    async move {
+        let replaced = cache_remote_metadata(repository.clone(), branch, metadata).await?;
+        if !claim {
+            return Ok(());
+        }
+        let claimed = match local_claim_expected(repository.clone(), name, branch).await {
+            Ok(expected) => claim_name(repository.clone(), name, expected, branch).await,
+            Err(err) => Err(err),
+        };
+        if claimed.is_err() {
+            revert_metadata(repository, branch, metadata, replaced).await;
+        }
+        claimed
+    }
 }
 
 /// Settles a restore the local metadata of `branch`, which the local key holds as `read`, records,
@@ -2885,14 +3294,15 @@ async fn serialize_metadata(
         .forward::<BranchError>("Failed to serialize branch metadata")
 }
 
-/// Swaps the metadata key of `branch` from `expected` to `hash`. A key that holds another value is
-/// left as it is, and the swap fails with [`BranchAlreadyExists`] naming the branch.
+/// Swaps the metadata key of `branch` from `expected` to `hash`, answering `expected`, the value
+/// it replaced. A key that holds another value is left as it is, and the swap fails with
+/// [`BranchAlreadyExists`] naming the branch.
 async fn swap_metadata_key(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
     expected: Hash,
     hash: Hash,
-) -> Result<(), BranchError> {
+) -> Result<Hash, BranchError> {
     let held = mutable_try_store(repository, METADATA, branch, expected, hash).await?;
     if held != expected {
         lore_debug!("Branch {branch} has metadata {held}, not {expected}, so it isn't rewritten");
@@ -2900,7 +3310,7 @@ async fn swap_metadata_key(
             branch: branch.to_string(),
         }));
     }
-    Ok(())
+    Ok(held)
 }
 
 /// Writes the record of a new branch: its metadata, swapped into the metadata key of `branch` from
@@ -3008,10 +3418,6 @@ struct CascadeMount {
 /// The staged state's rows come first, so a group's first row is the pin the next commit takes.
 /// A row of `state` that the staged state removes or remounts stays in its group, so the link is
 /// on the new branch once the change is unstaged.
-///
-/// Grouping keeps the cascade from racing itself: concurrent creates with the same branch ID
-/// resolve to one winner, and the loser is rejected with "branch has been advanced by another
-/// instance", failing the whole create.
 async fn cascade_mounts(
     repository: &Arc<RepositoryContext>,
     state: &State,
@@ -3036,129 +3442,564 @@ async fn cascade_mounts(
             link,
             staged: false,
         }))
-        .filter(|mount| mount.link.flags & link::LinkFlags::DisableAutoFollow == 0);
-    Ok(link::group_by_repository(mounts, |mount| {
-        mount.link.repository
-    }))
+        .filter(|mount| mount.link.auto_follows());
+    Ok(link::group_by(mounts, |mount| mount.link.repository))
 }
 
-/// Creates `branch` in the linked repositories, and moves each link that names an explicit
-/// branch onto it.
-///
-/// The links of `state_staged` and `state` both drive the cascade, the staged ones first, so a
-/// linked branch starts at the pin the next commit takes. A row naming an explicit branch is
-/// repinned in the state holding it, at its own pin, with the zero branch to follow the new one.
-///
-/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
-/// branch's latest, and `state_staged` is rebased onto it.
-#[allow(clippy::too_many_arguments)]
-async fn create_linked_branches(
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    state: Arc<State>,
-    state_staged: Option<Arc<State>>,
+/// The branch a cascade makes in linked repositories.
+struct LinkCascade<'a> {
+    token: &'a RepositoryWriteToken,
     branch: BranchId,
-    current_branch: BranchId,
-    current_latest: Hash,
-    name: String,
-    category: String,
-) -> Result<(Hash, Option<Hash>), BranchError> {
-    let link_groups = cascade_mounts(&repository, &state, state_staged.as_ref()).await?;
+    name: &'a str,
+    category: &'a str,
+    dry_run: bool,
+}
 
-    if link_groups.is_empty() {
-        return Ok((current_latest, None));
+/// A linked repository a cascade makes its branch in.
+#[lore_macro::test_pub]
+struct CascadeRepository {
+    reached: link::ReachedRepository,
+    /// The position in `reached.reaches` of the link whose pin the branch starts at.
+    start: usize,
+}
+
+impl CascadeRepository {
+    #[lore_macro::test_pub]
+    fn start(&self) -> &link::LinkReach {
+        &self.reached.reaches[self.start]
     }
 
-    let mut link_tasks = JoinSet::new();
+    /// The paths the repository's outcome is reported under: those of the links the next commit
+    /// keeps, or of every link where none does.
+    fn report_paths(&self) -> impl Iterator<Item = &str> {
+        let leads = self.reached.reaches.iter().any(|reach| reach.leads);
+        self.reached
+            .reaches
+            .iter()
+            .filter(move |reach| reach.leads || !leads)
+            .map(|reach| reach.mount_path.as_str())
+    }
 
-    for (link_id, mounts) in link_groups {
-        lore_spawn!(link_tasks, {
-            let link = repository.to_link_context(link_id).await;
-            let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
-                format!("Failed to connect to link repository {link_id}")
-            })?;
+    fn mounts(&self) -> String {
+        self.report_paths()
+            .map(link::display_path)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
 
-            let repository = repository.clone();
-            let state = state.clone();
-            let state_staged = state_staged.clone();
-            let branch_id = branch;
-            let branch_name = name.clone();
-            let branch_category = category.clone();
+/// A branch a cascade made in a linked repository, which a failure deletes.
+struct LinkedBranch {
+    repository: RepositoryId,
+    remote: Arc<Connection>,
+}
 
-            async move {
-                // The first mount seeds the branch point; the others adopt what
-                // it resolved to, since they all address the same branch.
-                let leader = mounts[0];
-                let resolved_parent_branch = leader.link.resolve_branch(current_branch);
+/// What [`create_linked_branches`] left.
+struct LinkedBranches {
+    /// The branch's latest revision.
+    head: Hash,
+    /// The staged state based on `head`, where the repins changed it.
+    staged: Option<Hash>,
+    /// The branches made in linked repositories.
+    created: Vec<LinkedBranch>,
+    outcomes: Vec<(CascadeRepository, link::LinkBranchOutcome)>,
+}
 
-                let outcome = link::create_branch(
-                    link.clone(),
-                    link_remote,
-                    branch_id,
-                    branch_name,
-                    branch_category,
-                    resolved_parent_branch,
-                    leader.link.signature,
-                )
-                .await
-                .forward_with::<BranchError, _>(|| {
-                    format!("Failed to create branch for link repository {link_id}")
-                })?;
+impl LinkedBranches {
+    fn unchanged(head: Hash) -> Self {
+        Self {
+            head,
+            staged: None,
+            created: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
 
-                for mount in mounts.iter() {
-                    let mount_state = match &state_staged {
-                        Some(state_staged) if mount.staged => state_staged,
-                        _ => &state,
-                    };
+    /// Reports how each linked repository's branch was resolved, once the whole create succeeded.
+    fn report(&self, branch: BranchId) {
+        for (linked, outcome) in &self.outcomes {
+            for path in linked.report_paths() {
+                link::report_branch_outcome(
+                    path,
+                    linked.reached.repository,
+                    branch,
+                    outcome.revision,
+                    outcome.reused,
+                );
+            }
+        }
+    }
+}
 
-                    // The create is shared, the reporting is not: every mount of the state that
-                    // seeded the branch reports its own outcome, keyed on its path, because the
-                    // repository ID cannot tell the mounts apart.
-                    if mount.staged == leader.staged {
-                        let link_path = mount_state
-                            .node_path(repository.clone(), mount.link.local_node)
-                            .await
-                            .unwrap_or_default();
+/// Creates the cascade's branch in the repositories `state_staged` and `state` link, at every
+/// depth, and moves each link that names an explicit branch onto it.
+///
+/// A linked branch starts at the pin the next commit takes, so a link the staged state replaces
+/// is followed but doesn't choose the pin. A repository several links reach starts at the newest
+/// of their pins ([`cascade_start`]). Every link row is repinned in the state holding it, so a
+/// link the staged state moves or removes stays on the new branch once unstaged. A row at the pin
+/// a branch starts at moves to the revision repinning the links below it.
+///
+/// Repinning `state` writes a revision on top of `current_latest`, which is returned as the
+/// branch's latest, and `state_staged` is rebased onto it. A dry run stops before the creates.
+///
+/// A failing create starts no more, deletes the branches made, and returns its error naming its
+/// links. The other failures are logged.
+async fn create_linked_branches(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    state_staged: Option<&Arc<State>>,
+    current_branch: BranchId,
+    current_latest: Hash,
+) -> Result<LinkedBranches, BranchError> {
+    let groups = cascade_mounts(repository, state, state_staged).await?;
+    let mut rows = Vec::new();
+    for (_link_id, mounts) in &groups {
+        let staged = mounts.iter().any(|mount| mount.staged);
+        for mount in mounts {
+            let mount_state = match state_staged {
+                Some(state_staged) if mount.staged => state_staged.as_ref(),
+                _ => state.as_ref(),
+            };
+            rows.push((mount_state, mount.link, mount.staged == staged));
+        }
+    }
+    let first_level = link::reach_links(repository, rows, current_branch, "", 0).await;
+    let reached = link::collect_with_context(repository, first_level)
+        .await
+        .forward::<BranchError>("walking the nested links")?;
+    let repositories =
+        link::try_join_links(reached.into_iter().map(cascade_start).collect()).await?;
+    if repositories.is_empty() || cascade.dry_run {
+        return Ok(LinkedBranches::unchanged(current_latest));
+    }
 
-                        link::report_branch_outcome(
-                            &link_path,
-                            link_id,
-                            branch_id,
-                            outcome.revision,
-                            outcome.reused,
-                        );
-                    }
+    let creates = (0..repositories.len())
+        .map(|position| create_cascade_branch(cascade, &repositories[position]))
+        .collect();
+    let results = link::join_links_until_failure(creates).await;
 
-                    // A row that tracks its parent's branch already resolves to the new one, at
-                    // the same revision, so it is left alone.
-                    if !mount.link.branch.is_zero() {
-                        link::update_link_pin_by_node(
-                            mount_state,
-                            repository.clone(),
-                            mount.link.repository,
-                            BranchId::default(),
-                            mount.link.signature,
-                            mount.link.local_node,
-                        )
+    let mut outcomes = Vec::with_capacity(results.len());
+    let mut created = Vec::new();
+    let mut failures = Vec::new();
+    for (linked, result) in repositories.iter().zip(results) {
+        match result {
+            Ok((remote, outcome)) => {
+                if !outcome.reused {
+                    created.push(LinkedBranch {
+                        repository: linked.reached.repository,
+                        remote,
+                    });
+                }
+                outcomes.push(outcome);
+            }
+            Err(err) => failures.push((err, linked)),
+        }
+    }
+    if let Some((first, mounts)) = log_cascade_failures(cascade, failures) {
+        delete_linked_branches(created, cascade.branch).await;
+        return Err(first).forward_with::<BranchError, _>(|| {
+            format!(
+                "creating branch {} in the linked repository at {mounts}",
+                cascade.name
+            )
+        });
+    }
+    if let Some(state_staged) = state_staged
+        && let Err(err) = follow_merge_entries(repository, state_staged, &groups).await
+    {
+        delete_linked_branches(created, cascade.branch).await;
+        return Err(err);
+    }
+
+    let index: HashMap<RepositoryId, usize> = repositories
+        .iter()
+        .enumerate()
+        .map(|(position, linked)| (linked.reached.repository, position))
+        .collect();
+    match store_cascade_repins(
+        cascade,
+        repository,
+        (state, state_staged),
+        &groups,
+        (&repositories, &index),
+        &outcomes,
+        current_latest,
+    )
+    .await
+    {
+        Ok((head, staged)) => Ok(LinkedBranches {
+            head,
+            staged,
+            created,
+            outcomes: repositories.into_iter().zip(outcomes).collect(),
+        }),
+        Err(err) => {
+            delete_linked_branches(created, cascade.branch).await;
+            Err(err)
+        }
+    }
+}
+
+/// An open merge writes its rows back on a resolve or an abort, so they follow the new branch as
+/// the staged rows do.
+async fn follow_merge_entries(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+) -> Result<(), BranchError> {
+    let followed: Vec<RepositoryId> = groups.iter().map(|(link_id, _)| *link_id).collect();
+    let mut entries = state_staged
+        .deserialize_link_merge_state(repository.clone())
+        .await
+        .forward::<BranchError>("Failed to deserialize link merge state")?;
+    let mut moved = false;
+    for entry in &mut entries {
+        moved |= entry.follow_parent_branch(&followed);
+    }
+    if moved {
+        state_staged
+            .serialize_link_merge_state(repository.clone(), &entries)
+            .await
+            .forward::<BranchError>("Failed to serialize link merge state")?;
+    }
+    Ok(())
+}
+
+/// `reached` with the link whose pin its branch starts at: the newest of the pins of the links
+/// the next commit keeps, or of every link where none does. A pin on a line that diverged from
+/// another's fails with [`InvalidArguments`] naming the two links, since no branch holds both.
+///
+/// A walk that spends its budget before it reaches the older pin proves neither, and the higher
+/// numbered pin is taken.
+#[lore_macro::test_pub]
+async fn cascade_start(reached: link::ReachedRepository) -> Result<CascadeRepository, BranchError> {
+    let leads = reached.reaches.iter().any(|reach| reach.leads);
+    let mut candidates =
+        (0..reached.reaches.len()).filter(|&position| reached.reaches[position].leads || !leads);
+    let Some(mut start) = candidates.next() else {
+        return Err(BranchError::internal(format!(
+            "no link reaches repository {}",
+            reached.repository
+        )));
+    };
+    let number = |pin: Hash| {
+        reached
+            .pins
+            .iter()
+            .find(|walked| walked.pin == pin)
+            .map(|walked| walked.number)
+            .ok_or_else(|| BranchError::internal(format!("revision {pin} was not read")))
+    };
+    for candidate in candidates {
+        let (current, reach) = (&reached.reaches[start], &reached.reaches[candidate]);
+        if reach.pin == current.pin {
+            continue;
+        }
+        let (current_number, reach_number) = (number(current.pin)?, number(reach.pin)?);
+        let (newer, newer_number, older, older_number) = if reach_number > current_number {
+            (reach, reach_number, current, current_number)
+        } else {
+            (current, current_number, reach, reach_number)
+        };
+        let search = if newer_number == older_number {
+            HistoryLineSearch::Diverged
+        } else {
+            Box::pin(find_revision_in_history_line(
+                reached.context.clone(),
+                newer.pin,
+                newer_number,
+                older.pin,
+                older_number,
+            ))
+            .await?
+        };
+        if search == HistoryLineSearch::Diverged {
+            return Err(BranchError::from(InvalidArguments {
+                reason: format!(
+                    "the links at {} and {} pin revisions of repository {} on lines that diverged. \
+                     Pin them on one line with `lore link update <path> --pin <revision>`, \
+                     commit, and create the branch again",
+                    link::display_path(&current.mount_path),
+                    link::display_path(&reach.mount_path),
+                    reached.repository
+                ),
+            }));
+        }
+        if reach_number > current_number {
+            start = candidate;
+        }
+    }
+    Ok(CascadeRepository { reached, start })
+}
+
+/// Connects to the linked repository and creates the cascade's branch there, at the pin it starts
+/// at, returning the connection a rollback deletes it through.
+async fn create_cascade_branch(
+    cascade: &LinkCascade<'_>,
+    linked: &CascadeRepository,
+) -> Result<(Arc<Connection>, link::LinkBranchOutcome), BranchError> {
+    let remote = linked
+        .reached
+        .context
+        .remote()
+        .await
+        .forward_with::<BranchError, _>(|| link::unreachable(linked.reached.repository))?;
+    let outcome = link::create_branch(
+        linked.reached.context.clone(),
+        remote.clone(),
+        cascade.branch,
+        cascade.name,
+        cascade.category,
+        linked.start().branch,
+        linked.start().pin,
+    )
+    .await
+    .forward::<BranchError>("creating the linked branch")?;
+    Ok((remote, outcome))
+}
+
+/// The first of `failures`, with the paths of its links, having logged each other failure on a
+/// line of its own. None where nothing failed.
+fn log_cascade_failures(
+    cascade: &LinkCascade<'_>,
+    failures: Vec<(BranchError, &CascadeRepository)>,
+) -> Option<(BranchError, String)> {
+    let mut failures = failures.into_iter();
+    let (first, first_linked) = failures.next()?;
+    for (err, linked) in failures {
+        lore_error!(
+            "Failed to create branch {} in the linked repository at {}: {err}",
+            cascade.name,
+            linked.mounts()
+        );
+    }
+    Some((first, first_linked.mounts()))
+}
+
+/// Repins the links of every repository the cascade made its branch in, each after the
+/// repositories its revision links, then those of `state` and `state_staged`, returning the head
+/// and staged state [`repin_links`] leaves there.
+///
+/// A holder's revision is read again here rather than kept from the walk, so the cascade holds no
+/// state of a repository between the walk and its repins. A reused branch keeps its own history,
+/// so the links below it are left as they are.
+async fn store_cascade_repins(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    outcomes: &[link::LinkBranchOutcome],
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    let linked: Vec<Vec<usize>> = repositories
+        .iter()
+        .zip(outcomes)
+        .map(|(linked, outcome)| {
+            let start = linked.start().pin;
+            match linked
+                .reached
+                .pins
+                .iter()
+                .find(|walked| walked.pin == start)
+            {
+                Some(walked) if !outcome.reused => walked
+                    .linked
+                    .iter()
+                    .filter_map(|repository| index.get(repository).copied())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        })
+        .collect();
+
+    let mut heads: Vec<Hash> = repositories
+        .iter()
+        .map(|linked| linked.start().pin)
+        .collect();
+    if linked.iter().any(|below| !below.is_empty()) {
+        // Few linked repositories hold links, so their repins are boxed rather than held by
+        // every create over links.
+        Box::pin(repin_holders(
+            cascade,
+            (repositories, index),
+            &linked,
+            &mut heads,
+        ))
+        .await?;
+    }
+
+    repin_links(
+        cascade,
+        repository,
+        (state, state_staged),
+        groups,
+        (repositories, index),
+        &heads,
+        current_latest,
+    )
+    .await
+}
+
+/// Repins the links each of `repositories` holds at the pin its branch starts at, in the levels
+/// [`repin_levels`] orders them in, the repositories of a level at once, and records each head.
+async fn repin_holders(
+    cascade: &LinkCascade<'_>,
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    linked: &[Vec<usize>],
+    heads: &mut [Hash],
+) -> Result<(), BranchError> {
+    for level in repin_levels(linked) {
+        let work = level
+            .iter()
+            .filter(|&&position| !linked[position].is_empty())
+            .map(|&position| {
+                let heads = &*heads;
+                async move {
+                    let holder = &repositories[position];
+                    let context = &holder.reached.context;
+                    let holder_state = State::deserialize(context.clone(), holder.start().pin)
                         .await
                         .forward_with::<BranchError, _>(|| {
                             format!(
-                                "Failed to update link reference for link repository {}",
-                                mount.link.repository
+                                "deserializing the revision linked at {}",
+                                link::display_path(&holder.start().mount_path)
                             )
                         })?;
-                    }
+                    let holder_groups = cascade_mounts(context, &holder_state, None).await?;
+                    let (head, _staged) = repin_links(
+                        cascade,
+                        context,
+                        (&holder_state, None),
+                        &holder_groups,
+                        (repositories, index),
+                        heads,
+                        holder.start().pin,
+                    )
+                    .await?;
+                    Ok::<_, BranchError>((position, head))
                 }
+            })
+            .collect();
+        for (position, head) in link::try_join_links(work).await? {
+            heads[position] = head;
+        }
+    }
+    Ok(())
+}
 
-                Ok(())
+/// The positions of `linked`, where `linked[i]` lists the positions the revision at `i` links, in
+/// levels: each after every position it links. A link cycle is cut where the walk first meets it.
+#[lore_macro::test_pub]
+fn repin_levels(linked: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    fn level_of(
+        position: usize,
+        linked: &[Vec<usize>],
+        levels: &mut [Option<usize>],
+        visiting: &mut [bool],
+    ) -> usize {
+        if let Some(level) = levels[position] {
+            return level;
+        }
+        visiting[position] = true;
+        let mut level = 0;
+        for &below in &linked[position] {
+            if !visiting[below] {
+                level = level.max(level_of(below, linked, levels, visiting) + 1);
             }
-        });
+        }
+        visiting[position] = false;
+        levels[position] = Some(level);
+        level
     }
 
-    lore_drain_tasks!(link_tasks, BranchError::internal("Task failed"))?;
+    let mut levels = vec![None; linked.len()];
+    let mut visiting = vec![false; linked.len()];
+    let mut ordered: Vec<Vec<usize>> = Vec::new();
+    for position in 0..linked.len() {
+        let level = level_of(position, linked, &mut levels, &mut visiting);
+        if ordered.len() <= level {
+            ordered.resize_with(level + 1, Vec::new);
+        }
+        ordered[level].push(position);
+    }
+    ordered
+}
 
+/// Repins the links of `groups` onto the cascade's branch, moving those at the pin a linked branch
+/// starts at to that repository's head, and stores what that changes.
+///
+/// Only a row that names an explicit branch, or whose revision moves, leaves a state to write, so
+/// the writes are boxed rather than held by every create over links.
+async fn repin_links(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    groups: &[(RepositoryId, Vec<CascadeMount>)],
+    (repositories, index): (&[CascadeRepository], &HashMap<RepositoryId, usize>),
+    heads: &[Hash],
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
+    for (link_id, mounts) in groups {
+        let Some(&position) = index.get(link_id) else {
+            continue;
+        };
+        let (pin, head) = (repositories[position].start().pin, heads[position]);
+        for mount in mounts {
+            let signature = if mount.link.signature == pin {
+                head
+            } else {
+                mount.link.signature
+            };
+            if mount.link.is_tracking() && signature == mount.link.signature {
+                continue;
+            }
+            let mount_state = match state_staged {
+                Some(state_staged) if mount.staged => state_staged,
+                _ => state,
+            };
+            link::update_link_pin_by_node(
+                mount_state,
+                repository.clone(),
+                mount.link.repository,
+                BranchId::default(),
+                signature,
+                mount.link.local_node,
+            )
+            .await
+            .forward_with::<BranchError, _>(|| {
+                format!(
+                    "repinning the link to repository {} onto branch {}",
+                    mount.link.repository, cascade.name
+                )
+            })?;
+        }
+    }
+
+    if !state.is_dirty() && state_staged.is_none_or(|state_staged| !state_staged.is_dirty()) {
+        return Ok((current_latest, None));
+    }
+    Box::pin(store_repinned_states(
+        cascade,
+        repository,
+        (state, state_staged),
+        current_latest,
+    ))
+    .await
+}
+
+/// Writes the repins `state` holds as a revision on top of `current_latest`, and `state_staged`
+/// rebased onto that revision, returning both.
+async fn store_repinned_states(
+    cascade: &LinkCascade<'_>,
+    repository: &Arc<RepositoryContext>,
+    (state, state_staged): (&Arc<State>, Option<&Arc<State>>),
+    current_latest: Hash,
+) -> Result<(Hash, Option<Hash>), BranchError> {
     let head = if state.is_dirty() {
-        store_repin_revision(&repository, token, &state, branch, current_latest).await?
+        store_repin_revision(cascade, repository, state, current_latest).await?
     } else {
         current_latest
     };
@@ -3174,7 +4015,7 @@ async fn create_linked_branches(
     let staged = match staged {
         Some(state_staged) => Some(
             state_staged
-                .serialize(repository.clone(), token)
+                .serialize(repository.clone(), cascade.token)
                 .await
                 .forward::<BranchError>("Failed to serialize staged state")?,
         ),
@@ -3184,36 +4025,19 @@ async fn create_linked_branches(
     Ok((head, staged))
 }
 
-/// Writes the repins `state` holds as a revision on top of `current_latest`.
+/// Writes the repins `state` holds as a revision on top of `current_latest`. The revision has one
+/// parent, so the history weave reads no changes of its own ([`commit::weave_changes`]).
 async fn store_repin_revision(
+    cascade: &LinkCascade<'_>,
     repository: &Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
     state: &Arc<State>,
-    branch: BranchId,
     current_latest: Hash,
 ) -> Result<Hash, BranchError> {
-    let metadata_hash = state.metadata_hash();
-
-    if metadata_hash.is_zero() {
-        return Err(BranchError::internal(
-            "Failed to deserialize revision metadata",
-        ));
-    }
-
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<BranchError>("Failed to deserialize revision metadata")?;
-
-    let message = original_metadata
-        .get_string(metadata::MESSAGE)
-        .forward::<BranchError>("Failed to deserialize revision metadata")?
-        .to_owned();
-
     let metadata = commit::prepare_commit_metadata(
         repository.clone(),
-        original_metadata,
-        branch,
-        message.clone(),
+        Metadata::new(),
+        cascade.branch,
+        format!("Repin links onto branch {}", cascade.name),
         None,
         None,
         None,
@@ -3231,18 +4055,73 @@ async fn store_repin_revision(
             .forward::<BranchError>("Failed to write revision metadata")?,
     );
 
-    commit::weave_history(
+    commit::weave_changes(
         repository.clone(),
         state.clone(),
         commit::BasedOn::FirstParent,
+        &[],
+        None,
     )
     .await
     .forward::<BranchError>("Failed to weave history")?;
 
     state
-        .serialize(repository.clone(), token)
+        .serialize_committed(repository.clone(), cascade.token)
         .await
         .forward::<BranchError>("Failed to serialize revision state")
+}
+
+/// Deletes the branches a failed cascade made in linked repositories.
+async fn delete_linked_branches(created: Vec<LinkedBranch>, branch: BranchId) {
+    futures::stream::iter(created)
+        .for_each_concurrent(link::MAX_CONCURRENT_LINK_TASKS, |made| async move {
+            if let Err(err) = delete_remote(made.remote, made.repository, branch).await {
+                lore_warn!(
+                    "Failed to remove branch {branch} from linked repository {}: {err}",
+                    made.repository
+                );
+            }
+        })
+        .await;
+}
+
+/// Access to the branch cascade for the crate's tests.
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::LinkCascade;
+    use super::repin_links;
+    use crate::lore::BranchId;
+    use crate::lore::Hash;
+    use crate::repository::RepositoryContext;
+    use crate::repository::RepositoryWriteToken;
+    use crate::state::State;
+
+    /// The size of the future that repins a cascade's links in `state`.
+    pub fn repin_links_future_size(
+        repository: &Arc<RepositoryContext>,
+        token: &RepositoryWriteToken,
+        state: &Arc<State>,
+    ) -> usize {
+        let cascade = LinkCascade {
+            token,
+            branch: BranchId::default(),
+            name: "",
+            category: "",
+            dry_run: false,
+        };
+        size_of_val(&repin_links(
+            &cascade,
+            repository,
+            (state, None),
+            &[],
+            (&[], &HashMap::new()),
+            &[],
+            Hash::default(),
+        ))
+    }
 }
 
 /// Archives `branch`, named `name`, whose metadata the metadata key holds locally as `expected`.
@@ -3302,16 +4181,116 @@ async fn release_archived_name(
     release_name(repository, name, branch).await
 }
 
-/// Archives `branch` with [`archive_record`], and sends a `BranchArchive` event where `repository`
-/// is neither a layer nor a link. Refuses the current branch, a protected branch, the default
-/// branch and a branch without a branch point. The name in the branch's metadata must map to the
-/// branch, as [`load_name_to_id`] looks it up, and otherwise the archive fails with
-/// [`BranchNotFound`]. A remote that refuses the lookup fails the archive with its refusal. A
-/// branch archived already fails the same way, unless the local store maps its name to nothing and
-/// the remote's mapping, or the id derived from the name, names the branch: the lookup caches that
-/// mapping and the remote's metadata, and the branch is archived again. Metadata that says the
-/// branch is archived while its name maps to it, as an older version's restore or an archive that
-/// stopped between its swap and its release leaves it, is archived the same way.
+/// Archives `branch` as [`archive_local`] does, and sends a `BranchArchive` event where
+/// `repository` is neither a layer nor a link. Refuses the current branch too, and fails with
+/// [`BranchNotFound`] where [`archive_local`] answers [`Archived::Already`].
+///
+/// A client's dry run makes the checks and sends the event, but archives nothing. That relies on
+/// `repository` being built by `RepositoryContext::new_with_state`, or derived from a context it
+/// built, as every context of the CLI's archive is: its store then discards the mapping the lookup
+/// caches for a name only the remote or the derived id maps, so a release would find no mapping
+/// and fail.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn delete(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> impl Future<Output = Result<(), BranchError>> {
+    async move {
+        // Do not allow deleting the current branch
+        if let Ok((_revision, current_branch)) =
+            crate::instance::load_current_anchor(&repository).await
+            && current_branch == branch
+        {
+            return Err(BranchError::from(DeleteCurrent {
+                branch: branch.to_string(),
+            }));
+        }
+
+        let (archived, branch_name) = archive_loop(
+            repository.clone(),
+            branch,
+            repository::discards_mutable_writes(),
+        )
+        .await?;
+        if archived == Archived::Already {
+            return Err(BranchError::from(BranchNotFound {
+                branch: branch_name,
+            }));
+        }
+
+        // A layer or link archive is a consequence of the outer one, not its own
+        // user-facing event, so reporting each one would read as repeated archives.
+        if !repository.is_layer() && !repository.is_link() {
+            event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
+                name: branch_name.into(),
+            })
+            .send();
+        }
+
+        Ok(())
+    }
+}
+
+/// What [`archive_local`] found a branch to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Archived {
+    /// The call archived the branch.
+    Now,
+    /// The branch was archived already: once a stopped restore is settled and a [`RELEASED`] name
+    /// released, its name doesn't map to it.
+    Already,
+}
+
+/// Whether `metadata` records a restore in progress or one that stopped ([`RESTORING`]), or a name a
+/// settled restore had claimed ([`RELEASED`]), which an archive of its branch settles or releases.
+pub fn holds_pending_name(metadata: &Metadata) -> bool {
+    restoring(metadata).is_some() || released(metadata).is_some()
+}
+
+/// Whether [`archive_local`] would change the names of `branch` in the local store of
+/// `repository`: the store holds its metadata, and the name the metadata records, or the name its
+/// [`RESTORING`] or [`RELEASED`] entry records, names the branch there, by the name's mapping or
+/// the id derived from it ([`lookup_name_local_unwritten`]). Writes nothing.
+///
+/// # Errors
+///
+/// A failed or corrupt read.
+pub async fn archives_locally(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+) -> Result<bool, BranchError> {
+    let Some((_, metadata)) = local_metadata(repository.clone(), branch).await? else {
+        return Ok(false);
+    };
+    for held in [
+        name(&metadata).ok(),
+        restoring(&metadata),
+        released(&metadata),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if lookup_name_local_unwritten(repository.clone(), held)
+            .await?
+            .is_some_and(|named| named.branch() == branch)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Archives `branch` with [`archive_record`]. Refuses a protected branch, the default branch and a
+/// branch without a branch point. Checks no current anchor and sends no event. The name in the
+/// branch's metadata must map to the branch, as [`load_name_to_id`] looks it up, and otherwise the
+/// branch is archived already. A remote that refuses the lookup, or a failed read of the derived
+/// id's latest or metadata, fails the archive with that error. A branch whose local store maps its
+/// name to nothing, and whose name the remote's mapping or the id derived from the name maps to it,
+/// is archived again: the lookup caches that mapping and the remote's metadata. Metadata that says
+/// the branch is archived while its name maps to it, as an older version's restore or an archive
+/// that stopped between its swap and its release leaves it, is archived the same way.
 ///
 /// Metadata that records a restore in progress, or one that stopped ([`RESTORING`]), is settled
 /// ([`settle_pending_restore`]): the archive swaps the record out and releases the name it names,
@@ -3319,122 +4298,115 @@ async fn release_archived_name(
 /// the record stayed, is archived as above. A metadata key that changed since the archive read it,
 /// as a restore, a protect or a metadata edit leaves it, sends the archive back to its read. A
 /// [`RELEASED`] name other than the branch's own, which a settled restore had claimed, is released
-/// before the lookup ([`unmarked`]), and the entry stays for the next restore to release
-/// again and remove. A branch whose name doesn't map to it then fails the archive with
-/// [`BranchNotFound`], as the branch is archived, unless this archive's settle released a name
-/// that mapped to the branch, the claim of the restore it settled: the branch read as live under
-/// that name, and the archive succeeds. So of two archives that settle one restore, one succeeds,
-/// and an archive that settles a restore stopped before its claim fails, as does one that
-/// releases only a [`RELEASED`] name, the claim of a restore settled before.
+/// before the lookup ([`unmarked`]), and the entry stays for the next restore to release again and
+/// remove. A branch whose name doesn't map to it then answers [`Archived::Already`], unless this
+/// archive's settle released a name that mapped to the branch, the claim of the restore it settled:
+/// the branch read as live under that name, and answers [`Archived::Now`]. So of two archives that
+/// settle one restore, one archives the branch, and an archive that settles a restore stopped
+/// before its claim answers [`Archived::Already`], as does one that releases only a [`RELEASED`]
+/// name, the claim of a restore settled before.
 ///
-/// A client's dry run makes the checks and sends the event, but archives nothing. That relies on
-/// `repository` being built by `RepositoryContext::new_with_state`, or derived from a context it
-/// built, as every context of the CLI's archive is: its store then discards the mapping the lookup
-/// caches for a name only the remote or the derived id maps, so a release would find no mapping
-/// and fail.
-pub async fn delete(
+/// Returns the archive's future with its answer, without a future of its own.
+pub fn archive_local(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
-) -> Result<(), BranchError> {
-    // Do not allow deleting the current branch
-    if let Ok((_revision, current_branch)) = crate::instance::load_current_anchor(&repository).await
-        && current_branch == branch
-    {
-        return Err(BranchError::from(DeleteCurrent {
-            branch: branch.to_string(),
-        }));
-    }
+) -> impl Future<Output = Result<Archived, BranchError>> {
+    futures::FutureExt::map(archive_loop(repository, branch, false), |archived| {
+        archived.map(|(archived, _)| archived)
+    })
+}
 
-    let discards = repository::discards_mutable_writes();
-    let mut settled = false;
-    let mut released_name = false;
-    let branch_name = loop {
-        let (read, read_locally, branch_metadata) =
-            archivable_metadata(&repository, branch).await?;
-        let branch_name = name(&branch_metadata).unwrap_or_default().to_string();
-        #[cfg(feature = "test-util")]
-        crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveMetadataRead).await;
-        if let Some(pending) = restoring(&branch_metadata) {
-            if discards {
-                break branch_name;
+/// [`archive_local`] with the branch's name, which stops before each write where `discards`, as a
+/// client's dry run does, answering [`Archived::Now`].
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn archive_loop(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    discards: bool,
+) -> impl Future<Output = Result<(Archived, String), BranchError>> {
+    async move {
+        let mut settled = false;
+        let mut released_name = false;
+        let archived = loop {
+            let (read, read_locally, branch_metadata) =
+                archivable_metadata(&repository, branch).await?;
+            let branch_name = name(&branch_metadata).unwrap_or_default().to_string();
+            #[cfg(feature = "test-util")]
+            crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveMetadataRead).await;
+            if let Some(pending) = restoring(&branch_metadata) {
+                if discards {
+                    break (Archived::Now, branch_name);
+                }
+                let pending = pending.to_string();
+                if let Some((_settled, released)) = settle_pending_restore(
+                    repository.clone(),
+                    branch,
+                    read,
+                    read_locally,
+                    branch_metadata,
+                    &pending,
+                )
+                .await?
+                {
+                    settled = true;
+                    released_name |= released;
+                }
+                continue;
             }
-            let pending = pending.to_string();
-            if let Some((_settled, released)) = settle_pending_restore(
+            if !settled
+                && !discards
+                && let Some(marked) = released(&branch_metadata)
+                && !fold_eq(marked, &branch_name)
+            {
+                release_unless(repository.clone(), branch, marked, unmarked).await?;
+            }
+
+            let mapped = match load_name_to_id(repository.clone(), &branch_name).await {
+                Ok(held) => held == branch,
+                Err(err) if err.is_branch_not_found() => false,
+                Err(err) => return Err(err),
+            };
+            if !mapped {
+                if released_name {
+                    break (Archived::Now, branch_name);
+                }
+                break (Archived::Already, branch_name);
+            }
+            #[cfg(feature = "test-util")]
+            crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveLookedUp).await;
+            if discards {
+                break (Archived::Now, branch_name);
+            }
+            let expected =
+                local_metadata_expected(repository.clone(), branch, read, read_locally).await;
+            match archive_record(
                 repository.clone(),
                 branch,
-                read,
-                read_locally,
+                &branch_name,
+                expected,
                 branch_metadata,
-                &pending,
             )
-            .await?
+            .await
             {
-                settled = true;
-                released_name |= released;
+                Ok(()) => break (Archived::Now, branch_name),
+                Err(err) if err.is_branch_already_exists() => {
+                    lore_debug!(
+                        "Branch {branch} changed since the archive read it as {branch_name}"
+                    );
+                }
+                Err(err) => return Err(err),
             }
-            continue;
-        }
-        if !settled
-            && !discards
-            && let Some(marked) = released(&branch_metadata)
-            && !fold_eq(marked, &branch_name)
-        {
-            release_unless(repository.clone(), branch, marked, unmarked).await?;
-        }
-
-        let mapped = match load_name_to_id(repository.clone(), &branch_name).await {
-            Ok(held) => held == branch,
-            Err(err) if err.is_branch_not_found() => false,
-            Err(err) => return Err(err),
         };
-        if !mapped {
-            if released_name {
-                break branch_name;
-            }
-            return Err(BranchError::from(BranchNotFound {
-                branch: branch_name,
-            }));
-        }
-        #[cfg(feature = "test-util")]
-        crate::test_util::branch_step(crate::test_util::BranchStep::ArchiveLookedUp).await;
-        if discards {
-            break branch_name;
-        }
-        let expected =
-            local_metadata_expected(repository.clone(), branch, read, read_locally).await;
-        match archive_record(
-            repository.clone(),
-            branch,
-            &branch_name,
-            expected,
-            branch_metadata,
-        )
-        .await
-        {
-            Ok(()) => break branch_name,
-            Err(err) if err.is_branch_already_exists() => {
-                lore_debug!("Branch {branch} changed since the archive read it as {branch_name}");
-            }
-            Err(err) => return Err(err),
-        }
-    };
-
-    // A layer or link archive is a consequence of the outer one, not its own
-    // user-facing event, so reporting each one would read as repeated archives.
-    if !repository.is_layer() && !repository.is_link() {
-        event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
-            name: branch_name.into(),
-        })
-        .send();
+        Ok(archived)
     }
-
-    Ok(())
 }
 
 /// The metadata of `branch`, as [`load_local_or_remote`] reads it, with its hash and whether the
-/// read was local, where [`delete`] may archive the branch. A protected branch, the default branch
-/// and one without a branch point are refused. A refusal of the read passes on; metadata that can't
-/// be read otherwise, or holds no name, fails with [`BranchNotFound`] naming the branch.
+/// read was local, where [`archive_local`] may archive the branch. A protected branch, the default
+/// branch and one without a branch point are refused. A refusal of the read passes on; metadata
+/// that can't be read otherwise, or holds no name, fails with [`BranchNotFound`] naming the branch.
 async fn archivable_metadata(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
@@ -3464,7 +4436,7 @@ async fn archivable_metadata(
         branch_name.to_string()
     };
 
-    if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
+    if protected(&branch_metadata) {
         return Err(BranchError::from(DeleteProtected { branch: display }));
     }
     if let Ok(repository_metadata) = repository::metadata_hash(repository.clone()).await
@@ -3681,14 +4653,15 @@ pub(crate) async fn list_remote_bounded(
     Ok(response.map(|response| response.list))
 }
 
+/// Emit the local branches, followed by the archived local branches when `archived` is set, or
+/// the remote's branches alone when `remote` is set.
 pub async fn list_output(
     repository: Arc<RepositoryContext>,
-    local: bool,
     remote: bool,
     archived: bool,
 ) -> Result<(), BranchError> {
     if remote {
-        return list_remote_output(repository, true).await;
+        return list_remote_output(repository).await;
     }
 
     // List local branches
@@ -3791,10 +4764,9 @@ pub async fn list_output(
                     return Ok(());
                 };
 
-                let Ok(id_bytes) = metadata.get_binary(ID) else {
+                let Ok(id) = branch::id(&metadata) else {
                     return Ok(());
                 };
-                let id: BranchId = id_bytes.into();
 
                 if active_ids.contains(&id) {
                     return Ok(());
@@ -3849,31 +4821,16 @@ pub async fn list_output(
         .send();
     }
 
-    if local {
-        return Ok(());
-    }
-
-    list_remote_output(repository, false).await
+    Ok(())
 }
 
-/// Emit the remote branch list. When `required` (an explicit `--remote`), a
-/// missing connection or a failed remote listing is propagated as an error;
-/// otherwise the remote is optional and such failures emit no remote events.
-async fn list_remote_output(
-    repository: Arc<RepositoryContext>,
-    required: bool,
-) -> Result<(), BranchError> {
-    let remote = match repository.remote().await {
-        Ok(remote) => remote,
-        Err(_) if !required => return Ok(()),
-        connection => connection.forward::<BranchError>("Failed to connect to remote")?,
-    };
-
-    let list = match list_remote(remote, repository.id).await {
-        Ok(list) => list,
-        Err(err) if required => return Err(err),
-        Err(_) => return Ok(()),
-    };
+/// Emit the remote's branch list. A missing connection or a failed listing is an error.
+async fn list_remote_output(repository: Arc<RepositoryContext>) -> Result<(), BranchError> {
+    let remote = repository
+        .remote()
+        .await
+        .forward::<BranchError>("connecting to the remote")?;
+    let list = list_remote(remote, repository.id).await?;
 
     event::LoreEvent::BranchListBegin(LoreBranchListBeginEventData {
         location: LoreBranchLocation::Remote,
@@ -4058,8 +5015,7 @@ pub async fn list_revisions(
         let branch_metadata = metadata(repository.clone(), b).await?;
         stack(&branch_metadata)
             .first()
-            .map(|parent| parent.revision)
-            .unwrap_or_default()
+            .map_or_default(|parent| parent.revision)
     };
     let limit = limit.unwrap_or(100);
 
@@ -4134,7 +5090,8 @@ pub async fn list_revisions(
 /// `DiffItem::Change` if the per-conflict text-merge succeeds —
 /// processed inline rather than buffered, so memory stays bounded at
 /// one conflict's worth of file realisation regardless of total
-/// conflict count.
+/// conflict count. `link_settlement` says what settles two links both
+/// sides put at one path.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3(
     repository: Arc<RepositoryContext>,
@@ -4146,6 +5103,7 @@ pub async fn diff3(
     include_same: bool,
     auto_resolve: bool,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     Box::pin(diff3_with_source_cap(
@@ -4160,6 +5118,7 @@ pub async fn diff3(
         None,
         None,
         graft_view,
+        link_settlement,
         tx,
     ))
     .await
@@ -4178,19 +5137,22 @@ pub async fn diff3_with_source_cap(
     source_cap: Option<usize>,
     history_walk_concurrency: Option<usize>,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     lore_debug!(
         "Branch diff branch {source_branch} revision {source_revision} -> branch {target_branch} revision {target_revision}"
     );
 
-    let base_revision = resolve_diff3_base(
+    // Boxed: a cold path, run once a diff, whose history walks would otherwise make the diff's
+    // future as large as theirs.
+    let (base_revision, merges) = Box::pin(resolve_diff3_base_and_merges(
         repository.clone(),
         source_branch,
         source_revision,
         target_branch,
         target_revision,
-    )
+    ))
     .await?;
 
     // `resolve_diff3_base` is documented never to return this, so reaching it is a
@@ -4224,6 +5186,8 @@ pub async fn diff3_with_source_cap(
         source_cap,
         history_walk_concurrency,
         graft_view,
+        merges,
+        link_settlement,
         inner_tx,
     ));
     relay_revision_diff3(driver, inner_rx, auto_resolve, &tx).await?;
@@ -4274,10 +5238,7 @@ async fn relay_revision_diff3(
 }
 
 /// Per-`DiffItem` step of `branch::diff3`'s auto-resolve drain. Kept
-/// sequential: parallelising without a concurrency cap breaks the
-/// streaming pipeline's memory bound — each in-flight conflict pins
-/// two `NodeChange`s and three open temp files until the text-merge
-/// completes.
+/// sequential, so that the stream holds one conflict's sides at a time.
 ///
 /// The text merge is boxed. Only a conflict with auto-resolve on reaches it,
 /// and inline it would make the step as large as the merge for every item.
@@ -4307,208 +5268,44 @@ fn emit_diff_item_with_auto_resolve(
     }
 }
 
-/// Realises the three sides of one conflict into temp files and runs
-/// `merge3_text_by_pathbuf`. Returns `Some(resolved_change)` only when
-/// the merge produces no conflict markers — any merge failure or any
-/// markers in the output preserve the conflict (returns `None`). The
-/// resolved change carries the executable bit [`change::merged_mode`] gives
-/// the file.
+/// The change the conflict between `change_from` and `change_to` resolves to where its text merges
+/// cleanly by [`crate::merge::TextRules::Lossy`]. It carries the executable bit
+/// [`change::merged_mode`] gives the file.
+///
+/// A side whose content can't be read leaves the conflict, so that a diff still reports it.
 #[lore_macro::test_pub]
 async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {
-    if change_from.path() != change_to.path() {
+    let Some(conflict) =
+        crate::merge::text_conflict(change_from, change_to, crate::merge::TextRules::Lossy)
+            .await
+            .forward::<BranchError>("reading a conflict's nodes")?
+    else {
         return Ok(None);
-    }
-    let theirs_path: PathBuf = util::fs::generate_temppath("theirs");
-    let base_path: PathBuf = util::fs::generate_temppath("base");
-    let mine_path: PathBuf = util::fs::generate_temppath("mine");
-    let theirs_file = theirs_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let base_file = base_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let mine_file = mine_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-
-    if change_from.to.mapping.node.is_valid_node_id() {
-        lore_trace!("Change from theirs has valid to node, realize theirs file {theirs_file}");
-        let node = change_from
-            .to
-            .mapping
-            .state
-            .block(
-                change_from.to.mapping.repository.clone(),
-                NodeBlock::index(change_from.to.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.to.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_from.to.mapping.repository.clone(),
-                &theirs_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change from theirs is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change from theirs has no valid to node, empty theirs file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&theirs_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    if !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&theirs_path))
-        .await
-        .unwrap_or(false)
-    {
-        lore_trace!("Change is not diffable and cannot be auto resolved, continue");
-        return Ok(None);
-    }
-
-    if change_from.from.mapping.node.is_valid_node_id() {
-        lore_trace!("Change from base has valid from node, realize base file {base_file}");
-        let node = change_from
-            .from
-            .mapping
-            .state
-            .block(
-                change_from.from.mapping.repository.clone(),
-                NodeBlock::index(change_from.from.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_from.from.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_from.from.mapping.repository.clone(),
-                &base_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change from base is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change from base has no valid to node, empty base file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&base_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    if change_to.to.mapping.node.is_valid_node_id() {
-        lore_trace!("Change to mine has valid from node, realize mine file {mine_file}");
-        let node = change_to
-            .to
-            .mapping
-            .state
-            .block(
-                change_to.to.mapping.repository.clone(),
-                NodeBlock::index(change_to.to.mapping.node),
-            )
-            .await
-            .forward::<BranchError>("Failed to deserialize revisions state")?
-            .node(Node::index(change_to.to.mapping.node));
-        // TODO(vri): UCS-19228 - Links: Realize link node files during branch sync
-        if node.is_file() {
-            if sync::realize_scratch_file(
-                change_to.to.mapping.repository.clone(),
-                &mine_path,
-                node,
-                Arc::default(),
-            )
-            .await
-            .forward::<BranchError>("Failed to auto resolve file")
-            .is_err()
-            {
-                return Ok(None);
-            }
-        } else {
-            lore_trace!("Change to mine is not a file, ignore auto resolve");
-            return Ok(None);
-        }
-    } else {
-        lore_trace!("Change to mine has no valid to node, empty mine file");
-        let _ = lore_io::IoDriver::global()
-            .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
-            .await;
-    }
-
-    let resolved = match crate::merge::merge3_text_by_pathbuf(
-        base_path.clone(),
-        mine_path.clone(),
-        theirs_path.clone(),
-        mine_path.clone(),
-        crate::merge::MergeTextMode::DryRun,
-    )
-    .await
-    {
+    };
+    match crate::merge::merge_conflict_as_text(&conflict).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(None),
         Err(err) => {
             lore_debug!(
-                "Auto resolve failed for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict remains: {err}"
+                "Auto resolve of {} failed, the conflict remains: {err}",
+                change_to.path()
             );
-            false
+            return Ok(None);
         }
-        Ok(true) => {
-            lore_debug!(
-                "Auto resolved with conflict markers for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict remains"
-            );
-            false
-        }
-        Ok(false) => {
-            lore_trace!(
-                "Auto resolved without any line conflicts for base {base_file}, mine {mine_file}, theirs {theirs_file} - conflict resolved"
-            );
-            true
-        }
-    };
-
-    let _ = util::fs::unlink(base_path).await;
-    let _ = util::fs::unlink(theirs_path).await;
-    let _ = util::fs::unlink(mine_path).await;
-
-    if resolved {
-        let mut to = change_to.to.clone();
-        if let Some(mode) = change::merged_mode(change_from, change_to) {
-            to.mode = mode;
-        }
-        Ok(Some(NodeChange {
-            action: change_to.action,
-            flags: change_to.flags | change::Flags::ConflictAutomerged,
-            from: change_to.from.clone(),
-            to,
-        }))
-    } else {
-        Ok(None)
     }
+    let mut to = change_to.to.clone();
+    if let Some(mode) = change::merged_mode(change_from, change_to) {
+        to.mode = mode;
+    }
+    Ok(Some(NodeChange {
+        action: change_to.action,
+        flags: change_to.flags | change::Flags::ConflictAutomerged,
+        from: change_to.from.clone(),
+        to,
+    }))
 }
 
 /// The stack of `branch` from its metadata, read locally or on the remote, and empty when it can't
@@ -4544,7 +5341,7 @@ async fn diff3_stack(
 /// Two branches resolve in two steps.
 /// `find_common_ancestor_from_branch_points` reads the stacks for the branch
 /// both sides descend from and the revision on it each side branched at, and
-/// answers from those. `find_common_ancestor_from_merges` then improves on that
+/// answers from those. `search_common_ancestor_from_merges` then improves on that
 /// answer where a merge has already carried one branch into the other, which the
 /// branch points cannot show.
 ///
@@ -4560,13 +5357,36 @@ async fn diff3_stack(
 /// fails with `BranchError::Divergent` when its two revisions share no history.
 ///
 /// Never returns the zero revision.
-pub async fn resolve_diff3_base(
+pub fn resolve_diff3_base(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
-) -> Result<Hash, BranchError> {
+) -> impl Future<Output = Result<Hash, BranchError>> + Send {
+    futures::FutureExt::map(
+        resolve_diff3_base_and_merges(
+            repository,
+            source_branch,
+            source_revision,
+            target_branch,
+            target_revision,
+        ),
+        |resolved| resolved.map(|(base, _merges)| base),
+    )
+}
+
+/// [`resolve_diff3_base`], also answering what the search for the base proved about merges
+/// between the two branches: [`revision::MergesAcross::NoneAboveBase`] where the branches differ
+/// and no merge in the repository joins them above the base.
+#[lore_macro::test_pub]
+pub(crate) async fn resolve_diff3_base_and_merges(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+) -> Result<(Hash, revision::MergesAcross), BranchError> {
     lore_debug!(
         "Resolve diff base between source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
     );
@@ -4616,16 +5436,25 @@ pub async fn resolve_diff3_base(
         common_ancestor
     };
 
-    let base_revision = find_common_ancestor_from_merges(
+    // Boxed: a cold path, run once a diff, whose walks would otherwise make every caller's future
+    // as large as theirs.
+    let search = Box::pin(search_common_ancestor_from_merges(
         repository.clone(),
         source_branch,
         source_revision,
         target_branch,
         target_revision,
         common_ancestor,
-    )
-    .await?
-    .unwrap_or(common_ancestor);
+    ))
+    .await?;
+    let base_revision = search.found.unwrap_or(common_ancestor);
+    // A branch's own history merges into itself, so the search proves nothing between a branch
+    // and itself.
+    let merges = if search.none_above_floor && source_branch != target_branch {
+        revision::MergesAcross::NoneAboveBase
+    } else {
+        revision::MergesAcross::Unknown
+    };
 
     lore_debug!(
         "Resolved diff base {base_revision} for source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
@@ -4638,7 +5467,7 @@ pub async fn resolve_diff3_base(
         return Err(BranchError::from(Divergent));
     }
 
-    Ok(base_revision)
+    Ok((base_revision, merges))
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor
@@ -4667,6 +5496,7 @@ pub async fn diff3_collect(
         include_same,
         auto_resolve,
         None,
+        revision::LinkSettlement::Tree,
     )
     .await
 }
@@ -4674,7 +5504,8 @@ pub async fn diff3_collect(
 /// `diff3_collect` that may adopt whole out-of-view subtrees.
 ///
 /// `graft_view` decides which subtrees the view excludes. `None` disables
-/// adoption and gives the unmodified walk.
+/// adoption and gives the unmodified walk. `link_settlement` says what
+/// settles two links both sides put at one path.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3_collect_with_graft(
     repository: Arc<RepositoryContext>,
@@ -4686,6 +5517,7 @@ pub async fn diff3_collect_with_graft(
     include_same: bool,
     auto_resolve: bool,
     graft_view: Option<Arc<crate::filter::Filter>>,
+    link_settlement: revision::LinkSettlement,
 ) -> Result<DiffResult, BranchError> {
     let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
         diff3(
@@ -4698,6 +5530,7 @@ pub async fn diff3_collect_with_graft(
             include_same,
             auto_resolve,
             graft_view,
+            link_settlement,
             tx,
         )
     })
@@ -4926,7 +5759,7 @@ enum HistoryLineSearch {
 /// that the two sit on one line, which makes the older one their base.
 ///
 /// Self parents only. A revision merged in from elsewhere is not on this line,
-/// and `find_common_ancestor_from_merges` is what reaches those.
+/// and `search_common_ancestor_from_merges` is what reaches those.
 ///
 /// Only this direction can succeed: a revision's number is one past its parents',
 /// so a walk backwards never reaches a higher numbered revision. The walk stops
@@ -5164,7 +5997,7 @@ struct WalkVisit {
     target: bool,
 }
 
-/// State shared by every walker of one `find_common_ancestor_from_merges` search.
+/// State shared by every walker of one `search_common_ancestor_from_merges` search.
 struct AncestorWalk {
     /// Which of the two walks has reached each revision. A revision reached by
     /// both is a common ancestor.
@@ -5182,6 +6015,9 @@ struct AncestorWalk {
     /// First read failure that cut a walk short, kept so the search can report
     /// an incomplete history rather than an absent common ancestor.
     failure: RwLock<Option<StateError>>,
+    /// The permits of the walks' pagers to request pages ahead, as [`find::lines_ahead`] gives
+    /// them.
+    lines_ahead: Arc<Semaphore>,
 }
 
 impl AncestorWalk {
@@ -5192,6 +6028,7 @@ impl AncestorWalk {
             floor_revision,
             floor_revision_number,
             failure: RwLock::new(None),
+            lines_ahead: find::lines_ahead(),
         }
     }
 
@@ -5201,6 +6038,22 @@ impl AncestorWalk {
                 std::cmp::max(found_revision_number, self.floor_revision_number)
             }
             None => self.floor_revision_number,
+        }
+    }
+
+    /// Waits for every walk of `tasks`. A walk that panicked or was cancelled left history
+    /// unwalked, so it counts as a failure to read it.
+    async fn join(&self, tasks: &mut JoinSet<()>) {
+        while let Some(joined) = tasks.join_next().await {
+            if let Err(err) = joined {
+                let mut failure = self.failure.write().await;
+                if failure.is_none() {
+                    *failure = Some(StateError::internal_with_context(
+                        err,
+                        "Failed to walk a history line for a common ancestor",
+                    ));
+                }
+            }
         }
     }
 }
@@ -5214,7 +6067,16 @@ async fn find_ancestor_walker(
     let mut tasks = JoinSet::new();
 
     let mut revision = revision_start;
+    let mut pager = find::LinePager::new(repository.clone(), walk.lines_ahead.clone());
+    let mut below = u64::MAX;
     while revision != Hash::default() {
+        // Read the line a page at a time rather than a revision per request, no further down than
+        // the walks prune: the floor, or the newest common ancestor found so far. A refused page
+        // leaves each state to be read on its own below.
+        if pager.paging() {
+            let floor = walk.prune_at_or_below().await;
+            pager.page_in(revision, below, floor).await;
+        }
         let state = match state::State::deserialize(repository.clone(), revision).await {
             Ok(state) => state,
             Err(err) => {
@@ -5293,10 +6155,12 @@ async fn find_ancestor_walker(
             });
         }
 
+        below = state_revision_number;
         revision = state.parent_self();
     }
 
-    while let Some(_result) = tasks.join_next().await {}
+    pager.finish().await;
+    walk.join(&mut tasks).await;
 }
 
 fn find_ancestor_walker_recurse(
@@ -5313,6 +6177,21 @@ fn find_ancestor_walker_recurse(
     ))
 }
 
+/// What [`search_common_ancestor_from_merges`] found.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MergeSearch {
+    /// The newest revision both walks reached, where they reached one.
+    found: Option<Hash>,
+    /// Whether the walks read both histories down to the floor, and found no revision both reach
+    /// numbered other than the floor is. A revision is numbered above each of its parents, so
+    /// each revision either side made since the floor is numbered above it, and a merge that took
+    /// one into the other would leave it on both histories. Neither side holds one, so no merge in
+    /// this repository joins them above the floor, which the base is then numbered as. It proves
+    /// nothing of the repositories links mount.
+    none_above_floor: bool,
+}
+
 /// Walk both branches' histories backwards for the newest revision reachable
 /// from both, which is the best available 3-way base.
 ///
@@ -5324,32 +6203,35 @@ fn find_ancestor_walker_recurse(
 /// revision at or below its revision number. Pass `Hash::default()` to search
 /// with no floor.
 ///
-/// Returns `Ok(None)` when the walks completed without finding anything above
-/// the floor, so the caller keeps its own base. Returns `Err` when a revision
-/// state could not be read and no common ancestor was found, so a transient read
-/// failure is never reported as an absent common ancestor.
+/// Answers the newest revision both walks reached, which is at or below the floor
+/// where they reach nothing newer, or none where they never met, so the caller keeps
+/// its own base, and whether they proved that no merge joins the two histories above
+/// the floor. Returns `Err` when a revision state could not be read and no common
+/// ancestor was found, so a transient read failure is never reported as an absent
+/// common ancestor.
 #[lore_macro::test_pub]
-async fn find_common_ancestor_from_merges(
+async fn search_common_ancestor_from_merges(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
     base_revision: Hash,
-) -> Result<Option<Hash>, BranchError> {
+) -> Result<MergeSearch, BranchError> {
     let mut tasks = JoinSet::new();
 
-    let floor_revision_number = match State::deserialize(repository.clone(), base_revision).await {
-        Ok(state) => state.revision_number(),
+    let floor = match State::deserialize(repository.clone(), base_revision).await {
+        Ok(state) => Some(state.revision_number()),
         Err(err) => {
             // Leaves the search unbounded, which still answers correctly but walks
             // both histories to their root revisions.
             lore_warn!(
                 "Could not read base revision {base_revision} to bound the common ancestor search: {err}"
             );
-            0
+            None
         }
     };
+    let floor_revision_number = floor.unwrap_or(0);
 
     lore_debug!(
         "Find common ancestor from merges of source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}, above base revision {base_revision} -> {floor_revision_number}"
@@ -5383,12 +6265,17 @@ async fn find_common_ancestor_from_merges(
         }
     });
 
-    while let Some(_result) = tasks.join_next().await {}
+    walk.join(&mut tasks).await;
 
     let found = *walk.common.read().await;
     let failure = walk.failure.write().await.take();
+    // A revision both walks reach below the floor becomes the base, and the walks left the
+    // revisions between it and the floor unread, so only one at the floor's number proves
+    // anything.
+    let none_above_floor = failure.is_none()
+        && floor.is_some_and(|floor| found.is_none_or(|(number, _)| number == floor));
 
-    match (found, failure) {
+    let found = match (found, failure) {
         (Some((revision_number, revision)), failure) => {
             if let Some(err) = failure {
                 lore_warn!(
@@ -5398,19 +6285,25 @@ async fn find_common_ancestor_from_merges(
                 lore_debug!("Revision {revision} -> {revision_number} found as common ancestor");
             }
 
-            Ok(Some(revision))
+            Some(revision)
         }
-        (None, Some(err)) => Err(err).forward::<BranchError>(
-            "Failed to read revision history while searching for a common ancestor",
-        ),
+        (None, Some(err)) => {
+            return Err(err).forward::<BranchError>(
+                "Failed to read revision history while searching for a common ancestor",
+            );
+        }
         (None, None) => {
             lore_debug!(
                 "Walk found no common ancestor newer than revision {base_revision} -> {floor_revision_number}, keeping it as base"
             );
 
-            Ok(None)
+            None
         }
-    }
+    };
+    Ok(MergeSearch {
+        found,
+        none_above_floor,
+    })
 }
 
 /// Send the event that begins a branch diff, reporting the resolved branches

@@ -418,6 +418,7 @@ mod quic_session_rebind_tests {
                             inflight_limit: 800,
                             handler_timeout: None,
                             permit_timeout: None,
+                            slow_send_threshold: None,
                         },
                     )) as Box<dyn StreamDataHandler>
                 }),
@@ -721,7 +722,7 @@ mod quic_session_rebind_tests {
             let outcome = GrpcServerBuilder::new()
                 .with_environment(environment)
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(immutable.clone(), immutable)
+                .with_immutable_store(immutable.clone(), immutable, None)
                 .with_mutable_store(mutable)
                 .with_lock_store(None)
                 .with_domain_context(None)
@@ -1347,6 +1348,7 @@ mod quic_session_rebind_tests {
             "",
             initial_token,
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("connecting with a valid credential should succeed");
@@ -1398,6 +1400,7 @@ mod quic_session_rebind_tests {
             "",
             replacement_token,
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("adopting a replacement credential should reuse the live connection");
@@ -2628,7 +2631,8 @@ mod quic_session_rebind_tests {
                 let mut context = lore_revision::repository::RepositoryContext::new_null_context(
                     local,
                     local_mutable,
-                );
+lore_revision::state::allow_all_repositories(),
+);
                 context.id = session.partition().await?;
                 let repository = Arc::new(context);
                 repository
@@ -2925,6 +2929,7 @@ mod quic_session_rebind_tests {
                     "",
                     "",
                     lore_transport::auth::AuthMode::Auto,
+                    None,
                 )
                 .await?;
                 let storage = connection.storage().await?;

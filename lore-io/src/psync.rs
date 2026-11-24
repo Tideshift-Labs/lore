@@ -10,6 +10,7 @@ use crate::buffer::StableBuf;
 use crate::buffer::StableBufList;
 use crate::buffer::StableBufListMut;
 use crate::pool::SyscallPool;
+use crate::pool::SyscallTask;
 use crate::pool::retry_on_interrupt;
 
 /// Segments per vectored syscall, matching the `IOV_MAX` of 1024 on Linux
@@ -355,19 +356,71 @@ impl PsyncDriver {
         SyscallPool::global().submit(move || file.metadata()).await
     }
 
+    pub(crate) async fn is_at(&self, file: Arc<File>, path: PathBuf) -> std::io::Result<bool> {
+        SyscallPool::global()
+            .submit(move || Ok(entry_identity(&path)? == Some(handle_file_id(&file)?)))
+            .await
+    }
+
+    /// Sets the length of `file`, which [`crate::holes::make_sparse`] marks sparse first where
+    /// `sparse`, in one job on the pool.
     pub(crate) async fn set_len<C: Send + 'static>(
         &self,
         file: Arc<File>,
         len: u64,
+        sparse: bool,
         completion: C,
     ) -> std::io::Result<()> {
         SyscallPool::global()
             .submit(move || {
+                if sparse {
+                    crate::holes::make_sparse(&file);
+                }
                 let set = retry_on_interrupt(|| file.set_len(len));
                 drop(completion);
                 set
             })
             .await
+    }
+
+    /// Runs [`crate::holes::empty`] on the syscall pool, in one job. Returns the pool's task, as
+    /// [`Self::next_data`] does.
+    pub(crate) fn empty(file: Arc<File>, len: u64) -> SyscallTask<std::io::Result<()>> {
+        SyscallPool::global().submit(move || crate::holes::empty(&file, len))
+    }
+
+    /// Runs [`crate::holes::next_data`] on the syscall pool. Returns the pool's task rather than
+    /// awaiting it: a forwarding `async fn` would add a level to every future awaiting this one,
+    /// which the compiler walks to prove that future `Send`.
+    pub(crate) fn next_data(
+        file: Arc<File>,
+        offset: u64,
+        mut cursor: crate::DataCursor,
+    ) -> SyscallTask<(
+        std::io::Result<Option<std::ops::Range<u64>>>,
+        crate::DataCursor,
+    )> {
+        SyscallPool::global().submit(move || {
+            let found = crate::holes::next_data(&file, offset, &mut cursor);
+            (found, cursor)
+        })
+    }
+
+    /// Runs [`crate::holes::punch_holes`] on the syscall pool, as [`Self::next_data`] runs its
+    /// lookup.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn punch_holes(
+        file: Arc<File>,
+        holes: Vec<std::ops::Range<u64>>,
+    ) -> SyscallTask<std::io::Result<()>> {
+        SyscallPool::global().submit(move || crate::holes::punch_holes(&file, &holes))
+    }
+
+    /// Runs [`crate::holes::holds_holes`] on the syscall pool, as [`Self::next_data`] runs its
+    /// lookup.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn holds_holes(file: Arc<File>) -> SyscallTask<bool> {
+        SyscallPool::global().submit(move || crate::holes::holds_holes(&file))
     }
 
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {
@@ -1096,6 +1149,15 @@ fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>>
     }
 }
 
+/// The device and inode numbers of the file `file` has open.
+#[cfg(target_family = "unix")]
+fn handle_file_id(file: &File) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
 /// The volume serial number and file ID of the file `path` names, symbolic links followed, and
 /// `None` where it names nothing, read through a handle opened for its attributes alone.
 ///
@@ -1105,15 +1167,9 @@ fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, u64)>>
 #[cfg(target_family = "windows")]
 fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, [u8; 16])>> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
 
-    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
     use windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES;
-    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
-    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
-    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
 
     let file = match std::fs::OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -1124,6 +1180,21 @@ fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, [u8; 1
         Err(err) if names_nothing(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
+    handle_file_id(&file).map(Some)
+}
+
+/// The volume serial number and file ID of the file `file` has open, read as [`entry_identity`]
+/// reads them.
+#[cfg(target_family = "windows")]
+fn handle_file_id(file: &File) -> std::io::Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ID_INFO;
+    use windows_sys::Win32::Storage::FileSystem::FileIdInfo;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandleEx;
+
     let mut info = FILE_ID_INFO::default();
     // SAFETY: the handle is open for the call, and `info` is a `FILE_ID_INFO` of the size passed,
     // which the call writes.
@@ -1136,7 +1207,7 @@ fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, [u8; 1
         )
     };
     if queried != 0 {
-        return Ok(Some((info.VolumeSerialNumber, info.FileId.Identifier)));
+        return Ok((info.VolumeSerialNumber, info.FileId.Identifier));
     }
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
     // SAFETY: the handle is open for the call, and `info` is the structure the call writes.
@@ -1146,7 +1217,7 @@ fn entry_identity(path: &std::path::Path) -> std::io::Result<Option<(u64, [u8; 1
     let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
     let mut identifier = [0u8; 16];
     identifier[..8].copy_from_slice(&index.to_le_bytes());
-    Ok(Some((u64::from(info.dwVolumeSerialNumber), identifier)))
+    Ok((u64::from(info.dwVolumeSerialNumber), identifier))
 }
 
 /// Adds the owner's write permission to the directory `path` names itself, through a handle that
@@ -1195,6 +1266,12 @@ fn make_owner_writable_impl(path: &std::path::Path) -> std::io::Result<()> {
 /// What `std::fs::metadata` answers for `path`.
 pub(crate) fn std_stat(path: &std::path::Path) -> std::io::Result<crate::Stat> {
     std::fs::metadata(path).map(|metadata| crate::Stat::from(&metadata))
+}
+
+/// What [`IoDriver::stat`](crate::IoDriver::stat) answers for `path`, read on the calling
+/// thread, for a caller on a blocking thread that reads many paths. Blocking.
+pub fn stat_blocking(path: &std::path::Path) -> std::io::Result<crate::Stat> {
+    stat_impl(path)
 }
 
 #[cfg(not(target_family = "windows"))]
@@ -1323,6 +1400,109 @@ fn write_segments<B: StableBufList>(file: File, buffers: B, durable: bool) -> st
         file.sync_all()?;
     }
     Ok(())
+}
+
+/// Flushes `file`'s data and metadata past its drive's cache: through `fcntl(F_FULLFSYNC)` on
+/// macOS, where a flush otherwise stops at that cache, and through `fsync` on other Unix systems.
+/// `File::sync_all` makes the same call on macOS; this makes it itself, so a test can count it.
+#[cfg(target_os = "macos")]
+pub(crate) fn sync_full(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    #[cfg(feature = "test-util")]
+    test_util::FULL_SYNCS.with(|count| count.set(count.get() + 1));
+    // SAFETY: the descriptor is open for the duration of the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Flushes `file`'s data and metadata past its drive's cache: through `fcntl(F_FULLFSYNC)` on
+/// macOS, where a flush otherwise stops at that cache, and through `fsync` on other Unix systems.
+#[cfg(all(target_family = "unix", not(target_os = "macos")))]
+pub(crate) fn sync_full(file: &File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+/// Flushes the directory `path` to disk, so the entries created, renamed or removed in it survive
+/// a power loss, through [`sync_full`].
+/// Windows has no call that flushes a directory, so there it does nothing. Blocking.
+#[cfg(target_family = "unix")]
+pub fn sync_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY)
+        .open(path)?;
+    sync_full(&dir)
+}
+
+/// Flushes the directory `path` to disk. Windows has no call that flushes a directory, so this
+/// does nothing. Blocking.
+#[cfg(target_family = "windows")]
+pub fn sync_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Flushes the directory that holds `path` through [`sync_dir`], the working directory for a
+/// bare name.
+pub(crate) fn sync_dir_of(path: &std::path::Path) -> std::io::Result<()> {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => sync_dir(parent),
+        Some(_) => sync_dir(std::path::Path::new(".")),
+        None => Ok(()),
+    }
+}
+
+/// Creates the directory `path`, but none of its parents, so a missing parent fails with
+/// `NotFound`. An existing directory at `path` is success, as [`forgive_existing_dir`] has it.
+/// Blocking.
+pub fn create_dir_in_existing_parent(path: &std::path::Path) -> std::io::Result<()> {
+    forgive_existing_dir(std::fs::create_dir(path), path)
+}
+
+/// Creates the directory `path` and its missing parents, on Unix with mode `0o700` before the
+/// umask, so that no other account can add to them, and flushes each directory it creates one in
+/// through [`sync_dir`]. An existing directory at `path` is success. Blocking.
+pub fn create_dir_all_private(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_family = "unix")]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(target_family = "unix"))]
+    let builder = std::fs::DirBuilder::new();
+    create_dir_and_parents(&builder, path)
+}
+
+/// Creates `path` through `builder`, after its missing parents, and flushes each directory it
+/// creates one in. Recurses once per missing parent, as `std::fs::create_dir_all` does.
+fn create_dir_and_parents(
+    builder: &std::fs::DirBuilder,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let created = match builder.create(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            else {
+                return Err(err);
+            };
+            create_dir_and_parents(builder, parent)?;
+            builder.create(path)
+        }
+        created => created,
+    };
+    match created {
+        Ok(()) => sync_dir_of(path),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(target_family = "unix")]
@@ -1508,4 +1688,19 @@ fn write_vectored_impl<B: StableBufList>(
         offset += done as u64;
     }
     Ok(total)
+}
+
+/// The count of flushes [`sync_full`] makes through `F_FULLFSYNC`, per thread.
+#[cfg(all(target_os = "macos", feature = "test-util"))]
+pub mod test_util {
+    use std::cell::Cell;
+
+    thread_local! {
+        pub(super) static FULL_SYNCS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// How many `F_FULLFSYNC` flushes this thread has made.
+    pub fn full_syncs_on_this_thread() -> usize {
+        FULL_SYNCS.with(Cell::get)
+    }
 }

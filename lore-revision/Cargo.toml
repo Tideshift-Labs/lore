@@ -41,7 +41,6 @@ ring = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true }
-serde_bytes = { workspace = true }
 # The attempt store's on-disk body (WP-120). JSON rather than TOML because the document is two
 # arrays of flat records, which TOML renders as a table-array wall, and because a self-describing
 # body keeps the format's compatibility rules in one place: unknown fields and a missing optional
@@ -57,7 +56,6 @@ tokio-util = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
-chrono = { workspace = true }
 url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
@@ -78,6 +76,7 @@ zerocopy = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+arc-swap = { workspace = true }
 lore-fuse = { path = "../lore-fuse" }
 
 # `MockTransport`, for provider tests that need the dispatcher's reply path.
@@ -88,6 +87,13 @@ lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
 name = "state_bench"
 path = "examples/state_bench/main.rs"
 required-features = ["state-bench"]
+
+# The walk benchmark, run by hand, as `lore-revision/BENCHMARKS.md` describes. Naming the feature
+# keeps `cargo test` and builds of all targets from building it.
+[[example]]
+name = "walk"
+path = "examples/walk.rs"
+required-features = ["walk-bench"]
 
 # The node operations' stress harness, run by hand through `scripts/state-stress/stress.py`, which
 # enables `state-stress`. Naming the feature keeps `cargo test` and builds of all targets from
@@ -103,6 +109,7 @@ bitcode = { workspace = true }
 ctor = { workspace = true }
 keyring-core = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-io = { workspace = true, features = ["test-util"] }
 # `test_seams` for the fork's `live_fixture` tests in tests/unit (WP-120).
 lore-revision = { workspace = true, features = ["test-util", "test_seams"] }
 lore-storage = { workspace = true, features = ["test-util"] }
@@ -141,7 +148,7 @@ seeding = []
 test_seams = ["lore-transport/test_seams"]
 trace_log = ["lore-base/trace_log"]
 vfs = []
-test-util = []
+test-util = ["lore-io/test-util"]
 # A build the instruction gate counts (`state-bench`, and lore's `revision-tree-bench`): the
 # test-only lock counters (`state::lock_counting`, `node::read_contention`) count nothing, so the
 # count measures the paths that ship. Examples build with the dev-dependencies, which turn on
@@ -151,6 +158,9 @@ bench = []
 # state_bench --features state-bench`. Naming the feature keeps `cargo test` and builds of all
 # targets from building it.
 state-bench = ["bench"]
+# The walk benchmark, run by hand: `cargo run --release -p lore-revision --example walk --features
+# walk-bench`.
+walk-bench = []
 # The node operations' scheduling points (`state::node::hooks`), which the stress harness drives:
 # enabled by `state-stress` alone, so no other build or test run carries them. Benchmarks never
 # build with it.

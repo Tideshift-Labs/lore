@@ -3,8 +3,10 @@
 //! `lore_revision_tree_commit` — freeze the handle's tree, write the 320-
 //! byte revision record, and atomically advance the target branch tip. The
 //! options struct carries the `remote_write` flag (`u8`, 0 or 1, not
-//! `bool`) selecting between local-only and remote-uploading commits.
+//! `bool`) selecting whether committing also uploads the revision, and the
+//! second parent of a merge revision.
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -25,7 +27,6 @@ use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData
 use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 
 use crate::call_delegation::dispatch_call;
@@ -33,10 +34,10 @@ use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::call::revision_tree_call;
 use crate::revision_tree::handle::ExclusiveAccess;
-use crate::revision_tree::handle::IN_MEMORY_MARKER;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
 use crate::storage::store::PerCallFlags;
+use crate::storage::store::StoreInternal;
 
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
@@ -46,6 +47,12 @@ use crate::storage::store::PerCallFlags;
 pub struct LoreRevisionTreeCommitOptions {
     /// Also upload the new revision to remote (local-only by default)
     pub remote_write: u8,
+    /// The second parent, the merged revision; zero commits a revision with one parent. The
+    /// revision the handle was loaded from is always the first parent, so a caller that records a
+    /// merge revision loads the handle at the revision the branch continues and names the merged
+    /// revision here. A merge revision needs a first parent: a handle loaded from the zero
+    /// revision takes no second parent.
+    pub parent_other: Hash,
 }
 
 /// Arguments for `lore_revision_tree_commit`.
@@ -57,7 +64,7 @@ pub struct LoreRevisionTreeCommitArgs {
     pub id: u64,
     /// Loaded revision-tree handle to freeze and commit
     pub handle: LoreRevisionTree,
-    /// Commit tuneables (local-only vs remote-uploading)
+    /// Commit tuneables: the upload and a merge revision's second parent
     pub options: LoreRevisionTreeCommitOptions,
 }
 
@@ -152,6 +159,18 @@ fn emit_commit_complete(
 /// what identifies a tip collision**, and it carries the tip to reload from so the
 /// recovery needs no extra query.
 ///
+/// **A merge revision.** `options.parent_other` names a second parent, the merged
+/// revision; zero commits a revision with one parent. The loaded revision is always the
+/// first parent: load the handle at the revision the branch continues, apply the result of
+/// merging as edits, and name the merged revision. The revision is numbered one above the
+/// higher of its parents' numbers, every change it records is marked as merged, and it
+/// commits even with no edits and no metadata set. A second parent that is the loaded
+/// revision, that the handle's store doesn't hold, or that is given to a handle loaded from
+/// the zero revision, is refused with `InvalidArguments` before anything is written,
+/// naming its hash; another failure to read it reports `Internal`, as the
+/// call's other reads do. A second parent claims that the revision holds that revision's
+/// history: name one only where merging brought in the whole of the merged line.
+///
 /// `options.remote_write = 1` uploads the revision within the call. It is a
 /// request, not a guarantee: a handle whose store is bound offline or local-only,
 /// or a call passing `globals.local`, silently commits local-only. So does a store
@@ -175,12 +194,12 @@ fn emit_commit_complete(
 /// compare-and-swap decides which one publishes and the loser fails carrying the tip
 /// the winner set, having possibly left orphan tree blocks behind. They are
 /// content-addressed and no revision references them.
-pub async fn commit(
+pub fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCommitArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, commit_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, commit_impl)
 }
 
 async fn commit_impl(
@@ -275,21 +294,23 @@ async fn commit_revision(
         }
     };
 
-    let token = RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER);
+    let token = StoreInternal::in_memory_write_token();
     match commit_in_memory_revision(
         repository_context.clone(),
         &token,
         state.clone(),
         metadata,
         current_revision,
+        args.options.parent_other,
         branch,
     )
     .await
     {
         Ok(revision) => {
             // The freeze cleared the staged marks its rehash reached, those an unfinished change
-            // left among them.
+            // left among them, and left no node staged for addition.
             state.clear_unfinished_change();
+            state.clear_tracked_below_added();
             *internal.pending_metadata.write() = Metadata::default();
             emit_commit_complete(id, revision, Hash::default(), LoreErrorCode::None);
             emit_commit_telemetry(
@@ -297,7 +318,7 @@ async fn commit_revision(
                 state.revision_number(),
                 branch,
                 revision,
-                current_revision,
+                state.parents(),
             );
             Ok(())
         }
@@ -337,8 +358,8 @@ async fn commit_revision(
 /// deserialized into a new `State` and takes its place. `serialize` left the snapshot's
 /// signature on itself and cleared its dirty flag, so both are restored — a handle with
 /// unserialized edits sitting on the revision it was loaded at is exactly the state the
-/// caller had — and so is an unfinished change the replaced State noted, which no serialization
-/// carries.
+/// caller had — and so are an unfinished change and a move below an added directory the replaced
+/// State noted, which no serialization carries.
 ///
 /// A failure here is the one case that still poisons: the handle is holding a tree
 /// neither committed nor restored, and no further call can be trusted against it. It
@@ -370,6 +391,9 @@ async fn restore_tree(
     if access.state().has_unfinished_change() {
         restored.note_unfinished_change();
     }
+    if access.state().may_hold_tracked_below_added() {
+        restored.note_tracked_below_added();
+    }
     access.replace(restored);
     Ok(())
 }
@@ -381,7 +405,7 @@ fn emit_commit_telemetry(
     revision_number: u64,
     branch: BranchId,
     revision: Hash,
-    parent: Hash,
+    [parent, parent_other]: [Hash; 2],
 ) {
     LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: internal.repository,
@@ -389,27 +413,22 @@ fn emit_commit_telemetry(
         revision,
         revision_number,
         parent,
-        parent_other: Hash::default(),
+        parent_other,
     })
     .send();
 }
 
 /// Carry a commit failure into the verb's error set: what a caller can fix through
-/// the arguments stays `InvalidArguments`, everything else becomes `Internal` with
-/// the reason attached. An oversized metadata buffer lands in the latter — the
-/// reason names the size, which is what a caller needs to shed keys and retry.
+/// the arguments stays `InvalidArguments`, everything else becomes `Internal`. An
+/// oversized metadata buffer lands in the latter — the reason names the size, which
+/// is what a caller needs to shed keys and retry.
 ///
-/// The `Internal` arm keeps the source error so its trace reaches the completion
-/// detail. This is the deepest chain in the namespace — the freeze walks a tree,
-/// `rehash_directory` fans out, `serialize` spawns a task per dirty block — so the
-/// locations are worth more here than anywhere else. The `InvalidArguments` arm
-/// carries a reason rather than a source by construction, which is enough: those
-/// are shallow rejections raised before any of that runs.
+/// The error keeps its trace, so it reaches the completion detail. This is the
+/// deepest chain in the namespace — the freeze walks a tree, `rehash_directory` fans
+/// out, `serialize` spawns a task per dirty block — so the locations are worth more
+/// here than anywhere else.
 fn map_commit_error(error: CommitError) -> CommitVerbError {
-    if error.is_invalid_arguments() {
-        return CommitVerbError::from(InvalidArguments {
-            reason: error.to_string(),
-        });
-    }
-    CommitVerbError::internal_with_context(error, "commit_in_memory_revision")
+    let Err(error) =
+        Err::<Infallible, _>(error).forward_any::<CommitVerbError>("commit_in_memory_revision");
+    error
 }

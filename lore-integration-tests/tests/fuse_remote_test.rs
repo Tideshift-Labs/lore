@@ -9,8 +9,7 @@
 //! and the mounted repository starts with empty local stores.
 
 #[cfg(all(test, feature = "integration_tests", target_os = "linux"))]
-mod fuse_remote_tests {
-    use std::collections::HashMap;
+mod needs_fuse {
     use std::os::fd::AsRawFd as _;
     use std::path::Path;
     use std::path::PathBuf;
@@ -27,15 +26,14 @@ mod fuse_remote_tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::test_util::TempDir;
     use lore_fuse::abi::Opcode;
+    use lore_fuse::mount::test_util::PlantedBusyWindow;
     use lore_fuse::mount::unmount_path;
     use lore_fuse::skip_without_fuse;
-    use lore_revision::environment::EnvironmentConfig;
     use lore_revision::fs::fuse::inode::InodeKind;
     use lore_revision::fs::fuse::listing_cache::LISTING_BLOCK_BYTES;
     use lore_revision::fs::fuse::listing_cache::LISTING_CACHE_BYTES;
     use lore_revision::fs::fuse::listing_cache::ListingCache;
     use lore_revision::fs::fuse::mount::FuseMount;
-    use lore_revision::fs::fuse::mount::FuseMountError;
     use lore_revision::fs::mount_manager::MountManager;
     use lore_revision::fs::mount_manager::MountManagerError;
     use lore_revision::fs::mount_manager_state::MountManagerState;
@@ -53,22 +51,17 @@ mod fuse_remote_tests {
     use lore_revision::repository::VfsConfig;
     use lore_revision::repository::VfsType;
     use lore_revision::repository::load_repository_config_from_dot_dir;
-    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
-    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
-    use lore_server::grpc::server::FeatureSettings;
-    use lore_server::grpc::server::GrpcServerBuilder;
-    use lore_server::grpc::server::GrpcTimeouts;
-    use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
-    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
+    use crate::common::net_common::TestServerStop;
     use crate::common::net_common::bind_matched_pair;
+    use crate::common::net_common::spawn_grpc_server;
     use crate::setup_execution;
 
     /// One fragment (under 256 KiB), and a size no tree block has, so fetches of it are
@@ -400,44 +393,26 @@ mod fuse_remote_tests {
     /// A `lore://` server over `store`: storage on QUIC, everything else on gRPC, one port.
     struct Server {
         url: String,
-        quic: Option<QuinnServer>,
-        grpc_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-        grpc_stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        stop: TestServerStop,
     }
 
     impl Server {
-        /// Stops serving: closes the QUIC endpoints and waits until they are idle, then stops the
-        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
-        /// the TCP listener has returned.
+        /// Stops serving, as [`TestServerStop::stop`] does.
         async fn shutdown(&mut self) {
-            if let Some(quic) = self.quic.take() {
-                quic.close().await;
-            }
-            drop(self.grpc_shutdown.take());
-            if let Some(stopped) = self.grpc_stopped.take() {
-                tokio::time::timeout(Duration::from_secs(10), stopped)
-                    .await
-                    .expect("the gRPC server stops")
-                    .expect("the gRPC server reports how it stopped")
-                    .expect("the gRPC server stops cleanly");
-            }
+            self.stop.stop().await;
         }
     }
 
-    async fn start_server(
-        immutable: Arc<dyn ImmutableStore>,
-        mutable: Arc<dyn MutableStore>,
-    ) -> Server {
+    fn start_server(immutable: Arc<dyn ImmutableStore>, mutable: Arc<dyn MutableStore>) -> Server {
         start_server_with_process_limit(
             immutable,
             mutable,
             lore_server::quic::tests::TEST_PROCESS_LIMIT,
         )
-        .await
     }
 
     /// [`start_server`], handling `process_limit` requests on each stream at once.
-    async fn start_server_with_process_limit(
+    fn start_server_with_process_limit(
         immutable: Arc<dyn ImmutableStore>,
         mutable: Arc<dyn MutableStore>,
         process_limit: usize,
@@ -461,66 +436,10 @@ mod fuse_remote_tests {
         )
         .expect("quinn server start");
 
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
-        let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
-            Arc::new(lore_server::notification::local::NotificationSender::default());
-        #[allow(clippy::disallowed_methods)]
-        tokio::spawn(async move {
-            let catalog = Arc::new(BaselineRepositoryCatalog::new(
-                BaselineAccess::Reachable,
-                immutable.clone(),
-                mutable.clone(),
-            ));
-            let outcome = GrpcServerBuilder::new()
-                .with_environment(EnvironmentConfig::default())
-                .with_feature(FeatureSettings::default())
-                .with_immutable_store(immutable.clone(), immutable)
-                .with_mutable_store(mutable)
-                .with_lock_store(None)
-                .with_notification(notification_sender, None)
-                .with_hook_dispatcher(Arc::new(HookDispatcher::empty()))
-                .with_tls_config(None, None, None)
-                .unwrap()
-                .with_admin_endpoints(HashMap::new(), vec![])
-                .with_http2_config(
-                    None,
-                    None,
-                    GrpcTimeouts {
-                        request_handler: Duration::from_secs(30),
-                        authorization: Duration::from_secs(30),
-                    },
-                    Default::default(),
-                    Default::default(),
-                    None,
-                )
-                .with_token_verification(
-                    lore_server::auth::jwt::TokenVerification::Ignore,
-                    Arc::new(AllowAllRepositoryAuthorizer),
-                    catalog,
-                )
-                .unwrap()
-                .serve_with_listener(listener, async {
-                    shutdown_rx.await.ok();
-                })
-                .await;
-            let _ = stopped_tx.send(outcome.map_err(|error| error.to_string()));
-        });
-        for _ in 0..100 {
-            if let Ok(outcome) = stopped_rx.try_recv() {
-                panic!("test server on {addr} stopped while starting: {outcome:?}");
-            }
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                return Server {
-                    url: format!("lore://127.0.0.1:{}", addr.port()),
-                    quic: Some(quic),
-                    grpc_shutdown: Some(shutdown_tx),
-                    grpc_stopped: Some(stopped_rx),
-                };
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+        Server {
+            url: format!("lore://{addr}"),
+            stop: spawn_grpc_server(listener, immutable, mutable).with_quic(quic),
         }
-        panic!("server at {addr} never started listening");
     }
 
     fn creation_args(
@@ -661,53 +580,6 @@ mod fuse_remote_tests {
             .clone()
     }
 
-    /// How long a test's unmount waits out a hold on its mount from outside the test, as a
-    /// desktop service probing a new mount under `/tmp` briefly takes.
-    const OUTSIDE_HOLD: Duration = Duration::from_secs(5);
-    const UNMOUNT_RETRY: Duration = Duration::from_millis(50);
-
-    /// Runs `unmount`, a plain one, again while it finds the mount busy, for at most
-    /// [`OUTSIDE_HOLD`]: answers how many times it found the mount busy first, or its last error,
-    /// which names the busy paths. Never lazy, so a hold the test itself leaks still fails it.
-    async fn waiting_out_holds<E>(
-        unmount: impl AsyncFn() -> Result<(), E>,
-        busy: impl Fn(&E) -> bool,
-    ) -> Result<usize, E> {
-        let deadline = Instant::now() + OUTSIDE_HOLD;
-        let mut found_busy = 0;
-        loop {
-            match unmount().await {
-                Ok(()) => return Ok(found_busy),
-                Err(error) if busy(&error) && Instant::now() < deadline => {
-                    found_busy += 1;
-                    tokio::time::sleep(UNMOUNT_RETRY).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    /// The manager's plain unmount of the mount at `root`, waiting out an outside hold.
-    async fn unmount_through(
-        manager: &MountManager,
-        root: &Path,
-    ) -> Result<usize, MountManagerError> {
-        waiting_out_holds(
-            async || manager.fuse().unmount(root, false).await,
-            |error| matches!(error, MountManagerError::MountsBusy(_)),
-        )
-        .await
-    }
-
-    /// `mount`'s plain unmount, waiting out an outside hold.
-    async fn unmount_mount(mount: &FuseMount) -> Result<usize, FuseMountError> {
-        waiting_out_holds(
-            async || mount.unmount(false).await,
-            |error| matches!(error, FuseMountError::MountsBusy(_)),
-        )
-        .await
-    }
-
     struct Fixture {
         // Field order is drop order: unmount before the directories go.
         mount: Arc<FuseMount>,
@@ -726,11 +598,12 @@ mod fuse_remote_tests {
             self.mount.metrics().snapshot(Opcode::Read).count
         }
 
-        /// Unmounts, waiting out an outside hold; answers how many times the mount was busy.
-        async fn unmount(self) -> usize {
-            unmount_through(&self.manager, &self.root)
+        async fn unmount(self) {
+            self.manager
+                .fuse()
+                .unmount(&self.root, false)
                 .await
-                .expect("unmount")
+                .expect("unmount");
         }
     }
 
@@ -772,7 +645,7 @@ mod fuse_remote_tests {
         let store = Arc::new(CountingStore::new(backend_immutable.clone()));
         let served: Arc<dyn ImmutableStore> = store.clone();
         let server =
-            start_server_with_process_limit(served, backend_mutable.clone(), process_limit).await;
+            start_server_with_process_limit(served, backend_mutable.clone(), process_limit);
 
         let id = RepositoryId::from(uuid::Uuid::now_v7());
         let revision = commit_to_server(backend_immutable, backend_mutable, id, files).await;
@@ -814,11 +687,19 @@ mod fuse_remote_tests {
             .await
             .expect("flushes");
         drop(token);
-        unmount_through(&manager, &root).await.expect("unmounts");
+        manager
+            .fuse()
+            .unmount(&root, false)
+            .await
+            .expect("unmounts");
 
-        let dot_lore = external_dir_for_instance(repository.instance_id)
+        let state = lore_revision::global::external_dir::resolve::resolve()
+            .expect("resolve the external root");
+        let dot_lore = external_dir_for_instance(&state, repository.instance_id)
             .expect("external dir resolves")
             .join(DOT_LORE);
+        let global = lore_revision::global::external_dir::canonical_global(&state.global)
+            .expect("the global data directory canonicalizes");
         let config = load_repository_config_from_dot_dir(&dot_lore).expect("config loads");
         let instance = InstanceMetadata {
             instance_id: repository.instance_id,
@@ -827,7 +708,7 @@ mod fuse_remote_tests {
         };
         manager
             .fuse()
-            .remount_instance(repository, &instance, &dot_lore, &config)
+            .remount_instance(repository, &instance, (&dot_lore, global), &config)
             .await
             .expect("the service remounts the instance at the served revision");
         let mount = manager
@@ -948,45 +829,6 @@ mod fuse_remote_tests {
             .await;
     }
 
-    /// A hold on the mount root from outside the test, as a desktop service probing a new mount
-    /// under `/tmp` takes, released once the unmount has found the mount busy, does not fail the
-    /// unmount.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_fixture_unmount_waits_out_a_brief_outside_hold() {
-        skip_without_fuse!();
-        LORE_CONTEXT
-            .scope(execution("brief-hold"), async move {
-                let fixture = remote_fixture().await;
-                let held = std::fs::File::open(&fixture.root).expect("open the mount root");
-                let (release, busy_seen) = std::sync::mpsc::channel::<()>();
-                let releasing = std::thread::spawn(move || {
-                    // Released early only where the unmount ended without finding it busy.
-                    let _ = busy_seen.recv();
-                    drop(held);
-                });
-                let busy =
-                    |error: &MountManagerError| matches!(error, MountManagerError::MountsBusy(_));
-                let found_busy = waiting_out_holds(
-                    async || {
-                        let answer = fixture.manager.fuse().unmount(&fixture.root, false).await;
-                        if answer.as_ref().is_err_and(busy) {
-                            let _ = release.send(());
-                        }
-                        answer
-                    },
-                    busy,
-                )
-                .await;
-                drop(release);
-                releasing.join().expect("the hold is released");
-                assert!(
-                    found_busy.as_ref().is_ok_and(|&found| found > 0),
-                    "the unmount answered {found_busy:?}, not after finding the mount held"
-                );
-            })
-            .await;
-    }
-
     /// A hold on the mount root that is never released fails the unmount, naming the mount.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fixture_unmount_fails_under_a_hold_never_released() {
@@ -995,7 +837,8 @@ mod fuse_remote_tests {
             .scope(execution("leaked-hold"), async move {
                 let fixture = remote_fixture().await;
                 let held = std::fs::File::open(&fixture.root).expect("open the mount root");
-                let refused = unmount_through(&fixture.manager, &fixture.root).await;
+                let _window = PlantedBusyWindow::new(&fixture.root, Duration::from_millis(100));
+                let refused = fixture.manager.fuse().unmount(&fixture.root, false).await;
                 let root = fixture.root.display().to_string();
                 assert!(
                     matches!(&refused, Err(MountManagerError::MountsBusy(busy)) if busy.paths == root),
@@ -1536,7 +1379,7 @@ mod fuse_remote_tests {
                 );
 
                 // A fresh mount has no page cache: the second pass is all local.
-                unmount_mount(&fixture.mount).await.expect("unmounts");
+                fixture.mount.unmount(false).await.expect("unmounts");
                 let remounted = fixture.mount.remount().await.expect("remounts");
                 let root = fixture.root.clone();
                 blocking(move || assert_tree_reads_back(&root, &expected)).await;
@@ -1545,7 +1388,7 @@ mod fuse_remote_tests {
                     0,
                     "the second pass fetches nothing"
                 );
-                unmount_mount(&remounted).await.expect("unmounts");
+                remounted.unmount(false).await.expect("unmounts");
             })
             .await;
     }
@@ -2875,7 +2718,7 @@ mod fuse_remote_tests {
         let (backend_immutable, backend_mutable) = memory_stores().await;
         let store = Arc::new(CountingStore::new(backend_immutable.clone()));
         let served: Arc<dyn ImmutableStore> = store.clone();
-        let server = start_server(served, backend_mutable.clone()).await;
+        let server = start_server(served, backend_mutable.clone());
 
         let id = RepositoryId::from(uuid::Uuid::now_v7());
         let borrowed: Vec<Vec<(&str, &[u8])>> = steps
@@ -2939,9 +2782,13 @@ mod fuse_remote_tests {
         .await
         .expect("create_local mounts the FUSE instance");
         if let Some(view) = view {
-            let dot_lore = external_dir_for_instance(created.instance_id)
-                .expect("external dir resolves")
-                .join(DOT_LORE);
+            let dot_lore = external_dir_for_instance(
+                &lore_revision::global::external_dir::resolve::resolve()
+                    .expect("resolve the external root"),
+                created.instance_id,
+            )
+            .expect("external dir resolves")
+            .join(DOT_LORE);
             // Fixture write of the instance's view, as clone copies it.
             #[allow(clippy::disallowed_methods)]
             std::fs::write(dot_lore.join(VIEW_FILTER), view).expect("view file");
@@ -3101,7 +2948,9 @@ mod fuse_remote_tests {
         }
 
         async fn unmount(self) {
-            unmount_through(&self.manager, &self.root)
+            self.manager
+                .fuse()
+                .unmount(&self.root, false)
                 .await
                 .expect("unmount");
         }

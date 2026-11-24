@@ -192,6 +192,7 @@ async fn fixture(token: &str) -> Fixture {
         "",
         token,
         lore_transport::auth::AuthMode::Auto,
+        None,
     )
     .await
     .expect("connect builds its storage connection to the scripted peer");
@@ -219,6 +220,7 @@ impl Fixture {
             "",
             token,
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("reconnect to the same remote");

@@ -1667,6 +1667,11 @@ pub async fn commit_exact_selection(
             Arc::new(HashMap::new()),
             current_branch,
             reporting,
+            // FORK-LOCAL (Tideshift, INV-CX): a selected path the working tree no longer holds
+            // refuses the commit rather than being settled into it (provisional, OPEN-S5R-1).
+            commit::MissingPaths::Refuse,
+            Vec::new(),
+            None,
             Some(admission.clone()),
         )
         .await

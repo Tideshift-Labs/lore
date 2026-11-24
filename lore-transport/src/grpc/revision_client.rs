@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use lore_base::lore_debug;
+use lore_base::lore_warn;
 use lore_base::types::BranchId;
 use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
@@ -22,8 +23,10 @@ use super::GRPCAuthRef;
 use super::REVISION_LIST_STRATEGY_HEADER;
 use super::RequestScopedCounter;
 use super::grpc_retry;
+use super::handle_branch_push_error;
 use super::handle_error;
 use super::inject_authn_bearer;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
@@ -211,17 +214,18 @@ impl RevisionService {
 
             let mut client = self.client.clone();
 
-            match client.branch_list(request).await {
+            let status = match client.branch_list(request).await {
                 Ok(response) => match collect_branch_list(response.into_inner(), limit).await {
                     Ok(response) => break response,
-                    Err(status) => {
-                        handle_error(&mut retry, status).await?;
-                    }
+                    Err(status) => status,
                 },
-                Err(status) => {
-                    handle_error(&mut retry, status).await?;
-                }
+                Err(status) => status,
+            };
+            // Not in `handle_error`: a command that sends many calls at once would warn for each.
+            if let Some(reason) = first_throttle_reason(&retry.retry, &status) {
+                lore_warn!("Remote is throttling the branch listing: {reason}");
             }
+            handle_error(&mut retry, status).await?;
         };
 
         Ok(list)
@@ -295,8 +299,13 @@ impl RevisionService {
         revision: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError> {
+    ) -> Result<BranchPushResponse, BranchPushError> {
         lore_debug!("Pushing branch: {} at {}", branch, revision);
+        // FORK-LOCAL (Tideshift, WP-120): the managed path journals and settles through
+        // `caller_operation::dispatch`, which speaks `ProtocolError`. The remote's marked refusal
+        // of a push onto a moved latest is kept aside and mapped by `branch_push_error` once the
+        // attempt is settled (a refusal settles as not applied), so it stays `BranchAdvanced`.
+        // An unknown outcome keeps its own variant through the strict forward.
         if crate::caller_operation::current_caller_operation().is_some() {
             let message = revision_v1::BranchPushRequest {
                 id: branch.into(),
@@ -304,7 +313,10 @@ impl RevisionService {
                 force,
                 fast_forward_merge,
             };
-            return crate::caller_operation::dispatch(
+            let refusal: std::sync::Mutex<Option<tonic::Status>> = std::sync::Mutex::new(None);
+            // `dispatch_recorded_result`, not `dispatch`: a journal failure (the outer error) is
+            // returned as it is, and only the RPC's own refusal is read as `BranchAdvanced`.
+            let result = crate::caller_operation::dispatch_recorded_result(
                 self.repository,
                 crate::outcome::GrpcRpc::RevisionBranchPush,
                 message.encode_to_vec(),
@@ -314,11 +326,19 @@ impl RevisionService {
                     let mut request = tonic::Request::new(message);
                     inject_authn_bearer(&mut request, &self.auth)?;
                     let mut client = self.client.clone();
-                    let response = client
-                        .branch_push(request)
-                        .await
-                        .map_err(ProtocolError::from)?
-                        .into_inner();
+                    let response = match client.branch_push(request).await {
+                        Ok(response) => response.into_inner(),
+                        Err(status) => {
+                            if matches!(
+                                crate::error::branch_push_error(status.clone()),
+                                BranchPushError::BranchAdvanced(_)
+                            ) && let Ok(mut kept) = refusal.lock()
+                            {
+                                *kept = Some(status.clone());
+                            }
+                            return Err(ProtocolError::from(status));
+                        }
+                    };
                     Ok(BranchPushResponse {
                         fast_forward_merged: response.fast_forward_merged,
                         revision: response.revision_signature.into(),
@@ -327,7 +347,18 @@ impl RevisionService {
                     })
                 },
             )
-            .await;
+            .await
+            .map_err(BranchPushError::from)?;
+            return match result {
+                Ok(response) => Ok(response),
+                Err(err) if !err.is_outcome_unknown() => {
+                    match refusal.lock().ok().and_then(|mut kept| kept.take()) {
+                        Some(status) => Err(crate::error::branch_push_error(status)),
+                        None => Err(BranchPushError::from(err)),
+                    }
+                }
+                Err(err) => Err(BranchPushError::from(err)),
+            };
         }
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
@@ -342,14 +373,14 @@ impl RevisionService {
                 force,
                 fast_forward_merge,
             });
-            inject_authn_bearer(&mut request, &self.auth)?;
+            inject_authn_bearer(&mut request, &self.auth).map_err(ProtocolError::from)?;
 
             let mut client = self.client.clone();
             match client.branch_push(request).await {
                 Ok(response) => {
                     break response.into_inner();
                 }
-                Err(status) => handle_error(&mut retry, status).await?,
+                Err(status) => handle_branch_push_error(&mut retry, status).await?,
             }
         };
 
@@ -417,8 +448,8 @@ impl RevisionService {
                     state: item.state,
                 })
                 .collect(),
-            next_revision: signature_backward.map(Into::into).unwrap_or_default(),
-            previous_revision: signature_forward.map(Into::into).unwrap_or_default(),
+            next_revision: signature_backward.map_or_default(Into::into),
+            previous_revision: signature_forward.map_or_default(Into::into),
         })
     }
 
@@ -523,6 +554,22 @@ fn branch_record_from_v1(branch: model_v1::Branch) -> BranchRecord {
         // Only a branch query carries the domain generation (WP-120).
         generation: None,
     }
+}
+
+/// The remote's reason for the first `RESOURCE_EXHAUSTED` answer of a call. `None` for a later
+/// answer of the same call, which would repeat the reason, and where the remote gave none.
+#[lore_macro::test_pub]
+fn first_throttle_reason<'a>(
+    retry: &crate::util::Retry,
+    status: &'a tonic::Status,
+) -> Option<&'a str> {
+    // FORK-LOCAL (Tideshift): a sourced `RESOURCE_EXHAUSTED` is a lost answer (an h2
+    // `ENHANCE_YOUR_CALM`), not the server throttling, so it gets no throttle warning.
+    (status.code() == tonic::Code::ResourceExhausted
+        && std::error::Error::source(status).is_none()
+        && retry.counter() == 0
+        && !status.message().is_empty())
+    .then(|| status.message())
 }
 
 #[lore_macro::test_pub]

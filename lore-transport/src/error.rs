@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
-use std::sync::Arc;
+use std::convert::Infallible;
 
 use lore_base::error::*;
 use lore_error_set::prelude::*;
@@ -318,7 +318,7 @@ fn is_answer_lost_code(code: tonic::Code) -> bool {
 /// Returns the code rather than a bare `bool` so a caller can report which failure produced the
 /// ambiguity, and so the field cannot rot into something only a test reads.
 #[lore_macro::test_pub]
-pub(crate) fn answer_lost_code(error: &ProtocolError) -> Option<tonic::Code> {
+pub(crate) fn answer_lost_code(error: &(dyn std::error::Error + 'static)) -> Option<tonic::Code> {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
         if let Some(lost) = source.downcast_ref::<AnswerLostInTransit>() {
@@ -371,7 +371,9 @@ fn not_prepared_marker(status: &tonic::Status) -> Option<uuid::Uuid> {
 }
 
 /// The attempt a not-prepared proof names, when the error carries one.
-pub(crate) fn not_prepared_attempt(error: &ProtocolError) -> Option<uuid::Uuid> {
+pub(crate) fn not_prepared_attempt(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<uuid::Uuid> {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
         if let Some(refused) = source.downcast_ref::<RefusedBeforePrepare>() {
@@ -384,6 +386,7 @@ pub(crate) fn not_prepared_attempt(error: &ProtocolError) -> Option<uuid::Uuid> 
 
 use crate::grpc::address_not_found_details;
 use crate::grpc::address_not_found_status;
+use crate::grpc::carries_branch_advanced;
 
 #[error_set(clone)]
 pub enum ProtocolError {
@@ -566,8 +569,9 @@ pub(crate) struct RequiredFragmentChanged {
 }
 
 /// Whether `error` is a `BranchPush` refused because a required fragment's membership moved. See
-/// [`RequiredFragmentChanged`].
-pub fn is_required_fragment_changed(error: &ProtocolError) -> bool {
+/// [`RequiredFragmentChanged`]. Takes any error so a [`BranchPushError`], which carries the mark
+/// through its strict forward, is read the same way.
+pub fn is_required_fragment_changed(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
         if source.downcast_ref::<RequiredFragmentChanged>().is_some() {
@@ -600,6 +604,38 @@ pub(crate) fn is_read_resend_allowed(error: &ProtocolError) -> bool {
         current = source.source();
     }
     false
+}
+
+/// The failures of a branch push at the remote: those of any call, and the remote's refusal of a
+/// push onto a branch latest that has moved on.
+#[error_set(clone)]
+pub enum BranchPushError {
+    Disconnected,
+    SlowDown,
+    NotAuthorized,
+    NotAuthenticated,
+    Maintenance,
+    NotFound,
+    AddressNotFound,
+    NoRemote,
+    NotSupported,
+    Oversized,
+    BranchAdvanced,
+    /// FORK-LOCAL (Tideshift, WP-120): a dispatched branch push whose outcome is not known, as
+    /// [`ProtocolError::OutcomeUnknown`]. Without it the strict forward below could not carry an
+    /// unknown outcome, and a lax one would turn it into `Internal`, which a caller's journal
+    /// reads as decisively not applied.
+    OutcomeUnknown,
+}
+
+/// The strict forward of any call's failure: every [`ProtocolError`] variant, the fork
+/// `OutcomeUnknown` included, keeps its variant. Deliberately not `forward_any`.
+impl From<ProtocolError> for BranchPushError {
+    #[track_caller]
+    fn from(err: ProtocolError) -> Self {
+        let Err(err) = Err::<Infallible, _>(err).forward::<Self>("pushing a branch");
+        err
+    }
 }
 
 impl From<tonic::Status> for ProtocolError {
@@ -672,9 +708,11 @@ impl From<tonic::Status> for ProtocolError {
                 };
                 // Upstream (v0.14, 7d8653d3) also puts the remote's words on the trace;
                 // both are kept, so trace readers and reason readers see the same cause.
-                refusal(ProtocolError::from(NotAuthenticated::new(reason)), &value)
+                with_remote_reason(ProtocolError::from(NotAuthenticated::new(reason)), &value)
             }
-            tonic::Code::PermissionDenied => refusal(ProtocolError::from(NotAuthorized), &value),
+            tonic::Code::PermissionDenied => {
+                with_remote_reason(ProtocolError::from(NotAuthorized), &value)
+            }
             tonic::Code::NotFound => ProtocolError::from(NotFound),
             tonic::Code::FailedPrecondition => match address_not_found_details(&value) {
                 Some(error) => ProtocolError::from(error),
@@ -759,7 +797,12 @@ impl From<tonic::Status> for ProtocolError {
             {
                 answer_lost(&value)
             }
-            tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
+            // Upstream 563c5c97 carries the server's words (the throttled BranchList hint) on the
+            // trace. The fork split above still runs first, so only a sourceless status, the
+            // server's own back-pressure, is `SlowDown`.
+            tonic::Code::ResourceExhausted => {
+                with_remote_reason(ProtocolError::from(SlowDown), &value)
+            }
             // Exact message only: the server's other `ABORTED` push refusals (a moved branch
             // preflight, an unavailable membership proof) are not marked, and neither is a
             // message that merely contains the reason.
@@ -815,16 +858,41 @@ fn outcome_unknown_marker(status: &tonic::Status) -> Option<OutcomeUnknown> {
     })
 }
 
-/// `error` with the message of `status`, the remote's reason for the refusal, on its trace when
-/// the remote gave one.
-fn refusal(mut error: ProtocolError, status: &tonic::Status) -> ProtocolError {
+/// The error of a branch push the remote answered with `status`: `FAILED_PRECONDITION` with the
+/// details of Lore Server's refusal of a push onto a branch latest that has moved, a push that
+/// isn't a fast-forward or a fast-forward merge that conflicts
+/// ([`branch_advanced_status`](crate::grpc::branch_advanced_status)), is `BranchAdvanced`, with
+/// the remote's reason on its trace. Every other status maps as any call's does, a hook's
+/// `FAILED_PRECONDITION` and an older Lore Server's refusal, which carry no details, included.
+#[lore_macro::test_pub]
+pub(crate) fn branch_push_error(status: tonic::Status) -> BranchPushError {
+    // FORK-LOCAL (Tideshift, WP-120): the fork's markers outrank the refusal's details. A status
+    // that marks its outcome unknown, its answer lost, or its request refused before prepare maps
+    // as `ProtocolError` maps it, so a marked unknown outcome is never read as a refusal.
+    if status.code() == tonic::Code::FailedPrecondition
+        && carries_branch_advanced(&status)
+        && !carries_fork_marker(&status)
+    {
+        return with_remote_reason(BranchPushError::from(BranchAdvanced), &status);
+    }
+    BranchPushError::from(ProtocolError::from(status))
+}
+
+/// FORK-LOCAL (Tideshift, WP-120): whether `status` carries a marker that `ProtocolError`'s mapping
+/// reads before any branch on the code.
+fn carries_fork_marker(status: &tonic::Status) -> bool {
+    is_unsupported_client_status(status)
+        || outcome_unknown_marker(status).is_some()
+        || (has_answer_lost_marker(status) && is_answer_lost_code(status.code()))
+        || is_tonic_lost_response(status)
+        || (is_unsettled_code(status.code()) && not_prepared_marker(status).is_some())
+}
+
+/// `error` with the message of `status`, the remote's reason for the refusal or the slow down, on
+/// its trace when the remote gave one.
+fn with_remote_reason<E: ErrorSet>(mut error: E, status: &tonic::Status) -> E {
     if !status.message().is_empty() {
-        error.push_trace(lore_error_set::Location::with_context(
-            file!(),
-            line!(),
-            column!(),
-            Arc::from(status.message()),
-        ));
+        error.push_context(status.message());
     }
     error
 }

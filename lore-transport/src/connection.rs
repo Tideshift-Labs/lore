@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Once;
 use std::sync::Weak;
 use std::sync::atomic::Ordering;
@@ -20,6 +21,8 @@ use lore_base::runtime::shutdown_block_on;
 use lore_base::types::*;
 use lore_error_set::prelude::*;
 use parking_lot::Mutex;
+use serde::Deserialize;
+use serde::de::value::StrDeserializer;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::task::AbortOnDropHandle;
@@ -33,6 +36,7 @@ use crate::auth::user_directory::UserDirectory;
 use crate::error::ProtocolError;
 use crate::grpc;
 use crate::quic;
+use crate::quic::client::CongestionAlgorithm;
 use crate::session::PartitionSessions;
 use crate::session::SessionPool;
 use crate::session::StorageConnector;
@@ -118,6 +122,34 @@ type FromSuppliedCredentials = bool;
 /// per-user default. A process carrying out calls for other processes reads the store each caller
 /// names, so what is cached from a store is keyed by it.
 pub(crate) type CredentialStore = String;
+
+/// Environment variable naming the congestion controller a connection's storage connections run
+/// when a process with no settings to name one, such as the CLI, establishes the connection:
+/// `bbr` or `cubic`.
+pub const CONGESTION_ALGORITHM_ENV: &str = "LORE_QUIC_CONGESTION_ALGORITHM";
+
+static CONGESTION_ALGORITHM: LazyLock<Option<String>> = LazyLock::new(|| {
+    std::env::var_os(CONGESTION_ALGORITHM_ENV).map(|value| value.to_string_lossy().into_owned())
+});
+
+/// The congestion controller `LORE_QUIC_CONGESTION_ALGORITHM` names, as the process first read it.
+fn process_congestion_algorithm() -> Result<CongestionAlgorithm, ProtocolError> {
+    congestion_algorithm_named(CONGESTION_ALGORITHM.as_deref())
+}
+
+/// The congestion controller a value of `LORE_QUIC_CONGESTION_ALGORITHM` names, by the names the
+/// server's `congestion_algorithm` keys take: BBR when the variable is unset or blank, and refused
+/// when it names neither algorithm.
+#[lore_macro::test_pub]
+fn congestion_algorithm_named(value: Option<&str>) -> Result<CongestionAlgorithm, ProtocolError> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(CongestionAlgorithm::Bbr);
+    };
+    CongestionAlgorithm::deserialize(StrDeserializer::<serde::de::value::Error>::new(value))
+        .map_err(|error| {
+            ProtocolError::internal(format!("{CONGESTION_ALGORITHM_ENV} is `{value}`: {error}"))
+        })
+}
 
 /// What a connection is cached under: the remote URL, the identity, whether the caller supplied
 /// its own credentials, the token store the connection authenticated from, and the auth mode it
@@ -497,6 +529,13 @@ fn refusal_is_final(err: &ProtocolError) -> bool {
 /// [`auth::authentication::select`]. Connections are cached per mode, so a
 /// call in another mode opens its own rather than reusing one that may be on
 /// the other path.
+///
+/// `congestion_algorithm` is the congestion controller a connection's storage connections run when
+/// this call establishes the connection. A call served a cached connection reuses it as it is,
+/// with the controller it was established with. A caller with no settings to name a controller,
+/// such as the CLI or a program using the storage API, passes `None`, and a connection it
+/// establishes runs the one `LORE_QUIC_CONGESTION_ALGORITHM` names.
+#[allow(clippy::too_many_arguments)]
 pub async fn connect(
     remote_url: &str,
     identity: &str,
@@ -505,6 +544,7 @@ pub async fn connect(
     identity_token: &str,
     access_token: &str,
     auth_mode: AuthMode,
+    congestion_algorithm: Option<CongestionAlgorithm>,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let (remote_url, protocol) = parse(remote_url)?;
 
@@ -537,6 +577,7 @@ pub async fn connect(
             identity_token,
             access_token,
             auth_mode,
+            congestion_algorithm,
         )
         .await
     })
@@ -553,7 +594,12 @@ async fn connect_impl(
     identity_token: String,
     access_token: String,
     auth_mode: AuthMode,
+    congestion_algorithm: Option<CongestionAlgorithm>,
 ) -> Result<Arc<Connection>, ProtocolError> {
+    let congestion_algorithm = match congestion_algorithm {
+        Some(congestion_algorithm) => congestion_algorithm,
+        None => process_congestion_algorithm()?,
+    };
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
     // Forward rather than `internal`-wrap so a classified failure (such as
@@ -626,6 +672,7 @@ async fn connect_impl(
         identity.clone(),
         credentials.clone(),
         auth_mode,
+        congestion_algorithm,
         environment,
         protocol.clone(),
     ));
@@ -717,6 +764,7 @@ async fn connect_impl(
                             repository,
                             index,
                             connection.credentials(),
+                            connection.congestion_algorithm,
                         )
                         .await;
                     match result {
@@ -1100,6 +1148,9 @@ pub struct Connection {
     /// The mode `auth_endpoint` was selected with, so a module connected through
     /// this connection takes the same path to the same server.
     auth_mode: AuthMode,
+    /// The congestion controller the storage connections run, as the connection was established
+    /// with it, which a module connected through this connection runs too.
+    congestion_algorithm: CongestionAlgorithm,
     pub environment: EnvironmentConfig,
     protocol: Arc<dyn Protocol>,
     /// Per-service readiness. Signalled by each subtask on completion (or
@@ -1154,12 +1205,14 @@ impl Drop for Connection {
 impl Connection {
     /// A connection to `remote_url` that has connected to nothing yet: every service pending and
     /// every cache empty.
+    #[allow(clippy::too_many_arguments)]
     fn unconnected(
         remote_url: Url,
         auth_endpoint: AuthEndpoint,
         identity: String,
         credentials: Arc<SuppliedCredentials>,
         auth_mode: AuthMode,
+        congestion_algorithm: CongestionAlgorithm,
         environment: EnvironmentConfig,
         protocol: Arc<dyn Protocol>,
     ) -> Self {
@@ -1169,6 +1222,7 @@ impl Connection {
             identity,
             credentials,
             auth_mode,
+            congestion_algorithm,
             protocol,
             environment,
             storage_ready: ServiceReady::new(),
@@ -1207,7 +1261,17 @@ impl Connection {
         storage: Vec<Arc<dyn Storage>>,
         ready: Result<(), ProtocolError>,
     ) -> Arc<Self> {
-        let connection = Self::detached_over(Arc::new(LoreProtocol::default()));
+        Self::detached_ready_as(String::new(), storage, ready)
+    }
+
+    /// A [`detached_ready`](Self::detached_ready) connection authenticated as `identity`.
+    #[cfg(feature = "test-util")]
+    fn detached_ready_as(
+        identity: String,
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+    ) -> Arc<Self> {
+        let connection = Self::detached_over(Arc::new(LoreProtocol::default()), identity);
         if !storage.is_empty() {
             *connection.storage.write() = Some(Arc::new(StorageConnector::new(storage)));
         }
@@ -1219,22 +1283,24 @@ impl Connection {
     /// admin and lock services through `protocol`.
     #[cfg(feature = "test-util")]
     pub fn detached_protocol(protocol: Arc<dyn Protocol>) -> Arc<Self> {
-        let connection = Self::detached_over(protocol);
+        let connection = Self::detached_over(protocol, String::new());
         connection.storage_ready.complete(Ok(()));
         connection.revision_ready.complete(Ok(()));
         connection.lock_ready.complete(Ok(()));
         connection
     }
 
-    /// A connection to no remote over `protocol`, with every service pending.
+    /// A connection to no remote over `protocol`, authenticated as `identity`, with every service
+    /// pending.
     #[cfg(feature = "test-util")]
-    fn detached_over(protocol: Arc<dyn Protocol>) -> Arc<Self> {
+    fn detached_over(protocol: Arc<dyn Protocol>, identity: String) -> Arc<Self> {
         Arc::new(Connection::unconnected(
             Url::parse("lore://detached.invalid").expect("valid URL"),
             AuthEndpoint::none(),
-            String::new(),
+            identity,
             Arc::default(),
             AuthMode::Auto,
+            CongestionAlgorithm::default(),
             EnvironmentConfig::default(),
             protocol,
         ))
@@ -1249,7 +1315,19 @@ impl Connection {
         repository: RepositoryId,
         revision: Arc<dyn Revision>,
     ) -> Arc<Self> {
-        let connection = Self::detached_ready(storage, ready);
+        Self::detached_revision_as(String::new(), storage, ready, repository, revision)
+    }
+
+    /// A [`detached_revision`](Self::detached_revision) connection authenticated as `identity`.
+    #[cfg(feature = "test-util")]
+    pub fn detached_revision_as(
+        identity: String,
+        storage: Vec<Arc<dyn Storage>>,
+        ready: Result<(), ProtocolError>,
+        repository: RepositoryId,
+        revision: Arc<dyn Revision>,
+    ) -> Arc<Self> {
+        let connection = Self::detached_ready_as(identity, storage, ready);
         connection.revision.insert(repository, revision);
         connection.revision_ready.complete(Ok(()));
         connection
@@ -1291,6 +1369,12 @@ impl Connection {
 
     pub fn identity(&self) -> &str {
         self.identity.as_str()
+    }
+
+    /// The congestion controller the storage connections run, as the connection was established
+    /// with it.
+    pub fn congestion_algorithm(&self) -> CongestionAlgorithm {
+        self.congestion_algorithm
     }
 
     /// The credentials supplied for the call in progress. Hand this to anything
@@ -1749,6 +1833,7 @@ impl Connection {
             &identity_token,
             &access_token,
             self.auth_mode,
+            Some(self.congestion_algorithm),
         )
         .await
     }
@@ -1773,6 +1858,7 @@ impl Protocol for LoreProtocol {
         partition: Partition,
         _index: usize,
         credentials: &Arc<SuppliedCredentials>,
+        congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         quic::storage(
             connection,
@@ -1781,6 +1867,7 @@ impl Protocol for LoreProtocol {
             identity,
             partition,
             credentials,
+            congestion_algorithm,
         )
         .await
     }
@@ -1801,6 +1888,7 @@ impl Protocol for GRPCProtocol {
         partition: Partition,
         index: usize,
         credentials: &Arc<SuppliedCredentials>,
+        _congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         grpc::storage(
             connection,
@@ -1831,6 +1919,7 @@ impl Protocol for UdsProtocol {
         _partition: Partition,
         _index: usize,
         credentials: &Arc<SuppliedCredentials>,
+        _congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         crate::uds::storage(remote_url, auth_endpoint, identity, credentials).await
     }

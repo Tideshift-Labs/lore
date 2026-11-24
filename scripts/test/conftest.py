@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # Copyright 2026 Khurram Virani
 # SPDX-License-Identifier: MIT
+import atexit
 import json
 import logging
 import os
@@ -382,8 +383,111 @@ def rest_client_credentials(thin_client_credentials, managed_cli_ports):
     return credentials
 
 
+# The file systems Lore verifies on Linux as local and durable, as `volume.rs` in lore-io names
+# them, by the type `/proc/self/mountinfo` gives.
+VERIFIED_LINUX_FILE_SYSTEMS = {
+    "btrfs",
+    "xfs",
+    "bcachefs",
+    "ext2",
+    "ext3",
+    "ext4",
+    "zfs",
+}
+
+
+def _linux_file_system(path: Path) -> str:
+    """The type of the file system that holds the existing `path`, from the mount of the longest
+    mount point above it in `/proc/self/mountinfo`."""
+    resolved = os.path.realpath(path)
+    best, kind = "", "unknown"
+    with open("/proc/self/mountinfo") as table:
+        for line in table:
+            fields = line.split()
+            mount_point = fields[4].replace("\\040", " ")
+            below = resolved == mount_point or resolved.startswith(
+                mount_point.rstrip("/") + "/"
+            )
+            if below and len(mount_point) >= len(best):
+                best, kind = mount_point, fields[fields.index("-") + 1]
+    return kind
+
+
+# The scratch directory made beside the outermost Lore working tree that holds the rootdir.
+BESIDE_TREE = "lore-test-scratch"
+
+
+def _outermost_tree(path: Path):
+    """The outermost directory at or above `path` that holds a `.lore` directory, if any."""
+    trees = [
+        ancestor for ancestor in [path, *path.parents] if (ancestor / ".lore").is_dir()
+    ]
+    return trees[-1] if trees else None
+
+
+def _refusal(candidate: Path):
+    """Why `candidate` can't hold a test's global directory and move targets, made where it is
+    missing: the working tree it lies in, or on Linux its file system. `None` where it can."""
+    tree = _outermost_tree(candidate)
+    if tree is not None:
+        return f"inside the Lore working tree at {tree}"
+    candidate.mkdir(parents=True, exist_ok=True)
+    if platform.system() != "Linux":
+        return None
+    kind = _linux_file_system(candidate)
+    return None if kind in VERIFIED_LINUX_FILE_SYSTEMS else kind
+
+
+# The scratch directories beside a working tree this process chose, removed as it ends.
+_MADE_BESIDE_TREE: set = set()
+
+
+def _remove_if_empty(path: Path):
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _verified_scratch_base(config, tmp_path_factory) -> Path:
+    """Where a test marked `verified_volume` makes its global directory and the targets it moves
+    the external root to: the first of pytest's base temp directory, `target/tmp` under the
+    rootdir, and a directory beside the outermost Lore working tree that holds the rootdir, in
+    that tree's parent, with no Lore working tree above it and, on Linux, on a file system Lore
+    verifies. The last is made where needed and removed, once empty, as the process that chose it
+    ends. Fails,
+    naming each candidate and why it was refused, where none qualifies. The temp directories of
+    macOS and Windows are on volumes Lore verifies, so only Linux checks the file system."""
+    build_tmp = Path(config.rootpath) / "target" / "tmp"
+    tree = _outermost_tree(build_tmp)
+    candidates = [tmp_path_factory.getbasetemp(), build_tmp]
+    if tree is not None:
+        candidates.append(tree.parent / BESIDE_TREE)
+    refused = []
+    for index, candidate in enumerate(candidates):
+        why = _refusal(candidate)
+        if why is None:
+            if index == 2 and candidate not in _MADE_BESIDE_TREE:
+                _MADE_BESIDE_TREE.add(candidate)
+                atexit.register(_remove_if_empty, candidate)
+            return candidate
+        refused.append(f"{candidate} ({why})")
+    pytest.fail(
+        "no scratch directory is on a file system Lore has verified as local and durable, "
+        "outside any Lore working tree: " + ", ".join(refused)
+    )
+
+
+def _scratch_base(request, tmp_path_factory) -> Path:
+    """The directory a test's scratch paths and global directory go in: a verified one for a test
+    marked `verified_volume`, else pytest's base temp directory."""
+    if request.node.get_closest_marker("verified_volume") is None:
+        return tmp_path_factory.getbasetemp()
+    return _verified_scratch_base(request.config, tmp_path_factory)
+
+
 @pytest.fixture(scope="function")
-def scratch_dir(tmp_path_factory, keep_test_data):
+def scratch_dir(tmp_path_factory, keep_test_data, request):
     """Returns a function handing out paths beside the test's repositories for
     the test to create things at -- shared stores, clone targets, instances --
     each removed when the test ends, pass or fail.
@@ -394,11 +498,12 @@ def scratch_dir(tmp_path_factory, keep_test_data):
     unless `unique=False` asks for the name verbatim.
     """
     created: list[Path] = []
+    base = _scratch_base(request, tmp_path_factory)
 
     def _scratch_dir(name: str, *, unique: bool = True, create: bool = False) -> Path:
         if unique:
             name = Lore.generate_random_name(name)
-        path = tmp_path_factory.getbasetemp() / name
+        path = base / name
         created.append(path)
         if create:
             path.mkdir(parents=True, exist_ok=True)
@@ -413,9 +518,10 @@ def scratch_dir(tmp_path_factory, keep_test_data):
 
 
 @pytest.fixture(scope="function")
-def global_dir_name(tmp_path_factory, keep_test_data):
+def global_dir_name(tmp_path_factory, keep_test_data, request):
     path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global")
+        _scratch_base(request, tmp_path_factory)
+        / Lore.generate_random_name("lore_global")
     )
     logger.info(f"Setting global directory for test to {path}")
     os.makedirs(path)
@@ -1193,6 +1299,11 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
+        "verified_volume: make the test's global directory and scratch paths on a file system "
+        "Lore verifies as local and durable, as a move of the external root needs",
+    )
+    config.addinivalue_line(
+        "markers",
         "runs_in_process(reason): keep the test's commands in their own process when "
         "LORE_TEST_SERVICE_SOCKET relays the rest of the run to a service",
     )
@@ -1219,3 +1330,51 @@ def pytest_collection_modifyitems(config, items):
                     reason="bug_reproduction: known unfixed bug", strict=True
                 )
             )
+
+
+def _hdiutil_volume(scratch_dir, name: str, file_system: str, size: str):
+    """A volume of `file_system` mounted for the test from a disk image made with hdiutil, or a
+    skip where hdiutil can't make one."""
+    if sys.platform != "darwin":
+        pytest.skip("the volume is made with hdiutil, which only macOS has")
+    image = scratch_dir(f"{name}_image", create=True) / "volume.dmg"
+    mount = scratch_dir(name, create=True)
+    for command in (
+        [
+            "hdiutil",
+            "create",
+            "-size",
+            size,
+            "-fs",
+            file_system,
+            "-volname",
+            "LoreTest",
+            str(image),
+        ],
+        ["hdiutil", "attach", "-nobrowse", "-mountpoint", str(mount), str(image)],
+    ):
+        made = subprocess.run(command, capture_output=True, text=True, check=False)
+        if made.returncode != 0:
+            pytest.skip(f"hdiutil cannot make a volume here: {made.stderr}")
+    try:
+        yield mount
+    finally:
+        subprocess.run(
+            ["hdiutil", "detach", "-force", str(mount)],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest.fixture
+def other_volume(scratch_dir):
+    """A small HFS+ volume mounted for the test, which shares no blocks with the volume the
+    repositories are on and cannot clone files itself, but keeps permissions and links."""
+    yield from _hdiutil_volume(scratch_dir, "other_volume", "HFS+", "50m")
+
+
+@pytest.fixture
+def apfs_volume(scratch_dir):
+    """A small APFS volume mounted for the test, another volume than the one the repositories
+    are on, of the one file system Lore verifies as local on macOS."""
+    yield from _hdiutil_volume(scratch_dir, "apfs_volume", "APFS", "100m")

@@ -57,6 +57,7 @@ use smallvec::SmallVec;
 use crate::filter::FilterStates;
 use crate::fs::fuse::FuseProviderError;
 use crate::fs::fuse::attr::host_attr;
+use crate::fs::fuse::attr::served_file_permissions;
 use crate::fs::fuse::filesystem::FuseFilesystem;
 use crate::fs::fuse::filesystem::HostKind;
 use crate::fs::fuse::filesystem::LookupCase;
@@ -630,19 +631,19 @@ impl Drop for TakenAside<'_> {
 
 impl LocalFiles {
     /// Opens `write`, creating it on first use, and empties the staging directory beside it.
-    /// Blocking.
+    /// Neither is made where the external directory that holds them is missing. Blocking.
     #[lore_macro::test_pub]
     pub(crate) fn open(write: &Path) -> Result<Self, FuseProviderError> {
         let root_path = write.to_path_buf();
         let staging = write.with_file_name(STAGING_DIRECTORY);
-        std::fs::create_dir_all(&root_path)
+        lore_io::create_dir_in_existing_parent(&root_path)
             .map_err(|error| open_failed("creating", &root_path, &error))?;
         if let Err(error) = std::fs::remove_dir_all(&staging)
             && error.kind() != std::io::ErrorKind::NotFound
         {
             return Err(open_failed("emptying", &staging, &error));
         }
-        std::fs::create_dir_all(&staging)
+        lore_io::create_dir_in_existing_parent(&staging)
             .map_err(|error| open_failed("creating", &staging, &error))?;
         let root = File::open(&root_path)
             .map_err(|error| open_failed("opening", &root_path, &error))?
@@ -1159,12 +1160,16 @@ pub(crate) enum Found {
         local: bool,
     },
     Symlink,
+    /// A link, which no write changes.
+    Link,
 }
 
 impl Found {
     fn of_entry(entry: &ListingEntry) -> Self {
         let local = entry.flags & entry_flags::LOCAL != 0;
-        if entry.flags & entry_flags::IS_DIR != 0 {
+        if entry.flags & entry_flags::LINK != 0 {
+            Self::Link
+        } else if entry.flags & entry_flags::IS_DIR != 0 {
             Self::Dir { local }
         } else if entry.flags & entry_flags::SYMLINK != 0 {
             Self::Symlink
@@ -1927,7 +1932,7 @@ impl FuseFilesystem {
     ) -> Result<EntryReply, ReadFault> {
         let local = self.writable()?;
         let name = new_name(name)?;
-        let (dir_node, parent_filter) = self.dir_node(parent)?;
+        let (dir_node, parent_filter) = self.dir_to_change(parent)?;
         let served = self.served();
         let absent = match self.resolve_to_attach(&served, parent, name, fetch).await? {
             Resolved {
@@ -2023,6 +2028,7 @@ impl FuseFilesystem {
                     view_line: view_line(state),
                     node: node_id,
                     local: true,
+                    link: false,
                 }
             }
         };
@@ -2344,7 +2350,7 @@ impl FuseFilesystem {
         if len != content {
             file.set_len(len).map_err(|error| io_errno(&error))?;
         }
-        set_file_mode(&file, if executable { 0o755 } else { 0o644 })?;
+        set_file_mode(&file, served_file_permissions(executable))?;
         let ((), raced) =
             self.at_host_path_watched(parent, Some(name.as_bytes()), |path, made_dirs| {
                 self.write_step_allowed(WriteStep::CopyUpPathBuilt { parent });
@@ -2495,7 +2501,8 @@ impl FuseFilesystem {
     }
 
     /// SETATTR of inode `ino`: size, mode and times; owner and group only as they are. A
-    /// tracked file is copied up first, and a tracked directory takes a new time only.
+    /// tracked file is copied up first, a tracked directory takes a new time only, and a link
+    /// takes nothing (`EROFS`).
     pub(crate) async fn setattr_node(
         &self,
         ino: u64,
@@ -2503,6 +2510,9 @@ impl FuseFilesystem {
         fetch: bool,
     ) -> Result<AttrReply, ReadFault> {
         let local = self.writable()?;
+        if self.inodes().get(ino).ok_or(Errno::ENOENT)?.kind.is_link() {
+            return Err(Errno::EROFS.into());
+        }
         let valid = attr.valid;
         let context = self.attr_context();
         if (valid & setattr_valid::UID != 0 && attr.uid != context.uid)
@@ -2646,11 +2656,13 @@ impl FuseFilesystem {
         fetch: bool,
     ) -> Result<(), ReadFault> {
         self.writable()?;
+        self.dir_to_change(parent)?;
         let name = std::str::from_utf8(name).map_err(|_invalid| Errno::ENOENT)?;
         let served = self.served();
         let resolved = self.resolve(&served, parent, name, fetch).await?;
         match (resolved.found, dir) {
             (Found::Nothing, _) => return Err(Errno::ENOENT.into()),
+            (Found::Link, _) => return Err(Errno::EROFS.into()),
             (found, true) if !found.is_dir() => return Err(Errno::ENOTDIR.into()),
             (found, false) if found.is_dir() => return Err(Errno::EISDIR.into()),
             _ => {}
@@ -2798,7 +2810,7 @@ impl FuseFilesystem {
                     ],
                 })
             }
-            Found::File { local: false } | Found::Nothing => Ok(Aside::Nothing),
+            Found::File { local: false } | Found::Nothing | Found::Link => Ok(Aside::Nothing),
         })
     }
 
@@ -2954,18 +2966,19 @@ impl FuseFilesystem {
         let served = self.served();
         let from = Side {
             dir: parent,
-            node: self.dir_node(parent)?.0,
+            node: self.dir_to_change(parent)?.0,
             name,
         };
         let to = Side {
             dir: newparent,
-            node: self.dir_node(newparent)?.0,
+            node: self.dir_to_change(newparent)?.0,
             name: newname,
         };
         let source = self.resolve(&served, from.dir, name, fetch).await?;
         let same_name = from.dir == to.dir && fold_eq(name, newname);
         match source.found {
             Found::Nothing => return Err(Errno::ENOENT.into()),
+            Found::Link => return Err(Errno::EROFS.into()),
             // A change of case alone respells the directory in place, whatever it holds.
             Found::Dir { .. } if same_name => {}
             Found::Dir { local: false } => return Err(Errno::EXDEV.into()),
@@ -3002,6 +3015,9 @@ impl FuseFilesystem {
             self.resolve_to_attach(served, to.dir, to.name, fetch)
                 .await?
         };
+        if target.found == Found::Link {
+            return Err(Errno::EROFS.into());
+        }
         let mut replaced = None;
         let mut counted = false;
         if target.found != Found::Nothing {
@@ -3742,6 +3758,13 @@ impl FuseFilesystem {
     /// by the node, place and inode recorded at its read, never by its path. A file or directory
     /// that cannot be read stays dirty, which is where it stood. Serialized with swaps.
     ///
+    /// The commit recorded the time each file showed as it was read, however recent. Before the
+    /// flips, the filesystem holding `write/` is waited on until it stamps later than each of them
+    /// ([`crate::state::wait_until_settled`]), so a write after a flip shows a later time; a file
+    /// a write changed since its read stays local, and its record is cleared, whatever time a
+    /// diff recorded for it before the lock was taken, and the records written back, so a diff
+    /// reads the file rather than compare it by a time.
+    ///
     /// `handed` are the directories the commit adds or moves, settled as the others are, empty
     /// ones included. The host directories of those cleared go once the deletion list is
     /// rewritten. Answers whether every step completed with no error, swallowed ones included,
@@ -3754,8 +3777,17 @@ impl FuseFilesystem {
         served: &ServedContent,
         handed: Vec<RelativePath>,
     ) -> Result<bool, FuseProviderError> {
-        if self.local_files().is_none() {
+        let Some(local) = self.local_files() else {
             return Ok(true);
+        };
+        let stored = served.stored_files();
+        if let Some(mtime_max) = stored.iter().map(|file| file.mtime).max() {
+            // Boxed, once per commit: the probe's futures would otherwise sit in the commit's.
+            Box::pin(crate::state::wait_until_settled(
+                local.staging_dir(),
+                mtime_max,
+            ))
+            .await;
         }
         let _swaps = self.swap_plan().lock().await;
         if let Some(hook) = self.commit_hook() {
@@ -3768,7 +3800,7 @@ impl FuseFilesystem {
         let mut dirs = handed;
         let mut kept = Vec::new();
         let mut unheld = Vec::new();
-        for file in served.stored_files() {
+        for file in stored {
             match self.flip_to_tracked(&current, &file).await {
                 Ok(Flip::Flipped) => {
                     self.count_commit_outcome(true);
@@ -3799,8 +3831,12 @@ impl FuseFilesystem {
             }
         }
         let mut gone = Vec::new();
+        let cleared = !kept.is_empty();
         for file in kept {
             self.count_commit_outcome(false);
+            self.recorded_times()
+                .set(&repository, &file.spelled, 0)
+                .await;
             match self.keep_committed(&current, &file).await {
                 Ok(true) => dirs.push(file.spelled.parent_path()),
                 Ok(false) => gone.push(file.spelled),
@@ -3812,6 +3848,10 @@ impl FuseFilesystem {
                     clean = false;
                 }
             }
+        }
+        if cleared && let Err(error) = Box::pin(self.recorded_times().write_back(&repository)).await
+        {
+            lore_warn!("FUSE writing back the records a commit cleared failed: {error}");
         }
         // Unread, the list is left whole, and the settle stays owed.
         let listed = self.read_deletions().unwrap_or_else(|| {
@@ -3845,6 +3885,62 @@ impl FuseFilesystem {
             .await?;
         self.remove_settled_host_dirs(&current, &settled.cleared);
         Ok(clean && settled.clean)
+    }
+
+    /// Serves from the store each of `files`, local files whose content an operation read from
+    /// `served` and found to be what `revision` holds for their node, as [`Self::committed`] flips
+    /// the files a commit stored ([`Self::flip_to_tracked`]): a file a write changed since its
+    /// read stays local. Then, as after a commit, the deletion list keeps only the paths the
+    /// revision holds and the State does not serve from it, so a path a move recorded while the
+    /// file was read leaves it.
+    /// Serialized with swaps; where `served` is no longer the one served, or stands at another
+    /// revision, nothing is flipped. Answers how many files it flipped.
+    pub(crate) async fn serve_unchanged(
+        &self,
+        files: &[ServedFile],
+        served: &Arc<Served>,
+        revision: &State,
+    ) -> usize {
+        if self.local_files().is_none() || files.is_empty() {
+            return 0;
+        }
+        let _swaps = self.swap_plan().lock().await;
+        if let Some(hook) = self.commit_hook() {
+            hook().await;
+        }
+        let current = self.served();
+        if !Arc::ptr_eq(&current, served) || current.revision() != revision.revision() {
+            return 0;
+        }
+        let mut flipped = 0;
+        let mut unheld = Vec::new();
+        for file in files {
+            match self.flip_to_tracked(&current, file).await {
+                Ok(Flip::Flipped) => flipped += 1,
+                Ok(Flip::Kept) => {}
+                Ok(Flip::Unheld(held)) => unheld.push(*held),
+                Err(error) => lore_warn!(
+                    "FUSE serving '{}' from the store failed: {error}",
+                    file.spelled
+                ),
+            }
+        }
+        for (settled, file) in unheld.iter().enumerate() {
+            if settled % SETTLES_BETWEEN_YIELDS == SETTLES_BETWEEN_YIELDS - 1 {
+                tokio::task::yield_now().await;
+            }
+            flipped += usize::from(self.settle_unheld(&current, file));
+        }
+        if flipped > 0
+            && let Err(error) = self
+                .rewrite_deletions_for(&current, (revision, &current.repository))
+                .await
+        {
+            lore_warn!(
+                "FUSE rewriting the deletion list after serving files from the store failed: {error}"
+            );
+        }
+        flipped
     }
 
     /// Arms the settle a commit owes before its revision may become current ([`SettleOwed`]),
@@ -4513,77 +4609,85 @@ impl FuseFilesystem {
 
     /// Gives local file `node_id`, at `path` as the State spells it and held at `place`, the
     /// content `target` over its local content, as a forced sync does: its node takes `target`
-    /// clean, the inode the kernel holds at the path turns store-served under its write guard,
-    /// which a WRITE holds across its host operation, and the host file leaves `write/` under the
-    /// same guard. The name is claimed throughout and recorded settled, as a commit's flip of a
-    /// file no inode holds is ([`Self::settle_unheld`]), so a lookup that read the file local
-    /// before makes no inode of it. Answers whether the node changed; a symbolic link, or a node
-    /// moved meanwhile, is left as it stands.
-    pub(crate) async fn overwrite_local_file(
-        &self,
-        current: &Served,
-        path: &RelativePath,
+    /// clean, the inode the kernel holds at the path turns store-served at `mtime`, the time the
+    /// caller records for the path, under its write guard, which a WRITE holds across its host
+    /// operation, and the host file leaves `write/` under the same guard. The name is claimed
+    /// throughout and recorded settled, as a commit's flip of a file no inode holds is
+    /// ([`Self::settle_unheld`]), so a lookup that read the file local before makes no inode of
+    /// it. Answers whether the node changed; a symbolic link, or a node moved meanwhile, is left
+    /// as it stands.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn overwrite_local_file<'a>(
+        &'a self,
+        current: &'a Served,
+        path: &'a RelativePath,
         node_id: NodeID,
         place: (NodeID, u64),
-        target: &StoredContent,
-    ) -> Result<bool, FuseProviderError> {
-        let Some(local) = self.local_files() else {
-            return Ok(false);
-        };
-        let block = current
-            .state
-            .block(current.repository.clone(), NodeBlock::index(node_id))
-            .await
-            .forward_any::<FuseProviderError>("reading a node a sync overwrites")?;
-        let take = |held: &mut NodeContent<'_>| {
-            if !held.is_file() || held.ext_flags().contains(NodeExtFlags::Symlink) {
-                return false;
-            }
-            held.set_content(target.address, target.size, target.mode);
-            held.clear_dirty_flags()
-        };
-        let remove_host = || {
-            if let Some(host) = relative_host_path(path) {
-                match local.remove_path(&host, false) {
-                    Ok(()) | Err(Errno::ENOENT) => {}
-                    Err(errno) => {
-                        lore_warn!(
-                            "FUSE could not remove the overwritten '{path}' from write/: {errno:?}"
-                        );
+        target: &'a StoredContent,
+        mtime: u64,
+    ) -> impl Future<Output = Result<bool, FuseProviderError>> + 'a {
+        async move {
+            let Some(local) = self.local_files() else {
+                return Ok(false);
+            };
+            let block = current
+                .state
+                .block(current.repository.clone(), NodeBlock::index(node_id))
+                .await
+                .forward_any::<FuseProviderError>("reading a node a sync overwrites")?;
+            let take = |held: &mut NodeContent<'_>| {
+                if !held.is_file() || held.ext_flags().contains(NodeExtFlags::Symlink) {
+                    return false;
+                }
+                held.set_content(target.address, target.size, target.mode);
+                held.clear_dirty_flags()
+            };
+            let remove_host = || {
+                if let Some(host) = relative_host_path(path) {
+                    match local.remove_path(&host, false) {
+                        Ok(()) | Err(Errno::ENOENT) => {}
+                        Err(errno) => {
+                            lore_warn!(
+                                "FUSE could not remove the overwritten '{path}' from write/: {errno:?}"
+                            );
+                        }
                     }
                 }
-            }
-        };
-        let _settling = Settling {
-            claim: Some(local.settling.claim(place)),
-            settled: &local.settled,
-        };
-        let held = self.live_inode(path);
-        let changed = if let Some(mut entry) = held.and_then(|ino| self.inodes().get_mut(ino)) {
-            let changed = current
-                .state
-                .node_change_in_place(&block, node_id, place, take);
-            if changed {
-                entry.kind = committed_kind(target);
-                entry.host_epoch += 1;
-                entry.host_file = 0;
-                remove_host();
-                let ino = entry.ino;
-                drop(entry);
-                self.fragment_cache().forget(ino);
-            }
-            changed
-        } else {
-            let changed = current
-                .state
-                .node_change_in_place(&block, node_id, place, take);
-            if changed {
-                remove_host();
-            }
-            changed
-        };
-        local.settle_log.record(place);
-        Ok(changed)
+            };
+            let _settling = Settling {
+                claim: Some(local.settling.claim(place)),
+                settled: &local.settled,
+            };
+            let held = self.live_inode(path);
+            let changed = if let Some(mut entry) = held.and_then(|ino| self.inodes().get_mut(ino)) {
+                let changed = current
+                    .state
+                    .node_change_in_place(&block, node_id, place, take);
+                if changed {
+                    entry.kind = committed_kind(target);
+                    entry.host_epoch += 1;
+                    entry.host_file = 0;
+                    entry.mtime = mtime;
+                    remove_host();
+                    let ino = entry.ino;
+                    drop(entry);
+                    self.fragment_cache().forget(ino);
+                }
+                changed
+            } else {
+                let changed = current
+                    .state
+                    .node_change_in_place(&block, node_id, place, take);
+                if changed {
+                    remove_host();
+                }
+                changed
+            };
+            local.settle_log.record(place);
+            Ok(changed)
+        }
     }
 
     /// Removes the host file of `path`, a local file a forced sync detached.

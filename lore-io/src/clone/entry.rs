@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 //! What the backends share: opening a source file without following a link, giving a copy the
-//! permissions and modification time the source's handle reports, copying links, and making the
-//! directories a clone fills entry by entry.
+//! permissions and modification time the source's handle reports, and copying links; and making
+//! and removing the directories of a copy filled entry by entry, and reading and setting their
+//! permission bits.
 
 use std::fs::File;
 use std::io;
@@ -19,16 +20,16 @@ pub(super) const PERMISSION_BITS: u32 = 0o7777;
 
 /// The owner's write and search bits, which adding an entry to a directory takes.
 #[cfg(target_family = "unix")]
-pub(super) const OWNER_FILLS: u32 = 0o300;
+pub const OWNER_FILLS: u32 = 0o300;
 
 /// The set-group-ID bit of a mode.
 #[cfg(target_family = "unix")]
-pub(super) const SETGID: u32 = 0o2000;
+pub const SETGID: u32 = 0o2000;
 
 /// The permission bits `mkdir` gives a directory it creates, less those the file mode creation
 /// mask clears.
 #[cfg(target_family = "unix")]
-pub(super) const CREATED_BITS: u32 = 0o777;
+pub const CREATED_BITS: u32 = 0o777;
 
 /// The error a block-cloning backend reports where it cannot clone, never copying in its place.
 pub(super) fn unsupported(call: &str) -> io::Error {
@@ -54,6 +55,23 @@ pub(super) enum OpenedSource {
 /// [`io::ErrorKind::IsADirectory`].
 #[cfg(target_family = "unix")]
 pub(super) fn open_source(source: Source<'_>) -> io::Result<OpenedSource> {
+    open_source_with(source, 0)
+}
+
+/// [`open_source`], leaving the file's access time as it is, which `O_NOATIME` asks of a file
+/// the caller owns; a file it doesn't own is opened again without it.
+#[cfg(target_os = "linux")]
+pub(super) fn open_source_keeping_atime(source: Source<'_>) -> io::Result<OpenedSource> {
+    match open_source_with(source, libc::O_NOATIME) {
+        Err(err) if err.raw_os_error() == Some(libc::EPERM) => open_source(source),
+        opened => opened,
+    }
+}
+
+/// [`open_source`] with the open's `flags` beside its own.
+#[cfg(target_family = "unix")]
+#[inline]
+fn open_source_with(source: Source<'_>, flags: libc::c_int) -> io::Result<OpenedSource> {
     use std::os::fd::FromRawFd;
 
     let name = source.name_for_call()?;
@@ -62,7 +80,7 @@ pub(super) fn open_source(source: Source<'_>) -> io::Result<OpenedSource> {
         libc::openat(
             source.parent_fd(),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | flags,
         )
     };
     if opened < 0 {
@@ -222,19 +240,19 @@ pub(super) fn names_file(path: &Path, file: &File) -> io::Result<bool> {
 /// What tells one directory from another on its volume, so a directory replaced after it was
 /// found is told from the one found: the device and inode numbers.
 #[cfg(target_family = "unix")]
-pub(super) type Identity = (u64, u64);
+pub type Identity = (u64, u64);
 
 /// What tells one directory from another on its volume, so a directory replaced after it was
 /// found is told from the one found: the volume serial number and the file ID.
 #[cfg(target_family = "windows")]
-pub(super) type Identity = (u64, [u8; 16]);
+pub type Identity = (u64, [u8; 16]);
 
-/// The identity of the directory at `path`, or `None` where something else is there, such as a
-/// link or a junction. Every component of `path` but the last is resolved, so a directory reached
-/// through a link swapped in above it answers with the identity of the directory the link leads
-/// to.
+/// The identity and the attributes of the directory at `path`, or `None` where something else is
+/// there, such as a link or a junction. Every component of `path` but the last is resolved, so a
+/// directory reached through a link swapped in above it answers with the identity of the directory
+/// the link leads to.
 #[cfg(target_family = "windows")]
-pub(super) fn directory_identity(path: &Path) -> io::Result<Option<Identity>> {
+pub(super) fn directory_identity(path: &Path) -> io::Result<Option<(Identity, u32)>> {
     windows::directory_identity(path)
 }
 
@@ -263,7 +281,7 @@ pub(super) fn file_id(file: &File) -> io::Result<(u64, [u8; 16])> {
 /// mask clears: true where it was created, false where a directory is already there, and
 /// [`io::ErrorKind::AlreadyExists`] where something else is.
 #[cfg(target_family = "unix")]
-pub(super) fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
+pub fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
     use std::os::unix::fs::DirBuilderExt;
 
     forgive_present_directory(std::fs::DirBuilder::new().mode(mode).create(path), path)
@@ -272,7 +290,7 @@ pub(super) fn create_directory(path: &Path, mode: u32) -> io::Result<bool> {
 /// Creates the directory `path`: true where it was created, false where a directory is already
 /// there, and [`io::ErrorKind::AlreadyExists`] where something else is.
 #[cfg(target_family = "windows")]
-pub(super) fn create_directory(path: &Path) -> io::Result<bool> {
+pub fn create_directory(path: &Path) -> io::Result<bool> {
     forgive_present_directory(std::fs::create_dir(path), path)
 }
 
@@ -291,8 +309,18 @@ fn forgive_present_directory(created: io::Result<()>, path: &Path) -> io::Result
     }
 }
 
+/// Removes the empty directory at `path`.
+pub fn remove_directory(path: &Path) -> io::Result<()> {
+    std::fs::remove_dir(path)
+}
+
+/// Whether nothing is at `path`, a link not followed, or what is there can't be read.
+pub fn is_vacant(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err()
+}
+
 /// Removes what a whole-directory clone that failed left at `path`.
-pub(super) fn remove_partial(path: &Path) -> io::Result<()> {
+pub fn remove_partial(path: &Path) -> io::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(left) if left.is_dir() => std::fs::remove_dir_all(path),
         Ok(_) => std::fs::remove_file(path),
@@ -305,7 +333,7 @@ pub(super) fn remove_partial(path: &Path) -> io::Result<()> {
 /// directory `parent`, read from a directory created there with every permission bit and removed
 /// again, as the mask cannot be read without changing it for every thread of the process.
 #[cfg(target_family = "unix")]
-pub(super) fn umask_in(parent: &Path) -> io::Result<u32> {
+pub fn umask_in(parent: &Path) -> io::Result<u32> {
     use std::os::unix::fs::DirBuilderExt;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
@@ -327,7 +355,7 @@ pub(super) fn umask_in(parent: &Path) -> io::Result<u32> {
 
 /// The permission bits of the directory at `path`.
 #[cfg(target_family = "unix")]
-pub(super) fn mode_of(path: &Path) -> io::Result<u32> {
+pub fn mode_of(path: &Path) -> io::Result<u32> {
     use std::os::unix::fs::PermissionsExt;
 
     Ok(std::fs::metadata(path)?.permissions().mode() & PERMISSION_BITS)
@@ -335,7 +363,7 @@ pub(super) fn mode_of(path: &Path) -> io::Result<u32> {
 
 /// Sets the permission bits of `path` to `mode`.
 #[cfg(target_family = "unix")]
-pub(super) fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+pub fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -354,7 +382,6 @@ mod windows {
     use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
     use windows_sys::Win32::Foundation::ERROR_NOT_SUPPORTED;
     use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
-    use windows_sys::Win32::Foundation::GENERIC_WRITE;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
@@ -374,7 +401,6 @@ mod windows {
     use windows_sys::Win32::Storage::FileSystem::MAXIMUM_REPARSE_DATA_BUFFER_SIZE;
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_GET_REPARSE_POINT;
-    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_SYMLINK;
 
     /// The tag bit that marks a reparse point standing for another name, as a symbolic link and a
@@ -458,13 +484,15 @@ mod windows {
     }
 
     /// [`super::directory_identity`].
-    pub(super) fn directory_identity(path: &Path) -> io::Result<Option<super::Identity>> {
+    pub(super) fn directory_identity(path: &Path) -> io::Result<Option<(super::Identity, u32)>> {
         let entry = open_entry(path, FILE_READ_ATTRIBUTES)?;
-        let is_directory = entry.metadata()?.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0;
-        if !is_directory || reparse_tag(&entry)?.is_some_and(|tag| tag & NAME_SURROGATE != 0) {
+        let attributes = entry.metadata()?.file_attributes();
+        if attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || reparse_tag(&entry)?.is_some_and(|tag| tag & NAME_SURROGATE != 0)
+        {
             return Ok(None);
         }
-        file_id(&entry).map(Some)
+        Ok(Some((file_id(&entry)?, attributes)))
     }
 
     /// The first pause before a held open refused for sharing is tried again, doubled before each
@@ -574,27 +602,7 @@ mod windows {
                 .create_new(true)
                 .open(destination)?;
         }
-        let set = open_entry(destination, GENERIC_WRITE).and_then(|to| {
-            let mut returned = 0u32;
-            // SAFETY: the handle is open, and `data` holds `length` bytes of reparse data.
-            let done = unsafe {
-                DeviceIoControl(
-                    to.as_raw_handle() as HANDLE,
-                    FSCTL_SET_REPARSE_POINT,
-                    data.as_ptr().cast(),
-                    length,
-                    std::ptr::null_mut(),
-                    0,
-                    &mut returned,
-                    std::ptr::null_mut(),
-                )
-            };
-            if done == 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
+        let set = crate::junction::set_reparse_point(destination, &data[..length as usize]);
         if set.is_err() {
             let _ = if is_directory {
                 std::fs::remove_dir(destination)

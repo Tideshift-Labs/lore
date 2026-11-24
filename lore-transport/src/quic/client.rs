@@ -51,6 +51,9 @@ use super::QuicClientError;
 use super::QuicOpCode;
 use super::TIME_THRESHOLD;
 use super::command_header::CommandHeader;
+use super::response_observer::ResponseObserver;
+use super::response_observer::ResponseObserverSlot;
+use super::response_reader::PendingCommands;
 use super::response_reader::ResponseReader;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
@@ -236,8 +239,12 @@ impl From<quinn::ConnectionStats> for ConnectionStats {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+/// The congestion controller of a QUIC connection, which paces what its own end sends.
+/// Configuration names it `bbr` or `cubic`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CongestionAlgorithm {
+    #[default]
     Bbr,
     Cubic,
 }
@@ -383,10 +390,16 @@ struct QuicQuinnConnection {
 ///
 /// The progress counter is shared with the locked half, so the read path can record progress
 /// through the owned guard it already holds and carry nothing more in its size-bounded future.
+///
+/// `pending` is the commands waiting for their answer on this stream, shared with the stream's
+/// [`ResponseReader`] (upstream `PendingCommands`, 8696757b). The fork keeps the command's own
+/// write (see the OPEN note on upstream's writer task in the sync notes), so the command registers
+/// itself here before its first byte goes out.
 struct StreamWriter {
     send: Arc<Mutex<StreamSend>>,
     progress: Arc<AtomicU64>,
     connection: quinn::Connection,
+    pending: Arc<PendingCommands>,
 }
 
 /// The locked half of a [`StreamWriter`].
@@ -396,7 +409,11 @@ struct StreamSend {
 }
 
 impl StreamWriter {
-    fn new(stream: quinn::SendStream, connection: quinn::Connection) -> Self {
+    fn new(
+        stream: quinn::SendStream,
+        connection: quinn::Connection,
+        pending: Arc<PendingCommands>,
+    ) -> Self {
         let progress = Arc::new(AtomicU64::new(0));
         Self {
             send: Arc::new(Mutex::new(StreamSend {
@@ -405,6 +422,7 @@ impl StreamWriter {
             })),
             progress,
             connection,
+            pending,
         }
     }
 }
@@ -451,6 +469,38 @@ pub fn managed_wait_bound() -> Duration {
 }
 
 impl QuicQuinnConnection {
+    /// Adds the stream of `quic` whose halves are `send` and `recv`, with its writer and a reader
+    /// of its answers, which share the commands waiting on the stream.
+    ///
+    /// FORK-LOCAL (Tideshift): upstream 8696757b spawns a writer task per stream here. The fork
+    /// keeps the command's own write, which the replay contract's dispatch proof and the WP-124
+    /// managed bound read (OPEN in the sync notes), so only the shared pending set and the
+    /// response observer are taken.
+    fn push_stream(
+        &mut self,
+        send: quinn::SendStream,
+        recv: quinn::RecvStream,
+        quic: &QuicConnection,
+    ) {
+        let pending = Arc::new(PendingCommands::new(quic.response_observer.clone()));
+        let stream_index = self.reader.len();
+        self.reader.push(ResponseReader::new(
+            recv,
+            pending.clone(),
+            quic.max_chunk_size,
+            quic.last_recv.clone(),
+            quic.created,
+            quic.v4,
+            self.connection.clone(),
+            stream_index,
+        ));
+        self.writer.push(Arc::new(StreamWriter::new(
+            send,
+            self.connection.clone(),
+            pending,
+        )));
+    }
+
     async fn close(&mut self) {
         let connection_id = self.connection.stable_id();
         lore_debug!(
@@ -461,8 +511,8 @@ impl QuicQuinnConnection {
         // CONNECTION_CLOSE(app, 0) as a graceful close (see is_graceful_close in
         // lore-server/src/quic/stream_handler.rs), so the stream-level FIN handshake
         // (1 RTT per stream) is unnecessary. Dropping the reader/writer vecs detaches
-        // the reader tasks; they exit promptly once the connection's close() below
-        // terminates their recv streams.
+        // the reader and writer tasks; they exit promptly once the connection's close()
+        // below terminates their streams.
         self.writer.clear();
         self.reader.clear();
         self.connection
@@ -568,6 +618,7 @@ pub struct QuicConnection {
     /// FORK-LOCAL (Tideshift, WP-124): the managed write idle bound, in milliseconds. Read once
     /// at construction from [`managed_idle_timeout`]; an atomic only so a test can shorten it.
     managed_idle_ms: AtomicU64,
+    response_observer: ResponseObserverSlot,
 }
 
 impl QuicConnection {
@@ -624,7 +675,15 @@ impl QuicConnection {
             managed_idle_ms: AtomicU64::new(
                 u64::try_from(managed_idle_timeout().as_millis()).unwrap_or(u64::MAX),
             ),
+            response_observer: ResponseObserverSlot::default(),
         }
+    }
+
+    /// Reports every response the connection reads from now on to `observer`, including those on
+    /// streams a reconnect opens. Returns `false`, leaving the first observer in place, when one
+    /// is already set.
+    pub fn observe_responses(&self, observer: Arc<dyn ResponseObserver>) -> bool {
+        self.response_observer.set(observer).is_ok()
     }
 
     fn managed_idle(&self) -> Duration {
@@ -752,9 +811,6 @@ impl QuicConnection {
     }
 
     pub async fn create_initial_stream(&self) -> Result<(), QuicClientError> {
-        let last_recv = self.last_recv.clone();
-        let created = self.created;
-
         {
             let mut connection = self.connection.write().await;
 
@@ -763,17 +819,7 @@ impl QuicConnection {
                 .open_bi()
                 .await
                 .map_err(|_err| QuicClientError::StreamOpen)?;
-            let quinn = connection.connection.clone();
-            connection
-                .writer
-                .push(Arc::new(StreamWriter::new(send, quinn)));
-            connection.reader.push(ResponseReader::new(
-                recv,
-                self.max_chunk_size,
-                last_recv,
-                created,
-                self.v4,
-            ));
+            connection.push_stream(send, recv, self);
             lore_trace!("Created initial connect bidirectional stream");
         }
 
@@ -819,6 +865,26 @@ impl QuicConnection {
         self.connection.read().await.connection.stats().into()
     }
 
+    /// The congestion controller the connection held now runs, as quinn reports it, or `None` for
+    /// one that is neither algorithm.
+    #[cfg(feature = "test-util")]
+    pub async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        let controller = self
+            .connection
+            .read()
+            .await
+            .connection
+            .congestion_state()
+            .into_any();
+        if controller.is::<congestion::Bbr>() {
+            Some(CongestionAlgorithm::Bbr)
+        } else if controller.is::<congestion::Cubic>() {
+            Some(CongestionAlgorithm::Cubic)
+        } else {
+            None
+        }
+    }
+
     /// Requests outstanding on each stream, as the stream selection sees them.
     pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
         std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
@@ -836,6 +902,58 @@ impl QuicConnection {
                 .count()
         })
     }
+
+    /// How many commands wait for their answer on any of the connection's streams.
+    #[cfg(feature = "test-util")]
+    pub async fn pending_commands(&self) -> usize {
+        self.connection
+            .read()
+            .await
+            .reader
+            .iter()
+            .map(ResponseReader::pending_commands)
+            .sum()
+    }
+
+    /// Opens every stream the connection may have.
+    #[cfg(feature = "test-util")]
+    pub async fn open_streams(self: &Arc<Self>) -> Result<(), QuicClientError> {
+        while self.stream_count.load(Ordering::Relaxed) < STREAM_COUNT {
+            add_stream(self.clone()).await?;
+        }
+        Ok(())
+    }
+
+    /// Opens every stream the connection may have, then holds the writer of each, so a command
+    /// sent meanwhile waits for its stream's writer until the [`HeldWriters`] are dropped.
+    ///
+    /// FORK-LOCAL (Tideshift): upstream holds its per-stream writer task; the fork has no writer
+    /// task (OPEN in the sync notes), so this holds each stream's writer lock instead. A command
+    /// still counts on its stream ([`QuicConnection::stream_inflight`]) while it waits.
+    #[cfg(feature = "test-util")]
+    pub async fn hold_writers(self: &Arc<Self>) -> Result<HeldWriters, QuicClientError> {
+        self.open_streams().await?;
+        let writers: Vec<_> = self
+            .connection
+            .read()
+            .await
+            .writer
+            .iter()
+            .map(|writer| writer.send.clone())
+            .collect();
+        let mut held = Vec::with_capacity(writers.len());
+        for writer in writers {
+            held.push(writer.lock_owned().await);
+        }
+        Ok(HeldWriters { _held: held })
+    }
+}
+
+/// The writers of a connection's streams, which [`QuicConnection::hold_writers`] holds until this
+/// is dropped. The guards are held only for their drop.
+#[cfg(feature = "test-util")]
+pub struct HeldWriters {
+    _held: Vec<tokio::sync::OwnedMutexGuard<StreamSend>>,
 }
 
 #[derive(Debug, Error)]
@@ -2195,9 +2313,6 @@ async fn give_up_at_deadline(connection: &QuicConnection) -> ReconnectDeadline {
 /// which compares its round-robin index against it, stops asking for more streams once
 /// all `STREAM_COUNT` of them exist.
 async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientError> {
-    let last_recv = connection.last_recv.clone();
-    let created = connection.created;
-
     let mut connection_lock = connection.connection.write().await;
 
     let stream_index = connection_lock.writer.len() as u32;
@@ -2213,17 +2328,7 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
                 }
             })
             .map_err(|_err| QuicClientError::StreamOpen)?;
-        let quinn = connection_lock.connection.clone();
-        connection_lock
-            .writer
-            .push(Arc::new(StreamWriter::new(send, quinn)));
-        connection_lock.reader.push(ResponseReader::new(
-            recv,
-            connection.max_chunk_size,
-            last_recv.clone(),
-            created,
-            connection.v4,
-        ));
+        connection_lock.push_stream(send, recv, &connection);
 
         connection
             .stream_count
@@ -2483,8 +2588,8 @@ where
 ///
 /// `AWAIT_RESPONSE` is a const parameter rather than a split into a write half and a wait half so
 /// that each instantiation is a single future: a wait half awaited by a write half would nest one
-/// future inside the other and grow the send path. A `false` instantiation compiles the response
-/// wait out entirely and resolves as soon as the bytes are written, yielding `Bytes::default()`.
+/// future inside the other and grow the send path. A `false` instantiation resolves as soon as the
+/// frame is written, yielding `Bytes::default()`.
 ///
 /// Either way the command is registered with the stream's [`ResponseReader`] before the bytes go
 /// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
@@ -2565,7 +2670,7 @@ async fn send_command_tracked<
     }
 
     let (writer, rx, stream_index, _inflight) = {
-        let (command_id, writer, rx, stream_index, inflight) = {
+        let (writer, rx, stream_index, inflight) = {
             let connection_lock = connection.connection.read().await;
             if connection_lock.reader.is_empty() {
                 lore_debug!("No quic stream available when sending command");
@@ -2615,15 +2720,6 @@ async fn send_command_tracked<
                 % connection_lock.reader.len();
             let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
 
-            let (tx, rx) = oneshot::channel();
-            let command_id = connection_lock.reader[stream_index]
-                .wait_for(tx)
-                .map_err(SendFailure::not_dispatched)?;
-            let writer = connection_lock.writer[stream_index].clone();
-            (command_id, writer, rx, stream_index as u32, inflight)
-        };
-
-        {
             // Skip any previous header in case this is a resend
             let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
             if total_size > connection.max_chunk_size {
@@ -2635,6 +2731,12 @@ async fn send_command_tracked<
                     QuicClientError::ClientMessageTooBig,
                 ));
             }
+
+            // Registered with the stream's reader (upstream `PendingCommands`, shared by the
+            // stream's writer and reader) before any byte goes out. A reader that has already
+            // stopped takes nothing: no byte was written, so the command is not dispatched.
+            let writer = connection_lock.writer[stream_index].clone();
+            let command_id = writer.pending.next_id();
             if v4 {
                 let header =
                     CommandHeader::new_with_session(command, command_id, total_size, session_id);
@@ -2643,7 +2745,13 @@ async fn send_command_tracked<
                 let header = CommandHeader::new(command, command_id, total_size);
                 chunks[0] = Bytes::from_owner(header.to_bytes());
             }
-        }
+            let (tx, rx) = oneshot::channel();
+            let queued = writer.pending.observed().then(Instant::now);
+            if !writer.pending.wait_for(command_id, tx, queued) {
+                return Err(SendFailure::not_dispatched(QuicClientError::Terminated));
+            }
+            (writer, rx, stream_index as u32, inflight)
+        };
 
         // FORK-LOCAL (Tideshift, WP-124): a managed write leaves here for the bounded send. Boxed,
         // and inside this block, so the read path's future carries only the box's variant and none

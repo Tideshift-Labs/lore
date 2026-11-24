@@ -296,6 +296,7 @@ impl SharedBackend {
             self.immutable.clone(),
             self.mutable.clone(),
             repository,
+            lore_revision::state::allow_all_repositories(),
         ))
     }
 

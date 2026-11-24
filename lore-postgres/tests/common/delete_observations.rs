@@ -41,14 +41,8 @@ pub async fn repository_delete_input_at(url: &str, repository_id: &[u8]) -> Repo
     RepositoryDeleteInput {
         repository_id: repository_id.to_vec(),
         expected_generation: None,
-        expected_name: repository
-            .as_ref()
-            .map(|row| row.get(0))
-            .unwrap_or_default(),
-        expected_metadata_hash: repository
-            .as_ref()
-            .map(|row| row.get(1))
-            .unwrap_or_default(),
+        expected_name: repository.as_ref().map_or_default(|row| row.get(0)),
+        expected_metadata_hash: repository.as_ref().map_or_default(|row| row.get(1)),
         branches,
         projection: Vec::new(),
         events: Vec::new(),
@@ -89,9 +83,9 @@ pub async fn branch_delete_input_at(
         repository_id: repository_id.to_vec(),
         branch_id: branch_id.to_vec(),
         expected_generation: None,
-        expected_name: branch.as_ref().map(|r| r.get(0)).unwrap_or_default(),
-        expected_metadata_hash: branch.as_ref().map(|r| r.get(1)).unwrap_or_default(),
-        expected_latest_hash: branch.as_ref().map(|r| r.get(2)).unwrap_or_default(),
+        expected_name: branch.as_ref().map_or_default(|r| r.get(0)),
+        expected_metadata_hash: branch.as_ref().map_or_default(|r| r.get(1)),
+        expected_latest_hash: branch.as_ref().map_or_default(|r| r.get(2)),
         delete_protected: false,
         legacy_default: false,
         projection: vec![],

@@ -1,12 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
-//! Dispatch helper for the content-addressed storage API.
+//! Dispatch helpers for the content-addressed storage API.
 //!
-//! `storage_call` mirrors `crate::call::repository_call` but without the
-//! repository working-tree checks. Every op goes through this helper so
-//! the in-flight counter protocol and the `Complete` / `End` event
-//! lifecycle are applied uniformly.
+//! `storage_call_with` runs an op on a storage handle behind the handle's in-flight guard and
+//! completes it with one `Complete` event; `storage_call` runs it with a dispatcher that sends
+//! every event.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,6 +16,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_error_set::FfiError;
 use lore_error_set::HasTrace;
 use lore_revision::event::LoreErrorDetail;
+use lore_revision::interface::ExecutionContext;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
 use lore_storage::StorageError;
@@ -29,13 +29,42 @@ use crate::storage::store::StoreInternal;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
-/// Run a storage-API op behind the in-flight counter protocol.
+/// Run a storage-API op as [`storage_call_with`] does, in an execution context whose events all go
+/// to `callback`.
+#[lore_macro::test_pub]
+#[inline]
+pub(crate) fn storage_call<Arg, T, F, Fut, ResT, ErrT>(
+    globals: LoreGlobalArgs,
+    callback: LoreEventCallback,
+    store_handle: LoreStore,
+    args: Arg,
+    caller: T,
+    command: F,
+) -> impl Future<Output = i32>
+where
+    ErrT: FfiError + HasTrace + std::fmt::Display + From<InvalidArguments>,
+    Arg: std::fmt::Debug,
+    F: FnOnce(Arc<StoreInternal>, Arg) -> Fut,
+    Fut: Future<Output = Result<ResT, ErrT>> + 'static,
+{
+    storage_call_with(
+        move || setup_execution(globals, callback),
+        store_handle,
+        args,
+        caller,
+        command,
+    )
+}
+
+/// Run an op on a storage handle behind the handle's in-flight guard.
 ///
 /// The helper:
-/// 1. Sets up an `ExecutionContext` and enters its `LORE_CONTEXT` scope.
+/// 1. Sets up an `ExecutionContext` with `execution` and enters its `LORE_CONTEXT` scope.
+///    `execution` runs at the first poll, so the context of a relayed call reads its caller's
+///    environment.
 /// 2. Acquires an [`OpGuard`] for the handle — if the handle is unknown
-///    or already closed, completes with the handle-miss error detail and
-///    returns its error code without invoking the op impl.
+///    or already closed, completes with `InvalidArguments` and returns
+///    its error code without invoking the op impl.
 /// 3. Passes a cloned `Arc<StoreInternal>` to the op impl (ownership
 ///    transferred; the impl can fan it out to spawned tasks).
 /// 4. Translates the impl's `Result` into a `Complete{status}` event.
@@ -48,27 +77,24 @@ use crate::util::log_command_info;
 /// before the returned future resolves — no background work outlives
 /// a data op. Use `JoinSet` / `join_all` to await spawned futures
 /// before returning.
-#[lore_macro::test_pub]
-pub(crate) async fn storage_call<Arg, T, F, Fut, ResT, ErrT>(
-    globals: LoreGlobalArgs,
-    callback: LoreEventCallback,
+pub(crate) async fn storage_call_with<Arg, T, S, F, Fut, ResT, ErrT>(
+    execution: S,
     store_handle: LoreStore,
     args: Arg,
     caller: T,
     command: F,
 ) -> i32
 where
-    ErrT: FfiError + HasTrace + std::fmt::Display,
+    ErrT: FfiError + HasTrace + std::fmt::Display + From<InvalidArguments>,
     Arg: std::fmt::Debug,
+    S: FnOnce() -> Arc<ExecutionContext>,
     F: FnOnce(Arc<StoreInternal>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
-    let execution = setup_execution(globals, callback);
-
     LORE_CONTEXT
-        .scope(execution, async move {
+        .scope(execution(), async move {
             let Some(guard) = OpGuard::enter(store_handle) else {
-                let err = StorageError::from(InvalidArguments {
+                let err = ErrT::from(InvalidArguments {
                     reason: "storage handle is unknown or has been closed".into(),
                 });
                 return execution_context()
@@ -81,7 +107,7 @@ where
             let time_start = Instant::now();
 
             let store = guard.store_clone();
-            let mut detail = LoreErrorDetail::from_result(command(store, args).await);
+            let mut detail = LoreErrorDetail::from_result(&command(store, args).await);
             // A managed child without a durable verdict dominates the per-item code summary.
             // Keep the actual journal identity when that summary has only numeric status codes.
             if let Some(context) = lore_transport::current_caller_operation() {

@@ -300,12 +300,26 @@ async fn apply_plan(
             Err(_) => strongest.merge(EntryFailure::Internal),
         }
     }
-
+    let state: &State = claim.state();
+    let drained = if state.holds_promoted_moves() {
+        Box::pin(lore_revision::file::stage::stage_promoted_moves_of_call(
+            &context, state, None,
+        ))
+        .await
+        .map(drop)
+    } else {
+        Ok(())
+    };
     if applied < total {
         let failed = total - applied;
         return Err(strongest.call_error(&format!("{failed}/{total} node modifies failed")));
     }
-    Ok(())
+    drained.map_err(|error| {
+        ModifyError::internal_with_context(
+            error,
+            "stage the moves of directories the modifies were in",
+        )
+    })
 }
 
 /// Rewrite a batch of file nodes' content fields.
@@ -317,8 +331,9 @@ async fn apply_plan(
 /// derived at commit and a link's address is its target, so neither holds
 /// content to rewrite. A zero `address.context` preserves the node's existing
 /// file id — unlike `add`, which generates one — because the node already
-/// carries an identity and replacing it would record the edit as a move. An
-/// empty batch succeeds.
+/// carries an identity and replacing it would record the edit as a move. A file
+/// added or moved through this handle stays an addition or a move, which the
+/// commit records with the new content. An empty batch succeeds.
 ///
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
 /// call's own `batch_id` and firing exactly once — after any per-entry
@@ -359,12 +374,12 @@ async fn apply_plan(
 /// Concurrency covers entries in different node blocks: each rewrite takes its
 /// target's block write lock for the field write, so entries sharing a block —
 /// which sequentially allocated node ids usually do — serialize on it.
-pub async fn modify(
+pub fn modify(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeModifyArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, modify_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, modify_impl)
 }
 
 /// Plan and apply one batch. Split out of the dispatcher closure so the batch

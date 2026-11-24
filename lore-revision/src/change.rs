@@ -93,6 +93,10 @@ bitflags! {
         // The working file holds the content the change ends at, so realizing the change carries
         // its executable bit alone. Set by the verify.
         const HoldsContent = 0b10000000000;
+        // A directory deleted as a whole, standing for the nodes below it that aren't listed on
+        // their own. Set by a walk whose caller expands the hierarchy itself, see
+        // `ChangeStream::spawn_subtrees`, and on the directories that expansion deletes.
+        const Subtree = 0b100000000000;
     }
 }
 bitflagsops!(Flags, u16);
@@ -112,6 +116,10 @@ impl Flags {
 
     pub fn holds_content(&self) -> bool {
         self.contains(Flags::HoldsContent)
+    }
+
+    pub fn is_subtree(&self) -> bool {
+        self.contains(Flags::Subtree)
     }
 
     pub fn is_merge(&self) -> bool {
@@ -357,9 +365,12 @@ impl NodeChange {
     pub fn reverse(&mut self) {
         // Reverse add/delete/copy - other actions are transitive
         if self.action == FileAction::Delete {
-            if self.flags.is_conflict() && self.to.flags.contains(NodeFlags::StagedDelete) {
-                // If the change is a conflict where the "from" state is a deleted node and the "to"
-                // state is staged delete, keep it as delete
+            if self.flags.is_conflict()
+                && self.to.flags.contains(NodeFlags::StagedDelete)
+                && !self.from.mapping.node.is_valid_node_id()
+            {
+                // A conflict the merge staged as a node added and deleted at once, which the from
+                // side never held, reverses to nothing to add.
             } else {
                 self.action = FileAction::Add;
             }

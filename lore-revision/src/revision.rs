@@ -3,6 +3,11 @@
 pub mod amend;
 pub mod bisect;
 pub mod cherry_pick;
+// Public to the tests alone, as `lore_macro::test_pub` makes an item.
+#[cfg(feature = "test-util")]
+pub mod deletions;
+#[cfg(not(feature = "test-util"))]
+mod deletions;
 pub mod diff;
 pub mod history;
 pub mod info;
@@ -56,6 +61,10 @@ use crate::state::StateError;
 use crate::state::TreeWalk;
 use crate::state::gather_tree_paths;
 use crate::util::path::RelativePath;
+use crate::util::path::covered_by_any;
+use crate::util::path::covers_any;
+use crate::util::path::overlaps_any;
+use crate::util::path::sorted_paths;
 
 /// Base metadata for revision
 #[derive(Default)]
@@ -230,11 +239,13 @@ pub(crate) async fn reported_metadata(
 /// Were the blanket exclusion refused, the filter would be empty, and target's
 /// walk would run unscoped and without the repository's view and ignore rules.
 fn filter_from_source_changes(source_changes: &[NodeChange]) -> Filter {
-    let mut filter = Filter::default();
-    if let Err(err) = filter.view.add_exclusion("**") {
-        lore_warn!("Failed to add target filter global exclusion: {err}");
-        return filter;
-    }
+    let mut filter = match Filter::excluding_all_from_view() {
+        Ok(filter) => filter,
+        Err(err) => {
+            lore_warn!("Failed to add target filter global exclusion: {err}");
+            return Filter::default();
+        }
+    };
     for change in source_changes {
         filter.view.add_path_inclusion(change.path());
         if let Some(from_path) = change.move_source() {
@@ -303,9 +314,35 @@ pub async fn diff3(
         None,
         None,
         None,
+        MergesAcross::Unknown,
+        LinkSettlement::Tree,
         tx,
     )
     .await
+}
+
+/// What the search for the base of a 3-way diff proved about merges between its two sides, for
+/// the pass that asks whether a conflicting change was already merged across.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergesAcross {
+    /// Nothing proven: a change of either side may have been merged into the other.
+    Unknown,
+    /// No merge in the diff's repository joins the two sides above the base, so no change either
+    /// made there since the base was merged into the other, and every conflict in it stands. A
+    /// conflict below a link has the linked repository's history, which this proves nothing of.
+    NoneAboveBase,
+}
+
+/// What settles two links a 3-way diff finds both sides put at one path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkSettlement {
+    /// The tree: nothing settles the links' rows, so two links that differ conflict in the tree.
+    Tree,
+    /// The links' rows, which the caller settles, as a branch merge does. Two links to one
+    /// repository put where no link stood give way to the target's in the tree, which leaves a
+    /// difference in pin, branch or flags to the row, and a mount both sides replaced so conflicts
+    /// only where a conflict stands at or below it.
+    Rows,
 }
 
 /// Default in-flight count for the history-walk parallel pass when
@@ -326,8 +363,16 @@ pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 ///   rather than by matching the message. Library callers (filesystem diff,
 ///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
 /// * `history_walk_concurrency` — permit count for the semaphore
-///   gating parallel `is_last_change_merged` history walks. Passing
-///   `None` falls back to `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+///   gating parallel `is_last_change_merged` history walks, and for the
+///   revision comparisons the walks of the history lines for deleted paths
+///   keep in flight between them, each with up to 64 path lookups in
+///   flight. Passing `None` falls back to
+///   `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+/// * `merges` — what the search for `base` proved about merges between
+///   the sides. With [`MergesAcross::NoneAboveBase`] a conflict in
+///   `repository` stands without a history walk.
+/// * `link_settlement` — what settles two links both sides put at one path,
+///   as [`LinkSettlement`] describes.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff3_with_source_cap(
     repository: Arc<RepositoryContext>,
@@ -341,6 +386,8 @@ pub async fn diff3_with_source_cap(
     // Decides which subtrees the view excludes and may be adopted whole.
     // `None` disables adoption.
     graft_view: Option<Arc<crate::filter::Filter>>,
+    merges: MergesAcross,
+    link_settlement: LinkSettlement,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
     let (state_base, state_source, state_target) = join!(
@@ -469,7 +516,9 @@ pub async fn diff3_with_source_cap(
             target_moves,
             renamed_alike,
             target_replacements,
+            mut relinked_alike,
             source_consumed,
+            link_settlement: _,
         } = Box::pin(join_target_walk(
             target_walk,
             &source_changes,
@@ -478,6 +527,7 @@ pub async fn diff3_with_source_cap(
             &mut conflicting_mounts,
             (&state_base, &state_target),
             include_same,
+            link_settlement,
         ))
         .await?;
         for (idx, consumed) in source_consumed.iter().enumerate() {
@@ -514,110 +564,50 @@ pub async fn diff3_with_source_cap(
             push_unique_path(&mut conflicting_mounts, &path);
         }
         joined_changes.append(&mut target_changes);
+        // Both sides move the subtree into one repository, so only a conflict at or below the
+        // mount, or taking its node from there, stands against it, and the links' rows settle the
+        // mount.
+        if !relinked_alike.is_empty() {
+            let conflicted = sorted_paths(joined_conflicts.iter().flat_map(|(source, target)| {
+                [
+                    source.path(),
+                    &source.from.mapping.path,
+                    target.path(),
+                    &target.from.mapping.path,
+                ]
+            }));
+            relinked_alike.retain(|mount| !covers_any(&conflicted, mount.as_str()));
+            let relinked = sorted_paths(relinked_alike.iter());
+            conflicting_mounts.retain(|mount| relinked.binary_search(&mount.as_str()).is_err());
+            joined_changes.retain(|change| !covered_by_any(&relinked, change.path().as_str()));
+        }
         (joined_changes, joined_conflicts)
     };
 
     if !joined_conflicts.is_empty() {
+        let conflicted = sorted_paths(joined_conflicts.iter().map(|(from, _to)| from.path()));
         joined_changes.retain(|item| {
-            if item.from.flags.is_directory() && item.action == FileAction::Delete {
-                for (from, _to) in joined_conflicts.iter() {
-                    if from.path().overlaps(item.path()) {
-                        return false;
-                    }
-                }
-            }
-            true
+            !(is_directory_delete(item) && overlaps_any(&conflicted, item.path().as_str()))
         });
         lore_debug!("Identify resolved conflicts through merges");
     }
 
-    // Producer loop acquires a permit before spawning, so the in-flight
-    // set never exceeds `permits` tasks — each in-flight walk pins an
-    // `Arc<State>` over a deserialised revision blob, and at 10k+
-    // conflicts unbounded fan-out blows past tens of GB of pinned state.
-    //
-    // No abort path: on error we stop spawning and let in-flight tasks
-    // finish naturally. Cancel-safety is not something the surrounding
-    // code is designed to tolerate today (e.g. a task aborted mid-write
-    // to a downstream channel could surface a partial value), so let
-    // them run to completion.
-    let permits = history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY);
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
-    let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
-    let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
-    let mut walk_err: Option<StateError> = None;
-    for (idx, (source_conflict, target_conflict)) in joined_conflicts.iter().enumerate() {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                walk_err = Some(StateError::internal_with_context(
-                    err,
-                    "history-walk semaphore closed",
-                ));
-                break;
-            }
-        };
-        while let Some(joined) = history_walks.try_join_next() {
-            match joined {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
-                Err(join_err) => {
-                    walk_err = walk_err.or(Some(StateError::internal_with_context(
-                        join_err,
-                        "history-walk task failed",
-                    )));
-                }
-            }
-        }
-        if walk_err.is_some() {
-            drop(permit);
-            break;
-        }
-        let source_conflict = source_conflict.clone();
-        let target_conflict = target_conflict.clone();
-        let state_branch_point = state_base.clone();
-        lore_spawn!(history_walks, async move {
-            let _permit = permit;
-            let is_merged_from_target = is_last_change_merged(
-                target_conflict.clone(),
-                target_branch,
-                source_conflict.clone(),
-                source_branch,
-                state_branch_point.clone(),
-            )
-            .await?;
-            let is_merged_from_source = is_last_change_merged(
-                source_conflict,
-                source_branch,
-                target_conflict,
-                target_branch,
-                state_branch_point,
-            )
-            .await?;
-            Ok(HistoryWalkOutcome {
-                index: idx,
-                is_merged_from_source,
-                is_merged_from_target,
-            })
-        });
-    }
-
-    while let Some(joined) = history_walks.join_next().await {
-        match joined {
-            Ok(Ok(outcome)) => outcomes.push(outcome),
-            Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
-            Err(join_err) => {
-                walk_err = walk_err.or(Some(StateError::internal_with_context(
-                    join_err,
-                    "history-walk task failed",
-                )));
-            }
-        }
-    }
-    if let Some(err) = walk_err {
-        return Err(err);
-    }
-    outcomes.sort_unstable_by_key(|o| o.index);
+    // Boxed: a cold path, run once a diff, whose walks would otherwise make every diff's future
+    // as large as theirs.
+    let outcomes = if joined_conflicts.is_empty() {
+        Vec::new()
+    } else {
+        Box::pin(merged_across(
+            &joined_conflicts,
+            repository.id,
+            merges,
+            source_branch,
+            target_branch,
+            state_base.clone(),
+            history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY),
+        ))
+        .await?
+    };
 
     let mut final_conflicts: Vec<(NodeChange, NodeChange)> = Vec::new();
     for outcome in outcomes {
@@ -650,9 +640,31 @@ pub async fn diff3_with_source_cap(
             );
         }
     }
+    // A mount conflict inside a linked repository is not resolvable yet, so there the removal
+    // stands. Boxed: run once a diff, its walks would otherwise make every diff's future as large
+    // as theirs.
+    if !repository.is_link() {
+        for mount in Box::pin(crate::link::removed_links_changed_by_the_other_side(
+            &repository,
+            &state_base,
+            [
+                (&state_source, source_branch),
+                (&state_target, target_branch),
+            ],
+            path.as_ref(),
+        ))
+        .await
+        .forward::<StateError>("Failed to compare the links of the merge")?
+        {
+            push_unique_path(&mut conflicting_mounts, &mount);
+        }
+    }
     for mount in conflicting_mounts.iter() {
         lore_debug!("{mount} was replaced on one side and changed on the other, conflict there");
-        joined_changes.retain(|change| !mount.covers(change.path()));
+        joined_changes.retain(|change| {
+            !mount.covers(change.path())
+                && !(is_directory_delete(change) && change.path().covers(mount))
+        });
         final_conflicts.retain(|(source_conflict, target_conflict)| {
             !mount.covers(source_conflict.path()) && !mount.covers(target_conflict.path())
         });
@@ -698,9 +710,169 @@ pub async fn diff3_with_source_cap(
     Ok(summary)
 }
 
+/// Whether the change of each side in each of `conflicts` was already merged into the other side,
+/// as [`is_last_change_merged`] answers, in the order of `conflicts`.
+///
+/// Where `merges` proves that no merge in `repository` joins the sides above `state_base`, a
+/// conflict whose every side is in `repository` stands without a walk. For the rest, the paths a
+/// side deleted are first found on its history line, in one walk of the line for all of them
+/// ([`deletions::Deletions::walk`]), down to `state_base`. Then up to `permits` conflicts are
+/// checked at once.
+#[allow(clippy::too_many_arguments)]
+async fn merged_across(
+    joined_conflicts: &[(NodeChange, NodeChange)],
+    repository: RepositoryId,
+    merges: MergesAcross,
+    source_branch: BranchId,
+    target_branch: BranchId,
+    state_base: Arc<State>,
+    permits: usize,
+) -> Result<Vec<HistoryWalkOutcome>, StateError> {
+    let stands =
+        |conflict: &(NodeChange, NodeChange)| stands_unwalked(conflict, repository, merges);
+    let standing = joined_conflicts
+        .iter()
+        .filter(|conflict| stands(conflict))
+        .count();
+    if standing > 0 {
+        lore_debug!(
+            "No merge joins the two sides above the base, so {standing} of {} conflicts stand",
+            joined_conflicts.len()
+        );
+    }
+    let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
+    let deletions = Arc::new(
+        deletions::Deletions::walk(
+            joined_conflicts.iter().filter(|conflict| !stands(conflict)),
+            repository,
+            state_base.revision_number(),
+            permits,
+        )
+        .await?,
+    );
+
+    // Producer loop acquires a permit before spawning, so the in-flight
+    // set never exceeds `permits` tasks — each in-flight walk pins an
+    // `Arc<State>` over a deserialised revision blob, and at 10k+
+    // conflicts unbounded fan-out blows past tens of GB of pinned state.
+    //
+    // No abort path: on error we stop spawning and let in-flight tasks
+    // finish naturally. Cancel-safety is not something the surrounding
+    // code is designed to tolerate today (e.g. a task aborted mid-write
+    // to a downstream channel could surface a partial value), so let
+    // them run to completion.
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
+    let mut walk_err: Option<StateError> = None;
+    for (idx, conflict) in joined_conflicts.iter().enumerate() {
+        if stands(conflict) {
+            outcomes.push(HistoryWalkOutcome {
+                index: idx,
+                is_merged_from_source: false,
+                is_merged_from_target: false,
+            });
+            continue;
+        }
+        let (source_conflict, target_conflict) = conflict;
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                walk_err = Some(StateError::internal_with_context(
+                    err,
+                    "history-walk semaphore closed",
+                ));
+                break;
+            }
+        };
+        while let Some(joined) = history_walks.try_join_next() {
+            match joined {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+                Err(join_err) => {
+                    walk_err = walk_err.or(Some(StateError::internal_with_context(
+                        join_err,
+                        "history-walk task failed",
+                    )));
+                }
+            }
+        }
+        if walk_err.is_some() {
+            drop(permit);
+            break;
+        }
+        let source_conflict = source_conflict.clone();
+        let target_conflict = target_conflict.clone();
+        let state_branch_point = state_base.clone();
+        let deletions = deletions.clone();
+        lore_spawn!(history_walks, async move {
+            let _permit = permit;
+            let is_merged_from_target = is_last_change_merged(
+                target_conflict.clone(),
+                target_branch,
+                source_conflict.clone(),
+                source_branch,
+                state_branch_point.clone(),
+                &deletions,
+            )
+            .await?;
+            let is_merged_from_source = is_last_change_merged(
+                source_conflict,
+                source_branch,
+                target_conflict,
+                target_branch,
+                state_branch_point,
+                &deletions,
+            )
+            .await?;
+            Ok(HistoryWalkOutcome {
+                index: idx,
+                is_merged_from_source,
+                is_merged_from_target,
+            })
+        });
+    }
+
+    while let Some(joined) = history_walks.join_next().await {
+        match joined {
+            Ok(Ok(outcome)) => outcomes.push(outcome),
+            Ok(Err(err)) => walk_err = walk_err.or(Some(err)),
+            Err(join_err) => {
+                walk_err = walk_err.or(Some(StateError::internal_with_context(
+                    join_err,
+                    "history-walk task failed",
+                )));
+            }
+        }
+    }
+    if let Some(err) = walk_err {
+        return Err(err);
+    }
+    outcomes.sort_unstable_by_key(|o| o.index);
+    Ok(outcomes)
+}
+
+/// Whether `conflict` stands without a walk of its history: where `merges` proves that no merge in
+/// `repository` joins the sides above the base, and every side of the conflict is in `repository`.
+/// A conflict below a link has the linked repository's history, which the proof says nothing of.
+#[lore_macro::test_pub]
+fn stands_unwalked(
+    (source, target): &(NodeChange, NodeChange),
+    repository: RepositoryId,
+    merges: MergesAcross,
+) -> bool {
+    merges == MergesAcross::NoneAboveBase
+        && [&source.from, &source.to, &target.from, &target.to]
+            .iter()
+            .all(|side| side.mapping.repository.id == repository)
+}
+
 #[lore_macro::test_pub]
 fn is_below(mount: &RelativePath, path: &RelativePath) -> bool {
     mount.covers(path) && mount != path
+}
+
+fn is_directory_delete(change: &NodeChange) -> bool {
+    change.action == FileAction::Delete && change.from.flags.is_directory()
 }
 
 #[lore_macro::test_pub]
@@ -763,7 +935,7 @@ fn conflicting_replacements(
             {
                 continue;
             }
-            if covers_any(&conflicted, path) || covers_any(&changed, path) {
+            if covers_any(&conflicted, path.as_str()) || covers_any(&changed, path.as_str()) {
                 push_unique_path(&mut paths, path);
             }
         }
@@ -797,24 +969,6 @@ fn sorted_replacements(mut replacements: Vec<Replacement>) -> Vec<Replacement> {
     replacements
 }
 
-fn sorted_paths<'a>(paths: impl Iterator<Item = &'a RelativePath>) -> Vec<&'a str> {
-    let mut sorted: Vec<&str> = paths.map(RelativePath::as_str).collect();
-    sorted.sort_unstable();
-    sorted
-}
-
-/// Whether `sorted` holds `path` or a path below it.
-fn covers_any(sorted: &[&str], path: &RelativePath) -> bool {
-    if sorted.binary_search(&path.as_str()).is_ok() {
-        return true;
-    }
-    let prefix = format!("{path}/");
-    let first = sorted.partition_point(|candidate| *candidate < prefix.as_str());
-    sorted
-        .get(first)
-        .is_some_and(|candidate| candidate.starts_with(&prefix))
-}
-
 async fn replacement_conflict(
     repository: &Arc<RepositoryContext>,
     state_base: &Arc<State>,
@@ -834,7 +988,7 @@ async fn replacement_conflict(
 /// The node `state` holds at `path`, which is the link node itself where the path ends at a mount
 /// rather than anything the linked repository holds. A side that holds nothing there is the side
 /// that deleted the path.
-async fn mount_node_change_state(
+pub(crate) async fn mount_node_change_state(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
     path: &RelativePath,
@@ -878,7 +1032,8 @@ fn mount_conflict_change(from: change::NodeChangeState, to: change::NodeChangeSt
 /// the file where the other tree holds the node with its ID, a file of the same identity; the move
 /// pairs with the source's changes once. Where the source changed both ends of the move, the delete
 /// joins where the file stood, as with no move. Records the target's mounts, and the source's
-/// mounts the target changed below, in `target_mounts` and `conflicting_mounts`.
+/// mounts the target changed below, in `target_mounts` and `conflicting_mounts`, and settles two
+/// links as `link_settlement` asks.
 #[allow(clippy::too_many_arguments)]
 #[lore_macro::test_pub]
 async fn join_target_walk<Summary: Default + Send + 'static>(
@@ -889,10 +1044,11 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
     conflicting_mounts: &mut Vec<RelativePath>,
     (state_base, state_target): (&Arc<State>, &Arc<State>),
     include_same: bool,
+    link_settlement: LinkSettlement,
 ) -> Result<Joined, StateError> {
     let source_moves = relocated_indices(source_changes, |_| true);
 
-    let mut joined = Joined::new(source_changes.len());
+    let mut joined = Joined::new(source_changes.len(), link_settlement);
     loop {
         let (target_change, at) = {
             let Some(target_change) = target_walk.next().await else {
@@ -902,6 +1058,11 @@ async fn join_target_walk<Summary: Default + Send + 'static>(
                 continue;
             }
             if change::is_link_replacement(&target_change) {
+                if link_settlement == LinkSettlement::Rows
+                    && links_alike(source_changes, &target_change)
+                {
+                    joined.relinked_alike.push(target_change.path().clone());
+                }
                 push_unique_path(target_mounts, target_change.path());
             }
             if let Some(to_type) = change::file_directory_replacement(&target_change) {
@@ -1102,6 +1263,22 @@ fn won_mounts(
         }
     }
     won
+}
+
+/// Whether `target_change` puts a link where the source's change at its path puts a link to the
+/// same repository, as [`puts_links_alike`] says.
+fn links_alike(source_changes: &[NodeChange], target_change: &NodeChange) -> bool {
+    index_at(source_changes, target_change.path().as_str())
+        .is_ok_and(|index| puts_links_alike(&source_changes[index], target_change))
+}
+
+/// Whether `source` and `target` each put a link to one repository where no link stood.
+fn puts_links_alike(source: &NodeChange, target: &NodeChange) -> bool {
+    source.to.is_link()
+        && target.to.is_link()
+        && source.to.address.context == target.to.address.context
+        && !source.from.is_link()
+        && !target.from.is_link()
 }
 
 /// Whether `path` stands below one of `mounts`.
@@ -1652,13 +1829,18 @@ struct Joined {
     /// The target's replacements of a file with a directory and of a directory with a file, once
     /// for each change that walks one.
     target_replacements: Vec<Replacement>,
+    /// The mounts both sides replaced with a link to one repository, where the links' rows settle
+    /// them, once for each change that walks one.
+    relinked_alike: Vec<RelativePath>,
     /// Whether a target change stood with each source change.
     source_consumed: Vec<bool>,
+    /// What settles two links both sides put at one path.
+    link_settlement: LinkSettlement,
 }
 
 impl Joined {
     #[lore_macro::test_pub]
-    fn new(source_count: usize) -> Self {
+    fn new(source_count: usize, link_settlement: LinkSettlement) -> Self {
         Joined {
             changes: Vec::new(),
             conflicts: Vec::new(),
@@ -1666,14 +1848,17 @@ impl Joined {
             target_moves: Vec::new(),
             renamed_alike: Vec::new(),
             target_replacements: Vec::new(),
+            relinked_alike: Vec::new(),
             source_consumed: vec![false; source_count],
+            link_settlement,
         }
     }
 
     /// Joins `target_change` with the source's change at `at`, its index among `source_changes`
     /// by path. The same move on both sides conflicts only where both edit the file, and is kept
-    /// in [`Self::renamed_alike`] where it renames a directory only in case. Any other pair
-    /// settles as [`settle_at_path`] settles it.
+    /// in [`Self::renamed_alike`] where it renames a directory only in case. Where the links' rows
+    /// settle them, two links to one repository put where no link stood give way to the
+    /// target's. Any other pair settles as [`settle_at_path`] settles it.
     #[lore_macro::test_pub]
     async fn join(
         &mut self,
@@ -1703,6 +1888,10 @@ impl Joined {
             if renames_directory(&target_change) {
                 self.renamed_alike.push(target_change);
             }
+        } else if self.link_settlement == LinkSettlement::Rows
+            && puts_links_alike(source_change, &target_change)
+        {
+            // The link's row settles what differs between the two.
         } else {
             match settle_at_path(source_change, &target_change, include_same).await? {
                 AtPath::Conflict => {
@@ -2321,13 +2510,15 @@ async fn is_last_change_merged(
     target_conflict: NodeChange,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<bool, StateError> {
     lore_debug!(
         "{} find last modified source revision",
         source_conflict.path().as_str()
     );
     let (last_source_modified_revision, last_source_modified_revision_number) =
-        find_last_modified_revision(&source_conflict, state_branch_point.clone()).await?;
+        find_last_modified_revision(&source_conflict, state_branch_point.clone(), deletions)
+            .await?;
     lore_debug!(
         "{} last modified source {} revision {} -> {}",
         source_conflict.path().as_str(),
@@ -2348,6 +2539,7 @@ async fn is_last_change_merged(
             source_branch,
             target_branch,
             state_branch_point.clone(),
+            deletions,
         )
         .await?
     {
@@ -2386,48 +2578,33 @@ async fn is_last_change_merged(
     }
 }
 
+/// The revision of the side of `change` that last modified its file, and its number.
+///
+/// A file the side deleted was last modified by the revision that deleted it, found on the side's
+/// history line ([`deletions::Deletions::last_held`]) down to `state_branch_point`. Where the line
+/// holds the file in no revision from there up, the branch point answers.
 async fn find_last_modified_revision(
     change: &NodeChange,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<(Hash, u64), StateError> {
     if !change.to.mapping.node.is_valid_node_id() {
-        // File was deleted from the target state, need to walk history to find it
-        // TODO(mjansson): Figure out a better way to store this metadata around file deletions
-        lore_debug!("Find last modified revision without to state, iterate revisions");
-
-        let repository = change.from.mapping.repository.clone();
-        let mut state_current = change.to.mapping.state.clone();
-        let mut state_parent = state_current.clone();
-        while state_current.revision_number() >= state_branch_point.revision_number() {
-            if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path().as_str())
-                .await
-            {
-                // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
-                lore_debug!(
-                    "Found {} existing in revision {} - {}",
-                    change.path().as_str(),
-                    state_current.revision(),
-                    state_current.revision_number()
-                );
-                if node_link.is_valid() {
-                    lore_debug!(
-                        "Last modified {} in parent revision {} - {}",
-                        change.path().as_str(),
-                        state_parent.revision(),
-                        state_parent.revision_number()
-                    );
-                    return Ok((state_parent.revision(), state_parent.revision_number()));
-                }
-            }
-
-            let parent_revision = state_current.parent_self();
-            if parent_revision.is_zero() {
-                break;
-            }
-
-            state_parent = state_current.clone();
-            state_current = State::deserialize(repository.clone(), parent_revision).await?;
+        let bound = state_branch_point.revision_number();
+        let last_held = deletions.last_held(
+            &change.to.mapping.repository,
+            &change.to.mapping.state,
+            change.path().as_str(),
+        )?;
+        if let Some(last_held) = last_held
+            && last_held.held_number >= bound
+        {
+            lore_debug!(
+                "Last modified {} in revision {} - {}, which deleted it",
+                change.path().as_str(),
+                last_held.removed_in,
+                last_held.removed_in_number
+            );
+            return Ok((last_held.removed_in, last_held.removed_in_number));
         }
 
         lore_debug!(
@@ -2451,7 +2628,7 @@ async fn find_last_modified_revision(
     let mut last_modified_revision_number = state.revision_number();
 
     // Check if node was modified in the LATEST revision
-    if let Ok(Some(_node_delta)) = state.node_delta(repository.clone(), node_id).await {
+    if let Ok(Some(_node_delta)) = state.node_change(repository.clone(), node_id).await {
         lore_debug!(
             "{} found last modified revision {} -> {} (HEAD)",
             change.path().as_str(),
@@ -2505,65 +2682,44 @@ async fn find_last_modified_revision(
 /// Each step reads the earlier revision's history at the node ID the history records for the file
 /// there, as a revision need not number the file as its first parent does. The walk ends at a
 /// revision that [adds the file without a merge](added_without_merge), the start revision included.
+///
+/// A file the target side deleted is found on its history line through `deletions`: the walk
+/// starts at the revision that deleted it, at the node the file had before. There is no merged
+/// revision where the line holds the file in no revision down to the branch point.
 #[lore_macro::test_pub]
 async fn find_last_merged_revision(
     change: &NodeChange,
     source_branch: BranchId,
     target_branch: BranchId,
     state_branch_point: Arc<State>,
+    deletions: &deletions::Deletions,
 ) -> Result<Option<(Hash, u64)>, StateError> {
     let (state_start, mut node_current) = if change.to.mapping.node.is_valid_node_id() {
         (change.to.mapping.state.clone(), change.to.mapping.node)
     } else {
-        // TODO(mjansson): Figure out a better way to store this metadata around file deletions
-        lore_debug!("Find last merged revision without to state, iterate revisions");
-
         let repository = change.to.mapping.repository.clone();
-        let mut state_current = change.to.mapping.state.clone();
-        let mut state_parent = state_current.clone();
-        loop {
-            if let Ok(node_link) = state_current
-                .find_node_link(repository.clone(), change.path().as_str())
-                .await
-            {
-                lore_debug!(
-                    "Found {} existing in revision {} - {} for last merged",
-                    change.path().as_str(),
-                    state_current.revision(),
-                    state_current.revision_number()
-                );
-
-                // If the node was existing in the current state, it means it was deleted in the previous (parent) revision
-                if node_link.is_valid() {
-                    lore_debug!(
-                        "Using {} parent revision {} - {} as last merged start revision",
-                        change.path().as_str(),
-                        state_parent.revision(),
-                        state_parent.revision_number()
-                    );
-                    break (state_parent, node_link.node);
-                }
-            }
-
-            if state_current.revision_number() <= state_branch_point.revision_number() {
-                lore_debug!(
-                    "Did not find node {} last modified, no merged revision",
-                    change.path().as_str()
-                );
-                return Ok(None);
-            }
-
+        let Some(last_held) = deletions.last_held(
+            &repository,
+            &change.to.mapping.state,
+            change.path().as_str(),
+        )?
+        else {
             lore_debug!(
-                "Node {} not present in revision {} - {} for last merged start, move to parent",
-                change.path().as_str(),
-                state_current.revision(),
-                state_current.revision_number()
+                "Did not find node {} last modified, no merged revision",
+                change.path().as_str()
             );
-
-            state_parent = state_current.clone();
-            state_current =
-                State::deserialize(repository.clone(), state_current.parent_self()).await?;
-        }
+            return Ok(None);
+        };
+        lore_debug!(
+            "Using {} deleting revision {} - {} as last merged start revision",
+            change.path().as_str(),
+            last_held.removed_in,
+            last_held.removed_in_number
+        );
+        (
+            State::deserialize(repository, last_held.removed_in).await?,
+            last_held.node,
+        )
     };
 
     // Now walk the history for the file from the target branch LATEST revision and
@@ -2571,9 +2727,15 @@ async fn find_last_merged_revision(
     // is later than the last modified revision we identified from the source branch file history
     let repository = change.to.mapping.repository.clone();
     if node_current.is_valid_node_id()
-        && let Some(delta) = state_start
-            .node_delta(repository.clone(), node_current)
-            .await?
+        && let Some(delta) = if change.to.mapping.node.is_valid_node_id() {
+            state_start
+                .node_change(repository.clone(), node_current)
+                .await?
+        } else {
+            state_start
+                .node_deletion(repository.clone(), node_current)
+                .await?
+        }
         && added_without_merge(delta.action, delta.flags)
     {
         return Ok(None);
@@ -2702,7 +2864,6 @@ pub async fn tree(
     revision: Hash,
     path: RelativePath,
     max_depth: usize,
-    can_read: crate::state::CanReadRepository,
     include_last_revision: bool,
 ) -> Result<TreeWalk, StateError> {
     lore_debug!(
@@ -2712,15 +2873,7 @@ pub async fn tree(
         path.as_str()
     );
     let state = State::deserialize(repository.clone(), revision).await?;
-    gather_tree_paths(
-        state,
-        repository,
-        path,
-        max_depth,
-        can_read,
-        include_last_revision,
-    )
-    .await
+    gather_tree_paths(state, repository, path, max_depth, include_last_revision).await
 }
 
 /// What a revision specifier names on a branch.
@@ -2855,7 +3008,7 @@ async fn resolved_branch(
         StateError::is_slow_down,
         "reading the branch a revision records",
     )?
-    .unwrap_or_else(|| named.map(|(branch, _)| branch).unwrap_or_default()))
+    .unwrap_or_else(|| named.map_or_default(|(branch, _)| branch)))
 }
 
 /// True when `signature` is a complete revision hash signature.
@@ -3072,7 +3225,7 @@ async fn branch_latest(
 /// The remote answers from its revision list where it can, since that costs one
 /// request against a walk of every revision in between. The number the list
 /// labels an item with picks it, and the item's state, which its signature fixes,
-/// confirms it, as [`find::verified_number`] reads it. Where no item is picked or
+/// confirms it, as [`find::verified_line_step`] reads it. Where no item is picked or
 /// confirmed, whichever latest the list did not answer from anchors that walk.
 ///
 /// Numbering starts at one, so zero names no revision and is refused before any
@@ -3127,7 +3280,7 @@ async fn resolve_revision_number(
             .items
             .iter()
             .find(|item| item.number == revision_number)
-            && find::verified_number(item) == Some(revision_number)
+            && find::verified_line_step(item).is_some_and(|(number, _)| number == revision_number)
         {
             revision = item.signature;
             lore_debug!("response revision {}", revision);

@@ -100,6 +100,18 @@ pub async fn handler(
         ));
     }
     let address = Address::from(req.address.unwrap_or_default());
+    // After admission (R-BLOCK-2) and before the governed prepare: an internal
+    // admission writes its receipt in `complete_governed`, so a refused or
+    // failed check here leaves none.
+    if !authorizer
+        .permits(&extensions, repository, Action::Obliterate)
+        .await?
+    {
+        warn!(
+            "Attempt to obliterate {address} in repository, but user does not have the correct permissions"
+        );
+        return Err(Status::permission_denied("Permission denied"));
+    }
     let governed = match admitted {
         Some(admitted) => {
             let domain = domain_context
@@ -140,14 +152,6 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            if !authorizer
-                .permits(&extensions, repository, Action::Obliterate)
-                .await
-            {
-                warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
-                return Err(Status::permission_denied("Permission denied"));
-            }
-
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)
                 .hook_point(HookPoint::Obliterate)

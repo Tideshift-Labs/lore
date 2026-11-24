@@ -16,15 +16,18 @@ use crate::connection::SuppliedCredentials;
 use crate::domain_receipt::DomainAttemptReceipt;
 use crate::domain_receipt::DomainReceipt;
 use crate::domain_receipt::DomainReceiptQuery;
+use crate::error::BranchPushError;
 use crate::error::ProtocolError;
 use crate::outcome::AttemptId;
+use crate::quic::client::CongestionAlgorithm;
 use crate::replay::MutableOutcome;
 use crate::types::*;
 
 /// Protocol interface
 #[async_trait]
 pub trait Protocol: Send + Sync {
-    /// Connect to remote storage service
+    /// Connect to remote storage service, pacing what it sends with `congestion_algorithm` where
+    /// the transport has a congestion controller.
     #[allow(clippy::too_many_arguments)]
     async fn storage(
         &self,
@@ -35,6 +38,7 @@ pub trait Protocol: Send + Sync {
         partition: Partition,
         index: usize,
         credentials: &Arc<SuppliedCredentials>,
+        congestion_algorithm: CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
     /// Connect to remote revision service, over gRPC as every protocol reaches it.
@@ -245,6 +249,13 @@ pub trait Storage: Send + Sync {
 
     /// Stop an active session, releasing server-side capacity.
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError>;
+
+    /// The congestion controller the transport connection runs, as the transport reports it, where
+    /// it has one.
+    #[cfg(feature = "test-util")]
+    async fn running_congestion_algorithm(&self) -> Option<CongestionAlgorithm> {
+        None
+    }
 
     /// Get the immutable fragment and payload for address
     async fn get(
@@ -557,16 +568,17 @@ pub trait Revision: Send + Sync {
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError>;
 
-    /// Push a new LATEST pointer for branch. Returns the (new) current LATEST pointer for the branch,
-    /// if this is different from the given LATEST pointer the operation failed due to the
-    /// LATEST pointer having moved.
+    /// Offer `latest` as the latest revision of `branch`, and return the latest the remote holds
+    /// after it. A remote that refuses the offer because its latest has moved on, or because a
+    /// fast-forward merge onto it conflicts, and marks that refusal, fails it with
+    /// `BranchAdvanced`, and one that lacks a fragment the revision names with `AddressNotFound`.
     async fn branch_push(
         &self,
         branch: BranchId,
         latest: Hash,
         force: bool,
         fast_forward_merge: bool,
-    ) -> Result<BranchPushResponse, ProtocolError>;
+    ) -> Result<BranchPushResponse, BranchPushError>;
 
     /// List the live branches, and the archived ones too with `include_deleted`; with `creator`,
     /// only those it created.

@@ -27,6 +27,15 @@ const LOCK_RETRY_MAX: Duration = Duration::from_millis(10);
 /// unbounded, so without this a peer that never releases is indistinguishable from a hang.
 const LOCK_WAIT_WARN: Duration = Duration::from_secs(5);
 
+/// How a lock is held: alone, or beside other shared holders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockMode {
+    Exclusive,
+    Shared,
+}
+
+/// An OS lock on a lock file, held until the guard drops. Two holders contend whenever either
+/// is exclusive, also on two open file descriptions in one process.
 pub struct FSLock {
     file: std::fs::File,
 }
@@ -49,7 +58,14 @@ impl FSLock {
     /// has it, without waiting: `None` while it is held.
     pub fn try_acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<Option<FSLock>> {
         let path = Self::file_lock_path(path.as_ref(), false)?;
-        Self::try_take(Self::open_lock_file(&path)?)
+        Self::try_take(Self::open_lock_file(&path)?, LockMode::Exclusive)
+    }
+
+    /// Takes the lock file [`try_acquire_file_lock`](Self::try_acquire_file_lock) takes, shared
+    /// with other shared holders, without waiting: `None` while an exclusive holder has it.
+    pub fn try_acquire_shared_file_lock(path: impl AsRef<Path>) -> std::io::Result<Option<FSLock>> {
+        let path = Self::file_lock_path(path.as_ref(), false)?;
+        Self::try_take(Self::open_lock_file(&path)?, LockMode::Shared)
     }
 
     /// What the name of the lock file guarding a path appends to the path's name.
@@ -110,36 +126,15 @@ impl FSLock {
         Ok(FSLock { file })
     }
 
-    /// Opens the lock file and takes the OS lock, retrying while another holder has it.
-    ///
-    /// The wait is non-blocking attempts with backoff rather than a blocking lock, so no runtime
-    /// thread is parked on a lock another process holds. Two properties change with that, and
-    /// both are deliberate. Kernel queueing is gone: a blocking lock queues its waiters, while
-    /// pollers race for whichever attempt lands after a release, so a waiter can be starved under
-    /// sustained contention. And the wait stays unbounded, matching the blocking lock callers had
-    /// before, which means a peer that never releases would otherwise look exactly like a hang —
-    /// hence the warning once the wait passes [`LOCK_WAIT_WARN`].
+    /// Opens the lock file and takes the OS lock, retrying as [`LockWait`] paces it while another
+    /// holder has it.
     pub async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
         let file = Self::open_with_retry(path).await?;
-
-        let started = std::time::Instant::now();
-        let mut delay = LOCK_RETRY_START;
-        let mut warned = false;
+        let mut wait = LockWait::new();
         loop {
-            match Self::try_lock(&file) {
+            match Self::try_lock(&file, LockMode::Exclusive) {
                 Ok(()) => return Ok(FSLock { file }),
-                Err(err) if is_lock_contended(&err) => {
-                    if !warned && started.elapsed() >= LOCK_WAIT_WARN {
-                        crate::lore_warn!(
-                            "Still waiting for lock \"{}\" held by another process after {} seconds",
-                            path.display(),
-                            started.elapsed().as_secs()
-                        );
-                        warned = true;
-                    }
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, LOCK_RETRY_MAX);
-                }
+                Err(err) if is_lock_contended(&err) => wait.next(path).await,
                 Err(err) => return Err(err),
             }
         }
@@ -155,12 +150,13 @@ impl FSLock {
     /// [`std::io::Error`] if the lock file cannot be opened, or if the lock cannot be
     /// attempted for a reason other than another holder having it.
     pub async fn try_acquire_exact_path(path: &Path) -> std::io::Result<Option<FSLock>> {
-        Self::try_take(Self::open_with_retry(path).await?)
+        Self::try_take(Self::open_with_retry(path).await?, LockMode::Exclusive)
     }
 
-    /// Takes the OS lock on `file` if no other holder has it: `None` while it is held.
-    fn try_take(file: std::fs::File) -> std::io::Result<Option<FSLock>> {
-        match Self::try_lock(&file) {
+    /// Takes the OS lock on `file` in `mode` if no holder it contends with has it: `None` while
+    /// one does.
+    fn try_take(file: std::fs::File, mode: LockMode) -> std::io::Result<Option<FSLock>> {
+        match Self::try_lock(&file, mode) {
             Ok(()) => Ok(Some(FSLock { file })),
             Err(err) if is_lock_contended(&err) => Ok(None),
             Err(err) => Err(err),
@@ -205,13 +201,17 @@ impl FSLock {
     }
 
     #[cfg(target_family = "windows")]
-    fn try_lock(file: &std::fs::File) -> std::io::Result<()> {
+    fn try_lock(file: &std::fs::File, mode: LockMode) -> std::io::Result<()> {
+        let exclusive = match mode {
+            LockMode::Exclusive => FileSystem::LOCKFILE_EXCLUSIVE_LOCK,
+            LockMode::Shared => 0,
+        };
         // Safety: Calling OS functions
         let ret = unsafe {
             let mut overlapped = std::mem::zeroed();
             FileSystem::LockFileEx(
                 file.as_raw_handle(),
-                FileSystem::LOCKFILE_EXCLUSIVE_LOCK | FileSystem::LOCKFILE_FAIL_IMMEDIATELY,
+                exclusive | FileSystem::LOCKFILE_FAIL_IMMEDIATELY,
                 0,
                 !0,
                 !0,
@@ -226,9 +226,13 @@ impl FSLock {
     }
 
     #[cfg(not(target_family = "windows"))]
-    fn try_lock(file: &std::fs::File) -> std::io::Result<()> {
+    fn try_lock(file: &std::fs::File, mode: LockMode) -> std::io::Result<()> {
+        let operation = match mode {
+            LockMode::Exclusive => libc::LOCK_EX,
+            LockMode::Shared => libc::LOCK_SH,
+        };
         // Safety: Calling OS functions
-        let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        let ret = unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) };
         if ret < 0 {
             Err(std::io::Error::last_os_error())
         } else {
@@ -266,6 +270,60 @@ impl FSLock {
         } else {
             Ok(())
         }
+    }
+}
+
+/// The pace of a wait for a lock another holder has: the caller makes a non-blocking attempt, and
+/// where it finds the lock held, awaits [`Self::next`] before the next.
+///
+/// The wait is non-blocking attempts with backoff rather than a blocking lock, so no runtime
+/// thread is parked on a lock another holder has. Two properties change with that, and both are
+/// deliberate. Kernel queueing is gone: a blocking lock queues its waiters, while pollers race for
+/// whichever attempt lands after a release, so a waiter can be starved under sustained contention.
+/// And the wait stays unbounded, matching a blocking lock, which means a holder that never
+/// releases would otherwise look exactly like a hang — hence the warning once the wait passes
+/// [`LOCK_WAIT_WARN`].
+///
+/// Not an async function taking the attempt, which would grow every future waiting through it by
+/// the attempt and a second copy of its arguments. The delay is in microseconds, to keep the pace
+/// small in a future.
+pub struct LockWait {
+    started: std::time::Instant,
+    delay_micros: u32,
+    warned: bool,
+}
+
+impl LockWait {
+    /// A wait that has made its first attempt.
+    pub fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            delay_micros: LOCK_RETRY_START.as_micros() as u32,
+            warned: false,
+        }
+    }
+
+    /// The sleep before the next attempt at the lock of `path`, which the warning names once the
+    /// wait passes [`LOCK_WAIT_WARN`]. Each delay doubles the one before, up to
+    /// [`LOCK_RETRY_MAX`].
+    pub fn next(&mut self, path: &Path) -> tokio::time::Sleep {
+        if !self.warned && self.started.elapsed() >= LOCK_WAIT_WARN {
+            crate::lore_warn!(
+                "Still waiting for lock \"{}\" after {} seconds",
+                path.display(),
+                self.started.elapsed().as_secs()
+            );
+            self.warned = true;
+        }
+        let sleep = tokio::time::sleep(Duration::from_micros(u64::from(self.delay_micros)));
+        self.delay_micros = (self.delay_micros * 2).min(LOCK_RETRY_MAX.as_micros() as u32);
+        sleep
+    }
+}
+
+impl Default for LockWait {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

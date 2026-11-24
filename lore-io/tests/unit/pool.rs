@@ -66,6 +66,94 @@ async fn work_on_its_own_thread_leaves_the_pool_free() {
     );
 }
 
+/// Work submitted inside `run_file_operations_on_this_thread` has run, on the submitting thread,
+/// by the time `submit` returns, and no pool thread is started for it.
+#[test]
+fn work_submitted_inside_the_call_runs_on_the_submitting_thread() {
+    let pool = SyscallPool::new(2);
+    let caller = std::thread::current().id();
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let task = run_file_operations_on_this_thread(|| {
+        let counted = ran.clone();
+        let task = pool.submit(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            std::thread::current().id()
+        });
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "run at the submission");
+        task
+    });
+
+    let mut task = std::pin::pin!(task);
+    let std::task::Poll::Ready(ran_on) =
+        task.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+    else {
+        panic!("the result is ready without a pool thread");
+    };
+    assert_eq!(ran_on, caller);
+    assert_eq!(pool.stats().threads_high_water, 0, "no pool thread");
+}
+
+/// The thread submits to the pool again once `run_file_operations_on_this_thread` returns, a
+/// nested call leaves the outer one in force, and another thread's submissions go to the pool
+/// meanwhile.
+#[tokio::test]
+async fn the_thread_goes_back_to_the_pool_after_the_call() {
+    let pool = Arc::new(SyscallPool::new(1));
+    let caller = std::thread::current().id();
+    let submitted_by = |pool: &SyscallPool| pool.submit(|| std::thread::current().id());
+
+    let (after_nested, elsewhere) = run_file_operations_on_this_thread(|| {
+        run_file_operations_on_this_thread(|| {});
+        let after_nested = submitted_by(&pool);
+
+        let other_pool = pool.clone();
+        let elsewhere = std::thread::spawn(move || {
+            let submitter = std::thread::current().id();
+            (submitter, submitted_by(&other_pool))
+        });
+        (after_nested, elsewhere.join().expect("the other thread"))
+    });
+    assert_eq!(
+        after_nested.await,
+        caller,
+        "the outer call is still in force"
+    );
+    let (other_submitter, ran_on) = elsewhere;
+    assert_ne!(ran_on.await, other_submitter, "the other thread's work");
+
+    assert_ne!(submitted_by(&pool).await, caller, "back on a pool thread");
+}
+
+/// Work that panics when it runs at its submission leaves `submit` to return, and resumes the
+/// panic on its awaiter, as work on a pool thread does.
+#[test]
+fn panic_at_the_submission_resumes_on_awaiter() {
+    let pool = SyscallPool::new(1);
+    let task = run_file_operations_on_this_thread(|| pool.submit(|| panic!("deliberate")));
+
+    let mut task = std::pin::pin!(task);
+    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+    }));
+    assert!(polled.is_err(), "the awaiter takes the panic");
+}
+
+/// A panic in the call ends it for the thread, which submits to the pool again.
+#[tokio::test]
+async fn a_panic_in_the_call_leaves_the_thread_submitting_to_the_pool() {
+    let pool = SyscallPool::new(1);
+    let panicked =
+        std::panic::catch_unwind(|| run_file_operations_on_this_thread(|| panic!("deliberate")));
+    assert!(panicked.is_err());
+
+    let caller = std::thread::current().id();
+    let ran_on = pool.submit(|| std::thread::current().id()).await;
+    assert_ne!(ran_on, caller, "back on a pool thread");
+}
+
 /// The snapshot is taken under one lock, so a burst cannot be observed with more threads
 /// than the cap allows or with counts that do not add up.
 #[tokio::test(flavor = "multi_thread")]
@@ -468,5 +556,134 @@ fn refused_threads_reserved_together_release_their_slots() {
         pool.inner.state.lock().running,
         0,
         "slots were not released"
+    );
+}
+
+thread_local! {
+    /// Times the thread ran the begin hook and the end hook, and whether the thread is idle: it ran
+    /// the begin hook and no end hook since.
+    static IDLE_BEGINS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IDLE_ENDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static IDLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the thread runs the jobs of [`LOCK_TEST_POOL`], and whether its last begin hook
+    /// found that pool's lock free.
+    static IN_LOCK_TEST_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static BEGIN_FOUND_LOCK_FREE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The pool of the test that the begin hook runs without the pool's lock held.
+static LOCK_TEST_POOL: std::sync::OnceLock<SyscallPool> = std::sync::OnceLock::new();
+
+/// Set by the begin hook on the thread of [`LOCK_TEST_POOL`].
+static LOCK_TEST_BEGUN: AtomicBool = AtomicBool::new(false);
+
+fn record_idle_begin() {
+    IDLE_BEGINS.set(IDLE_BEGINS.get() + 1);
+    IDLE.set(true);
+    if IN_LOCK_TEST_POOL.get() {
+        let pool = LOCK_TEST_POOL.get().expect("the pool of the lock test");
+        BEGIN_FOUND_LOCK_FREE.set(pool.inner.state.try_lock().is_some());
+        LOCK_TEST_BEGUN.store(true, Ordering::Release);
+    }
+}
+
+fn record_idle_end() {
+    IDLE_ENDS.set(IDLE_ENDS.get() + 1);
+    IDLE.set(false);
+}
+
+/// Sets the hooks that record their calls on the thread, once for the tests that read them: the
+/// hooks are set once per process.
+fn set_recording_idle_hooks() {
+    static SET: std::sync::Once = std::sync::Once::new();
+    SET.call_once(|| {
+        assert!(
+            set_idle_hooks(IdleHooks {
+                begin: record_idle_begin,
+                end: record_idle_end,
+            }),
+            "hooks set by another test"
+        );
+    });
+}
+
+/// A pool thread runs the begin hook as it waits for work, and the end hook once it has work,
+/// before the work runs.
+#[tokio::test]
+async fn a_pool_thread_runs_the_idle_hooks_around_its_wait() {
+    set_recording_idle_hooks();
+    let pool = SyscallPool::new(1);
+    let first = pool
+        .submit(|| (std::thread::current().id(), IDLE_BEGINS.get()))
+        .await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while pool.inner.state.lock().idle == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool thread never waited"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let second = pool
+        .submit(|| (std::thread::current().id(), IDLE_BEGINS.get(), IDLE.get()))
+        .await;
+    assert_eq!(first.0, second.0, "one thread ran both");
+    assert!(
+        second.1 > first.1,
+        "the begin hook did not run as it waited"
+    );
+    assert!(!second.2, "the end hook did not run before the work");
+}
+
+/// A pool thread runs the begin hook without the pool's lock held, which every submitter takes.
+#[tokio::test]
+async fn a_pool_thread_runs_the_begin_hook_without_the_pool_lock() {
+    set_recording_idle_hooks();
+    let pool = LOCK_TEST_POOL.get_or_init(|| SyscallPool::new(1));
+    pool.submit(|| IN_LOCK_TEST_POOL.set(true)).await;
+    // Polls a flag the hook sets rather than the pool's state, whose lock the hook would find held.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !LOCK_TEST_BEGUN.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the pool thread never waited"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    assert!(
+        pool.submit(|| BEGIN_FOUND_LOCK_FREE.get()).await,
+        "the begin hook ran with the pool's lock held"
+    );
+}
+
+/// A pool thread that finds work queued as it ends a job takes the work without waiting, and runs
+/// neither hook.
+#[tokio::test]
+async fn a_pool_thread_taking_queued_work_runs_no_idle_hook() {
+    set_recording_idle_hooks();
+    let pool = SyscallPool::new(1);
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let first = pool.submit(move || {
+        released.recv().expect("the release");
+        (
+            std::thread::current().id(),
+            IDLE_BEGINS.get(),
+            IDLE_ENDS.get(),
+        )
+    });
+    let second = pool.submit(|| {
+        (
+            std::thread::current().id(),
+            IDLE_BEGINS.get(),
+            IDLE_ENDS.get(),
+        )
+    });
+    release.send(()).expect("the first job waits");
+    let (first, second) = (first.await, second.await);
+    assert_eq!(first.0, second.0, "one thread ran both");
+    assert_eq!(
+        (second.1, second.2),
+        (first.1, first.2),
+        "the thread ran an idle hook between queued jobs"
     );
 }

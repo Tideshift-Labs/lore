@@ -19,9 +19,19 @@
 //! Unlike `get`, no `GET_HEADER` or `GET_DATA` events are emitted; only the terminal
 //! `GET_ITEM_COMPLETE`.
 //!
-//! Multi-fragment writes go through a temp file at `<path>.loretmp` (or `<path>.<ext>.loretmp`
-//! if `path` already has an extension); the rename to the final target is atomic. A failure
-//! mid-write removes the temp file, so the target is either the finished range or untouched.
+//! Multi-fragment writes go through a temporary file at `<path>.loretmp`, the name of `path` with
+//! `.loretmp` appended; the rename to the final target is atomic, so the target is either the
+//! finished range or untouched. The temporary file is emptied before it is written, and a hole of
+//! the content is left unwritten in it. A write of a range of at least 32 MiB that fails or stops
+//! keeps the temporary file, with its resume record beside it, as the `lore_storage_get_file`
+//! contract describes. A later write of the same content and range to the same path resumes from
+//! it, emptying it only where a hole of the content holds data there or its holes cannot be
+//! checked: a fragment the temporary file holds, checked against its address, is not fetched
+//! again, and a hole is not written. A write of other content or another range of at least 32 MiB
+//! empties it.
+//!
+//! A path takes one get at a time. Items that name the same path, in one call or in concurrent
+//! calls of this function or `lore_storage_get_file_resolved`, are not supported.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -32,6 +42,7 @@ use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreString;
@@ -46,7 +57,6 @@ use crate::interface::LoreGlobalArgs;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::invalid_item;
-use crate::storage::item_detail;
 use crate::storage::offset_past_end;
 use crate::storage::store::StoreInternal;
 
@@ -61,8 +71,8 @@ pub struct LoreStorageGetFileItem {
     pub partition: Partition,
     /// Content address to read; `hash == Hash::default()` truncates `path` to zero bytes
     pub address: Address,
-    /// Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
-    /// stage via `<path>.loretmp` then atomically rename
+    /// Destination path, which takes one get at a time; empty rejects with `INVALID_ARGUMENTS`.
+    /// Multi-fragment writes go through `<path>.loretmp`, renamed into place atomically
     pub path: LoreString,
     /// First content byte to write, counted from the start of the decompressed content.
     /// Past the end of the content rejects with `INVALID_ARGUMENTS`
@@ -70,7 +80,11 @@ pub struct LoreStorageGetFileItem {
     /// Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
     /// requested range starting at its own first byte, and is sized to it
     pub length: u64,
-    /// Cache fetched fragments back to the local store, not just write them to `path`
+    /// Cache fetched fragments in the local store, not just write them to `path`, as they always
+    /// are for a fragment written with `PayloadLocalCachePriority` or one of revision state. A
+    /// fetched fragment that is not cached is still written to the local store as an entry
+    /// without its payload, so a put of the same content uploads nothing. Either is marked stored
+    /// durable
     pub local_cache: u8,
 }
 
@@ -97,12 +111,12 @@ pub struct LoreStorageGetFileArgs {
 }
 
 /// Write one or more content-addressed payloads to filesystem paths.
-pub async fn get_file(
+pub fn get_file(
     globals: LoreGlobalArgs,
     args: LoreStorageGetFileArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, get_file_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, get_file_local)
 }
 
 async fn get_file_local(
@@ -151,7 +165,7 @@ async fn get_file_item(
     LoreEvent::StorageGetItemComplete(LoreStorageGetItemCompleteEventData {
         id: item.id,
         address,
-        error: item_detail(&result),
+        error: LoreErrorDetail::from_result(&result),
     })
     .send();
     result
@@ -182,7 +196,10 @@ async fn resolve_get_file_item(
         return Ok(());
     }
 
-    let mut read_options = effective.read_options(remote_session.is_some());
+    let mut read_options = effective
+        .read_options(remote_session.is_some())
+        .resuming_write()
+        .sparse_writing();
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }

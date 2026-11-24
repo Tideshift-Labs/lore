@@ -7,7 +7,7 @@
 //! the operation is built on sit here with it, reaching the driver for this provider alone.
 
 #[cfg(not(feature = "test-util"))]
-mod clone;
+pub(crate) mod clone;
 #[cfg(feature = "test-util")]
 pub mod clone;
 
@@ -25,8 +25,8 @@ use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
 use lore_io::StatKind;
-use lore_io::clone::CloneStats;
 
+use super::filesystem_provider::CaseLookup;
 use super::filesystem_provider::CloneAnswer;
 use super::filesystem_provider::CloneRun;
 use super::filesystem_provider::DirectoryEntry;
@@ -38,8 +38,10 @@ use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceCloneError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
+use super::filesystem_provider::ListedEntry;
 use super::filesystem_provider::StaticDispatchDirectoryListing;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
+use crate::fs::walk::CloneStats;
 use crate::hash::hash_string;
 use crate::immutable;
 use crate::lore_debug;
@@ -56,14 +58,14 @@ use crate::util::path::RelativePath;
 /// OS-backed filesystem provider.
 #[derive(Debug)]
 pub struct OsFilesystem {
-    filesystem_root: PathBuf,
+    filesystem_root: Arc<Path>,
 }
 
 impl OsFilesystem {
     /// Create a new OS-backed filesystem provider.
     pub fn new(filesystem_root: impl AsRef<Path>) -> Self {
         Self {
-            filesystem_root: filesystem_root.as_ref().to_path_buf(),
+            filesystem_root: Arc::from(filesystem_root.as_ref()),
         }
     }
 
@@ -109,13 +111,13 @@ impl FilesystemProvider for OsFilesystem {
 pub struct OsOperation {
     /// Where the mounted filesystem starts, which every repository in it shares: a link
     /// or layer context inherits its parent's path, so this is not a repository's root.
-    filesystem_root: PathBuf,
+    filesystem_root: Arc<Path>,
 }
 
 impl OsOperation {
     /// Where `path` is on disk, under the root the operation was opened on -- the top-level
     /// repository every link and layer in it shares.
-    fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
+    pub(crate) fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
         path.to_absolute_path(&self.filesystem_root)
             .forward::<FsError>("placing a path below the filesystem root")
     }
@@ -140,16 +142,41 @@ pub struct OsDirectoryListing {
 impl OsDirectoryListing {
     /// The next entry the repository tracks, passing over every entry it holds nothing for.
     pub(crate) async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
+        loop {
+            match self.next_with_untracked().await? {
+                Ok(ListedEntry::Tracked(entry)) => return Some(Ok(entry)),
+                Ok(ListedEntry::Untracked(_)) => {}
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
+
+    /// The next entry whose name could be read, a symbolic link and a special file included. Of
+    /// those, one whose name is not text is passed over, as [`file_list_item`] passes over all of
+    /// them.
+    pub(crate) async fn next_with_untracked(&mut self) -> Option<Result<ListedEntry, FsError>> {
         while let Some(entry) = self.entries.next().await {
+            if let Ok(found) = &entry
+                && (found.is_symlink
+                    || found
+                        .metadata
+                        .as_ref()
+                        .is_some_and(|metadata| metadata.kind == StatKind::Other))
+            {
+                if let Ok(name) = entry_name(found.file_name.clone()) {
+                    return Some(Ok(ListedEntry::Untracked(name)));
+                }
+                continue;
+            }
             match file_list_item(entry)
                 .forward_any::<FsError>("A directory entry names what is not text")
             {
                 Ok(Some(item)) => {
-                    return Some(Ok(DirectoryEntry {
+                    return Some(Ok(ListedEntry::Tracked(DirectoryEntry {
                         name: item.name,
-                        info: FileInfo::from_stat(&item.metadata),
+                        info: item.info,
                         name_hash: item.name_hash,
-                    }));
+                    })));
                 }
                 Ok(None) => {}
                 Err(err) => return Some(Err(err)),
@@ -195,6 +222,44 @@ impl InstanceOperation for OsOperation {
         }
     }
 
+    /// Reads the paths on the blocking pool, [`DIRECTORIES_PER_TASK`] to a task and
+    /// [`DIRECTORY_TASKS_AT_ONCE`] tasks side by side, each through one path buffer
+    /// ([`directories_held_below`]).
+    async fn directories_held(
+        &self,
+        paths: Arc<[RelativePath]>,
+        held: &mut Vec<bool>,
+    ) -> Result<(), FsError> {
+        held.reserve(paths.len());
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut answered: Vec<Option<Vec<bool>>> = Vec::new();
+        let mut starts = (0..paths.len()).step_by(DIRECTORIES_PER_TASK).enumerate();
+        loop {
+            while tasks.len() < DIRECTORY_TASKS_AT_ONCE
+                && let Some((index, start)) = starts.next()
+            {
+                let root = self.filesystem_root.clone();
+                let paths = paths.clone();
+                let end = paths.len().min(start + DIRECTORIES_PER_TASK);
+                lore_base::lore_spawn_blocking!(tasks, move || {
+                    (index, directories_held_below(&root, &paths[start..end]))
+                });
+            }
+            let Some(joined) = tasks.join_next().await else {
+                break;
+            };
+            let (index, read) = joined.internal("Reading whether directories are held")?;
+            if answered.len() <= index {
+                answered.resize_with(index + 1, || None);
+            }
+            answered[index] = Some(read?);
+        }
+        for read in answered.into_iter().flatten() {
+            held.extend(read);
+        }
+        Ok(())
+    }
+
     /// The same lookup as [`file_info`](Self::file_info): the working tree is the only view
     /// this provider has, so a tracked path and an untracked one are read alike.
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
@@ -203,6 +268,16 @@ impl InstanceOperation for OsOperation {
 
     /// A path through a name no node may carry, which the root is refused for, is held in no
     /// spelling.
+    /// [`CaseLookup::OnMiss`] on Linux, whose file systems do not fold case, and
+    /// [`CaseLookup::Listing`] elsewhere.
+    fn case_lookup(&self) -> CaseLookup {
+        if cfg!(target_os = "linux") {
+            CaseLookup::OnMiss
+        } else {
+            CaseLookup::Listing
+        }
+    }
+
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         let Ok(path) = self.absolute(path) else {
             return Some(false);
@@ -210,12 +285,14 @@ impl InstanceOperation for OsOperation {
         lore_io::IoDriver::global().holds_name_exactly(path).await
     }
 
+    /// A path holding no directory, nothing or a file, is not found ([`listing_failure`]).
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let path = self.absolute(path)?;
+        let entries = lore_io::IoDriver::global()
+            .read_dir(self.absolute(path)?)
+            .await
+            .map_err(|error| listing_failure(error, path))?;
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
-            OsDirectoryListing {
-                entries: lore_io::IoDriver::global().read_dir(path).await?,
-            },
+            Box::new(OsDirectoryListing { entries }),
         )))
     }
 
@@ -242,6 +319,7 @@ impl InstanceOperation for OsOperation {
         &self,
         repository: Arc<RepositoryContext>,
         path: &RelativePath,
+        _mtime: u64,
         previous: Address,
         previous_size: u64,
         established: &lore_storage::ContentHashes,
@@ -375,10 +453,45 @@ impl InstanceOperation for OsOperation {
 pub struct FileListItem {
     /// The name of the file/directory (not the full path).
     pub name: String,
-    /// What the name holds: its kind, size, modification time and permission bits.
-    pub metadata: lore_io::Stat,
+    /// What was measured of it: a file with its size, time and mode, or a directory.
+    pub info: FileInfo,
     /// Pre-computed hash of the lowercase name for efficient lookups.
     pub name_hash: u64,
+}
+
+/// The entries of a directory a walk takes one at a time: read from the file system, or held by an
+/// operation that answers for the directory itself.
+pub enum EntryListing {
+    Os(Box<lore_io::DirStream>),
+    Items(std::vec::IntoIter<FileListItem>),
+}
+
+impl EntryListing {
+    /// The next entry: `Ok(None)` for one the walk carries nothing for, and `None` once the
+    /// directory is exhausted. See [`file_list_item`].
+    pub async fn next(&mut self) -> Option<Result<Option<FileListItem>, PathError>> {
+        match self {
+            EntryListing::Os(entries) => entries.next().await.map(file_list_item),
+            EntryListing::Items(items) => items.next().map(|item| Ok(Some(item))),
+        }
+    }
+
+    /// [`Self::next`], skipping each entry read from the file system that `passes_over` says the
+    /// walk passes over unread. An operation's own entries are what it holds, and are all taken.
+    pub async fn next_unless(
+        &mut self,
+        mut passes_over: impl FnMut(&std::io::Result<lore_io::DirEntry>) -> bool,
+    ) -> Option<Result<Option<FileListItem>, PathError>> {
+        match self {
+            EntryListing::Os(entries) => loop {
+                let entry = entries.next().await?;
+                if !passes_over(&entry) {
+                    return Some(file_list_item(entry));
+                }
+            },
+            EntryListing::Items(items) => items.next().map(|item| Ok(Some(item))),
+        }
+    }
 }
 
 /// Result of listing a filesystem path.
@@ -388,7 +501,7 @@ pub enum PathListingResult {
     ///
     /// The listing yields an entry per child, named relative to the directory (just the
     /// filename, not the full path). [`file_list_item`] turns one into a [`FileListItem`].
-    Directory { listing: Box<lore_io::DirStream> },
+    Directory { listing: EntryListing },
 
     /// The path was a regular file.
     ///
@@ -400,6 +513,9 @@ pub enum PathListingResult {
     /// that we don't handle. A link is stat'd through to what it points at, so one naming a file
     /// or a directory answers as that rather than as a kind we hold nothing for.
     NotFound,
+
+    /// The path was a directory that could not be listed, so what it holds is unknown.
+    Unlistable,
 }
 
 impl PathListingResult {
@@ -449,8 +565,8 @@ pub fn file_list_item(
     let name = entry_name(entry.file_name)?;
     let name_hash = hash_string(name.as_str());
     Ok(Some(FileListItem {
+        info: FileInfo::from_stat(&metadata),
         name,
-        metadata,
         name_hash,
     }))
 }
@@ -474,6 +590,7 @@ pub fn entry_name(name: std::ffi::OsString) -> Result<String, PathError> {
 /// # Returns
 /// * `PathListingResult::Directory` - If path is a directory, with a listing of its children
 /// * `PathListingResult::File` - If path is a single file, with its metadata
+/// * `PathListingResult::Unlistable` - If path is a directory that cannot be listed
 /// * `PathListingResult::NotFound` - If path doesn't exist or isn't accessible
 ///
 /// # Path Semantics
@@ -487,7 +604,7 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
 
     if let Ok(listing) = driver.read_dir(path.as_path()).await {
         return Ok(PathListingResult::Directory {
-            listing: Box::new(listing),
+            listing: EntryListing::Os(Box::new(listing)),
         });
     }
 
@@ -495,6 +612,9 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         return Ok(PathListingResult::NotFound);
     };
 
+    if metadata.kind == lore_io::StatKind::Directory {
+        return Ok(PathListingResult::Unlistable);
+    }
     if metadata.kind == lore_io::StatKind::File {
         let file_name = match path.file_name() {
             Some(name) => entry_name(name.to_os_string())?,
@@ -505,7 +625,7 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         Ok(PathListingResult::File {
             item: FileListItem {
                 name: file_name,
-                metadata,
+                info: FileInfo::from_stat(&metadata),
                 name_hash,
             },
         })
@@ -591,7 +711,8 @@ fn rename_unifying<'a>(
 ///
 /// A `to_path` naming the entry `from_path` does, as another spelling of its name does on a file
 /// system that folds case, or one that cannot be told apart from it, is not unified: removing or
-/// emptying it could remove the source. `refused` is answered and both stay as they stand.
+/// emptying it could remove the source. `refused` is answered and both stay as they stand, as it
+/// is for a `to_path` the rename refused as not found, whose directory is missing.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[lore_macro::test_pub]
@@ -609,6 +730,9 @@ fn unify_refused_rename<'a>(
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
+        if to_kind.is_none() && refused.kind() == std::io::ErrorKind::NotFound {
+            return Err(refused);
+        }
 
         if let Some(to_kind) = to_kind
             && (from_kind == StatKind::Directory) != (to_kind == StatKind::Directory)
@@ -660,4 +784,46 @@ fn unify_refused_rename<'a>(
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
     }
+}
+
+/// What a listing of `path` answers for `error`: a path holding no directory, nothing or a file,
+/// is not found.
+fn listing_failure(error: std::io::Error, path: &RelativePath) -> FsError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            lore_base::error::FileNotFound {
+                resource: path.to_string(),
+            }
+            .into()
+        }
+        _ => error.into(),
+    }
+}
+
+/// The paths [`InstanceOperation::directories_held`] reads on one blocking task.
+const DIRECTORIES_PER_TASK: usize = 256;
+
+/// The blocking tasks [`InstanceOperation::directories_held`] runs side by side, so a cold cache
+/// waits on several reads at once.
+const DIRECTORY_TASKS_AT_ONCE: usize = 4;
+
+/// Whether `root` holds a directory at each of `paths`, as [`InstanceOperation::directories_held`]
+/// answers, read with one path buffer: a path a stat is refused permission for holds one, a path
+/// holding nothing or through a file none.
+fn directories_held_below(root: &Path, paths: &[RelativePath]) -> Result<Vec<bool>, FsError> {
+    let mut buffer = PathBuf::new();
+    let mut held = Vec::with_capacity(paths.len());
+    for path in paths {
+        path.place_below(root, &mut buffer)
+            .forward::<FsError>("placing a path below the filesystem root")?;
+        held.push(match lore_io::stat_blocking(&buffer) {
+            Ok(stat) => matches!(stat.kind, StatKind::Directory),
+            Err(error) => match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => false,
+                std::io::ErrorKind::PermissionDenied => true,
+                _ => return Err(error.into()),
+            },
+        });
+    }
+    Ok(held)
 }

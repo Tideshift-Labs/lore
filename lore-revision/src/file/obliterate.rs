@@ -43,6 +43,7 @@ pub struct LoreFileObliterateEventData {
 
 #[error_set]
 pub enum ObliterateError {
+    LinkPinsDiverge,
     InvalidArguments,
     InvalidPath,
     InvalidAddress,
@@ -130,9 +131,10 @@ pub(crate) async fn obliterate_file(
         .flatten()
         .unwrap_or(current_revision);
 
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<ObliterateError>("Failed to deserialize state")?;
+    let state =
+        state::State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+            .await
+            .forward::<ObliterateError>("Failed to deserialize state")?;
 
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
@@ -204,6 +206,15 @@ pub(crate) async fn obliterate_file(
     )
     .await
     .forward::<ObliterateError>("Failed to stage deleted path")?;
+    if state.holds_promoted_moves() {
+        Box::pin(crate::file::stage::stage_promoted_moves_of_call(
+            &repository,
+            &state,
+            None,
+        ))
+        .await
+        .forward::<ObliterateError>("Failed to stage the move of a directory the path is in")?;
+    }
 
     let signature = state
         .serialize(repository.clone(), token)

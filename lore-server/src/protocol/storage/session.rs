@@ -11,6 +11,7 @@ use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
 use lore_revision::lore::RepositoryId;
 use lore_storage::CorrelationHold;
+use tonic::Status;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::Grants;
@@ -112,8 +113,7 @@ pub fn token_expiry_gates(request: &crate::quic::storage_service::ParsedStorageR
 pub fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+        .map_or_default(|elapsed| elapsed.as_secs())
 }
 
 pub struct SessionEntry {
@@ -168,7 +168,12 @@ impl SessionEntry {
     /// command. Same contract as `RepositoryAuthorizer::permits`: answered
     /// from the grants enumerated at session start, asked of the authorizer
     /// when they were not enumerable, with or without a verified token.
-    pub async fn permits(&self, authorizer: &dyn RepositoryAuthorizer, action: Action) -> bool {
+    /// `Err` when the check failed rather than denied.
+    pub async fn permits(
+        &self,
+        authorizer: &dyn RepositoryAuthorizer,
+        action: Action,
+    ) -> Result<bool, Status> {
         let token = self.token.as_deref().map(VerifiedTokenOwned::as_token);
         permits_with(
             authorizer,
@@ -338,7 +343,7 @@ impl SessionMap {
         held: Vec<CorrelationHold>,
     ) -> Result<(u32, String), SessionError> {
         self.active_sessions
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_SESSIONS).then_some(active + 1)
             })
             .map_err(|_err| SessionError::LimitReached)?;

@@ -65,6 +65,7 @@ use lore_postgres::domain::receipts::ReceiptKey;
 use lore_revision::branch;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_storage::hash;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
@@ -2101,6 +2102,7 @@ impl GovernedBranchCreate {
                 uploads.clone(),
                 mutable,
                 repository.id,
+                no_link_traversal(),
             )),
             uploads,
         }))
@@ -3147,8 +3149,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
             settings
                 .lock_store
                 .as_ref()
-                .map(|s| s.mode.as_str())
-                .unwrap_or_default(),
+                .map_or_default(|s| s.mode.as_str()),
         ),
     ] {
         // A store on some other backend is genuinely out of scope for a

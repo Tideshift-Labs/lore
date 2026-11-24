@@ -10,8 +10,8 @@ use lore_base::lore_spawn;
 use lore_base::lore_spawn_blocking;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
-use lore_base::runtime::runtime_flush_guarded;
 use lore_base::test_util::TempDir;
+use lore_base::types::FragmentFlags;
 use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_revision::interface::LoreGlobalArgs;
@@ -25,21 +25,31 @@ use lore_revision::records::Record;
 use lore_revision::records::RecordBatch;
 use lore_revision::records::RecordKey;
 use lore_revision::records::SHARD_RECORDS_MAX;
+use lore_revision::repository::DOT_LORE;
+use lore_revision::repository::RecordsLocation;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryConfig;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::VfsConfig;
 use lore_revision::repository::VfsType;
-use lore_revision::repository::keeps_records_on_disk;
+use lore_revision::repository::get_cached_in_memory_stores;
+use lore_revision::repository::load_and_connect;
+use lore_revision::repository::records_location;
+use lore_revision::repository::repository_release;
 use lore_revision::state;
+use lore_revision::test_util::hold_in_memory_store_misses;
 use lore_revision::util::path::RelativePath;
 use lore_storage::FlushOptions;
+use lore_storage::test_util::fail_packfile_syncs;
+use lore_storage::test_util::packfile_sync_failures_left;
 
 use crate::helper::committed_repository;
 use crate::helper::relative_path;
+use crate::helper::stage_paths;
 use crate::helper::test_execution_with;
 use crate::helper::test_file_write;
+use crate::repository::test_helpers::store_fragment;
 
 /// A key in shard `shard`, told apart from the shard's other keys by `fill`.
 fn key(shard: u8, fill: u8) -> RecordKey {
@@ -84,7 +94,7 @@ async fn in_context(test: impl std::future::Future<Output = ()>) {
 /// Writes back `records`, which must succeed.
 async fn write_back(records: &Arc<InstanceRecords>, token: &RepositoryWriteToken) {
     records
-        .write_back(token, ())
+        .write_back(token, false, ())
         .await
         .expect("write back the records");
 }
@@ -114,6 +124,115 @@ async fn records_written_back_are_read_by_the_next_holder() {
             shard_file(FORMAT_VERSION, &[(key(1, 1), 100)]),
             "the header, then the records sorted by key, with the removed one left out"
         );
+    })
+    .await;
+}
+
+/// Records tell from their directory's listing alone whether it holds a shard: the mark, a
+/// temporary file and a directory that does not exist hold none.
+#[tokio::test]
+async fn records_tell_from_the_listing_whether_the_directory_holds_a_shard() {
+    in_context(async {
+        let dir = TempDir::new("records-listing-");
+        let token = token(&dir).await;
+        let directory = dir.path().join(RECORDS_DIR);
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(!records.has_shard_files().await, "no directory, no shard");
+        drop(records);
+
+        std::fs::create_dir_all(&directory).expect("create the directory");
+        test_file_write(&directory.join(NO_STORE_RECORDS), b"");
+        test_file_write(&directory.join("07.tmp"), b"cut short");
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(
+            !records.has_shard_files().await,
+            "a mark and a temporary file"
+        );
+        records.set(key(7, 1), 700).await;
+        write_back(&records, &token).await;
+        drop(records);
+        assert!(
+            InstanceRecords::open(dir.path())
+                .await
+                .has_shard_files()
+                .await
+        );
+    })
+    .await;
+}
+
+/// A process holds one set of records per directory, whatever path names it, until the last
+/// holder lets it go, so one write-back writes both holders' times.
+#[tokio::test]
+async fn holders_of_one_directory_share_one_set_of_records() {
+    in_context(async {
+        let dir = TempDir::new("records-shared-");
+        let token = token(&dir).await;
+        std::fs::create_dir(dir.path().join("sub")).expect("a directory to name the path through");
+        let first = InstanceRecords::open(dir.path()).await;
+        let second = InstanceRecords::open(&dir.path().join("sub").join("..")).await;
+        assert!(Arc::ptr_eq(&first, &second));
+        first.set(key(3, 1), 300).await;
+        second.set(key(3, 2), 302).await;
+        write_back(&first, &token).await;
+        drop((first, second));
+
+        let reopened = InstanceRecords::open(dir.path()).await;
+        assert_eq!(reopened.lookup(&key(3, 1)).await, Lookup::Recorded(300));
+        assert_eq!(reopened.lookup(&key(3, 2)).await, Lookup::Recorded(302));
+    })
+    .await;
+}
+
+/// Records tell whether a time was set, adopted or removed since they were opened. A lookup is
+/// no change, and records opened again, once let go, start with none.
+#[tokio::test]
+async fn records_tell_whether_they_changed_since_they_were_opened() {
+    in_context(async {
+        let dir = TempDir::new("records-changed-");
+        let token = token(&dir).await;
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
+        assert!(!records.has_changed());
+        records.set(key(5, 1), 500).await;
+        assert!(records.has_changed());
+        write_back(&records, &token).await;
+        assert!(records.has_changed(), "a write-back leaves the change told");
+        drop(records);
+
+        let records = InstanceRecords::open(dir.path()).await;
+        assert!(!records.has_changed());
+        records.remove(&key(5, 1)).await;
+        assert!(records.has_changed(), "a removal is a change");
+    })
+    .await;
+}
+
+/// Records kept in memory hold the times set in them, read no mutable store, and mark no shard to
+/// write back.
+#[tokio::test]
+async fn records_kept_in_memory_mark_no_shard_to_write_back() {
+    in_context(async {
+        let records = InstanceRecords::in_memory();
+        assert!(!records.has_store_records());
+        records.set(key(1, 1), 100).await;
+        records.set(key(1, 2), 200).await;
+        records.remove(&key(1, 2)).await;
+        let mut batch = RecordBatch::with_capacity(1);
+        batch.push(Record::new(key(9, 1), 900));
+        records.set_all(batch).await.expect("set the batch");
+
+        assert_eq!(records.lookup(&key(1, 1)).await, Lookup::Recorded(100));
+        assert!(matches!(
+            records.lookup(&key(1, 2)).await,
+            Lookup::Missing(_)
+        ));
+        assert_eq!(records.lookup(&key(9, 1)).await, Lookup::Recorded(900));
+        assert!(records.has_changed());
+        assert!(!records.is_dirty(), "no shard to write back");
     })
     .await;
 }
@@ -242,6 +361,38 @@ async fn a_shard_that_does_not_parse_is_absent() {
     .await;
 }
 
+/// A replace sets its time only where the key still holds the time expected, none included: a
+/// time set since is kept.
+#[tokio::test]
+async fn a_replace_keeps_a_time_set_since_the_time_expected() {
+    in_context(async {
+        let dir = TempDir::new("records-replace-");
+        let records = InstanceRecords::open(dir.path()).await;
+
+        records.replace(key(6, 1), 0, 100).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(100)
+        ));
+        records.replace(key(6, 1), 50, 200).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(100)
+        ));
+        records.replace(key(6, 1), 100, 300).await;
+        assert!(matches!(
+            records.lookup(&key(6, 1)).await,
+            Lookup::Recorded(300)
+        ));
+        records.replace(key(6, 2), 300, 400).await;
+        assert!(matches!(
+            records.lookup(&key(6, 2)).await,
+            Lookup::Missing(_)
+        ));
+    })
+    .await;
+}
+
 /// A time read from elsewhere after a lookup missed is not adopted once the shard has changed,
 /// since the change may be a newer record of the path, or its removal.
 #[tokio::test]
@@ -275,21 +426,44 @@ async fn a_time_is_not_adopted_over_a_change_since_the_lookup() {
     .await;
 }
 
-/// A time set for a key and not merged yet, which a lookup does not see, wins over a time
-/// adopted after that lookup.
+/// A time set for a key the shard does not hold, and its removal, are seen by a lookup before the
+/// shard merges them, the latest for the key first.
 #[tokio::test]
-async fn a_time_set_wins_over_one_adopted_after_it() {
+async fn a_time_set_for_a_new_key_is_seen_before_the_shard_merges_it() {
     in_context(async {
-        let dir = TempDir::new("records-set-then-adopt-");
+        let dir = TempDir::new("records-set-seen-");
+        let records = InstanceRecords::open(dir.path()).await;
+        records.set(key(5, 1), 200).await;
+        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(200));
+        records.set(key(5, 1), 300).await;
+        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(300));
+        records.remove(&key(5, 1)).await;
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
+    })
+    .await;
+}
+
+/// A removal not merged yet wins over a time adopted after the lookup that missed.
+#[tokio::test]
+async fn a_removal_waiting_to_be_merged_wins_over_a_time_adopted_after_it() {
+    in_context(async {
+        let dir = TempDir::new("records-remove-then-adopt-");
         let token = token(&dir).await;
         let records = InstanceRecords::open(dir.path()).await;
         records.set(key(5, 1), 200).await;
+        records.remove(&key(5, 1)).await;
         let Lookup::Missing(generation) = records.lookup(&key(5, 1)).await else {
-            panic!("a new key is seen once merged");
+            panic!("the removal is seen before the merge");
         };
         records.adopt(key(5, 1), 100, generation).await;
         write_back(&records, &token).await;
-        assert_eq!(records.lookup(&key(5, 1)).await, Lookup::Recorded(200));
+        assert!(matches!(
+            records.lookup(&key(5, 1)).await,
+            Lookup::Missing(_)
+        ));
     })
     .await;
 }
@@ -311,6 +485,32 @@ async fn removing_a_key_not_held_changes_nothing_to_write() {
             !records.is_dirty(),
             "the time read before the removal is not adopted"
         );
+    })
+    .await;
+}
+
+/// A batch of the times the records already hold changes no shard, and leaves nothing to write
+/// back.
+#[tokio::test]
+async fn a_batch_of_the_times_held_changes_nothing_to_write() {
+    in_context(async {
+        let dir = TempDir::new("records-batch-held-");
+        let token = token(&dir).await;
+        let records = InstanceRecords::open(dir.path()).await;
+        let batch = || {
+            let mut batch = RecordBatch::with_capacity(2);
+            batch.push(Record::new(key(3, 1), 100));
+            batch.push(Record::new(key(3, 2), 200));
+            batch
+        };
+        records.set_all(batch()).await.expect("set the records");
+        write_back(&records, &token).await;
+        records
+            .set_all(batch())
+            .await
+            .expect("set the records again");
+        assert!(!records.is_dirty(), "the same times change no shard");
+        assert_eq!(records.lookup(&key(3, 2)).await, Lookup::Recorded(200));
     })
     .await;
 }
@@ -458,7 +658,7 @@ async fn a_failed_shard_write_is_reported_and_tried_again() {
         std::fs::create_dir_all(shard_path(dir.path(), 5).join("blocked"))
             .expect("block the shard");
 
-        assert!(records.write_back(&token, ()).await.is_err());
+        assert!(records.write_back(&token, false, ()).await.is_err());
         assert!(
             records.is_dirty(),
             "the failed shard is still to be written"
@@ -552,14 +752,14 @@ async fn a_shard_write_waits_for_the_last_one_to_land() {
             started,
             release: release_rx,
         };
-        let first = lore_spawn!(Arc::clone(&records).write_shard_file(7, held));
+        let first = lore_spawn!(Arc::clone(&records).write_shard_file(7, false, held));
         lore_spawn_blocking!(move || started_rx.recv())
             .await
             .expect("join the wait")
             .expect("the first write ends");
 
         records.set(key(7, 2), 200).await;
-        let mut second = std::pin::pin!(Arc::clone(&records).write_shard_file(7, ()));
+        let mut second = std::pin::pin!(Arc::clone(&records).write_shard_file(7, false, ()));
         assert!(second.as_mut().now_or_never().is_none());
         assert!(
             records.is_dirty(),
@@ -645,21 +845,30 @@ async fn instance_record(repository: &RepositoryContext, path: &RelativePath) ->
         .await
 }
 
-/// Runs `test` on the multi-thread runtime, under the execution `args` give, against a committed
-/// repository holding `files`, which it is handed with the repository's path.
+/// Runs `test` in a task on the test's own runtime, under the execution `args` give, against a
+/// committed repository holding `files`, which it is handed with the repository's path.
 async fn in_repository_with<F, Fut>(args: LoreGlobalArgs, files: &[&str], test: F)
 where
     F: FnOnce(Arc<RepositoryContext>, PathBuf) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send,
 {
     let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+    in_execution_with(args, async move {
+        let (repository, tempdir) = committed_repository("", &files).await;
+        test(repository, tempdir.to_path_buf()).await;
+        drop(tempdir);
+    })
+    .await;
+}
+
+/// Runs `body` in the execution context of a command given `args`.
+async fn in_execution_with(
+    args: LoreGlobalArgs,
+    body: impl std::future::Future<Output = ()> + Send + 'static,
+) {
     #[allow(clippy::disallowed_methods)]
     runtime()
-        .spawn(LORE_CONTEXT.scope(test_execution_with(args), async move {
-            let (repository, tempdir) = committed_repository("", &files).await;
-            test(repository, tempdir.to_path_buf()).await;
-            drop(tempdir);
-        }))
+        .spawn(LORE_CONTEXT.scope(test_execution_with(args), body))
         .await
         .expect("Test task failed");
 }
@@ -846,7 +1055,8 @@ async fn records_are_written_back_after_the_command() {
 
         repository.try_spawn_post_command_flush(FlushOptions::default());
         drop(repository);
-        runtime_flush_guarded().await;
+        // The flush's task holds a sibling of the instance's token until it ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
 
         let records = InstanceRecords::open(&dot_path).await;
         assert_eq!(records.lookup(&key).await, Lookup::Recorded(5678));
@@ -859,30 +1069,349 @@ async fn records_are_written_back_after_the_command() {
     .await;
 }
 
-/// An in-memory instance keeps its records in the mutable store.
+/// Records a time for `file` in `repository`'s instance, and stores a fragment whose packfile is not
+/// synced, so that a flush that syncs fails once [`fail_packfile_syncs`] has armed it. Returns the
+/// record's key and the instance's dot directory.
+async fn record_with_a_fragment_pending(
+    repository: &Arc<RepositoryContext>,
+    file: &RelativePath,
+) -> (RecordKey, PathBuf) {
+    state::file_modified_time_store(repository.clone(), file, 5678).await;
+    let payload = b"a payload whose sync fails";
+    store_fragment(
+        repository,
+        payload,
+        FragmentFlags::empty(),
+        payload.len() as u64,
+    )
+    .await;
+    let dot_path = repository
+        .dot_dir_path()
+        .expect("a dot directory")
+        .to_path_buf();
+    (
+        state::file_modified_time_record_key(repository.salt(), file),
+        dot_path,
+    )
+}
+
+/// The flush a command ends with writes no records once its store flush has failed: the anchors
+/// on disk still name the revision before the command, which the records do not describe.
 #[tokio::test]
-async fn an_in_memory_instance_keeps_its_records_in_the_store() {
-    let args = LoreGlobalArgs {
+async fn records_are_not_written_back_after_a_failed_store_flush() {
+    in_repository(|repository, path| async move {
+        let file = relative_path("unflushed.file");
+        let (key, dot_path) = record_with_a_fragment_pending(&repository, &file).await;
+
+        fail_packfile_syncs(1);
+        repository.try_spawn_post_command_flush(FlushOptions::SYNC_DATA);
+        drop(repository);
+        // The flush's task holds a sibling of the instance's token until it ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
+        assert_eq!(
+            packfile_sync_failures_left(),
+            0,
+            "the flush ran, and its immutable store's flush failed"
+        );
+
+        let records = InstanceRecords::open(&dot_path).await;
+        assert!(matches!(records.lookup(&key).await, Lookup::Missing(_)));
+    })
+    .await;
+}
+
+/// A flush whose store flush fails returns the error and writes no records.
+#[tokio::test]
+async fn a_failed_store_flush_writes_no_records() {
+    in_repository(|repository, _| async move {
+        let file = relative_path("unflushed.file");
+        let (key, dot_path) = record_with_a_fragment_pending(&repository, &file).await;
+
+        fail_packfile_syncs(1);
+        assert!(
+            repository.flush(FlushOptions::SYNC_DATA).await.is_err(),
+            "the flush returns the store's error"
+        );
+        assert_eq!(
+            packfile_sync_failures_left(),
+            0,
+            "the immutable store's flush failed"
+        );
+        drop(repository);
+
+        let records = InstanceRecords::open(&dot_path).await;
+        assert!(matches!(records.lookup(&key).await, Lookup::Missing(_)));
+    })
+    .await;
+}
+
+/// The arguments of a command over an instance whose stores are in memory.
+fn in_memory_args() -> LoreGlobalArgs {
+    LoreGlobalArgs {
         in_memory: 1,
         ..LoreGlobalArgs::default()
-    };
-    in_repository_with(args, &[], |repository, path| async move {
-        assert!(repository.instance_records().is_none());
+    }
+}
+
+/// An in-memory instance keeps its records in memory beside its stores: a commit, a time recorded
+/// and a batch reach them, and neither its mutable store nor its Lore directory holds any.
+#[tokio::test]
+async fn an_in_memory_instance_keeps_its_records_in_memory() {
+    in_repository_with(in_memory_args(), &[], |repository, path| async move {
+        let committed = relative_path("committed.file");
+        let committed_path = path.join("committed.file");
+        test_file_write(&committed_path, b"committed");
+        std::fs::File::options()
+            .write(true)
+            .open(&committed_path)
+            .and_then(|file| {
+                file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30))
+            })
+            .expect("date the file before any clock the commit reads");
+        stage_paths(&repository, &path, &["committed.file"], true, false).await;
+        assert!(matches!(
+            instance_record(&repository, &committed).await,
+            Lookup::Missing(_)
+        ));
+        lore_revision::commit::commit_boxed(
+            repository.clone(),
+            repository
+                .try_write_token()
+                .expect("the repository is open for writing"),
+            lore_revision::commit::CommitOptions::new("Commit".to_string()),
+        )
+        .await
+        .expect("commit");
+        assert_eq!(
+            instance_record(&repository, &committed).await,
+            Lookup::Recorded((1 << 30) * 1000),
+            "the commit recorded the file's time"
+        );
+
         let file = relative_path("in-memory.file");
         state::file_modified_time_store(repository.clone(), &file, 5678).await;
-        assert_eq!(store_time(&repository, &file).await, 5678);
         assert_eq!(
             state::file_modified_time(repository.clone(), &file).await,
             5678
         );
+        assert_eq!(store_time(&repository, &file).await, 0, "not in the store");
         state::file_modified_time_clear(repository.clone(), &file).await;
-        assert_eq!(store_time(&repository, &file).await, 0);
-        assert!(
-            !path
-                .join(lore_revision::repository::DOT_LORE)
-                .join(RECORDS_DIR)
-                .exists()
+        assert_eq!(
+            state::file_modified_time(repository.clone(), &file).await,
+            0
         );
+
+        let cloned = relative_path("cloned.file");
+        let collected = state::RecordedModifiedTimes::default();
+        collected.push(state::file_modified_time_entry(&repository, &cloned, 6789));
+        collected.store(repository.clone()).await;
+        assert_eq!(
+            instance_record(&repository, &cloned).await,
+            Lookup::Recorded(6789)
+        );
+        assert_eq!(
+            store_time(&repository, &cloned).await,
+            0,
+            "not in the store"
+        );
+
+        repository
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush the instance");
+        assert!(!path.join(DOT_LORE).join(RECORDS_DIR).exists());
+    })
+    .await;
+}
+
+/// Every context over an in-memory instance's stores shares its records, which the process keeps
+/// with the stores until it releases them.
+#[tokio::test]
+async fn contexts_over_an_in_memory_instance_share_its_records() {
+    in_repository_with(in_memory_args(), &[], |repository, path| async move {
+        let file = relative_path("shared.file");
+        state::file_modified_time_store(repository.clone(), &file, 5678).await;
+        let other = load_and_connect(&path, RepositoryAccess::ReadOnly)
+            .await
+            .expect("open the instance again");
+        let records = repository
+            .instance_records()
+            .expect("the instance keeps its records in memory");
+        assert!(Arc::ptr_eq(
+            records,
+            other
+                .instance_records()
+                .expect("the instance keeps its records in memory")
+        ));
+        assert_eq!(state::file_modified_time(other.clone(), &file).await, 5678);
+
+        let records = Arc::downgrade(records);
+        drop((repository, other));
+        assert!(
+            records.upgrade().is_some(),
+            "kept for the instance's next command"
+        );
+        repository_release(&path);
+        assert!(records.upgrade().is_none(), "released with the stores");
+    })
+    .await;
+}
+
+/// Opens of an instance with in-memory stores that both find none of its stores cached share the
+/// stores and records the first of them creates, which the cache keeps.
+#[tokio::test]
+async fn racing_first_opens_of_an_in_memory_instance_share_its_records() {
+    in_repository(|repository, path| async move {
+        drop(repository);
+        let (reached, mut missed) = tokio::sync::mpsc::unbounded_channel();
+        let open_held = |resume: Arc<tokio::sync::Notify>| {
+            let path = path.clone();
+            lore_spawn!(LORE_CONTEXT.scope(
+                test_execution_with(in_memory_args()),
+                hold_in_memory_store_misses(reached.clone(), resume, async move {
+                    load_and_connect(&path, RepositoryAccess::ReadOnly).await
+                }),
+            ))
+        };
+        let (first_resume, second_resume) = (Arc::default(), Arc::default());
+        let first = open_held(Arc::clone(&first_resume));
+        let within = std::time::Duration::from_secs(10);
+        assert!(
+            matches!(
+                tokio::time::timeout(within, missed.recv()).await,
+                Ok(Some(()))
+            ),
+            "the first open finds no stores cached"
+        );
+        let second = open_held(Arc::clone(&second_resume));
+        assert!(
+            matches!(
+                tokio::time::timeout(within, missed.recv()).await,
+                Ok(Some(()))
+            ),
+            "the second open finds no stores cached"
+        );
+
+        first_resume.notify_one();
+        let first = first
+            .await
+            .expect("the first open ran")
+            .expect("open the instance");
+        second_resume.notify_one();
+        let second = second
+            .await
+            .expect("the second open ran")
+            .expect("open the instance");
+        let records = first
+            .instance_records()
+            .expect("the instance keeps its records in memory");
+        assert!(Arc::ptr_eq(
+            records,
+            second
+                .instance_records()
+                .expect("the instance keeps its records in memory")
+        ));
+        let cached =
+            get_cached_in_memory_stores(&path.join(DOT_LORE)).expect("the stores are cached");
+        assert!(Arc::ptr_eq(records, &cached.records));
+        drop((first, second, cached));
+        repository_release(&path);
+    })
+    .await;
+}
+
+/// The context that creates an in-memory instance records in the set cached beside its stores,
+/// which the instance's later commands share.
+#[tokio::test]
+async fn creating_an_in_memory_instance_records_beside_its_stores() {
+    in_execution_with(in_memory_args(), async {
+        let tempdir = crate::helper::generate_tempdir();
+        let path = tempdir.to_path_buf();
+        let token = RepositoryWriteToken::acquire(&path).await;
+        let created = lore_revision::repository::create_local(
+            &path,
+            &token,
+            lore_revision::lore::RepositoryId::from(uuid::Uuid::now_v7()),
+            lore_revision::lore::BranchId::from(uuid::Uuid::now_v7()),
+            lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+            RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("create the instance");
+        let cached = get_cached_in_memory_stores(&path.join(DOT_LORE))
+            .expect("the instance's stores are cached");
+        assert!(Arc::ptr_eq(
+            created
+                .instance_records()
+                .expect("the instance keeps its records in memory"),
+            &cached.records
+        ));
+        drop((created, cached, token));
+        repository_release(&path);
+    })
+    .await;
+}
+
+/// A command over an instance with in-memory stores keeps its records apart from the set in the
+/// instance's Lore directory, where it shares the repository lock a command over the stores on
+/// disk took, and writes none of that lock's records back: its flush does not reach the stores on
+/// disk they describe.
+#[tokio::test]
+async fn an_in_memory_command_keeps_its_records_apart_from_the_lore_directory() {
+    in_repository(|repository, path| async move {
+        let on_disk = load_and_connect(&path, RepositoryAccess::ReadOnly)
+            .await
+            .expect("open the instance");
+        drop(repository);
+        let in_memory = LORE_CONTEXT
+            .scope(
+                test_execution_with(in_memory_args()),
+                load_and_connect(&path, RepositoryAccess::ReadWrite),
+            )
+            .await
+            .expect("open the instance with in-memory stores");
+        let on_disk_records = on_disk
+            .instance_records()
+            .expect("the instance keeps its records on disk");
+        assert!(!Arc::ptr_eq(
+            on_disk_records,
+            in_memory
+                .instance_records()
+                .expect("the command keeps its records in memory")
+        ));
+
+        let file = relative_path("apart.file");
+        state::file_modified_time_store(in_memory.clone(), &file, 5678).await;
+        assert_eq!(
+            state::file_modified_time(in_memory.clone(), &file).await,
+            5678
+        );
+        assert_eq!(state::file_modified_time(on_disk.clone(), &file).await, 0);
+
+        on_disk_records.set(key(4, 1), 400).await;
+        in_memory
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush the in-memory stores");
+        in_memory
+            .write_back_instance_records()
+            .await
+            .expect("write back the records");
+        assert!(
+            on_disk_records.is_dirty(),
+            "left to the commands over the stores on disk"
+        );
+        in_memory.try_spawn_post_command_flush(FlushOptions::default());
+        drop(in_memory);
+        // A flush that writes the records back holds a sibling of the instance's token until it
+        // ends.
+        drop(RepositoryWriteToken::acquire(&path).await);
+        assert!(
+            on_disk_records.is_dirty(),
+            "left to the commands over the stores on disk"
+        );
+        repository_release(&path);
     })
     .await;
 }
@@ -990,10 +1519,11 @@ async fn clearing_removes_the_record_and_zeroes_an_older_instances_store_record(
     .await;
 }
 
-/// Only SWFS and in-memory instances keep their records in the store. Every other instance,
-/// a FUSE mount included, keeps them in its Lore directory.
+/// SWFS instances keep their records in the mutable store, other instances whose stores are in
+/// memory keep them in memory, and every other instance, a FUSE mount included, in its Lore
+/// directory.
 #[test]
-fn only_swfs_and_in_memory_instances_keep_their_records_in_the_store() {
+fn each_instance_keeps_its_records_where_its_kind_and_its_stores_say() {
     for vfs_type in [VfsType::None, VfsType::Fuse, VfsType::Swfs] {
         let config = RepositoryConfig {
             vfs: Some(VfsConfig {
@@ -1002,14 +1532,17 @@ fn only_swfs_and_in_memory_instances_keep_their_records_in_the_store() {
             }),
             ..RepositoryConfig::default()
         };
-        assert_eq!(
-            keeps_records_on_disk(&config, false),
-            vfs_type != VfsType::Swfs,
-            "{vfs_type}"
-        );
-        assert!(
-            !keeps_records_on_disk(&config, true),
-            "{vfs_type} in memory"
-        );
+        for in_memory in [false, true] {
+            let expected = match (vfs_type, in_memory) {
+                (VfsType::Swfs, _) => RecordsLocation::MutableStore,
+                (_, true) => RecordsLocation::Memory,
+                _ => RecordsLocation::DotDirectory,
+            };
+            assert_eq!(
+                records_location(&config, in_memory),
+                expected,
+                "{vfs_type}, in memory: {in_memory}"
+            );
+        }
     }
 }

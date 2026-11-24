@@ -31,6 +31,7 @@ pub(crate) mod net_common {
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
     use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
@@ -168,35 +169,56 @@ pub(crate) mod net_common {
     }
 
     /// Binds a port on the loopback interface and serves gRPC on it as [`spawn_grpc_server`]
-    /// does. Returns the server's `grpc://` URL, and the sender and receiver `spawn_grpc_server`
-    /// returns.
+    /// does. Returns the server's `grpc://` URL, and what stops it.
     pub(crate) fn start_grpc_server(
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-    ) -> (
-        String,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<String>,
-    ) {
+    ) -> (String, TestServerStop) {
+        start_grpc_server_with(
+            backend_immutable,
+            backend_mutable,
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+    }
+
+    /// [`start_grpc_server`] with `authorizer` deciding each request's access.
+    pub(crate) fn start_grpc_server_with(
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> (String, TestServerStop) {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("binds a port to serve on");
         let addr = listener.local_addr().expect("the listener has an address");
-        let (shutdown, stopped) = spawn_grpc_server(listener, backend_immutable, backend_mutable);
-        (format!("grpc://{addr}"), shutdown, stopped)
+        let stop = spawn_grpc_server_with(listener, backend_immutable, backend_mutable, authorizer);
+        (format!("grpc://{addr}"), stop)
     }
 
-    /// Serves gRPC on `listener` until the returned sender is dropped, and reports through the
-    /// returned receiver once the serve task has returned.
+    /// Serves gRPC on `listener` until the returned [`TestServerStop`] stops it or is dropped.
     pub(crate) fn spawn_grpc_server(
         listener: std::net::TcpListener,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
         backend_mutable: Arc<dyn lore_storage::MutableStore>,
-    ) -> (
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<String>,
-    ) {
+    ) -> TestServerStop {
+        spawn_grpc_server_with(
+            listener,
+            backend_immutable,
+            backend_mutable,
+            Arc::new(AllowAllRepositoryAuthorizer),
+        )
+    }
+
+    /// [`spawn_grpc_server`] with `authorizer` deciding each request's access.
+    pub(crate) fn spawn_grpc_server_with(
+        listener: std::net::TcpListener,
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> TestServerStop {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel();
+        let serve_ended = Arc::new(AtomicBool::new(false));
+        let ended = serve_ended.clone();
 
         let notification_sender: Arc<dyn lore_revision::notification::NotificationSender> =
             Arc::new(lore_server::notification::local::NotificationSender::default());
@@ -212,7 +234,7 @@ pub(crate) mod net_common {
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
+                .with_immutable_store(backend_immutable.clone(), backend_immutable, None)
                 .with_mutable_store(backend_mutable)
                 .with_lock_store(None)
                 // CR-029 inserted this step; `None` is the non-Postgres cell path these
@@ -237,7 +259,7 @@ pub(crate) mod net_common {
                 .with_token_verification(
                     lore_server::auth::jwt::TokenVerification::Ignore,
                     false,
-                    Arc::new(AllowAllRepositoryAuthorizer),
+                    authorizer,
                     repository_catalog,
                 )
                 .unwrap()
@@ -245,13 +267,63 @@ pub(crate) mod net_common {
                     shutdown_rx.await.ok();
                 })
                 .await;
-            let _ = stopped_tx.send(match outcome {
-                Ok(()) => "stopped before the test finished".to_string(),
-                Err(error) => format!("failed: {error}"),
-            });
+            ended.store(true, Ordering::Release);
+            let _ = stopped_tx.send(outcome.map_err(|error| format!("{error:#}")));
         });
 
-        (shutdown_tx, stopped_rx)
+        TestServerStop {
+            quic: None,
+            shutdown: Some(shutdown_tx),
+            stopped: Some(stopped_rx),
+            serve_ended,
+        }
+    }
+
+    /// Bound on the wait for a test gRPC server's stop report.
+    const SHUTDOWN_WAIT: Duration = Duration::from_secs(10);
+
+    /// What stops a test server: the QUIC server of a `lore://` server, the sender whose drop
+    /// stops the gRPC server [`spawn_grpc_server`] started, and the receiver of its stop report.
+    /// Dropped, it signals the stop and waits for none of it.
+    pub(crate) struct TestServerStop {
+        quic: Option<lore_server::quic::quinn::QuinnServer>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+        stopped: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+        /// Set by the gRPC serve task once it has returned, and with it dropped its listener,
+        /// before it reports how it stopped.
+        serve_ended: Arc<AtomicBool>,
+    }
+
+    impl TestServerStop {
+        /// Adds `quic`, the QUIC server of a `lore://` server, to what [`Self::stop`] stops.
+        pub(crate) fn with_quic(mut self, quic: lore_server::quic::quinn::QuinnServer) -> Self {
+            self.quic = Some(quic);
+            self
+        }
+
+        /// Whether the gRPC serve task has returned, and with it dropped its listener, so the
+        /// server accepts no connection.
+        pub(crate) fn serve_ended(&self) -> bool {
+            self.serve_ended.load(Ordering::Acquire)
+        }
+
+        /// Closes the QUIC server's endpoints and waits until they are idle, then stops the
+        /// gRPC server and waits for its report of a clean stop, sent once the serve task holding
+        /// the TCP listener has returned. Panics unless the report comes within
+        /// [`SHUTDOWN_WAIT`]. A part already stopped is skipped.
+        pub(crate) async fn stop(&mut self) {
+            if let Some(quic) = self.quic.take() {
+                quic.close().await;
+            }
+            drop(self.shutdown.take());
+            if let Some(stopped) = self.stopped.take() {
+                tokio::time::timeout(SHUTDOWN_WAIT, stopped)
+                    .await
+                    .expect("the gRPC server stops")
+                    .expect("the gRPC server reports how it stopped")
+                    .expect("the gRPC server stops cleanly");
+            }
+        }
     }
 
     /// Whether a test server's immutable store serves a payload under a partition it doesn't hold
@@ -308,14 +380,7 @@ pub(crate) mod net_common {
         globals: LoreGlobalArgs,
         remote_url: Option<&str>,
     ) -> LoreStore {
-        let opened: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-        let sink = opened.clone();
-        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::StorageOpened(data) = event {
-                *sink.lock().unwrap() = Some(data.handle_id);
-            }
-        }));
-        let status = lore::storage::open::open(
+        open_handle_with_args(
             globals,
             LoreStorageOpenArgs {
                 in_memory: 1,
@@ -325,10 +390,25 @@ pub(crate) mod net_common {
                 has_remote_config: u8::from(remote_url.is_some()),
                 ..Default::default()
             },
-            callback,
         )
-        .await;
-        assert_eq!(status, 0, "opening an in-memory store must succeed");
+        .await
+    }
+
+    /// Opens a storage handle with `args`, and `globals` for the open call. Panics unless the open
+    /// succeeds and reports its handle.
+    pub(crate) async fn open_handle_with_args(
+        globals: LoreGlobalArgs,
+        args: LoreStorageOpenArgs,
+    ) -> LoreStore {
+        let opened: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let sink = opened.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StorageOpened(data) = event {
+                *sink.lock().unwrap() = Some(data.handle_id);
+            }
+        }));
+        let status = lore::storage::open::open(globals, args, callback).await;
+        assert_eq!(status, 0, "opening the storage handle must succeed");
         let handle_id = opened.lock().unwrap().expect("STORAGE_OPENED must fire");
         LoreStore { handle_id }
     }
@@ -337,7 +417,10 @@ pub(crate) mod net_common {
     pub(crate) async fn close_handle(handle: LoreStore) {
         let status = lore::storage::close::close(
             LoreGlobalArgs::default(),
-            LoreStorageCloseArgs { handle },
+            LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             None,
         )
         .await;
@@ -378,6 +461,7 @@ pub(crate) mod net_common {
                     },
                     remote_write,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk,
                 }]),
             },
@@ -401,14 +485,15 @@ pub(crate) mod net_common {
     }
 
     /// An immutable store that forwards every method but `get_into` to the store it wraps and
-    /// counts what reaches it: the gets, the puts with and without a payload, and the copies, with
-    /// each copy's source.
+    /// counts what reaches it: the gets, the metadata reads, the puts with and without a payload,
+    /// and the copies, with each copy's source.
     /// One built with [`refusing_copy`](Self::refusing_copy) refuses every copy, as a peer that
     /// won't answer one does. Its `get_into` is the trait's default, which reads through `get`, so
     /// every payload read counts as a get.
     pub(crate) struct CountingStore {
         inner: Arc<dyn ImmutableStore>,
         gets: Arc<AtomicUsize>,
+        metadata_reads: AtomicUsize,
         payload_puts: AtomicUsize,
         empty_puts: AtomicUsize,
         copies: AtomicUsize,
@@ -430,6 +515,7 @@ pub(crate) mod net_common {
             Arc::new(Self {
                 inner,
                 gets: Arc::default(),
+                metadata_reads: AtomicUsize::new(0),
                 payload_puts: AtomicUsize::new(0),
                 empty_puts: AtomicUsize::new(0),
                 copies: AtomicUsize::new(0),
@@ -456,6 +542,11 @@ pub(crate) mod net_common {
             self.gets.clone()
         }
 
+        /// The metadata reads that reached the store since it was built or last reset.
+        pub(crate) fn metadata_reads(&self) -> usize {
+            self.metadata_reads.load(Ordering::SeqCst)
+        }
+
         /// The puts and copies counted since the store was built or last reset.
         pub(crate) fn traffic(&self) -> Traffic {
             Traffic {
@@ -465,9 +556,10 @@ pub(crate) mod net_common {
             }
         }
 
-        /// Zeroes the put and copy counts and clears the recorded copy sources. The get count is
-        /// kept.
+        /// Zeroes the metadata read, put and copy counts and clears the recorded copy sources. The
+        /// get count is kept.
         pub(crate) fn reset(&self) {
+            self.metadata_reads.store(0, Ordering::SeqCst);
             self.payload_puts.store(0, Ordering::SeqCst);
             self.empty_puts.store(0, Ordering::SeqCst);
             self.copies.store(0, Ordering::SeqCst);
@@ -549,6 +641,7 @@ pub(crate) mod net_common {
             partition: Partition,
             address: Address,
         ) -> Result<StoreGetData, StoreError> {
+            self.metadata_reads.fetch_add(1, Ordering::SeqCst);
             self.inner.clone().get_metadata(partition, address).await
         }
 

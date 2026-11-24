@@ -748,8 +748,8 @@ async fn a_command_dropped_mid_write_leaves_its_stream_framed() {
 }
 
 /// A command sent while a stream finishes a dropped frame goes out on another stream rather than
-/// waiting on the held writer. The server reads nothing meanwhile, so it is written only on a
-/// stream other than the dropped frame's.
+/// queueing behind the dropped frame's rest. The server reads nothing meanwhile, so it is written
+/// only on a stream other than the dropped frame's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_finishing_a_dropped_frame_is_passed_over() {
     use bytes::Bytes;
@@ -810,6 +810,132 @@ async fn a_command_after_a_reset_frame_is_answered_over_a_new_connection() {
     .expect("the command after the reset stream was never answered");
     assert!(answered.is_ok(), "{answered:?}");
     assert_eq!(server.accepted_connections(), 2);
+}
+
+/// Many commands queued at once on each stream, each frame larger than the stream takes in one
+/// write, are each written whole and one after another: every command is answered, over the one
+/// connection, and no stream's reader meets an answer it does not expect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn many_commands_queued_on_each_stream_are_all_answered() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    use crate::quic::storage_service::test_server::wait_until;
+
+    const COMMANDS: usize = 300;
+    let (server, _client, quic) = served_connection().await;
+    let writers = quic.hold_writers().await.expect("open every stream");
+    let commands: Vec<_> = (0..COMMANDS)
+        .map(|index| {
+            let quic = quic.clone();
+            lore_base::lore_spawn!(async move {
+                let mut chunks = [
+                    Bytes::new(),
+                    Bytes::from(vec![index as u8; 1000 + index]),
+                    Bytes::from_static(b"tail"),
+                ];
+                send_normal(quic, Command::Put as u8, 0, true, &mut chunks).await
+            })
+        })
+        .collect();
+    wait_until(
+        || quic.stream_inflight().iter().sum::<u64>() == COMMANDS as u64,
+        "the commands were never all queued",
+    )
+    .await;
+    let inflight = quic.stream_inflight();
+    assert!(
+        inflight[PRIORITY_STREAM_COUNT as usize..]
+            .iter()
+            .all(|&count| count > 1),
+        "a stream holds at most one command: {inflight:?}"
+    );
+    drop(writers);
+
+    for command in commands {
+        let answered = tokio::time::timeout(Duration::from_secs(10), command)
+            .await
+            .expect("a command was never answered")
+            .expect("the command's task");
+        assert!(answered.is_ok(), "{answered:?}");
+    }
+    assert_eq!(quic.pending_commands().await, 0);
+    assert_eq!(quic.streams_ended(), 0);
+    assert_eq!(server.accepted_connections(), 1);
+}
+
+/// A frame of more chunks than a queued frame holds reaches the server whole, its chunks one after
+/// another.
+///
+/// FORK-LOCAL (Tideshift, D-QS2): the fork writes the frame itself and has no queued-frame chunk
+/// limit, so the test uses upstream's limit (6) as a literal; the property still holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_frame_of_more_chunks_than_a_queued_frame_holds_arrives_whole() {
+    use bytes::Bytes;
+
+    use crate::quic::storage_service::test_server::ECHO;
+
+    const FRAME_CHUNKS: usize = 6;
+    let (_server, _client, quic) = served_connection().await;
+    let mut chunks: Vec<Bytes> = std::iter::once(Bytes::new())
+        .chain((0..FRAME_CHUNKS + 2).map(|index| Bytes::from(vec![index as u8; 100 + index])))
+        .collect();
+    let payload: Vec<u8> = chunks[1..].iter().flatten().copied().collect();
+    let answered = tokio::time::timeout(
+        Duration::from_secs(10),
+        send_normal(quic, ECHO as u8, 0, true, &mut chunks),
+    )
+    .await
+    .expect("the frame never arrived whole");
+    assert_eq!(answered.expect("the echo"), payload);
+}
+
+/// A command too big to send is refused before anything is written, so no answer will come for it,
+/// and it leaves no command waiting on the stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_too_big_to_send_leaves_nothing_pending() {
+    use bytes::Bytes;
+    use lore_transport::quic::QuicClientError;
+    use lore_transport::quic::storage_service::Command;
+    use lore_transport::quic::storage_service::MAX_CHUNK_SIZE;
+
+    let (_server, _client, quic) = served_connection().await;
+    let mut too_big = [Bytes::new(), Bytes::from(vec![0u8; MAX_CHUNK_SIZE + 1])];
+    let refused = send_normal(quic.clone(), Command::Put as u8, 0, true, &mut too_big).await;
+    assert!(
+        matches!(refused, Err(QuicClientError::ClientMessageTooBig)),
+        "{refused:?}"
+    );
+    assert_eq!(quic.pending_commands().await, 0);
+}
+
+/// A command dropped once its frame is written still waits on its stream, so the reader takes its
+/// answer when it comes rather than ending the stream on an answer it does not expect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_dropped_after_its_write_is_answered_and_its_stream_kept() {
+    use bytes::Bytes;
+    use lore_transport::quic::storage_service::Command;
+
+    let (server, _client, quic) = served_connection().await;
+    server.pause_reading();
+    let mut small = [Bytes::new(), Bytes::from_static(b"dropped")];
+    let dropped = tokio::time::timeout(
+        Duration::from_millis(100),
+        send_normal(quic.clone(), Command::Put as u8, 0, true, &mut small),
+    )
+    .await;
+    assert!(dropped.is_err(), "the command was answered: {dropped:?}");
+    assert_eq!(quic.pending_commands().await, 1);
+
+    server.resume_reading();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while quic.pending_commands().await != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the dropped command's answer never came");
+    assert_eq!(quic.streams_ended(), 0);
 }
 
 mod controller_factory {
@@ -886,5 +1012,62 @@ mod controller_factory {
         );
 
         assert_eq!(controller.window(), SMALL_SEND_WINDOW);
+    }
+}
+
+mod observe_responses {
+    use bytes::Bytes;
+    use lore_transport::quic::response_observer::ObservedResponse;
+    use lore_transport::quic::response_observer::ResponseObserver;
+    use lore_transport::quic::storage_service::Command;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct Recorded(Mutex<Vec<ObservedResponse>>);
+
+    impl ResponseObserver for Recorded {
+        fn observe(&self, response: &ObservedResponse, _connection: &quinn::Connection) {
+            self.0.lock().push(*response);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_observer_sees_each_answered_command() {
+        let (_server, _client, quic) = served_connection().await;
+        let recorded = Arc::new(Recorded::default());
+        assert!(quic.observe_responses(recorded.clone()));
+
+        let mut chunks = [Bytes::new(), Bytes::from_static(b"observed")];
+        send_normal(quic.clone(), Command::Put as u8, 0, true, &mut chunks)
+            .await
+            .expect("the put is answered");
+
+        // The reader observes a response once it has handed it over, so the observation can trail
+        // the answer.
+        let observed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let observed = recorded.0.lock().clone();
+                if !observed.is_empty() {
+                    return observed;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the response was never observed");
+        let [response] = observed.as_slice() else {
+            panic!("expected one observed response, got {observed:?}");
+        };
+        assert_eq!(response.opcode, Command::Put as u8);
+        assert_eq!(response.error_status, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_observer_is_refused() {
+        let (_server, _client, quic) = served_connection().await;
+
+        assert!(quic.observe_responses(Arc::new(Recorded::default())));
+        assert!(!quic.observe_responses(Arc::new(Recorded::default())));
     }
 }

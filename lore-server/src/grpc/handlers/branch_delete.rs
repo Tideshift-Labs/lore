@@ -9,6 +9,7 @@ use lore_proto::BranchDeleteResponse;
 use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
@@ -91,6 +92,7 @@ pub async fn handler(
         immutable_store,
         mutable_store,
         repository_id,
+        no_link_traversal(),
     ));
     LORE_CONTEXT
         .scope(execution, async move {

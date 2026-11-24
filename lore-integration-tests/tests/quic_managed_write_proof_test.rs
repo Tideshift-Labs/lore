@@ -441,6 +441,7 @@ mod quic_managed_write_proof_tests {
             let mut context = lore_revision::repository::RepositoryContext::new_null_context(
                 local,
                 local_mutable,
+                lore_revision::state::allow_all_repositories(),
             );
             context.id = partition;
             let repository = Arc::new(context);
@@ -564,6 +565,7 @@ mod quic_managed_write_proof_tests {
             "",
             "",
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("connect to the cell over a pool of storage connections")

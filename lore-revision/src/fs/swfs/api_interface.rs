@@ -5,19 +5,25 @@
 //! The `swfs_api` module will always contain the C API's types even if the library isn't linked.
 pub mod swfs_api;
 
+use std::ffi::c_int;
 use std::ops::Deref;
 use std::sync::Arc;
 
 use dashmap::DashSet;
+use lore_base::error::NotSupported;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
 
 use crate::event::LoreErrorDetail;
+use crate::fs::swfs::file::SwfsFileArray;
+use crate::fs::swfs::frozen_files::FrozenFile;
 use crate::fs::swfs::handle_gate::HandleGate;
 use crate::fs::swfs::handle_gate::HandleGateGuard;
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
+use crate::fs::swfs::operation_lock::OperationGuard;
+use crate::fs::swfs::operation_lock::OperationLock;
 use crate::fs::swfs::paths::RelativePathKey;
 use crate::service_state::ServiceStateImpl;
 
@@ -47,6 +53,12 @@ pub struct SwfsInterface {
     /// by [`SwfsInterface::close`], which waits for the uses in progress before it closes the
     /// handle.
     gate: HandleGate,
+    /// Which command holds the mount's operation.
+    operation_lock: OperationLock,
+    /// A thaw SWFS couldn't finish, with the files it describes, which leaves the mount frozen
+    /// until the next command to hold the operation finishes it.
+    #[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(unused))]
+    failed_thaw: parking_lot::Mutex<Option<SwfsFileArray>>,
     #[allow(unused)]
     resources: MountResources,
 }
@@ -81,6 +93,12 @@ impl SwfsInterface {
         })
     }
 
+    /// Waits for the mount's operation, which the caller holds until it drops the guard, after the
+    /// thaw that ends it. Refused where the calling command holds it already.
+    pub async fn lock_operation(&self) -> Result<OperationGuard, NotSupported> {
+        self.operation_lock.acquire().await
+    }
+
     /// The handle as a key for finding this interface from an SWFS callback. It is never passed
     /// to SWFS, so it stays valid after the mount closes, to remove the entry it keys.
     pub fn lookup_key(&self) -> WrappedHandle {
@@ -100,10 +118,86 @@ impl SwfsInterface {
     }
 }
 
+#[cfg(feature = "test-util")]
+impl SwfsInterface {
+    /// An interface over `resources` that mounted nothing, for a test of what an operation
+    /// answers without SWFS. Freezing or thawing it fails, as its gate starts closed.
+    pub fn unmounted(resources: MountResources) -> Arc<Self> {
+        let gate = HandleGate::default();
+        gate.close(|| {});
+        Arc::new(Self {
+            handle: WrappedHandle::new(std::ptr::null_mut()),
+            gate,
+            resources,
+            operation_lock: OperationLock::default(),
+            failed_thaw: parking_lot::Mutex::new(None),
+        })
+    }
+}
+
 impl Drop for SwfsInterface {
     fn drop(&mut self) {
         self.cleanup();
     }
+}
+
+/// How long a thaw waits for SWFS to finish it, in milliseconds: a thaw has been seen to take
+/// under twenty, and takes longer while much I/O reaches the mount. Not 0, which SWFS takes as no
+/// limit.
+#[lore_macro::test_pub]
+const THAW_WAIT_MS: c_int = 3000;
+const _: () = assert!(
+    THAW_WAIT_MS > 0,
+    "SWFS takes 0 as no limit, and less as no wait"
+);
+
+/// What became of a thaw.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Thaw {
+    Thawed,
+    /// SWFS held no freeze of the mount, so there was nothing to thaw.
+    NotFrozen,
+    /// SWFS couldn't finish the thaw, which is kept for the next command to finish.
+    StillFrozen,
+}
+
+/// Thaws a mount that is `frozen`, applying `files`, with `swfs_thaw`, which asks SWFS to thaw and
+/// waits up to [`THAW_WAIT_MS`] milliseconds for it to finish. A thaw that doesn't finish is kept
+/// in `kept`, with its files, for the next command to finish.
+///
+/// A `swfsFreeze` or `swfsThaw` that returns `false` leaves `swfsIsFrozen` as it was, then and
+/// afterwards, so the next command finds the mount still frozen. The SWFS team guarantees this,
+/// though `swfs.h` describes a call whose wait ended as queued work that is still done.
+#[lore_macro::test_pub]
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+fn thaw_or_keep(
+    frozen: bool,
+    files: SwfsFileArray,
+    swfs_thaw: impl FnOnce(&SwfsFileArray, c_int) -> bool,
+    kept: &parking_lot::Mutex<Option<SwfsFileArray>>,
+) -> Thaw {
+    if !frozen {
+        return Thaw::NotFrozen;
+    }
+    if swfs_thaw(&files, THAW_WAIT_MS) {
+        return Thaw::Thawed;
+    }
+    *kept.lock() = Some(files);
+    Thaw::StillFrozen
+}
+
+/// Ends a freeze no operation holds of a mount that is `frozen`, with [`thaw_or_keep`], applying
+/// the files of the thaw kept in `kept`, if one is, or none.
+#[lore_macro::test_pub]
+#[cfg_attr(not(all(windows, target_arch = "x86_64")), allow(dead_code))]
+fn thaw_leftover(
+    frozen: bool,
+    swfs_thaw: impl FnOnce(&SwfsFileArray, c_int) -> bool,
+    kept: &parking_lot::Mutex<Option<SwfsFileArray>>,
+) -> Thaw {
+    let files = kept.lock().take().unwrap_or_else(SwfsFileArray::empty);
+    thaw_or_keep(frozen, files, swfs_thaw, kept)
 }
 
 /// Logic elsewhere should prevent an `SwfsInterface` from being constructed on a target SWFS
@@ -119,23 +213,43 @@ impl SwfsInterface {
     }
 
     #[allow(clippy::unused_async)]
-    pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsInterfaceError> {
+    pub async fn freeze(
+        self: &Arc<Self>,
+        _token: SwfsExecutionToken,
+        _operation: OperationGuard,
+    ) -> Result<OperationGuard, SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
     #[allow(clippy::unused_async)]
     pub async fn thaw(
-        &self,
+        self: &Arc<Self>,
         _token: SwfsExecutionToken,
         _apply_changes: bool,
         _written_paths: &DashSet<RelativePathKey>,
-    ) -> Result<(), SwfsInterfaceError> {
+        _removals: &crate::fs::swfs::state::ThawRemovals,
+        _operation: OperationGuard,
+    ) -> Result<OperationGuard, SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
     pub fn mount(_resources: MountResources) -> Result<Arc<Self>, SwfsInterfaceError> {
         Err(Self::no_swfs_error())
     }
+    pub fn frozen_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
+    pub fn read_frozen_range(
+        &self,
+        _path: &str,
+        _offset: u64,
+        _into: &mut [u8],
+    ) -> Result<bool, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
+    pub fn modified_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+        Err(Self::no_swfs_error())
+    }
     #[allow(clippy::unused_async)]
-    pub async fn wait_for_ready(&self) -> Result<(), SwfsInterfaceError> {
+    pub async fn wait_for_ready(self: &Arc<Self>) -> Result<(), SwfsInterfaceError> {
         let _ = self;
         Err(Self::no_swfs_error())
     }
@@ -157,62 +271,294 @@ mod swfs_impl {
     use std::ffi::c_int;
     use std::ffi::c_void;
     use std::ptr::slice_from_raw_parts_mut;
+    use std::sync::atomic::AtomicPtr;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
 
     use lore_base::log::LoreLogLevel;
     use lore_error_set::ForwardStrict;
+    use lore_error_set::prelude::*;
     use tokio::task::yield_now;
 
     use super::*;
     use crate::fs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
+    use crate::fs::swfs::api_interface::swfs_api::SWFSDataCBFn;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
     use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
     use crate::fs::swfs::api_interface::swfs_api::SWFSInit;
     use crate::fs::swfs::api_interface::swfs_api::SWFSResult_Enum;
+    use crate::fs::swfs::api_interface::swfs_api::swfs_u16;
+    use crate::fs::swfs::api_interface::swfs_api::swfs_u32;
     use crate::fs::swfs::api_interface::swfs_api::swfs_u64;
     use crate::fs::swfs::api_interface::swfs_api::swfs_ubyte;
     use crate::fs::swfs::api_interface::swfs_api::swfsClose;
     use crate::fs::swfs::api_interface::swfs_api::swfsFillDirAddFiles;
     use crate::fs::swfs::api_interface::swfs_api::swfsFreeze;
+    use crate::fs::swfs::api_interface::swfs_api::swfsGetFrozenFileList;
+    use crate::fs::swfs::api_interface::swfs_api::swfsGetModifiedFileList;
     use crate::fs::swfs::api_interface::swfs_api::swfsInit;
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
+    use crate::fs::swfs::api_interface::swfs_api::swfsIsFrozen;
+    use crate::fs::swfs::api_interface::swfs_api::swfsReadFrozenFile;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
+    use crate::fs::swfs::file::DIRECTORY_ATTRIBUTE;
+    use crate::fs::swfs::file::SwfsFile;
     use crate::fs::swfs::file::SwfsFileArray;
+    use crate::fs::swfs::frozen_files::FrozenListCollector;
+    use crate::fs::swfs::frozen_files::FrozenReadBuffer;
+    use crate::fs::swfs::frozen_files::frozen_read_range;
+    use crate::fs::swfs::frozen_files::moves_in;
+    use crate::fs::swfs::modified_tree::Change;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
     use crate::fs::swfs::panic_guard::panic_guard_swfs_callback;
     use crate::fs::swfs::paths::SwfsPath;
+    use crate::fs::swfs::renamed_at_risk::note_move;
+    use crate::fs::swfs::served_tree::ServedTree;
+    use crate::fs::swfs::state::ThawRemovals;
     use crate::fs::swfs::state::written_files;
     use crate::lore_debug;
+    use crate::lore_warn;
     use crate::service_state::ServiceStateImpl;
+    use crate::util::path::RelativePath;
+
+    /// What a thaw that SWFS couldn't finish tells the user.
+    const THAW_FAILED: &str = "SWFS couldn't thaw the instance, most often because too much I/O \
+                               is happening on it at once. Wait until that I/O has stopped, then \
+                               run another command on the instance to recover it";
 
     impl SwfsInterface {
         pub fn resources(&self) -> &MountResources {
             &self.resources
         }
 
-        #[allow(clippy::unused_async)]
-        pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
-            let handle = self.handle().forward::<SwfsWorkError>("Unable to freeze")?;
-            if unsafe {
-                swfsFreeze(
-                    handle.handle(),
-                    Some(swfs_freeze_callback),
-                    std::ptr::null_mut(),
-                )
-            } {
-                Ok(())
-            } else {
-                Err(SwfsWorkError::internal("Failed to freeze"))
+        /// Freezes the mount for the operation `operation` holds, and returns the guard once the
+        /// freeze has taken hold, when the frozen files can be read. A freeze no operation holds,
+        /// which a command that ended before its thaw left, or a thaw SWFS couldn't finish, is
+        /// ended first. A freeze SWFS refuses or doesn't take in time leaves the mount as it was,
+        /// as `thaw_or_keep` describes.
+        ///
+        /// The blocking task owns the guard, so the mount is released only once SWFS has answered,
+        /// even if this future is dropped.
+        pub async fn freeze(
+            self: &Arc<Self>,
+            _token: SwfsExecutionToken,
+            operation: OperationGuard,
+        ) -> Result<OperationGuard, SwfsWorkError> {
+            self.call_blocking("waiting on SWFS for the freeze", move |this, handle| {
+                match this.end_leftover_freeze(handle) {
+                    Thaw::NotFrozen => {}
+                    Thaw::Thawed => {
+                        lore_warn!(
+                            "Ended an SWFS freeze of {} that an earlier command left behind",
+                            this.resources.mount_path_nul_terminated.to_string_lossy()
+                        );
+                    }
+                    Thaw::StillFrozen => return Err(SwfsWorkError::internal(THAW_FAILED)),
+                }
+                let frozen = unsafe {
+                    swfsFreeze(
+                        handle,
+                        Some(swfs_freeze_callback),
+                        std::ptr::null_mut(),
+                        FREEZE_WAIT_MS,
+                    )
+                };
+                if !frozen {
+                    return Err(SwfsWorkError::internal(format!(
+                        "SWFS refused to freeze the instance, or couldn't within \
+                         {FREEZE_WAIT_MS} ms, and left it as it was"
+                    )));
+                }
+                this.resources.modified().begin_freeze();
+                Ok(operation)
+            })
+            .await
+            .forward::<SwfsWorkError>("Freezing the mount")?
+        }
+
+        /// Thaws the mount, applying the changes to `written_paths` if `apply_changes`, and returns
+        /// the guard of the operation once SWFS has finished the thaw and the mount is thawed, so
+        /// the operation goes on holding the mount while it finishes its work there. Where SWFS
+        /// can't finish it, the mount stays frozen, and the thaw is kept for the next
+        /// [`Self::freeze`] to finish. The paths in `removals` are named as [`written_files`]
+        /// names them.
+        ///
+        /// The thaw is always attempted. Where the files to apply can't be described, the thaw
+        /// applies none, which changes nothing SWFS shows, and the failure is returned, so the
+        /// command fails rather than go on as if the mount showed what it wrote. SWFS then goes on
+        /// showing what it held of the files the operation wrote.
+        ///
+        /// The blocking task owns `operation`, the guard of the operation that froze the mount,
+        /// and hands it back only from a finished thaw: the mount of any other is released once
+        /// SWFS has answered, even if this future is dropped.
+        pub async fn thaw(
+            self: &Arc<Self>,
+            token: SwfsExecutionToken,
+            apply_changes: bool,
+            written_paths: &DashSet<RelativePathKey>,
+            removals: &ThawRemovals,
+            operation: OperationGuard,
+        ) -> Result<OperationGuard, SwfsWorkError> {
+            let (files, served, named, described) = match self
+                .describe_written(token, apply_changes, written_paths, removals)
+                .await
+            {
+                Ok((files, served, named)) => {
+                    (SwfsFileArray::new(files), Some(served), Some(named), Ok(()))
+                }
+                Err(error) => (SwfsFileArray::empty(), None, None, Err(error)),
+            };
+            let conflicts = THAW_CONFLICTS.load(Ordering::Acquire);
+            let thawed = self
+                .call_blocking("waiting on SWFS for the thaw", move |this, handle| {
+                    let thaw = thaw_or_keep(
+                        unsafe { swfsIsFrozen(handle) },
+                        files,
+                        |files, wait_ms| unsafe { swfsThaw(handle, files.array_ptr(), wait_ms) },
+                        &this.failed_thaw,
+                    );
+                    if thaw == Thaw::StillFrozen {
+                        // Logged here as well as returned: the command may fail for another
+                        // reason first, or be gone, and this says how to recover.
+                        lore_warn!(
+                            "{THAW_FAILED} ({})",
+                            this.resources.mount_path_nul_terminated.to_string_lossy()
+                        );
+                    }
+                    // Any guard but a finished thaw's is released here, once the thaw, or the
+                    // record of it, is done.
+                    (thaw, (thaw == Thaw::Thawed).then_some(operation))
+                })
+                .await;
+            // The record drops what the thaw took off SWFS's list, unless the thaw did not finish,
+            // named fewer files than the operation wrote, or skipped an entry for a path the user
+            // holds, any of which leaves it to be rebuilt.
+            let applied = matches!(&thawed, Ok((Thaw::Thawed, _)))
+                && THAW_CONFLICTS.load(Ordering::Acquire) == conflicts;
+            let applied_named = named.as_deref().filter(|_| applied);
+            self.resources.modified().end_thaw(applied_named).await;
+            if let Some(named) = applied_named {
+                self.resources.renamed().forget_named(named);
+            }
+            // A failure to describe the files comes first, being what the command failed on.
+            described.forward::<SwfsWorkError>("Describing the files the operation wrote")?;
+            match thawed.forward::<SwfsWorkError>("Thawing the mount")? {
+                (Thaw::Thawed, Some(operation)) => {
+                    if let Some(served) = served.filter(|_| apply_changes) {
+                        self.resources.set_described(served);
+                        self.resources.note_described_unlisted(written_paths);
+                    }
+                    Ok(operation)
+                }
+                (Thaw::NotFrozen, _) => Err(SwfsWorkError::internal(
+                    "SWFS held no freeze of the instance to thaw",
+                )),
+                _ => Err(SwfsWorkError::internal(THAW_FAILED)),
             }
         }
 
-        pub async fn thaw(
+        /// The files frozen with the mount, as of the freeze.
+        pub fn frozen_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            self.listed_files(swfsGetFrozenFileList)
+        }
+
+        /// The files SWFS holds modified, whether frozen or not, as `swfsGetModifiedFileList` lists
+        /// them: each as a `FrozenFile`, the entries being alike. SWFS keeps the list across thaws
+        /// that do not name a file and across remounts, and names a deletion as well.
+        pub fn modified_files(&self) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            self.listed_files(swfsGetModifiedFileList)
+        }
+
+        /// The files one of SWFS's list calls names, which hands them over through a
+        /// [`FrozenListCollector`].
+        fn listed_files(
+            &self,
+            list: unsafe extern "C" fn(
+                SWFSHandle,
+                SWFSDataCBFn,
+                *mut std::os::raw::c_void,
+            ) -> swfs_u32,
+        ) -> Result<Vec<FrozenFile>, SwfsInterfaceError> {
+            // Held across the call, so the mount cannot close under it.
+            let handle = self.handle()?;
+            let mut collector = FrozenListCollector::default();
+            unsafe {
+                list(
+                    handle.handle(),
+                    Some(swfs_frozen_list_callback),
+                    std::ptr::from_mut(&mut collector).cast(),
+                );
+            }
+            Ok(collector.into_files())
+        }
+
+        /// Fills `into` with the content of the frozen file at the SWFS-side `path` (backslash
+        /// separated, leading backslash) from `offset`, answering `false` where SWFS has none to
+        /// give.
+        ///
+        /// SWFS reads the whole blocks the range touches into the buffer frozen reads share, sized
+        /// to those blocks, so a read holds no more of the file than `into` and a block at either
+        /// end; a buffer larger than `FROZEN_READ_RETAINED` is released after the read.
+        pub fn read_frozen_range(
+            &self,
+            path: &str,
+            offset: u64,
+            into: &mut [u8],
+        ) -> Result<bool, SwfsInterfaceError> {
+            // Held across the read, so the mount cannot close under it.
+            let guard = self.handle()?;
+            let handle = guard.handle();
+            let length = swfs_u16::try_from(path.len())
+                .internal("converting the frozen file path's length to SWFS's 16-bit length")?;
+            // `swfsReadFrozenFile` takes no user data, so its buffer callback finds the buffer
+            // through this, and one read runs at a time, in the buffer the lock holds.
+            let mut buffer = FROZEN_READ_SERIAL.lock();
+            let (start, blocks) = frozen_read_range(offset, into.len());
+            let copied = buffer.read(
+                |target| {
+                    FROZEN_READ_TARGET.store(target, Ordering::Release);
+                    let read = unsafe {
+                        swfsReadFrozenFile(
+                            handle,
+                            path.as_ptr().cast(),
+                            length,
+                            start,
+                            blocks,
+                            Some(swfs_frozen_read_callback),
+                        )
+                    };
+                    FROZEN_READ_TARGET.store(std::ptr::null_mut(), Ordering::Release);
+                    read
+                },
+                (offset - start) as usize,
+                into,
+            );
+            match copied {
+                None => Ok(false),
+                Some(true) => Ok(true),
+                Some(false) => Err(SwfsInterfaceError::internal(format!(
+                    "SWFS read fewer bytes of the frozen {path} than its size holds"
+                ))),
+            }
+        }
+
+        /// Reloads the state the mount serves, whatever `apply_changes` is, so the mount serves the
+        /// state the operation left, then returns the files a thaw applies for the changes to
+        /// `written_paths`, described as that state holds them, none unless `apply_changes`, and
+        /// the tree they are described from, and the paths it names other than as directories. The
+        /// paths in `removals` are named as [`written_files`] names them.
+        ///
+        /// The modified-file record moves to the state reloaded, rather than being emptied by it,
+        /// until the thaw is applied to it ([`ModifiedTree::end_thaw`]).
+        async fn describe_written(
             &self,
             token: SwfsExecutionToken,
             apply_changes: bool,
             written_paths: &DashSet<RelativePathKey>,
-        ) -> Result<(), SwfsWorkError> {
+            removals: &ThawRemovals,
+        ) -> Result<DescribedThaw, SwfsWorkError> {
             let file_time: u64;
             #[cfg(target_os = "windows")]
             {
@@ -230,38 +576,81 @@ mod swfs_impl {
                 file_time = 0;
             }
 
-            // The written nodes are described as the state after this operation holds them.
+            self.resources.modified().begin_thaw();
             self.resources.update_state(token).await?;
-            let state = self.resources.current_read_state().ok_or_else(|| {
-                SwfsWorkError::internal("Describing written nodes with no repository state")
-            })?;
-            let mut files = Vec::new();
-            written_files(
-                &mut files,
-                self.resources.repository(),
-                state,
-                written_paths,
-                file_time,
-            )
-            .await?;
-            let files = SwfsFileArray::new(files);
-            let handle = self
-                .handle()
-                .forward::<SwfsWorkError>("Getting SWFS handle for thaw")?;
-            if unsafe {
-                swfsThaw(
-                    handle.handle(),
-                    if apply_changes {
-                        files.array_ptr()
-                    } else {
-                        std::ptr::null_mut()
-                    },
-                )
-            } {
-                Ok(())
-            } else {
-                Err(SwfsWorkError::internal("Failed to thaw"))
+            let served = self.resources.served_tree();
+            if !apply_changes {
+                return Ok((Vec::new(), served, Vec::new()));
             }
+            // SWFS lists a moved file by its new path, and its origin as a deletion. A thaw naming only
+            // the new path commits the add and leaves the origin deleted in SWFS's list, so a path the
+            // operation wrote that SWFS holds as moved is named with its origin.
+            let listed = self
+                .modified_files()
+                .forward::<SwfsWorkError>("Listing the files SWFS holds modified")?;
+            let moves = moves_in(&listed);
+            if !moves.is_empty() {
+                // Each move's destination, in any spelling, which each written path and the
+                // directories above it are looked up in, rather than each move tested against
+                // every written path.
+                let mut origins: std::collections::HashMap<String, String> = moves
+                    .into_iter()
+                    .map(|(from, to)| (to.to_lowercase(), from))
+                    .collect();
+                let mut found = Vec::new();
+                for written in written_paths.iter() {
+                    if origins.is_empty() {
+                        break;
+                    }
+                    let mut at = written.0.as_lowercase_str();
+                    while !at.is_empty() {
+                        if let Some(from) = origins.remove(at) {
+                            found.push(from);
+                        }
+                        at = at.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    }
+                }
+                for from in found {
+                    if let Ok(from) = RelativePath::new_from_initial_path(&from) {
+                        written_paths.insert(RelativePathKey(from));
+                    }
+                }
+            }
+            let mut files = Vec::new();
+            let mut named = Vec::new();
+            // With no revision there is nothing to describe from: what the operation wrote that
+            // no state holds was written to the mount when it finalized (ADR-00033), which is all
+            // of it, such as during a clone that tracks no remote branch.
+            if served.current().is_some() {
+                named = written_files(
+                    &mut files,
+                    &served,
+                    self.resources.mount_path(),
+                    removals,
+                    &self.resources.take_removed_below_mounts(),
+                    written_paths,
+                    file_time,
+                )
+                .await?;
+            }
+            self.resources
+                .list_directories_described_again(written_paths)
+                .await;
+            Ok((files, served, named))
+        }
+
+        /// Ends a freeze of the mount of `handle` that no operation holds, applying the files of a
+        /// thaw SWFS couldn't finish if one is kept. Only an operation freezes the mount, and only
+        /// while it holds it, so a freeze its holder finds, or one found when the mount is
+        /// mounted, is one left behind: by a thaw that SWFS couldn't finish, by a command that
+        /// ended before its thaw, or by a service that ended mid-operation. Every freeze after it
+        /// would be refused while it stood.
+        fn end_leftover_freeze(&self, handle: SWFSHandle) -> Thaw {
+            thaw_leftover(
+                unsafe { swfsIsFrozen(handle) },
+                |files, wait_ms| unsafe { swfsThaw(handle, files.array_ptr(), wait_ms) },
+                &self.failed_thaw,
+            )
         }
 
         pub fn mount(resources: MountResources) -> Result<Arc<Self>, SwfsInterfaceError> {
@@ -279,6 +668,9 @@ mod swfs_impl {
                     notify_move: Some(swfs_c_notify_move),
                     notify_delete: Some(swfs_c_notify_delete),
                 },
+                // SWFS takes anything below 1 as 1, writing synchronously; 2 was its default before
+                // it said so.
+                num_write_threads: 2,
                 ..unsafe { std::mem::zeroed::<SWFSInit>() }
             };
 
@@ -300,18 +692,77 @@ mod swfs_impl {
             let this = Arc::new(Self {
                 handle: WrappedHandle(handle),
                 gate: HandleGate::default(),
+                operation_lock: OperationLock::default(),
+                failed_thaw: parking_lot::Mutex::new(None),
                 resources,
             });
             Ok(this)
         }
 
-        pub async fn wait_for_ready(&self) -> Result<(), SwfsInterfaceError> {
+        /// Whether SWFS holds the mount frozen.
+        #[lore_macro::test_pub]
+        #[cfg(feature = "test-util")]
+        fn is_frozen(&self) -> Result<bool, SwfsInterfaceError> {
+            Ok(unsafe { swfsIsFrozen(self.handle()?.handle()) })
+        }
+
+        /// Waits until SWFS has finished starting the mount, then ends a freeze found on it that no
+        /// command holds. A command can find the mount before it is ready, so before ending a
+        /// freeze this waits for any command holding the mount's operation to finish.
+        pub async fn wait_for_ready(self: &Arc<Self>) -> Result<(), SwfsInterfaceError> {
             // A guard for each check rather than across the wait, so a close need not wait for
             // the mount to become ready.
             while unsafe { swfsIsBusy(self.handle()?.handle()) } {
                 yield_now().await;
             }
+            // Held while a freeze found is ended: the mount can be found by commands before it is
+            // ready, and one of them may have frozen it, which this must not end.
+            let operation = self.lock_operation().await.map_err(|error| {
+                SwfsInterfaceError::internal_with_context(
+                    error,
+                    "Holding the mount to end a freeze found when it was mounted",
+                )
+            })?;
+            match self
+                .call_blocking("thawing a freeze found at mount", move |this, handle| {
+                    let thaw = this.end_leftover_freeze(handle);
+                    drop(operation);
+                    thaw
+                })
+                .await?
+            {
+                Thaw::NotFrozen => {}
+                Thaw::Thawed => {
+                    lore_warn!(
+                        "SWFS mount {} was frozen when it was mounted; thawed it",
+                        self.resources.mount_path_nul_terminated.to_string_lossy()
+                    );
+                }
+                Thaw::StillFrozen => {
+                    return Err(SwfsInterfaceError::internal(
+                        "SWFS mount was frozen when it was mounted and could not be thawed",
+                    ));
+                }
+            }
             Ok(())
+        }
+
+        /// Runs `call` with the interface and the mount's handle on a blocking thread: a freeze or
+        /// a thaw that waits for SWFS blocks its thread for up to its timeout. The task holds the
+        /// interface and the handle until `call` returns, even if this future is dropped, so a
+        /// close waits for it.
+        async fn call_blocking<T: Send + 'static>(
+            self: &Arc<Self>,
+            attempting: &'static str,
+            call: impl FnOnce(&Self, SWFSHandle) -> T + Send + 'static,
+        ) -> Result<T, SwfsInterfaceError> {
+            let this = self.clone();
+            lore_base::lore_spawn_blocking!(move || -> Result<T, SwfsInterfaceError> {
+                let handle = this.handle()?;
+                Ok(call(&this, handle.handle()))
+            })
+            .await
+            .internal(attempting)?
         }
 
         /// Unmount from SWFS and release the mount path. Does nothing if it is already closed.
@@ -392,14 +843,77 @@ mod swfs_impl {
             }
         }
 
-        #[allow(clippy::unused_self)]
-        fn notify_write(&self, _file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_create(&self, _file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_move(&self, _old_file: *mut SWFSFile, _new_file: *mut SWFSFile) {}
-        #[allow(clippy::unused_self)]
-        fn notify_delete(&self, _file: *mut SWFSFile) {}
+        // The notify callbacks only feed the modified-file record. They have no caller to report
+        // a failure to, so a change that cannot be read leaves the record untrusted.
+        fn notify_write(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                // A directory's own writes are its times changing as entries come and go, which
+                // the create and delete callbacks for those entries already cover.
+                Some((_, true)) => {}
+                Some((path, false)) => self.record_change(Change::Written(path)),
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_create(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                Some((path, directory)) => {
+                    self.resources.renamed().created(&path, directory);
+                    self.record_change(Change::Created { path, directory });
+                }
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_move(&self, old_file: *mut SWFSFile, new_file: *mut SWFSFile) {
+            match (Self::notified_node(old_file), Self::notified_node(new_file)) {
+                (Some((from, _)), Some((to, directory))) => {
+                    // Noted before the record takes the move in, as what it held at the origin
+                    // tells whether the moved node has bytes of its own.
+                    self.resources
+                        .run_in_runtime_with_context(async move |_token| {
+                            note_move(&self.resources, &from, &to, directory).await;
+                            self.resources
+                                .modified()
+                                .record(Change::Moved {
+                                    from,
+                                    to,
+                                    directory,
+                                })
+                                .await;
+                        });
+                }
+                _ => self.resources.modified().distrust(),
+            }
+        }
+
+        fn notify_delete(&self, file: *mut SWFSFile) {
+            match Self::notified_node(file) {
+                Some((path, directory)) => {
+                    self.resources.renamed().deleted(&path);
+                    self.record_change(Change::Deleted { path, directory });
+                }
+                None => self.resources.modified().distrust(),
+            }
+        }
+
+        fn record_change(&self, change: Change) {
+            self.resources
+                .run_in_runtime_with_context(async move |_token| {
+                    self.resources.modified().record(change).await;
+                });
+        }
+
+        /// The node path and whether it is a directory, for the file a callback was given.
+        fn notified_node(file: *mut SWFSFile) -> Option<(String, bool)> {
+            let file = unsafe { &*file };
+            let path = unsafe { CStr::from_ptr(file.path) }.to_string_lossy();
+            let node_path = Self::handle_lore_result(SwfsPath(&path).node_path())?;
+            Some((
+                node_path.0.as_str().to_owned(),
+                file.finfo.attrs & DIRECTORY_ATTRIBUTE != 0,
+            ))
+        }
 
         #[allow(clippy::unused_self)]
         fn freeze_callback(
@@ -435,6 +949,9 @@ mod swfs_impl {
             // for, and SWFS serves a read it could not complete as zeros, so this may be the only
             // trace of a file served wrong.
             crate::lore_error!("{message}");
+            if error_code == swfs_api::SWFSResult_Enum_SWFSResult_ThawPathConflict {
+                THAW_CONFLICTS.fetch_add(1, Ordering::AcqRel);
+            }
             // SWFS calls this from C with nothing of ours to carry the state,
             // so this is one of the paths that reaches for the global.
             ServiceStateImpl::global().push_log(LoreLogLevel::Error, message);
@@ -459,6 +976,47 @@ mod swfs_impl {
         }
     }
 
+    /// The thaw entries SWFS has skipped for a path the user holds something at
+    /// (`SWFSResult_ThawPathConflict`), across the process: the error callback is the process's,
+    /// and names no mount.
+    static THAW_CONFLICTS: AtomicU64 = AtomicU64::new(0);
+
+    /// What [`SwfsInterface::describe_written`] gives a thaw: its files, the tree they are described
+    /// from, and the paths it names other than as directories.
+    type DescribedThaw = (Vec<SwfsFile>, Arc<ServedTree>, Vec<RelativePath>);
+
+    /// The one buffer frozen reads are made in, one read at a time.
+    static FROZEN_READ_SERIAL: parking_lot::Mutex<FrozenReadBuffer> =
+        parking_lot::Mutex::new(FrozenReadBuffer::new());
+    static FROZEN_READ_TARGET: AtomicPtr<FrozenReadBuffer> = AtomicPtr::new(std::ptr::null_mut());
+
+    /// `user_data` is the `FrozenListCollector` that `frozen_files` or `modified_files` passed in.
+    unsafe extern "C" fn swfs_frozen_list_callback(
+        _handle: SWFSHandle,
+        user_data: *mut c_void,
+        start_buff: *mut swfs_ubyte,
+        num_bytes: usize,
+        out_num_buff_bytes: *mut usize,
+    ) -> *mut swfs_ubyte {
+        let collector = unsafe { &mut *user_data.cast::<FrozenListCollector>() };
+        unsafe { collector.on_callback(start_buff, num_bytes, out_num_buff_bytes) }
+    }
+
+    /// The buffer is the one `read_frozen_range` published, which is what is being read.
+    unsafe extern "C" fn swfs_frozen_read_callback(
+        _handle: SWFSHandle,
+        _user_data: *mut c_void,
+        start_buff: *mut swfs_ubyte,
+        num_bytes: usize,
+        out_num_buff_bytes: *mut usize,
+    ) -> *mut swfs_ubyte {
+        let target = FROZEN_READ_TARGET.load(Ordering::Acquire);
+        if target.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*target).on_callback(start_buff, num_bytes, out_num_buff_bytes) }
+    }
+
     fn lookup_handle(handle: SWFSHandle) -> Result<Arc<SwfsInterface>, SwfsInterfaceError> {
         let mount_manager = MountManagerState::mount_manager().ok_or(
             SwfsInterfaceError::internal("Looking up SWFS interface without SWFS being enabled"),
@@ -470,6 +1028,14 @@ mod swfs_impl {
                 "Missing SWFS interface for handle",
             ))
     }
+
+    /// How long `swfsFreeze` waits for the freeze to take hold, in milliseconds. It has been seen
+    /// to take a few. Not 0, which SWFS takes as no limit.
+    const FREEZE_WAIT_MS: c_int = 100;
+    const _: () = assert!(
+        FREEZE_WAIT_MS > 0,
+        "SWFS takes 0 as no limit, and less as no wait"
+    );
 
     /// Creates a C function that takes an `SWFSHandle` as its first argument and calls the associated
     /// method on that handle's `SwfsInterface`, under [`panic_guard_swfs_callback`].
@@ -537,5 +1103,23 @@ mod swfs_impl {
                 error_message,
             )
         })
+    }
+}
+
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use super::SwfsInterface;
+    use crate::fs::swfs::file::SwfsFileArray;
+
+    impl SwfsInterface {
+        /// Keeps `files` as a thaw SWFS couldn't finish, as a thaw that fails does.
+        pub fn keep_failed_thaw(&self, files: SwfsFileArray) {
+            *self.failed_thaw.lock() = Some(files);
+        }
+
+        /// Whether a thaw SWFS couldn't finish is kept for the next command.
+        pub fn has_failed_thaw(&self) -> bool {
+            self.failed_thaw.lock().is_some()
+        }
     }
 }

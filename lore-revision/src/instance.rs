@@ -13,7 +13,6 @@ use lore_base::error::MountsBusy;
 use lore_base::fs::lock::FSLock;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
-use lore_io::clone::CloneStats;
 use lore_storage::ReadOptions;
 use lore_storage::StoreError;
 use lore_storage::store_types::KeyType;
@@ -49,8 +48,12 @@ use crate::fs::filesystem_provider::InstanceCloneError;
 use crate::fs::filesystem_provider::clone_io_failure;
 use crate::fs::filesystem_provider::lore_directory_within;
 use crate::fs::mount_manager_state::MountManagerState;
-use crate::global::external_dir::check_for_external_lore_dir;
+use crate::fs::walk::CloneStats;
+use crate::global::external_dir::access::resolve_shared;
 use crate::global::external_dir::external_dir_for_instance;
+use crate::global::external_dir::resolve::Lookup;
+use crate::global::external_dir::resolve::RootState;
+use crate::global::external_dir::resolve::resolve;
 use crate::hash;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -61,12 +64,19 @@ use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
 use crate::repository::VfsType;
+use crate::util::in_use::is_free;
+use crate::util::in_use::is_in_use;
+use crate::util::in_use::rename_is_retryable;
+use crate::util::in_use::retry_while_in_use;
 use crate::util::to_hex_str;
 
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
 pub const ANCHOR_CURRENT_BRANCH: &str = "anchor-current-branch";
 pub const ANCHOR_STAGED: &str = "anchor-staged";
+/// Names the commit intent among an instance's anchor keys ([`anchor_key`]): the revision a commit
+/// of the instance publishes ([`store_commit_intent`]).
+pub const ANCHOR_COMMITTING: &str = "anchor-committing";
 
 /// A unique identity for a repository instance (a local checkout).
 ///
@@ -189,15 +199,99 @@ pub struct InstanceMetadata {
 /// its `.lore` directory: `repository create --force` or a re-clone on a
 /// shared store, or a checkout moved onto the path of a deleted one. Those
 /// registrations are retired here, so the instance list never carries two
-/// entries for one root directory.
+/// entries for one root directory. One listing serves the retirement and the
+/// refusal, with `InvalidArguments`, of a path where a virtual instance is
+/// registered, as [`refuse_virtual_instance_among`] refuses it.
 pub async fn register_instance(
     repository: &Arc<RepositoryContext>,
     instance_id: InstanceId,
     path: &str,
 ) -> Result<(), InstanceRegistryError> {
     let normalized_path = crate::util::path::clean(path.to_owned());
+    let others = match list_instances(repository).await {
+        Ok(instances) => Some(others_at_path(instances, instance_id, &normalized_path)),
+        Err(err) => {
+            lore_warn!("Failed to list instances while registering {instance_id}: {err}");
+            None
+        }
+    };
+    if let Some(others) = others.as_deref().filter(|others| !others.is_empty()) {
+        let state = resolve().forward::<InstanceRegistryError>("resolving the external root")?;
+        refuse_virtual_instance_among(&state, others, &normalized_path).await?;
+    }
     store_normalized_registration(repository, instance_id, &normalized_path).await?;
-    retire_instances_at_path(repository, instance_id, &normalized_path).await;
+    for other in others.unwrap_or_default() {
+        lore_debug!(
+            "Retiring instance {other} registered at {normalized_path}, superseded by \
+             {instance_id}"
+        );
+        remove_instance_keys(repository, other).await;
+    }
+    Ok(())
+}
+
+/// Refuses, with `InvalidArguments`, to place an instance other than `current` at `path`, as
+/// [`register_instance`] refuses to register it there, judging the external directories in the
+/// root `state`. For a command that checks before it changes anything.
+pub async fn refuse_registered_virtual_instance_at(
+    repository: &Arc<RepositoryContext>,
+    state: &RootState,
+    current: InstanceId,
+    path: &str,
+) -> Result<(), InstanceRegistryError> {
+    let normalized_path = crate::util::path::clean(path.to_owned());
+    let instances = list_instances(repository).await?;
+    let others = others_at_path(instances, current, &normalized_path);
+    refuse_virtual_instance_among(state, &others, &normalized_path).await
+}
+
+/// The instances of `instances` other than `current` and the zero id that are registered at
+/// `normalized_path`, which is already in the form [`crate::util::path::clean`] produces.
+fn others_at_path(
+    instances: Vec<InstanceMetadata>,
+    current: InstanceId,
+    normalized_path: &str,
+) -> Vec<InstanceId> {
+    let mut scratch = String::new();
+    instances
+        .into_iter()
+        .filter(|instance| {
+            instance.instance_id != current
+                && !instance.instance_id.is_zero()
+                && names_same_path(&instance.path, normalized_path, &mut scratch)
+        })
+        .map(|instance| instance.instance_id)
+        .collect()
+}
+
+/// Refuses an instance at `normalized_path` with `InvalidArguments` while one of `others`
+/// registered there is a virtual instance, judged in the external root `state`: its external
+/// directory is present and its config names a virtual filesystem or can't be read, or its lookup
+/// is unknown. Registering there would retire it, though its empty mount point only waits for its
+/// service or its root.
+async fn refuse_virtual_instance_among(
+    state: &RootState,
+    others: &[InstanceId],
+    normalized_path: &str,
+) -> Result<(), InstanceRegistryError> {
+    for &other in others {
+        let is_virtual = match state.lookup(other) {
+            Lookup::Absent => false,
+            Lookup::Unknown(_) => true,
+            Lookup::Present(dot_lore) => {
+                !matches!(external_vfs(&dot_lore).await, Some(VfsType::None))
+            }
+        };
+        if is_virtual {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "{normalized_path}: virtual instance {other} is registered there; remove \
+                     it, or use another path"
+                ),
+            }
+            .into());
+        }
+    }
     Ok(())
 }
 
@@ -260,44 +354,6 @@ fn names_same_path(path: &str, normalized: &str, scratch: &mut String) -> bool {
     scratch == normalized
 }
 
-/// Retire every registration other than `current` that records
-/// `normalized_path`, which is already in the form
-/// [`crate::util::path::clean`] produces.
-///
-/// Run by [`register_instance`] once its own record is written, so a path the
-/// registering checkout owns is left holding one entry without waiting for a
-/// reader to notice.
-///
-/// Best-effort: a failure to enumerate leaves the entries for
-/// [`instance_prune`], which classifies them as superseded.
-async fn retire_instances_at_path(
-    repository: &Arc<RepositoryContext>,
-    current: InstanceId,
-    normalized_path: &str,
-) {
-    let instances = match list_instances(repository).await {
-        Ok(instances) => instances,
-        Err(err) => {
-            lore_warn!("Failed to list instances while registering {current}: {err}");
-            return;
-        }
-    };
-    let mut scratch = String::new();
-    for instance in instances {
-        if instance.instance_id == current
-            || instance.instance_id.is_zero()
-            || !names_same_path(&instance.path, normalized_path, &mut scratch)
-        {
-            continue;
-        }
-        lore_debug!(
-            "Retiring instance {} registered at {normalized_path}, superseded by {current}",
-            instance.instance_id
-        );
-        remove_instance_keys(repository, instance.instance_id).await;
-    }
-}
-
 /// Zero the registration and anchor keys of `instance_id`, removing it from the
 /// store. Reports whether the write was possible: a read-only caller leaves the
 /// entry to the next writer. Failures are otherwise ignored, since a key that
@@ -313,7 +369,12 @@ async fn remove_instance_keys(
     let _ = handle
         .store(repository.id, key, Hash::default(), key_type)
         .await;
-    for function in [ANCHOR_CURRENT, ANCHOR_CURRENT_BRANCH, ANCHOR_STAGED] {
+    for function in [
+        ANCHOR_CURRENT,
+        ANCHOR_CURRENT_BRANCH,
+        ANCHOR_STAGED,
+        ANCHOR_COMMITTING,
+    ] {
         let (key, key_type) = anchor_key(repository.salt(), function, instance_id);
         let _ = handle
             .store(repository.id, key, Hash::default(), key_type)
@@ -366,6 +427,7 @@ async fn reconcile_instances(
     let instances = list_instances(repository)
         .await
         .forward::<InstanceError>("listing registered instances")?;
+    let state = resolve().forward::<InstanceError>("resolving the external root")?;
     let mut live = Vec::with_capacity(instances.len());
     let mut stale = Vec::new();
     let mut retired_any = false;
@@ -374,7 +436,7 @@ async fn reconcile_instances(
             live.push(instance);
             continue;
         }
-        let staleness = instance_staleness(&instance.path, instance.instance_id).await;
+        let staleness = instance_staleness(&state, &instance.path, instance.instance_id).await;
         if !staleness.is_stale() {
             live.push(instance);
             continue;
@@ -405,8 +467,8 @@ async fn reconcile_instances(
             });
         }
     }
-    if retired_any {
-        let _ = repository.flush(FlushOptions::default()).await;
+    if retired_any && let Err(err) = repository.flush(FlushOptions::default()).await {
+        lore_warn!("Failed to flush the retired instance registrations: {err}");
     }
     Ok((live, stale))
 }
@@ -427,7 +489,7 @@ pub async fn load_instance_metadata(
 fn instance_metadata_of(metadata: &Metadata) -> InstanceMetadata {
     InstanceMetadata {
         instance_id: registered_id(metadata),
-        path: registered_path(metadata),
+        path: registered_path(metadata).to_owned(),
         created: metadata.get_u64(CREATED).unwrap_or_default(),
     }
 }
@@ -444,11 +506,8 @@ fn registered_id(metadata: &Metadata) -> InstanceId {
 
 /// The path that the registration blob `metadata` holds, empty where it holds none or one that
 /// isn't UTF-8.
-fn registered_path(metadata: &Metadata) -> String {
-    metadata
-        .get_string(PATH)
-        .map(str::to_owned)
-        .unwrap_or_default()
+fn registered_path(metadata: &Metadata) -> &str {
+    metadata.get_string(PATH).unwrap_or_default()
 }
 
 /// Attempt to recover a lost instance ID by enumerating all registered
@@ -593,7 +652,7 @@ pub struct InstanceRecord {
     /// The instance's id, from its registration
     pub instance_id: InstanceId,
     /// The instance's working directory, as registered
-    pub path: String,
+    pub path: LoreString,
     /// The instance's current revision, zero where it has none
     pub revision: Hash,
     /// Whether the registration still describes a live checkout
@@ -652,6 +711,7 @@ fn visit_records<'a>(
             .list(repository.id, KeyType::Instance)
             .await
             .forward::<InstanceError>("listing registered instances")?;
+        let state = resolve().forward::<InstanceError>("resolving the external root")?;
         loop {
             let Some((_, metadata_hash)) = registrations.next().await else {
                 return Ok(());
@@ -662,7 +722,7 @@ fn visit_records<'a>(
                 continue;
             };
             if let Some((branch, record)) =
-                instance_record(repository, only, registration, instance_id).await?
+                instance_record(repository, &state, only, registration, instance_id).await?
             {
                 visit(branch, record);
             }
@@ -676,12 +736,13 @@ fn visit_records<'a>(
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
-fn instance_record(
-    repository: &Arc<RepositoryContext>,
+fn instance_record<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    state: &'a RootState,
     only: Option<BranchId>,
     registration: Metadata,
     instance_id: InstanceId,
-) -> impl Future<Output = Result<Option<(BranchId, InstanceRecord)>, InstanceError>> + '_ {
+) -> impl Future<Output = Result<Option<(BranchId, InstanceRecord)>, InstanceError>> + 'a {
     async move {
         let Some(branch) = load_anchor(repository, ANCHOR_CURRENT_BRANCH, instance_id)
             .await
@@ -693,12 +754,12 @@ fn instance_record(
         if only.is_some_and(|only| only != branch) {
             return Ok(None);
         }
-        let path = registered_path(&registration);
         let revision = load_anchor(repository, ANCHOR_CURRENT, instance_id)
             .await
             .forward::<InstanceError>("loading the current revision of an instance")?
             .unwrap_or_default();
-        let staleness = instance_staleness(&path, instance_id).await;
+        let path = LoreString::from(registered_path(&registration));
+        let staleness = instance_staleness(state, path.as_str(), instance_id).await;
         Ok(Some((
             branch,
             InstanceRecord {
@@ -872,8 +933,37 @@ pub async fn load_staged_revision(
     Ok(None)
 }
 
-/// Write the current anchor to the mutable store.
+/// Write the current anchor to the mutable store, clearing the commit intent
+/// ([`store_commit_intent`]) first where one is left: the anchor moves away from the revision it
+/// names.
+///
+/// A non-zero intent is one a commit left when it was cut short. The cleared intent is flushed
+/// before the anchor is written, so that a flush cut short cannot land the anchor without it.
+/// That clear is a cold path, boxed.
 pub async fn store_current_anchor(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<(), AnchorError> {
+    if !load_commit_intent(repository).await?.is_zero() {
+        Box::pin(clear_commit_intent_on_disk(repository)).await?;
+    }
+    store_committed_current_anchor(repository, revision).await
+}
+
+/// Clears the commit intent and flushes the stores, for [`store_current_anchor`].
+async fn clear_commit_intent_on_disk(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(), AnchorError> {
+    store_commit_intent(repository, Hash::default()).await?;
+    repository
+        .flush(crate::lore::execution_context().globals().flush_options())
+        .await
+        .forward_any::<AnchorError>("flushing the cleared commit intent")
+}
+
+/// Write the current anchor to the mutable store, keeping the commit intent
+/// ([`store_commit_intent`]) for a commit that makes `revision` current.
+pub(crate) async fn store_committed_current_anchor(
     repository: &Arc<RepositoryContext>,
     revision: Hash,
 ) -> Result<(), AnchorError> {
@@ -884,6 +974,71 @@ pub async fn store_current_anchor(
         .await
         .forward_any::<AnchorError>("failed to store current anchor")?;
     Ok(())
+}
+
+/// Write the commit intent to the mutable store (no flush): `revision`, which a commit of this
+/// instance publishes as its branch's latest and makes current, or zero once the commit's anchors
+/// are on disk.
+///
+/// The intent, on disk before the branch latest is stored, tells the next commit that a branch
+/// latest the anchors are behind is this instance's own commit rather than one of another
+/// instance, see [`crate::commit::store_branch_latest_and_make_current`] for the order of the
+/// writes. [`store_current_anchor`] clears it.
+pub(crate) async fn store_commit_intent(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+) -> Result<(), AnchorError> {
+    let (key, key_type) = anchor_key(repository.salt(), ANCHOR_COMMITTING, repository.instance_id);
+    let handle = repository.try_write_mutable_store().ok_or(WriteRequired)?;
+    handle
+        .store(repository.id, key, revision, key_type)
+        .await
+        .forward_any::<AnchorError>("storing the commit intent")?;
+    Ok(())
+}
+
+/// Load the commit intent ([`store_commit_intent`]) of this instance, zero when there is none.
+#[lore_macro::test_pub]
+pub(crate) async fn load_commit_intent(
+    repository: &Arc<RepositoryContext>,
+) -> Result<Hash, AnchorError> {
+    load_own_anchor(repository, ANCHOR_COMMITTING).await
+}
+
+/// Load this instance's current anchor from the mutable store: its revision, zero when there is
+/// none, and its branch. Unlike [`load_current_anchor`], a store that fails a read fails the call,
+/// and so does a missing branch, rather than falling back to the legacy anchor file.
+pub(crate) async fn load_own_current_anchor(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(Hash, BranchId), AnchorError> {
+    let revision = load_own_anchor(repository, ANCHOR_CURRENT).await?;
+    let branch = load_own_anchor(repository, ANCHOR_CURRENT_BRANCH).await?;
+    if branch.is_zero() {
+        return Err(AnchorError::internal("anchor branch is missing"));
+    }
+    Ok((revision, branch.to_context()))
+}
+
+/// Load the revision of this instance's staged anchor from the mutable store, `None` where the
+/// store holds none or holds zero. Unlike [`load_staged_revision`], a store that fails the read
+/// fails the call.
+pub(crate) async fn load_own_staged_revision(
+    repository: &Arc<RepositoryContext>,
+) -> Result<Option<Hash>, AnchorError> {
+    load_anchor(repository, ANCHOR_STAGED, repository.instance_id)
+        .await
+        .forward_any::<AnchorError>("loading the staged anchor")
+}
+
+/// Load the anchor `function` names of this instance, zero where the store holds none.
+async fn load_own_anchor(
+    repository: &Arc<RepositoryContext>,
+    function: &str,
+) -> Result<Hash, AnchorError> {
+    load_anchor(repository, function, repository.instance_id)
+        .await
+        .map(Option::unwrap_or_default)
+        .forward_any::<AnchorError>("loading an anchor")
 }
 
 /// Write the current branch to the mutable store (no flush).
@@ -1066,14 +1221,16 @@ fn names_unreachable_volume(_error: &io::Error) -> bool {
 /// registration active.
 ///
 /// The instance file is looked up through
-/// [`crate::repository::get_dot_lore_path`], so a legacy `.urc` directory and
-/// an SWFS mount whose `.lore` lives outside the path are both resolved.
+/// [`crate::repository::get_dot_lore_path_in`], so a legacy `.urc` directory and
+/// a virtual instance whose `.lore` lives outside the path are both resolved.
 ///
 /// Outside the service no mount manager resolves an SWFS instance, whose path
 /// is absent or an empty mount point while it is not mounted. An SWFS instance
-/// cannot be removed by hand, so its external `.lore` in the global data
-/// directory is evidence it still exists, and outweighs a missing path or
-/// checkout.
+/// cannot be removed by hand, so its external `.lore` in the external root
+/// `state` is evidence it still exists, and outweighs a missing path or
+/// checkout. An external directory whose lookup is unknown, as while the root
+/// is unavailable or a move of it is recorded, is no evidence it is gone, and
+/// keeps the registration active.
 ///
 /// A FUSE instance's path is an empty mount point while it is not mounted, as
 /// when the service is stopped, or mid-move, so its external `.lore`
@@ -1084,58 +1241,78 @@ fn names_unreachable_volume(_error: &io::Error) -> bool {
 /// An external `.lore` whose config is there but cannot be read or parsed is
 /// no evidence the instance is gone, whichever VFS it was, so it keeps the
 /// registration too.
-pub async fn instance_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
-    let staleness = path_staleness(path, instance_id).await;
-    if !matches!(
-        staleness,
-        InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
-    ) {
-        return staleness;
-    }
-    let Ok(external) = crate::global::external_dir::external_lore_dir(instance_id) else {
-        return staleness;
-    };
-    match external_vfs(&external).await {
-        None | Some(VfsType::Swfs) => InstanceStaleness::Active,
-        Some(VfsType::Fuse) if staleness == InstanceStaleness::CheckoutMissing => {
-            InstanceStaleness::Active
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn instance_staleness<'a>(
+    state: &'a RootState,
+    path: &'a str,
+    instance_id: InstanceId,
+) -> impl Future<Output = InstanceStaleness> + 'a {
+    async move {
+        let staleness = path_staleness(state, path, instance_id).await;
+        if !matches!(
+            staleness,
+            InstanceStaleness::PathMissing | InstanceStaleness::CheckoutMissing
+        ) {
+            return staleness;
         }
-        Some(_) => staleness,
+        let external = match state.lookup(instance_id) {
+            Lookup::Present(external) => external,
+            Lookup::Absent => return staleness,
+            Lookup::Unknown(_) => return InstanceStaleness::Active,
+        };
+        match external_vfs(&external).await {
+            None | Some(VfsType::Swfs) => InstanceStaleness::Active,
+            Some(VfsType::Fuse) if staleness == InstanceStaleness::CheckoutMissing => {
+                InstanceStaleness::Active
+            }
+            Some(_) => staleness,
+        }
     }
 }
 
 /// Classify the registration of `instance_id` at `path` by what the path
 /// holds, as [`instance_staleness`] does before consulting external `.lore`
 /// directories.
-async fn path_staleness(path: &str, instance_id: InstanceId) -> InstanceStaleness {
-    if path.is_empty() {
-        return InstanceStaleness::Active;
-    }
-    let io = lore_io::IoDriver::global();
-    match io.stat(path).await {
-        Ok(_) => {}
-        Err(err) if is_absent(&err) => return InstanceStaleness::PathMissing,
-        Err(_) => return InstanceStaleness::Active,
-    }
-    let Ok(dot_path) = crate::repository::get_dot_lore_path(Path::new(path)) else {
-        return InstanceStaleness::Active;
-    };
-    let expected = instance_id.as_bytes();
-    match io
-        .read_file_bytes(dot_path.join(crate::repository::INSTANCE))
-        .await
-    {
-        // Same read as `InstanceId::read_from_file`: the leading 16 bytes.
-        Ok(bytes) if bytes.len() >= expected.len() => {
-            if instance_id.is_zero() || bytes[..expected.len()] == *expected {
-                InstanceStaleness::Active
-            } else {
-                InstanceStaleness::Superseded
-            }
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn path_staleness<'a>(
+    state: &'a RootState,
+    path: &'a str,
+    instance_id: InstanceId,
+) -> impl Future<Output = InstanceStaleness> + 'a {
+    async move {
+        if path.is_empty() {
+            return InstanceStaleness::Active;
         }
-        Ok(_) => InstanceStaleness::CheckoutMissing,
-        Err(err) if is_absent(&err) => InstanceStaleness::CheckoutMissing,
-        Err(_) => InstanceStaleness::Active,
+        let io = lore_io::IoDriver::global();
+        match io.stat(path).await {
+            Ok(_) => {}
+            Err(err) if is_absent(&err) => return InstanceStaleness::PathMissing,
+            Err(_) => return InstanceStaleness::Active,
+        }
+        let Ok(dot_path) = crate::repository::get_dot_lore_path_in(Path::new(path), state) else {
+            return InstanceStaleness::Active;
+        };
+        let expected = instance_id.as_bytes();
+        match io
+            .read_file_bytes(dot_path.join(crate::repository::INSTANCE))
+            .await
+        {
+            // Same read as `InstanceId::read_from_file`: the leading 16 bytes.
+            Ok(bytes) if bytes.len() >= expected.len() => {
+                if instance_id.is_zero() || bytes[..expected.len()] == *expected {
+                    InstanceStaleness::Active
+                } else {
+                    InstanceStaleness::Superseded
+                }
+            }
+            Ok(_) => InstanceStaleness::CheckoutMissing,
+            Err(err) if is_absent(&err) => InstanceStaleness::CheckoutMissing,
+            Err(_) => InstanceStaleness::Active,
+        }
     }
 }
 
@@ -1161,8 +1338,7 @@ async fn instance_anchor_state(
         .await
         .ok()
         .flatten()
-        .map(|h| h.to_context())
-        .unwrap_or_default();
+        .map_or_default(|h| h.to_context());
     let branch_name = if !branch_id.is_zero() {
         crate::branch::metadata(repository.clone(), branch_id)
             .await
@@ -1527,15 +1703,33 @@ fn check_mount(
     }
 }
 
-/// The VFS serving the instance at `path`, after checking as [`check_mount`] does that it can be
-/// acted on: the VFS of the service's mount of `instance_id` at `path`, which the check requires
-/// of an instance with an external directory, or [`VfsType::None`] for one in a directory of its
-/// own.
+/// Whether the instance `instance_id` at `path` has an external directory, by its `lookup`: a
+/// lookup that is unknown refuses to `action` it where a mount is at `path`, and reads as an
+/// ordinary instance where none is.
+#[lore_macro::test_pub]
+fn external_presence(
+    lookup: &Lookup,
+    mounted: bool,
+    instance_id: InstanceId,
+    path: &str,
+    action: &str,
+) -> Result<bool, InstanceError> {
+    match lookup {
+        Lookup::Present(_) => Ok(true),
+        Lookup::Unknown(unknown) if mounted => Err(InstanceError::internal(format!(
+            "Unable to {action} the virtual instance {instance_id} at {path}: {unknown}"
+        ))),
+        Lookup::Absent | Lookup::Unknown(_) => Ok(false),
+    }
+}
+
+/// The external root, and the VFS serving the instance at `path` once [`check_mount`] finds it can
+/// be acted on, resolved under shared access where the service mounts an instance at `path`.
 fn require_own_mount(
     instance_id: InstanceId,
     path: &str,
     action: &str,
-) -> Result<VfsType, InstanceError> {
+) -> Result<(RootState, VfsType), InstanceError> {
     let mount_manager = MountManagerState::mount_manager();
     let mounted = match &mount_manager {
         Some(mount_manager) => mount_manager
@@ -1543,22 +1737,35 @@ fn require_own_mount(
             .forward_any::<InstanceError>("failed to look up the mount")?,
         None => None,
     };
+    let state = if mounted.is_some() {
+        resolve_shared()
+    } else {
+        resolve()
+    }
+    .forward::<InstanceError>("resolving the external root")?;
+    let lookup = state.lookup(instance_id);
     check_mount(
         instance_id,
-        matches!(check_for_external_lore_dir(instance_id), Ok(Some(_))),
+        external_presence(&lookup, mounted.is_some(), instance_id, path, action)?,
         mount_manager.is_some(),
         mounted.map(|(mounted, _)| mounted),
         path,
         action,
     )?;
-    Ok(mounted.map_or(VfsType::None, |(_, vfs)| vfs))
+    Ok((state, mounted.map_or(VfsType::None, |(_, vfs)| vfs)))
 }
 
-/// Fail where Windows would refuse to rename or delete `instance_path` because a process has it
-/// as its working directory, before anything has been changed.
-fn require_working_directory_outside(
-    instance_path: &str,
-    action: &str,
+/// How to run an instance move or delete whose working directory is inside the instance.
+const OUTSIDE_THE_INSTANCE: &str =
+    "Run the command from outside the instance, naming it with --repository";
+
+/// Fail where Windows would refuse to rename or delete `path`, which `subject` names in the
+/// message, such as "delete the instance", because a process has it as its working directory,
+/// before anything has been changed. `advice` tells the caller how to run the command instead.
+pub(crate) fn require_working_directory_outside(
+    path: &str,
+    subject: &str,
+    advice: &str,
 ) -> Result<(), InstanceError> {
     if !cfg!(target_family = "windows") {
         return Ok(());
@@ -1570,57 +1777,13 @@ fn require_working_directory_outside(
     };
     let working_directory =
         crate::util::path::clean(working_directory.to_string_lossy().into_owned()).to_lowercase();
-    let instance = crate::util::path::clean(instance_path.to_owned()).to_lowercase();
-    if working_directory == instance || working_directory.starts_with(&format!("{instance}/")) {
+    let inside = crate::util::path::clean(path.to_owned()).to_lowercase();
+    if working_directory == inside || working_directory.starts_with(&format!("{inside}/")) {
         return Err(InstanceError::internal(format!(
-            "Cannot {action} the instance at {instance_path} while it is the working directory. \
-             Run the command from outside the instance, naming it with --repository"
+            "Cannot {subject} at {path} while it is the working directory. {advice}"
         )));
     }
     Ok(())
-}
-
-/// First wait before a move or delete reissues a file operation that failed because something
-/// had the instance's files in use, in milliseconds.
-#[lore_macro::test_pub]
-const IN_USE_RETRY_START_MILLIS: u64 = 50;
-
-/// Longest wait the backoff grows to, in milliseconds.
-#[lore_macro::test_pub]
-const IN_USE_RETRY_MAXIMUM_MILLIS: u64 = 2_000;
-
-/// Waits before an operation that keeps failing in use is reported. With the schedule above this
-/// waits about fifteen seconds, longer than the ten seconds a finished command in the same process
-/// keeps the instance's stores open by default.
-#[lore_macro::test_pub]
-const IN_USE_RETRY_LIMIT: usize = 12;
-
-/// Whether `error` says that something has the files in use, so the operation can succeed once
-/// it lets go: another Lore command reading the instance, in this process or another, or a
-/// program the user has open in it.
-#[lore_macro::test_pub]
-fn is_in_use(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::ResourceBusy || is_in_use_for_platform(error)
-}
-
-/// Whether a failed rename of an instance to `to` is worth reissuing: the files were in use and
-/// the target is still free. Windows reports a rename onto a path that is taken as access denied,
-/// the same error a file open in the directory gives, and no wait frees that path.
-#[lore_macro::test_pub]
-fn rename_is_retryable<'a>(
-    error: &io::Error,
-    to: &'a Path,
-) -> impl Future<Output = bool> + use<'a> {
-    let in_use = is_in_use(error);
-    async move { in_use && is_free(to).await }
-}
-
-/// Whether nothing is at `path`, linked or not. A path that cannot be checked counts as taken.
-async fn is_free(path: &Path) -> bool {
-    matches!(
-        lore_io::IoDriver::global().symlink_stat(path).await,
-        Err(error) if error.kind() == io::ErrorKind::NotFound
-    )
 }
 
 /// Whether a failed delete of an instance directory is worth reissuing: the files were in use, or
@@ -1629,59 +1792,6 @@ async fn is_free(path: &Path) -> bool {
 #[lore_macro::test_pub]
 fn delete_is_retryable(error: &io::Error) -> bool {
     is_in_use(error) || error.kind() == io::ErrorKind::DirectoryNotEmpty
-}
-
-/// Windows refuses to rename a directory with a file open in it as access denied, and to delete
-/// a file another handle shares no deletion with as a sharing violation.
-#[cfg(target_family = "windows")]
-fn is_in_use_for_platform(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(code)
-            if code == windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32
-                || code == windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32
-                || code == windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32
-    )
-}
-
-/// No other kernel refuses a rename or delete because a file is open.
-#[cfg(not(target_family = "windows"))]
-fn is_in_use_for_platform(_error: &io::Error) -> bool {
-    false
-}
-
-/// Runs `operation`, reissuing it with backoff for as long as it fails with an error `retryable`
-/// accepts, up to [`IN_USE_RETRY_LIMIT`] times. Any other failure is reported at once.
-///
-/// Takes plain closures returning futures rather than `AsyncFn`s, whose higher-ranked lifetimes
-/// defeat `Send` inference for the callers that spawn these commands.
-#[lore_macro::test_pub]
-async fn retry_while_in_use<T, E, F, O, R, RO>(
-    action: &str,
-    retryable: R,
-    mut operation: F,
-) -> Result<T, E>
-where
-    E: fmt::Display,
-    F: FnMut() -> O,
-    O: Future<Output = Result<T, E>>,
-    R: Fn(&E) -> RO,
-    RO: Future<Output = bool>,
-{
-    let mut retry = crate::util::time::retry(
-        IN_USE_RETRY_START_MILLIS,
-        IN_USE_RETRY_MAXIMUM_MILLIS,
-        IN_USE_RETRY_LIMIT,
-    );
-    loop {
-        match operation().await {
-            Ok(value) => return Ok(value),
-            Err(error) if retryable(&error).await && retry.wait().await => {
-                lore_debug!("Retrying to {action}, which failed in use: {error}");
-            }
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 /// A delete of an instance's files that failed, with the directory that holds what is left.
@@ -1923,7 +2033,7 @@ async fn instance_delete_with(
     let path = repository.path_for_display().to_string();
     // Everything that can fail on a bad configuration is checked before anything is changed, and
     // by a dry run too.
-    let vfs = require_own_mount(instance_id, &path, "delete")?;
+    let (state, vfs) = require_own_mount(instance_id, &path, "delete")?;
 
     // Emit begin event
     LoreEvent::RepositoryInstanceDeleteBegin(LoreRepositoryInstanceDeleteBeginEventData {
@@ -1933,12 +2043,12 @@ async fn instance_delete_with(
     })
     .send();
 
-    require_working_directory_outside(&path, "delete")?;
+    require_working_directory_outside(&path, "delete the instance", OUTSIDE_THE_INSTANCE)?;
     let shared_store = uses_shared_store(&repository).await?;
     // The directory a delete removes, and the name it renames that directory to first. A taken
     // name is refused in every case, as only a refused rename tells a mount point.
     let directory = if vfs.is_virtual() {
-        external_dir_for_instance(instance_id)
+        external_dir_for_instance(&state, instance_id)
             .forward_any::<InstanceError>("failed to find the external directory")?
     } else {
         PathBuf::from(&path)
@@ -2027,6 +2137,7 @@ async fn instance_delete_with(
                 } else if let Some(mm) = MountManagerState::mount_manager() {
                     mm.swfs()
                         .remove_mount(Path::new(&path))
+                        .await
                         .forward::<InstanceError>("unmounting the instance")?;
                 }
             }
@@ -2098,7 +2209,7 @@ async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
 #[allow(clippy::unused_async)]
 async fn unmount_fuse_instance(path: &str) -> Result<(), InstanceError> {
     Err(InstanceError::internal(format!(
-        "The instance at {path} is a virtual clone, which only Linux serves"
+        "The instance at {path} is a FUSE instance, which only Linux serves"
     )))
 }
 
@@ -2182,7 +2293,7 @@ async fn move_fuse_mount(
     _to: &str,
 ) -> Result<(), InstanceError> {
     Err(InstanceError::internal(format!(
-        "The instance at {from} is a virtual clone, which only Linux serves"
+        "The instance at {from} is a FUSE instance, which only Linux serves"
     )))
 }
 
@@ -2372,7 +2483,7 @@ async fn instance_move_with(
     }
     crate::repository::refuse_instance_nested_at(target)?;
 
-    let vfs = require_own_mount(instance_id, &source_path, "move")?;
+    let (state, vfs) = require_own_mount(instance_id, &source_path, "move")?;
     if vfs.is_virtual()
         && let Some(mm) = MountManagerState::mount_manager()
         && mm.is_mounted(target).unwrap_or(false)
@@ -2381,10 +2492,13 @@ async fn instance_move_with(
             "Target path is already an instance mount: {target_path}"
         )));
     }
-    require_working_directory_outside(&source_path, "move")?;
+    require_working_directory_outside(&source_path, "move the instance", OUTSIDE_THE_INSTANCE)?;
     // The new path is recorded through the instance's config and, if it has one, its shared
     // store, so a problem with either is found before anything is moved.
     uses_shared_store(&repository).await?;
+    refuse_registered_virtual_instance_at(&repository, &state, instance_id, target_path)
+        .await
+        .forward::<InstanceError>("checking the instances registered at the target")?;
 
     // Emit begin event
     LoreEvent::RepositoryInstanceMoveBegin(LoreRepositoryInstanceMoveBeginEventData {
@@ -2481,9 +2595,14 @@ fn display_path(path: &Path) -> String {
 /// Where a clone at `target_path` can be created: its resolved parent joined with its name.
 ///
 /// Refused with [`InstanceError::InvalidArguments`]: a destination that exists, one whose parent
-/// does not, one that names no directory, and one nested in another instance or in a virtual
-/// instance's mount.
-fn resolve_clone_destination(target_path: &str) -> Result<PathBuf, InstanceError> {
+/// does not, one that names no directory, one nested in another instance or in a virtual
+/// instance's mount, and, where cloning `writes_beside` it, one whose name leaves no room for the
+/// names cloning gives the paths beside it.
+#[lore_macro::test_pub]
+fn resolve_clone_destination(
+    target_path: &str,
+    writes_beside: bool,
+) -> Result<PathBuf, InstanceError> {
     if target_path.is_empty() {
         return Err(refused_target("no target path given".to_string()));
     }
@@ -2499,9 +2618,9 @@ fn resolve_clone_destination(target_path: &str) -> Result<PathBuf, InstanceError
     // The longest name the clone gives a path beside the destination: a removal's, which ends
     // in [`REMOVING_SUFFIX`] after the in-progress name and its 32 hexadecimal digits.
     let longest = name.len() + IN_PROGRESS_INFIX.len() + 32 + REMOVING_SUFFIX.len();
-    if longest > MAX_NAME_LENGTH {
+    if writes_beside && longest > MAX_NAME_LENGTH {
         return Err(refused(&format!(
-            "its name is too long for the directory the clone writes beside it, whose name \
+            "its name is too long for the directory that cloning writes beside it, whose name \
              adds {} characters",
             longest - name.len()
         )));
@@ -2532,7 +2651,7 @@ async fn clone_anchors(
     }
     if anchors[1].is_zero() {
         return Err(InstanceError::internal(format!(
-            "Instance {instance} has no branch to give its clone"
+            "Instance {instance} has no branch to give the new instance"
         )));
     }
     Ok(anchors)
@@ -2550,7 +2669,7 @@ async fn store_anchors(
         handle
             .store(repository.id, key, value, key_type)
             .await
-            .forward::<InstanceError>("storing the clone's anchors")?;
+            .forward::<InstanceError>("storing the new instance's anchors")?;
     }
     lore_debug!("Instance {clone} took its source's anchors");
     Ok(())
@@ -2573,7 +2692,7 @@ async fn move_clone_into_place(in_progress: &Path, destination: &Path) -> io::Re
             let (from, to) = (in_progress.to_path_buf(), destination.to_path_buf());
             async move {
                 lore_base::lore_spawn_blocking!(move || lore_io::rename::rename_no_replace(
-                    &from, &to
+                    &from, &to, false
                 ))
                 .await
                 .unwrap_or_else(|err| Err(io::Error::other(err)))
@@ -2591,10 +2710,10 @@ fn in_progress_path(destination: &Path, clone_id: InstanceId) -> PathBuf {
 
 /// What a removal of an in-progress directory appends to its name as it renames it aside, so a
 /// removal cut short leaves a directory the next clone removes whatever is left in it.
-const REMOVING_SUFFIX: &str = ".removing";
+pub(crate) const REMOVING_SUFFIX: &str = ".removing";
 
 /// The name an in-progress directory is renamed to while it is removed.
-fn removing_path(in_progress: &Path) -> PathBuf {
+pub(crate) fn removing_path(in_progress: &Path) -> PathBuf {
     sibling_with_suffix(in_progress, REMOVING_SUFFIX)
 }
 
@@ -2627,18 +2746,25 @@ pub struct InstanceClonePlan {
     target_path: String,
     /// The instance ID the copy takes.
     clone_id: InstanceId,
-    /// Where the clone is written before it takes the destination, beside it.
+    /// The VFS serving the source, [`VfsType::None`] for one in a directory of its own.
+    vfs: VfsType,
+    /// Where the copy is written: beside the destination before it takes it, or for a virtual
+    /// clone, the new instance's external directory, which its mount serves the destination from.
     in_progress: PathBuf,
     /// Held from the plan to the finish, so another clone to the destination never takes this
     /// clone's in-progress directory for one an interrupted clone left.
     in_progress_lock: Arc<InProgressLock>,
     answer: CloneAnswer,
     allow_copy: bool,
+    /// Set once the new instance is at its destination, so the finish removes nothing cloning
+    /// wrote.
+    placed: AtomicBool,
 }
 
 #[cfg(feature = "test-util")]
 impl InstanceClonePlan {
-    /// Where the clone is written before it takes the destination.
+    /// Where the copy is written: beside the destination, or for a virtual clone, the new
+    /// instance's external directory.
     pub fn in_progress(&self) -> &Path {
         &self.in_progress
     }
@@ -2649,19 +2775,36 @@ impl InstanceClonePlan {
     }
 }
 
-/// Refuses a clone from `source` to `target` whose `answer` does not share blocks, unless
-/// `allow_copy` opts into the copy it describes, with [`InstanceError::NotSupported`], and a copy
-/// the destination has no room for with [`InstanceError::Oversized`]. An unsupported clone is
-/// always refused.
+/// Refuses cloning `source`, served by `vfs`, to `target` where `answer` does not share blocks,
+/// unless `allow_copy` opts into the copy it describes, with [`InstanceError::NotSupported`], and a
+/// copy the volume it writes to has no room for with [`InstanceError::Oversized`]. An unsupported
+/// answer is always refused. A FUSE instance's copy is written to the external root, so its remedy
+/// names the external root, and its free-space refusal names the external root's volume, not the
+/// destination's.
 #[lore_macro::test_pub]
 fn refuse_clone(
     answer: &CloneAnswer,
     allow_copy: bool,
     source: &str,
+    vfs: VfsType,
     target: &str,
 ) -> Result<(), InstanceError> {
     use lore_base::units::format_bytes_to_string;
 
+    let (remedy, written_to) = if vfs == VfsType::Fuse {
+        (
+            "Put the external root, which holds the local changes of every FUSE instance, on a \
+             filesystem that clones files (Btrfs, XFS or bcachefs)",
+            "the external root's volume",
+        )
+    } else {
+        (
+            "Put the instances on a filesystem that clones files (Dev Drive or ReFS on Windows, \
+             APFS on macOS, Btrfs, XFS or bcachefs on Linux), with the destination on the \
+             source's volume",
+            "the destination's volume",
+        )
+    };
     match answer {
         CloneAnswer::Unsupported { reason } => Err(NotSupported {
             operation: format!("cloning {source} to {target}: {reason}"),
@@ -2669,10 +2812,8 @@ fn refuse_clone(
         .into()),
         CloneAnswer::CopiesBytes { reason, size, .. } if !allow_copy => Err(NotSupported {
             operation: format!(
-                "cloning {source} to {target} by sharing data blocks: {reason}. Put the \
-                 instances on a filesystem that clones files (Dev Drive or ReFS on Windows, APFS \
-                 on macOS, Btrfs, XFS or bcachefs on Linux), with the destination on the source's volume, \
-                 or allow a copy, which takes {} for {} files and holds the store's locks \
+                "cloning {source} to {target} by sharing data blocks: {reason}. {remedy}, or \
+                 allow a copy, which takes {} for {} files and holds the store's locks \
                  throughout",
                 format_bytes_to_string(size.size),
                 size.file_count
@@ -2683,7 +2824,7 @@ fn refuse_clone(
             size, available, ..
         } if *available < size.size => Err(Oversized {
             context: format!(
-                "copying {source} to {target} takes {}, and the destination's volume has {} free",
+                "copying {source} to {target} takes {}, and {written_to} has {} free",
                 format_bytes_to_string(size.size),
                 format_bytes_to_string(*available)
             ),
@@ -2705,12 +2846,12 @@ fn send_clone_progress(phase: LoreRepositoryInstanceClonePhase, path: &str, stat
 }
 
 /// Whether anything is at `path`.
-async fn is_present(path: &Path) -> bool {
+pub(crate) async fn is_present(path: &Path) -> bool {
     lore_io::IoDriver::global().symlink_stat(path).await.is_ok()
 }
 
 /// Releases the lock of the clone in progress at `in_progress` and removes its lock file.
-async fn release_in_progress_lock(in_progress: &Path, lock: FSLock) {
+pub(crate) async fn release_in_progress_lock(in_progress: &Path, lock: FSLock) {
     let named = in_progress.to_path_buf();
     let lock_file = lore_base::lore_spawn_blocking!(move || FSLock::lock_file_of(&named)).await;
     drop(lock);
@@ -2750,14 +2891,14 @@ async fn remove_leftover_clones(destination: &Path, own: &Path) {
         Ok(Ok(leftovers)) => leftovers,
         Ok(Err(err)) => {
             lore_warn!(
-                "Failed to list the directory holding {} for clones an interruption left: {err}",
+                "Failed to list the directory holding {} for directories that interrupted cloning left: {err}",
                 destination.display()
             );
             return;
         }
         Err(err) => {
             lore_warn!(
-                "Failed to list the directory holding {} for clones an interruption left: {err}",
+                "Failed to list the directory holding {} for directories that interrupted cloning left: {err}",
                 destination.display()
             );
             return;
@@ -2809,7 +2950,7 @@ async fn remove_clone_left(path: &Path, aside: Option<&Path>) -> bool {
         &display_path(path),
         CloneStats::default(),
     );
-    remove_clone_directory(path, aside, "an interrupted clone").await
+    remove_clone_directory(path, aside, "interrupted cloning").await
 }
 
 /// Removes `path`, a directory `left_by` left, renamed aside to `aside` first where given, and
@@ -2836,7 +2977,8 @@ async fn remove_clone_directory(path: &Path, aside: Option<&Path>, left_by: &str
 ///
 /// In a dry run (the global `dry_run` flag), stops there and returns `None`. Otherwise removes
 /// the in-progress directories interrupted clones to the destination left, and returns the plan,
-/// holding the lock of its own in-progress directory.
+/// holding the lock of its own in-progress directory: for a virtual clone, its external
+/// directory, which a service that starts removes where an interrupted clone left it.
 pub async fn instance_clone_plan(
     repository: Arc<RepositoryContext>,
     target_path: &str,
@@ -2863,20 +3005,28 @@ async fn instance_clone_plan_with(
     let instance_id = repository.instance_id;
     let source = repository.require_path()?.to_path_buf();
     let dot_path = repository.dot_dir_path()?.to_path_buf();
+    let (state, vfs) = require_own_mount(
+        instance_id,
+        &repository.path_for_display().to_string(),
+        "clone",
+    )?;
     if !uses_shared_store(&repository).await? {
         return Err(NotSupported {
-            operation: "cloning an instance with a local store, since the clone's anchors and \
-                        registration would be written to the source's own store; only an \
-                        instance on a shared store can be cloned"
-                .to_string(),
+            operation:
+                "cloning an instance with a local store, since the new instance's anchors and \
+                 registration would be written to the source's own store; only an instance \
+                 on a shared store can be cloned"
+                    .to_string(),
         }
         .into());
     }
     // Resolving the destination stats each directory above it, so it runs off the runtime.
     let target = target_path.to_string();
-    let destination = lore_base::lore_spawn_blocking!(move || resolve_clone_destination(&target))
-        .await
-        .internal("resolving the clone's destination")??;
+    let writes_beside = vfs != VfsType::Fuse;
+    let destination =
+        lore_base::lore_spawn_blocking!(move || resolve_clone_destination(&target, writes_beside))
+            .await
+            .internal("resolving the new instance's destination")??;
     let target_path = display_path(&destination);
     let source_path = display_path(&source);
     let answer = provider
@@ -2890,7 +3040,7 @@ async fn instance_clone_plan_with(
         CloneAnswer::SharesBlocks { volume, .. } => (
             LoreRepositoryInstanceCloneMethod::SharesBlocks,
             Some(volume),
-            lore_io::clone::TreeSize::default(),
+            crate::fs::walk::TreeSize::default(),
             0,
             "",
         ),
@@ -2909,7 +3059,7 @@ async fn instance_clone_plan_with(
         CloneAnswer::Unsupported { reason } => (
             LoreRepositoryInstanceCloneMethod::Unsupported,
             None,
-            lore_io::clone::TreeSize::default(),
+            crate::fs::walk::TreeSize::default(),
             0,
             reason.as_str(),
         ),
@@ -2929,7 +3079,7 @@ async fn instance_clone_plan_with(
         reason: LoreString::from_str(reason),
     })
     .send();
-    refuse_clone(&answer, allow_copy, &source_path, &target_path)?;
+    refuse_clone(&answer, allow_copy, &source_path, vfs, &target_path)?;
 
     if dry_run {
         LoreEvent::RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData {
@@ -2944,21 +3094,27 @@ async fn instance_clone_plan_with(
     }
 
     let clone_id = InstanceId::generate();
-    let in_progress = in_progress_path(&destination, clone_id);
+    let in_progress = if vfs == VfsType::Fuse {
+        external_dir_for_instance(&state, clone_id)
+            .forward_any::<InstanceError>("finding the new instance's external directory")?
+    } else {
+        in_progress_path(&destination, clone_id)
+    };
     // The lock file's name holds the new instance ID, so no other clone holds it; the lock is
     // taken off the runtime, as resolving its path stats the directory it lies in.
     let locking = in_progress.clone();
-    let in_progress_lock =
-        lore_base::lore_spawn_blocking!(move || FSLock::try_acquire_file_lock(&locking))
-            .await
-            .internal("locking the clone's in-progress directory")?
-            .internal("locking the clone's in-progress directory")?
-            .ok_or_else(|| {
-                InstanceError::internal(format!(
-                    "{}: another clone holds the lock of this clone's in-progress directory",
-                    display_path(&in_progress)
-                ))
-            })?;
+    let in_progress_lock = lore_base::lore_spawn_blocking!(move || FSLock::try_acquire_file_lock(
+        &locking
+    ))
+    .await
+    .internal("locking the new instance's in-progress directory")?
+    .internal("locking the new instance's in-progress directory")?
+    .ok_or_else(|| {
+        InstanceError::internal(format!(
+            "{}: another process holds the lock of the new instance's in-progress directory",
+            display_path(&in_progress)
+        ))
+    })?;
     remove_leftover_clones(&destination, &in_progress).await;
     Ok(Some(InstanceClonePlan {
         provider,
@@ -2968,36 +3124,40 @@ async fn instance_clone_plan_with(
         destination,
         target_path,
         clone_id,
+        vfs,
         in_progress_lock: Arc::new(InProgressLock {
             _lock: in_progress_lock,
             in_progress: in_progress.clone(),
+            remove_file: false,
         }),
         in_progress,
         answer,
         allow_copy,
+        placed: AtomicBool::new(false),
     }))
 }
 
 /// Clones the current instance as `plan` describes: copies its directory, `.lore` included,
 /// through the provider's clone backend, and registers the copy as an instance of its own at the
-/// source's current revision, branch and staged state.
+/// source's current revision, branch and staged state. A virtual clone's copy is its external
+/// directory, which its mount serves the destination from, as [`place_virtual_clone`] describes.
 ///
 /// The anchors are read, and a destination another live instance is registered at is refused,
-/// before the clone writes anything. The copy is written to the plan's in-progress directory,
-/// whose Lore directory is marked as a clone in progress, names the copy's new ID and is marked
-/// as holding no store records before anything else is copied. The modified-time records are
-/// written back first, so the copy's first scan hashes only the files a scan of the source would:
-/// those with no record, and those changed since theirs. A source moved or deleted during the copy
-/// fails the clone: `instance move` and `instance delete` take no repository lock, so the lock does
-/// not keep them out, though on Windows the copy's hold on the directory it lists refuses them. The anchors are written to the shared store, and synced to disk,
-/// before the copy takes the destination, and the registration, which retires other
+/// before the clone writes anything. The copy is written to the plan's in-progress directory, whose
+/// Lore directory is marked as a clone in progress, names the copy's new ID and is marked as
+/// holding no store records before anything else is copied. The modified-time records are written
+/// back first, so the first scan of a copy of an on-disk instance hashes only the files a scan of
+/// the source would: those with no record, and those changed since theirs. A source moved or
+/// deleted during the copy fails the clone: `instance move` and `instance delete` take no
+/// repository lock, so the lock does not keep them out, though on Windows the copy's hold on the
+/// directory it lists refuses them. The anchors are written to the shared store, and synced to
+/// disk, before the copy takes the destination, and the registration, which retires other
 /// registrations at the destination, only once it has. A failure before the move removes the
 /// clone's keys as far as the store allows; a crash before it leaves the clone's three anchor keys
-/// and no registration, and a crash after it an instance that registers itself when a write
-/// command next opens it. The copied files' data is not synced: after a power loss a copied file
-/// can hold less than its kept time vouches for, as after any copy the system has not written
-/// out. A failure names the in-progress directory and leaves it for [`instance_clone_finish`] to
-/// remove.
+/// and no registration, and a crash after it an instance that registers itself when a write command
+/// next opens it. The copied files' data is not synced: after a power loss a copied file can hold
+/// less than its kept time vouches for, as after any copy the system has not written out. A failure
+/// names the in-progress directory and leaves it for [`instance_clone_finish`] to remove.
 ///
 /// The caller holds the instance's repository lock alone, and with it the store's locks, for
 /// the whole call (see [`crate::repository::load_and_connect_exclusive`]), so no other command
@@ -3019,13 +3179,7 @@ async fn instance_clone_with(
     register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
 ) -> Result<(), InstanceError> {
     let instance_id = repository.instance_id;
-    let context = || {
-        format!(
-            "cloning to {}, in progress at {}",
-            plan.target_path,
-            display_path(&plan.in_progress)
-        )
-    };
+    let context = || clone_context(plan);
     // An instance moved to the source's path since the plan is not the tree the plan measured.
     if instance_id != plan.source_id {
         return Err(FileNotFound {
@@ -3068,71 +3222,13 @@ async fn instance_clone_with(
         .forward_with::<InstanceError, _>(context)?;
 
     send_clone_progress(LoreRepositoryInstanceClonePhase::Registering, "", stats);
-    let flush_options = crate::lore::execution_context().globals().flush_options();
-    let placed = async {
-        store_anchors(&repository, plan.clone_id, anchors).await?;
-        // Synced whatever `--sync-data` says, so the rename never lands on disk before them.
-        repository
-            .flush(FlushOptions::SYNC_DATA)
+    if plan.vfs == VfsType::Fuse {
+        place_virtual_clone(&repository, plan, anchors, register)
             .await
-            .forward_any::<InstanceError>("flushing the clone's anchors")?;
-        match move_into_place(&plan.in_progress, &plan.destination).await {
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
-                ) =>
-            {
-                Err(refused_target(format!(
-                    "{}: it already exists",
-                    plan.target_path
-                )))
-            }
-            moved => moved
-                .map_err(|err| clone_io_failure(err, "moving the clone to its destination"))
-                .forward::<InstanceError>("moving the clone to its destination"),
-        }
+            .forward_with::<InstanceError, _>(context)?;
+    } else {
+        place_clone(&repository, plan, anchors, move_into_place, register).await?;
     }
-    .await;
-    if let Err(err) = placed {
-        remove_instance_keys(&repository, plan.clone_id).await;
-        let _ = repository.flush(flush_options).await;
-        return Err(err).forward_with::<InstanceError, _>(context);
-    }
-    if let Ok(dot_name) = lore_directory_within(&plan.source, &plan.dot_path)
-        && let Err(err) = lore_io::IoDriver::global()
-            .remove_file(plan.destination.join(dot_name).join(CLONE_IN_PROGRESS_MARK))
-            .await
-    {
-        lore_warn!(
-            "Failed to remove the mark of a clone in progress from {}: {err}",
-            plan.target_path
-        );
-    }
-    // A registration synced to disk never names a destination the move has not reached there.
-    if flush_options.sync_data {
-        let destination = plan.destination.clone();
-        match lore_base::lore_spawn_blocking!(move || sync_parent_directory(&destination)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => lore_warn!(
-                "Failed to sync the directory holding {}: {err}",
-                plan.target_path
-            ),
-            Err(err) => lore_warn!(
-                "Failed to sync the directory holding {}: {err}",
-                plan.target_path
-            ),
-        }
-    }
-    register(&repository, plan.clone_id, &plan.target_path)
-        .await
-        .forward_with::<InstanceError, _>(|| {
-            format!(
-                "registering the clone at {}, which registers itself when a write command next \
-                 opens it",
-                plan.target_path
-            )
-        })?;
 
     LoreEvent::RepositoryInstanceCloneComplete(LoreRepositoryInstanceCloneCompleteEventData {
         instance_id: plan.clone_id,
@@ -3151,16 +3247,252 @@ async fn instance_clone_with(
     Ok(())
 }
 
-/// Syncs the directory that holds `path` to disk, so a rename into it survives a power loss.
-/// Windows has no call that syncs a directory, so there it does nothing.
-fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    #[cfg(target_family = "unix")]
-    if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
+/// What cloning as `plan` describes says it was doing, where it fails.
+fn clone_context(plan: &InstanceClonePlan) -> String {
+    format!(
+        "cloning to {}, in progress at {}",
+        plan.target_path,
+        display_path(&plan.in_progress)
+    )
+}
+
+/// Places the copy `plan` made in its own directory: gives it the source's `anchors`, moves it to
+/// the destination through `move_into_place`, removes the mark of an instance being cloned and
+/// registers it through `register`, as [`instance_clone`] describes.
+async fn place_clone(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    anchors: [Hash; 3],
+    move_into_place: impl AsyncFn(&Path, &Path) -> io::Result<()>,
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let context = || clone_context(plan);
+    let flush_options = crate::lore::execution_context().globals().flush_options();
+    let placed = async {
+        store_anchors(repository, plan.clone_id, anchors).await?;
+        // Synced whatever `--sync-data` says, so the rename never lands on disk before them.
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .forward_any::<InstanceError>("flushing the new instance's anchors")?;
+        match move_into_place(&plan.in_progress, &plan.destination).await {
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                Err(refused_target(format!(
+                    "{}: it already exists",
+                    plan.target_path
+                )))
+            }
+            moved => moved
+                .map_err(|err| clone_io_failure(err, "moving the new instance to its destination"))
+                .forward::<InstanceError>("moving the new instance to its destination"),
+        }
     }
-    #[cfg(target_family = "windows")]
-    let _ = path;
+    .await;
+    if let Err(err) = placed {
+        remove_instance_keys(repository, plan.clone_id).await;
+        if let Err(flush_err) = repository.flush(flush_options).await {
+            lore_warn!(
+                "Failed to flush the removal of the new instance's registration after cloning failed: {flush_err}"
+            );
+        }
+        return Err(err).forward_with::<InstanceError, _>(context);
+    }
+    plan.placed.store(true, Ordering::Release);
+    if let Ok(dot) = clone_lore_directory(plan, &plan.destination) {
+        remove_clone_mark(&dot, &plan.target_path).await;
+    }
+    // A registration synced to disk never names a destination the move has not reached there.
+    if flush_options.sync_data {
+        let destination = plan.destination.clone();
+        match lore_base::lore_spawn_blocking!(move || sync_parent_directory(&destination)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => lore_warn!(
+                "Failed to sync the directory holding {}: {err}",
+                plan.target_path
+            ),
+            Err(err) => lore_warn!(
+                "Failed to sync the directory holding {}: {err}",
+                plan.target_path
+            ),
+        }
+    }
+    register(repository, plan.clone_id, &plan.target_path)
+        .await
+        .forward_with::<InstanceError, _>(|| {
+            format!(
+                "registering the new instance at {}, which registers itself when a write command \
+                 next opens it",
+                plan.target_path
+            )
+        })
+}
+
+/// Places the virtual clone whose external directory `plan` wrote: gives it the source's
+/// `anchors`, makes its mount point at the destination, registers it there through `register`,
+/// mounts it at the revision the anchors name, and removes the mark of an instance being cloned.
+///
+/// The mount point is made before the registration, which retires other registrations at the
+/// destination, so cloning to a destination another cloning has taken since the plan is refused
+/// before it registers. A service that stops part way, as a crash stops it, finds on its next
+/// start either a new instance it has not registered, whose external directory it removes with the
+/// empty mount point its mark names, or a registered one with its mount point, which it mounts. A
+/// failure removes the mount point and the new instance's keys, as far as the store allows, and
+/// leaves the external directory for [`instance_clone_finish`] to remove.
+async fn place_virtual_clone(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    anchors: [Hash; 3],
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let anchored = async {
+        store_anchors(repository, plan.clone_id, anchors).await?;
+        // Synced whatever `--sync-data` says, so a registration never lands on disk before them.
+        repository
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .forward_any::<InstanceError>("flushing the new instance's anchors")
+    }
+    .await;
+    let placed = match anchored {
+        Ok(()) => place_mount(repository, plan, register).await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = placed {
+        remove_instance_keys(repository, plan.clone_id).await;
+        let flush_options = crate::lore::execution_context().globals().flush_options();
+        if let Err(flush_err) = repository.flush(flush_options).await {
+            lore_warn!(
+                "Failed to flush the removal of the new instance's registration after cloning failed: {flush_err}"
+            );
+        }
+        return Err(err);
+    }
+    plan.placed.store(true, Ordering::Release);
+    remove_clone_mark(
+        &plan.in_progress.join(crate::repository::DOT_LORE),
+        &plan.target_path,
+    )
+    .await;
     Ok(())
+}
+
+/// Makes the mount point of the virtual clone `plan` wrote at its destination, which must not
+/// exist, then registers the new instance there through `register` and mounts it, removing the
+/// mount point again where either fails.
+async fn place_mount(
+    repository: &Arc<RepositoryContext>,
+    plan: &InstanceClonePlan,
+    register: impl AsyncFn(&Arc<RepositoryContext>, InstanceId, &str) -> Result<(), InstanceError>,
+) -> Result<(), InstanceError> {
+    let mount_point = plan.destination.clone();
+    let made = lore_base::lore_spawn_blocking!(move || std::fs::create_dir(&mount_point))
+        .await
+        .internal("making the new instance's mount point")?;
+    match made {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(refused_target(format!(
+                "{}: it already exists",
+                plan.target_path
+            )));
+        }
+        Err(err) => {
+            return Err(clone_io_failure(
+                err,
+                "making the new instance's mount point",
+            ))
+            .forward::<InstanceError>("making the new instance's mount point");
+        }
+    }
+    let mounted = match register(repository, plan.clone_id, &plan.target_path).await {
+        Ok(()) => mount_fuse_clone(repository, plan).await,
+        Err(err) => Err(err).forward::<InstanceError>("registering the new instance"),
+    };
+    if mounted.is_err()
+        && let Err(err) = lore_io::IoDriver::global()
+            .remove_dir(&plan.destination)
+            .await
+    {
+        lore_warn!(
+            "Unable to remove {}, the mount point of an instance whose cloning failed: {err}",
+            plan.target_path
+        );
+    }
+    mounted
+}
+
+/// Mounts the virtual clone `plan` wrote on the mount point made at its destination.
+#[cfg(target_os = "linux")]
+async fn mount_fuse_clone(
+    repository: &RepositoryContext,
+    plan: &InstanceClonePlan,
+) -> Result<(), InstanceError> {
+    let Some(mm) = MountManagerState::mount_manager() else {
+        return Err(InstanceError::internal(format!(
+            "{}: a FUSE instance is cloned only in the service, which mounts it",
+            plan.target_path
+        )));
+    };
+    let dot_lore = plan.in_progress.join(crate::repository::DOT_LORE);
+    let config = crate::repository::load_repository_config_from_dot_dir(&dot_lore)
+        .forward_any::<InstanceError>("loading the new instance's config")?;
+    mm.fuse()
+        .mount_clone(
+            repository,
+            &plan.destination,
+            (plan.clone_id, &dot_lore),
+            &config,
+        )
+        .await
+        .forward_with::<InstanceError, _>(|| {
+            format!("mounting the new instance at {}", plan.target_path)
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unused_async)]
+async fn mount_fuse_clone(
+    _repository: &RepositoryContext,
+    plan: &InstanceClonePlan,
+) -> Result<(), InstanceError> {
+    Err(InstanceError::internal(format!(
+        "The instance at {} is a FUSE instance, which only Linux serves",
+        plan.source.display()
+    )))
+}
+
+/// Removes the mark of an instance being cloned from the new instance's Lore directory at `dot`,
+/// warning where it cannot: the new instance at `target_path` stands either way.
+async fn remove_clone_mark(dot: &Path, target_path: &str) {
+    if let Err(err) = lore_io::IoDriver::global()
+        .remove_file(dot.join(CLONE_IN_PROGRESS_MARK))
+        .await
+    {
+        lore_warn!("Failed to remove the mark of cloning in progress from {target_path}: {err}");
+    }
+}
+
+/// The Lore directory of the copy `plan` makes, in the copy at `root`: where the source's is in
+/// its tree, or for a virtual clone, in its external directory.
+fn clone_lore_directory(
+    plan: &InstanceClonePlan,
+    root: &Path,
+) -> Result<PathBuf, InstanceCloneError> {
+    if plan.vfs == VfsType::Fuse {
+        return Ok(root.join(crate::repository::DOT_LORE));
+    }
+    Ok(root.join(lore_directory_within(&plan.source, &plan.dot_path)?))
+}
+
+/// Syncs the directory that holds `path` to disk through [`lore_io::sync_dir`], so a rename into
+/// it survives a power loss.
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    path.parent().map_or(Ok(()), lore_io::sync_dir)
 }
 
 /// Refuses a clone to `target_path` while another instance that is not stale is registered
@@ -3173,9 +3505,10 @@ async fn refuse_registered_destination(
     let instances = list_instances(repository)
         .await
         .forward::<InstanceError>("listing the instances registered at the destination")?;
+    let state = resolve().forward::<InstanceError>("resolving the external root")?;
     for instance in instances {
         if crate::util::path::clean(instance.path.clone()) == target_path
-            && instance_staleness(&instance.path, instance.instance_id).await
+            && instance_staleness(&state, &instance.path, instance.instance_id).await
                 == InstanceStaleness::Active
         {
             return Err(refused_target(format!(
@@ -3228,30 +3561,33 @@ async fn register_clone(
 ) -> Result<(), InstanceError> {
     register_instance(repository, clone, target_path)
         .await
-        .forward::<InstanceError>("registering the clone")?;
+        .forward::<InstanceError>("registering the new instance")?;
     let flush_options = crate::lore::execution_context().globals().flush_options();
     repository
         .flush(flush_options)
         .await
-        .forward_any::<InstanceError>("flushing the clone's registration")
+        .forward_any::<InstanceError>("flushing the new instance's registration")
 }
 
 /// Finishes a clone after [`instance_clone`], whatever it returned: removes the in-progress
 /// directory a failure left, at background disk priority and retrying while its files are in
 /// use, and the in-progress directory's lock file. The command waits for the removal, which
 /// takes minutes for a large tree; one cut short leaves the directory for the next clone to the
-/// same destination to remove.
+/// same destination to remove, or for a virtual clone, for the next service to start.
 pub async fn instance_clone_finish(plan: InstanceClonePlan) {
     // Shared only with a copy a provider left running after `clone_instance` returned, which
     // keeps the directory, and the lock file, for the next clone to the destination to remove.
-    let Some(lock) = Arc::into_inner(plan.in_progress_lock) else {
+    let Some(mut lock) = Arc::into_inner(plan.in_progress_lock) else {
         return;
     };
-    if is_present(&plan.in_progress).await
+    let placed = plan.placed.load(Ordering::Acquire);
+    lock.remove_file = placed && plan.vfs == VfsType::Fuse;
+    if !placed
+        && is_present(&plan.in_progress).await
         && !remove_clone_directory(
             &plan.in_progress,
             Some(&removing_path(&plan.in_progress)),
-            "a failed clone",
+            "failed cloning",
         )
         .await
     {
@@ -3265,11 +3601,15 @@ pub async fn instance_clone_finish(plan: InstanceClonePlan) {
 /// no in-progress directory left, as when a clone is cancelled before its copy starts or once
 /// the finish has removed the directory, it removes its lock file too; dropped while the
 /// in-progress path itself still exists, it leaves the file for the clone that removes the
-/// directory.
+/// directory, unless [`InProgressLock::remove_file`] says the path stays as the external
+/// directory of a new instance cloned from a virtual clone.
 struct InProgressLock {
     /// Held for the value's life and released after the lock file is removed.
     _lock: FSLock,
     in_progress: PathBuf,
+    /// Set where the in-progress path stays as the placed new instance's external directory, as
+    /// when cloning a virtual clone, so the lock file goes with the lock.
+    remove_file: bool,
 }
 
 impl Drop for InProgressLock {
@@ -3278,7 +3618,7 @@ impl Drop for InProgressLock {
     fn drop(&mut self) {
         // A stat and an unlink, run once as a clone ends, and run while the lock is still held,
         // as the field drops after this.
-        if std::fs::symlink_metadata(&self.in_progress).is_err()
+        if (self.remove_file || std::fs::symlink_metadata(&self.in_progress).is_err())
             && let Ok(file) = FSLock::lock_file_of(&self.in_progress)
         {
             let _ = std::fs::remove_file(file);
@@ -3289,34 +3629,41 @@ impl Drop for InProgressLock {
 /// Copies the instance directory as `plan` describes to its in-progress directory. The copy's
 /// Lore directory is first given the mark of a clone in progress, the clone's instance file and
 /// the mark of an instance holding no store records, and the copy is then made through the
-/// plan's provider, with a `Copying` progress event sent with its counts each event interval.
+/// plan's provider, with a `Copying` progress event sent with its counts each event interval. A
+/// virtual clone's mark names its destination, whose empty mount point a service that starts
+/// after a crash removes.
 async fn copy_instance_directory(
     repository: &Arc<RepositoryContext>,
     plan: &InstanceClonePlan,
 ) -> Result<CloneStats, InstanceCloneError> {
-    let dot = plan
-        .in_progress
-        .join(lore_directory_within(&plan.source, &plan.dot_path)?);
+    let dot = clone_lore_directory(plan, &plan.in_progress)?;
     let io = lore_io::IoDriver::global();
     io.create_dir_all(&dot)
         .await
-        .map_err(|err| clone_io_failure(err, "creating the clone's Lore directory"))?;
-    io.write_file_bytes(dot.join(CLONE_IN_PROGRESS_MARK), bytes::Bytes::new(), false)
+        .map_err(|err| clone_io_failure(err, "creating the new instance's Lore directory"))?;
+    let mark = if plan.vfs == VfsType::Fuse {
+        bytes::Bytes::copy_from_slice(plan.destination.as_os_str().as_encoded_bytes())
+    } else {
+        bytes::Bytes::new()
+    };
+    io.write_file_bytes(dot.join(CLONE_IN_PROGRESS_MARK), mark, false)
         .await
-        .map_err(|err| clone_io_failure(err, "marking the clone as in progress"))?;
+        .map_err(|err| clone_io_failure(err, "marking the new instance as in progress"))?;
     plan.clone_id
         .write_to_file(dot.join(crate::repository::INSTANCE))
         .await
-        .map_err(|err| clone_io_failure(err, "writing the clone's instance ID"))?;
+        .map_err(|err| clone_io_failure(err, "writing the new instance's ID"))?;
     crate::records::mark_holding_no_store_records(&dot)
         .await
-        .map_err(|err| clone_io_failure(err, "marking the clone as holding no store records"))?;
+        .map_err(|err| {
+            clone_io_failure(err, "marking the new instance as holding no store records")
+        })?;
 
     let started = std::time::Instant::now();
     // The copy keeps the in-progress directory's lock and the instance's locks, through the
     // repository context, until it ends, should this future be dropped before it.
     let run = crate::fs::filesystem_provider::CloneRun {
-        progress: Arc::new(lore_io::clone::Progress::default()),
+        progress: Arc::new(crate::fs::walk::Progress::default()),
         hold: Arc::new((Arc::clone(&plan.in_progress_lock), Arc::clone(repository))),
     };
     let clone = std::pin::pin!(plan.provider.clone_instance(
@@ -3344,7 +3691,7 @@ async fn copy_instance_directory(
 /// interval the call's globals set, until it ends.
 async fn report_copy_progress<T>(
     mut clone: std::pin::Pin<&mut impl Future<Output = T>>,
-    progress: &lore_io::clone::Progress,
+    progress: &crate::fs::walk::Progress,
 ) -> T {
     let mut each_interval =
         tokio::time::interval(crate::lore::execution_context().globals().event_interval());

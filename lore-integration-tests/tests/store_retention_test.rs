@@ -339,7 +339,10 @@ async fn open_handle(repository: &Path) -> LoreStore {
 async fn close_handle(repository: &Path, store: LoreStore) {
     let status = close::close(
         globals(repository, false),
-        close::LoreStorageCloseArgs { handle: store },
+        close::LoreStorageCloseArgs {
+            handle: store,
+            ..Default::default()
+        },
         None,
     )
     .await;
@@ -369,6 +372,7 @@ async fn put(repository: &Path, store: LoreStore, payload: &[u8]) -> Address {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             }]),
         },
@@ -666,7 +670,6 @@ async fn a_retaining_process_keeps_a_closed_handles_stores_for_the_next_open() {
             let immutable = Arc::downgrade(&handle::immutable_for_test(first).expect("open"));
             let mutable = Arc::downgrade(&handle::mutable_for_test(first).expect("open"));
             close_handle(dir.path(), first).await;
-            runtime_flush_guarded().await;
             assert_eq!(
                 stores.held(),
                 [false, false],

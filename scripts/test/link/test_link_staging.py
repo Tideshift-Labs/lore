@@ -16,6 +16,7 @@ from link_helpers import (
 )
 from lore_parsers import parse_status_json
 from test_utils import (
+    commit_unstaged_below_a_staged_deletion,
     has_staged_anchor,
     status_by_path,
     unstaged_entries,
@@ -1003,3 +1004,53 @@ def test_link_stage_move_outside_links(new_lore_repo):
         for path, entry in status_by_path(parent).items()
     }
     assert staged == {to_path: ("move", _MOVED_FILE, True)}
+
+
+@pytest.mark.smoke
+def test_link_add_in_a_dirty_moved_directory_stages_its_whole_move(new_lore_repo):
+    """A link added inside a directory `lore file dirty move` moved stages the directory's whole
+    move, as staging inside it does: each file that moved with it takes a staged move, and the
+    commit takes them all.
+    """
+    link_repo = make_repo(new_lore_repo, {"linked.txt": "linked content\n"})
+    parent = make_repo(
+        new_lore_repo,
+        {"a/f.txt": "f\n", "a/sub/g.txt": "g\n", "other.txt": "other\n"},
+    )
+    os.rename(os.path.join(parent.path, "a"), os.path.join(parent.path, "b"))
+    parent.dirty_move("a", "b", offline=True)
+
+    parent.link_add("b/lib", link_repo.get_id(), "/")
+
+    entries = status_by_path(parent, offline=True)
+    moved = entries.get("b")
+    assert moved is not None, f"b is not in the status: {sorted(entries)}"
+    assert moved["action"] == "move" and moved.get("fromPath") == "a", (
+        f"b must be a move from a: {moved}"
+    )
+    assert moved["flagStaged"] is True and moved["flagDirty"] is False, (
+        f"b's whole move must be staged, nothing below it left marked: {moved}"
+    )
+    marked = sorted(path for path in entries if path.startswith("b/"))
+    assert marked == [], (
+        f"the files that moved with b must take staged moves: {entries}"
+    )
+
+    parent.commit("Add a link in the moved directory")
+    left = status_by_path(parent, offline=True)
+    assert not any(entry.get("flagStaged") for entry in left.values()), (
+        f"the commit takes every staged move: {left}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_below_a_staged_deletion_keeps_the_path(new_lore_repo):
+    """Unstaging a path below a directory of a link's repository staged for deletion
+    keeps the path and each directory above it in the linked revision, as in the
+    parent's own tree."""
+    parent_repo, _ = make_parent_with_link(
+        new_lore_repo,
+        link_files={"r/a/y": b"y\n", "r/a/z": b"z\n", "r/keep": b"keep\n"},
+    )
+
+    commit_unstaged_below_a_staged_deletion(parent_repo, f"{DEFAULT_LINK_MOUNT}/r")

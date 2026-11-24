@@ -433,7 +433,10 @@ mod open_tests {
     ) -> i32 {
         lore::storage::close::close(
             globals(),
-            lore::storage::close::LoreStorageCloseArgs { handle },
+            lore::storage::close::LoreStorageCloseArgs {
+                handle,
+                ..Default::default()
+            },
             callback,
         )
         .await
@@ -532,6 +535,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -593,6 +597,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -653,6 +658,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -665,6 +671,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -760,6 +767,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
 
@@ -821,6 +829,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -833,6 +842,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -990,6 +1000,7 @@ mod open_tests {
             data,
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1792,6 +1803,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
             lore::storage::put::LoreStoragePutItem {
@@ -1804,6 +1816,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             },
         ];
@@ -1896,6 +1909,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (put_status, put_completes) =
@@ -3444,6 +3458,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -3575,6 +3590,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk,
         };
         let (put_status, completes) = put_items(handle, vec![item]).await;
@@ -4069,6 +4085,8 @@ mod open_tests {
                     path: LoreString::from(file.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
                 lore::storage::put_file::LoreStoragePutFileItem {
@@ -4078,6 +4096,8 @@ mod open_tests {
                     path: LoreString::default(),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -4130,6 +4150,8 @@ mod open_tests {
             path: LoreString::from(file.path().display().to_string().as_str()),
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
+            skip_holes: 0,
             fixed_size_chunk: 0,
         };
         let (status, completes) = put_file_items(handle, vec![item]).await;
@@ -4185,6 +4207,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4218,6 +4242,8 @@ mod open_tests {
                 path: LoreString::from(missing.display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4250,6 +4276,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -4291,6 +4319,8 @@ mod open_tests {
                 path: LoreString::from(file.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 64 * 1024,
             }],
         )
@@ -4643,6 +4673,8 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk,
                 },
             ],
@@ -5317,6 +5349,8 @@ mod open_tests {
                 path: LoreString::from(directory.path().display().to_string().as_str()),
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
+                skip_holes: 0,
                 fixed_size_chunk: 0,
             }],
         )
@@ -5480,6 +5514,8 @@ mod open_tests {
                     path: LoreString::from(source.path().display().to_string().as_str()),
                     remote_write: 1,
                     local_cache: 0,
+                    remote_query: 0,
+                    skip_holes: 0,
                     fixed_size_chunk: 0,
                 },
             ],
@@ -5526,6 +5562,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 64 * 1024,
         };
         let (put_status, put_completes) = put_items(handle, vec![item]).await;
@@ -5599,6 +5636,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 };
                 let (status, completes) = put_items(handle, vec![item]).await;
@@ -5930,6 +5968,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (status, completes) = put_items(handle, vec![item]).await;
@@ -6053,6 +6092,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             })
             .collect();
@@ -6142,6 +6182,7 @@ mod open_tests {
                     },
                     remote_write: 0,
                     local_cache: 0,
+                    remote_query: 0,
                     fixed_size_chunk: 0,
                 })
                 .collect();
@@ -6412,6 +6453,7 @@ mod open_tests {
             },
             remote_write: 0,
             local_cache: 0,
+            remote_query: 0,
             fixed_size_chunk: 0,
         };
         let (_sink, cb) = make_sink();
@@ -6437,9 +6479,8 @@ mod open_tests {
     ///
     /// 1. Every open + close completes without panic under contention.
     /// 2. While at least one handle holds the path's backend Arc, the `Weak` upgrades.
-    /// 3. After every handle closes AND every spawned flush task drops its Arc clone, the
-    ///    `Weak` no longer upgrades — proving the cache holds only a `Weak` and the backend
-    ///    really tears down on last-strong-ref-drop.
+    /// 3. After every handle closes, the `Weak` no longer upgrades — proving the cache holds
+    ///    only a `Weak` and the backend really tears down on last-strong-ref-drop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_open_and_close_against_same_path_converges_cleanly() {
         use std::sync::Arc;
@@ -6457,8 +6498,8 @@ mod open_tests {
 
         // Open one anchor handle outside the race so we can grab the path-shared backend Arc
         // and downgrade it to a `Weak`. The backend cache holds only a `Weak`, so when this
-        // local Arc, every per-handle clone, and every close-spawned flush task's clone all
-        // drop, the `Weak` fails to upgrade — that's the last-strong-ref-drop signal.
+        // local Arc and every per-handle clone drop, the `Weak` fails to upgrade — that's the
+        // last-strong-ref-drop signal.
         let (anchor_sink, anchor_cb) = make_sink();
         assert_eq!(
             open::open(
@@ -6526,8 +6567,7 @@ mod open_tests {
             assert_eq!(result.expect("task panic"), 0, "open/close race");
         }
 
-        // Close the anchor. After this, no `StoreInternal` references the backend; only the
-        // close-spawned flush task's Arc clones can keep it alive. Poll until they drop and
+        // Close the anchor. After this, no `StoreInternal` references the backend. Poll until
         // the Weak fails to upgrade — bounded so a regression doesn't hang.
         let (_, anchor_close_cb) = make_sink();
         assert_eq!(close_handle(anchor_handle, anchor_close_cb).await, 0);
@@ -6543,7 +6583,7 @@ mod open_tests {
         }
         assert!(
             released,
-            "backend Arc must be released after all handles + flush tasks drop their refs",
+            "backend Arc must be released after all handles close",
         );
     }
 
@@ -6592,6 +6632,7 @@ mod open_tests {
                 },
                 remote_write: 0,
                 local_cache: 0,
+                remote_query: 0,
                 fixed_size_chunk: 0,
             };
             let (_sink, cb) = make_sink();

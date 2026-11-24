@@ -19,15 +19,12 @@ use tonic::server::NamedService;
 use tower::Layer;
 use tower::Service;
 
-use crate::authnz::auth::is_auth_unavailable;
 use crate::authnz::auth::with_auth_budget;
-use crate::authnz::repository_authorizer::Grants;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_repository;
 use crate::grpc::get_verified_token;
-use crate::grpc::no_repository_access_status;
 
 /// Refuses requests for a partition the caller cannot reach, before the
 /// handler runs. Reaching a partition is the whole `read` check; handlers
@@ -103,15 +100,6 @@ pub struct PartitionAccessService<S> {
     authorization_timeout: Duration,
 }
 
-/// The authorization stage's verdict on one request.
-enum Access {
-    /// Reachable; the enumerated grants when the authorizer had them.
-    Granted(Option<Grants>),
-    Denied,
-    /// FORK-LOCAL (Tideshift): the auth service did not answer in time.
-    Unavailable(Status),
-}
-
 /// The partition the request names, [`None`] when doesn't name one.
 fn named_partition(headers: &HeaderMap) -> Result<Option<RepositoryId>, Status> {
     if !headers.contains_key(PARTITION_ID_KEY) && !headers.contains_key(REPOSITORY_ID_KEY) {
@@ -152,35 +140,22 @@ where
                 Err(status) => return Ok(status.into_http()),
             };
 
-            // Authorization denials are flattened to `Denied` inside the
-            // timed stage, so elapsing is the only thing the stage reports
-            // besides a verdict. Only the extensions are borrowed into the
-            // stage, not the request, so the future stays `Send` for any
-            // body type.
+            // Only the extensions are borrowed into the timed stage, not the
+            // request, so the future stays `Send` for any body type.
             let access = {
                 let extensions = request.extensions();
                 tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
-                    match authorizer.granted_access(token.as_ref(), repository).await {
-                        // v0.13.0: grants are inserted with or without a
-                        // token. The fork's former `token.is_some()` filter
-                        // existed only because fork `permits()` refused a
-                        // tokenless caller; upstream's `permits()` now asks
-                        // the authorizer for one anyway, and `AllowAll`
-                        // grants only `ALLOW_ALL_ACTIONS`, never an elevated
-                        // action, so the filter changes no verdict.
-                        Ok(grants) => Access::Granted(grants),
-                        // FORK-LOCAL (Tideshift): an auth service that did
-                        // not answer in time is not a denial.
-                        Err(status) if is_auth_unavailable(&status) => Access::Unavailable(status),
-                        Err(_denied) => Access::Denied,
-                    }
+                    // v0.13.0: grants are inserted with or without a token;
+                    // `AllowAll` grants only `ALLOW_ALL_ACTIONS`, never an
+                    // elevated action.
+                    authorizer.granted_access(token.as_ref(), repository).await
                 })
                 .await
             };
 
             match access {
-                Ok(Access::Granted(grants)) => {
+                Ok(Ok(grants)) => {
                     if let Some(grants) = grants {
                         // The enumeration also answers the handler's action
                         // checks, without another authorizer call.
@@ -195,10 +170,10 @@ where
                     // work it owns once it has the body.
                     inner.call(request).await
                 }
-                // Flattened to one uniform status, so an unauthorized caller
-                // learns nothing from the reason.
-                Ok(Access::Denied) => Ok(no_repository_access_status().into_http()),
-                Ok(Access::Unavailable(status)) => Ok(status.into_http()),
+                // `granted_access` has flattened a denial to one uniform
+                // status, and keeps a failed check's own (the fork's auth
+                // timeout included).
+                Ok(Err(status)) => Ok(status.into_http()),
                 Err(_elapsed) => Ok(authorization_timeout_status().into_http()),
             }
         }))

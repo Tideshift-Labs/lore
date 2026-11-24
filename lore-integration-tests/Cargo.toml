@@ -125,7 +125,7 @@ libc = { workspace = true }
 lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
 
 [features]
-integration_tests = ["lore-server/integration_tests"]
+integration_tests = ["lore-server/integration_tests", "dep:tonic"]
 # WP-124 follow-up (d): builds lore-server with its QUIC fault seam, for quic_fault_injection_test.rs.
 quic_faults = ["lore-server/failure_generator"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

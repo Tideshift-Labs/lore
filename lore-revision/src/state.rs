@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 pub(crate) mod block;
+mod counterpart;
 #[cfg(not(feature = "test-util"))]
 mod diff;
 #[cfg(feature = "test-util")]
@@ -36,6 +37,9 @@ use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use bytes::Bytes;
+pub(crate) use counterpart::find_counterpart_node;
+pub(crate) use counterpart::node_at_path;
+pub(crate) use counterpart::same_file_counterpart;
 pub(crate) use diff::DiffFlags;
 pub use diff::DiffWalkStats;
 pub use diff::GraftOracle;
@@ -44,7 +48,6 @@ pub(crate) use diff::diff_states_into;
 pub(crate) use diff::diff_subtree_flagged;
 use futures::future::Either;
 use lore_base::error::InvalidPath;
-use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 pub use node::ServedNodes;
@@ -63,6 +66,7 @@ pub use node::clear::ServedClear;
 pub use node::detach::Detach;
 pub use node::detach::IfUnchanged;
 pub use node::discard::DiscardCounts;
+pub use node::discard::Removals;
 pub use node::discard::WalkDiscards;
 pub(crate) use node::discard::apply_pending_discards;
 pub use node::discard::node_discard_free;
@@ -97,7 +101,9 @@ pub use node::rewrite::Rewrite;
 use serde::Serialize;
 pub use stream::ChangeSender;
 pub use stream::ChangeStream;
-use stream::emit;
+use stream::ChunkedChanges;
+use stream::Deletes;
+pub(crate) use stream::emit;
 use tokio::join;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -112,11 +118,13 @@ use crate::change::NodeChange;
 use crate::change::NodeChangeState;
 use crate::errors::InvalidArguments;
 use crate::errors::LinkNotFound;
+use crate::errors::LinkPinsDiverge;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
 use crate::errors::Oversized;
 use crate::errors::SlowDown;
 use crate::errors::StateErrors;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterPath;
 use crate::filter::FilterStates;
@@ -129,10 +137,13 @@ use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::ListedEntry;
+use crate::fs::realize::stage_destination_ancestors;
+use crate::fs::realize::stage_realized_change;
+use crate::fs::realize::stage_realized_delete;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
-use crate::immutable::ReadBoxFromImmutable;
 use crate::immutable::ReadFromImmutable;
 use crate::immutable::WriteToImmutable;
 use crate::immutable::read_options_from_repository;
@@ -165,8 +176,6 @@ use crate::node::INVALID_BLOCK;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::NodeBlockData;
-use crate::node::NodeBlockDataV0;
 use crate::node::NodeDelta;
 use crate::node::NodeExtFlags;
 use crate::node::NodeFileMetadata;
@@ -179,7 +188,9 @@ use crate::node::NodeLink;
 use crate::node::NodeNameLock;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
+use crate::node::StoredNodeBlock;
 use crate::node::node_to_file_metadata;
+use crate::node::read_stored_node_block;
 use crate::records::InstanceRecords;
 use crate::records::Lookup;
 use crate::records::Record;
@@ -189,6 +200,7 @@ use crate::repository::DOT_LORE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
+use crate::repository::prefetch;
 use crate::revision::RevisionMetadata;
 use crate::stage::stage_delete;
 use crate::store::KeyType;
@@ -382,10 +394,10 @@ pub mod lock_counting {
 
 /// Counts of the chain nodes a find by name ([`State::find_subnode`],
 /// [`State::find_subnode_resident`]) steps through, while enabled, per thread and process-wide,
-/// so a test can show what a path's finds cost, and apart from them, per thread, those a children
-/// walk steps through (a listing, a search since a mark). A find or a walk counts its steps
-/// locally and adds them once as it ends, on the thread it ends on. Disabled, it costs one relaxed
-/// load of a flag nothing writes. Built with `test-util` only.
+/// so a test can show what a path's finds cost, and apart from them those a children walk steps
+/// through (a listing, a search since a mark). A find or a walk counts its steps locally and adds
+/// them once as it ends, on the thread it ends on. Disabled, it costs one relaxed load of a flag
+/// nothing writes. Built with `test-util` only.
 #[cfg(feature = "test-util")]
 pub mod step_counting {
     use std::cell::Cell;
@@ -395,6 +407,7 @@ pub mod step_counting {
 
     static COUNTING: AtomicBool = AtomicBool::new(false);
     static TOTAL: AtomicU64 = AtomicU64::new(0);
+    static WALK_TOTAL: AtomicU64 = AtomicU64::new(0);
 
     thread_local! {
         static THREAD: Cell<u64> = const { Cell::new(0) };
@@ -419,6 +432,11 @@ pub mod step_counting {
     /// Children walk steps counted on the calling thread.
     pub fn thread_walk_steps() -> u64 {
         WALK_THREAD.with(Cell::get)
+    }
+
+    /// Children walk steps counted on every thread.
+    pub fn total_walk_steps() -> u64 {
+        WALK_TOTAL.load(Ordering::Relaxed)
     }
 
     /// One find's or walk's steps, added to its counts when it drops, however it ends.
@@ -456,6 +474,7 @@ pub mod step_counting {
             }
             if self.walk {
                 WALK_THREAD.with(|count| count.set(count.get() + self.count));
+                WALK_TOTAL.fetch_add(self.count, Ordering::Relaxed);
             } else {
                 THREAD.with(|count| count.set(count.get() + self.count));
                 TOTAL.fetch_add(self.count, Ordering::Relaxed);
@@ -727,6 +746,39 @@ impl ChainWalk {
     }
 }
 
+/// What [`State::find_subnode_in`] answers for the node it found, given whether that node is
+/// staged for deletion, and where it finds none.
+trait FoundSubnode: Sized {
+    fn found(node: NodeID, deleted: bool) -> Self;
+
+    /// The answer where the parent holds no node of the name or cannot take children.
+    fn absent() -> Result<Self, StateError> {
+        Err(NodeNotFound.into())
+    }
+}
+
+impl FoundSubnode for NodeID {
+    fn found(node: NodeID, _deleted: bool) -> Self {
+        node
+    }
+}
+
+impl FoundSubnode for (NodeID, bool) {
+    fn found(node: NodeID, deleted: bool) -> Self {
+        (node, deleted)
+    }
+}
+
+impl FoundSubnode for Option<(NodeID, bool)> {
+    fn found(node: NodeID, deleted: bool) -> Self {
+        Some((node, deleted))
+    }
+
+    fn absent() -> Result<Self, StateError> {
+        Ok(None)
+    }
+}
+
 /// A find by name over one directory's chain, stepped by its caller, which reads each node from
 /// a block it obtains its own way.
 struct NameSearch {
@@ -796,6 +848,12 @@ impl NameSearch {
         }
     }
 
+    /// Goes on past `node`, which holds the name, to the next node of the chain.
+    #[inline]
+    fn pass(&mut self, node: &Node) {
+        self.next = node.sibling();
+    }
+
     /// Steps over `node`, read for the node [`Self::next`] answered: whether it holds the name.
     #[inline]
     fn found(&mut self, node_id: NodeID, node: &Node) -> Result<bool, StateError> {
@@ -860,6 +918,7 @@ pub struct StateNodeChildrenWithNameIterator {
 impl StateNodeChildrenWithNameIterator {
     /// Live children the walk passed over because their block could not give back their name.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) fn skipped_invalid(&self) -> u32 {
         self.skipped_invalid
     }
@@ -913,6 +972,7 @@ impl StateNodeChildrenWithNameIterator {
     /// type docs) — copy it out with [`NodeNameLock::freeze`] if needed.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node, NodeNameLock)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -941,6 +1001,7 @@ impl StateNodeChildrenWithNameIterator {
 
             let block = self.current_block.as_ref().unwrap();
             let (node, name) = block.node_and_name_ref(Node::index(node_id));
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => {
                     restart = true;
@@ -976,6 +1037,7 @@ impl StateNodeChildrenWithNameIterator {
         name: &mut Vec<u8>,
     ) -> Result<Option<(NodeID, Node)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -1007,6 +1069,7 @@ impl StateNodeChildrenWithNameIterator {
             let node = block
                 .node_and_name_bytes(Node::index(node_id), name)
                 .forward::<StateError>("Node name")?;
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => {
                     name.truncate(start);
@@ -1043,6 +1106,7 @@ pub struct StateNodeChildrenIterator {
 /// sibling chain may leave a block and come back to it, and the one just seen is the likeliest
 /// match.
 #[lore_macro::test_pub]
+#[cfg(any(target_os = "linux", feature = "test-util"))]
 fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bool {
     if blocks.iter().rev().any(|seen| Arc::ptr_eq(seen, block)) {
         return false;
@@ -1054,6 +1118,7 @@ fn push_distinct(blocks: &mut Vec<Arc<NodeBlock>>, block: &Arc<NodeBlock>) -> bo
 impl StateNodeChildrenIterator {
     /// The node block holding the child [`Self::next`] returned last.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) fn block(&self) -> Option<&Arc<NodeBlock>> {
         self.current_block.as_ref()
     }
@@ -1149,6 +1214,7 @@ impl StateNodeChildrenIterator {
     /// Get the next child node.
     pub async fn next(&mut self) -> Result<Option<(NodeID, Node)>, StateError> {
         let mut restart = false;
+        let mut steps = step_counting::Steps::walk();
         loop {
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached_reader(crate::state::node::hooks::Point::IterStep)
@@ -1173,6 +1239,7 @@ impl StateNodeChildrenIterator {
 
             let block = self.current_block.as_ref().unwrap();
             let node = block.node(Node::index(node_id));
+            steps.step();
             match self.walk.step(node_id, &node)? {
                 ChainStep::Restart => restart = true,
                 ChainStep::Skip => self.current_node_id = node.sibling(),
@@ -1260,6 +1327,10 @@ pub struct State {
     /// began, so a directory may be staged with no change below it
     /// ([`Self::has_unfinished_change`]).
     unfinished_change: AtomicBool,
+    /// A C API move of a node not staged for addition into a directory staged for addition
+    /// checked its destination since this State was built or last committed through the C API
+    /// ([`Self::may_hold_tracked_below_added`]).
+    tracked_below_added: AtomicBool,
     /// Deserializing semaphore
     deserialize: tokio::sync::Semaphore,
     /// Unused node/block semaphore
@@ -1272,6 +1343,10 @@ pub struct State {
     /// them ([`Self::node_free_pending`]); made by the first, as most States are never deleted
     /// from through the C API and the queue is 256 bytes.
     pending: std::sync::OnceLock<Box<crossbeam_queue::SegQueue<NodeID>>>,
+    /// The directories marked dirty as moved whose move a staged climb staged with a node below
+    /// them, kept until a caller stages each whole move ([`Self::take_promoted_moves`]); made by
+    /// the first, as most States never promote one.
+    promoted: std::sync::OnceLock<Box<crossbeam_queue::SegQueue<NodeID>>>,
     /// How many times a find by name walked a chain again, read by tests.
     find_restarts: AtomicU64,
     /// How many times an attach looked its name up again, read by tests.
@@ -1308,6 +1383,9 @@ pub struct State {
     /// The revision this tree was built on, with its signature, read apart from this tree the
     /// first time [`State::tracks`] asks about it.
     base: parking_lot::Mutex<Option<(Hash, Arc<State>)>>,
+    /// The revision a staged merge revision was built on where that is its second parent
+    /// ([`State::note_staged_on`]).
+    staged_on: std::sync::OnceLock<Hash>,
 }
 
 impl std::fmt::Debug for State {
@@ -1330,6 +1408,9 @@ pub enum StateFormat {
     Initial = 1,
     /// Node name hash is lower case
     LowerCaseHash = 2,
+    /// Holds link merge state in a layout earlier builds would misread, so they refuse it.
+    /// Written only while a merge is in progress, so committed revisions stay readable.
+    LinkMergeState = 3,
 }
 
 #[repr(C)]
@@ -1378,6 +1459,15 @@ impl StateData {
     pub(crate) fn has_state_magic(&self) -> bool {
         self.magic == STATE_MAGIC
     }
+
+    #[lore_macro::test_pub]
+    fn format_to_write(&self) -> u32 {
+        if self.hash_link_merge.is_zero() {
+            StateFormat::LowerCaseHash as u32
+        } else {
+            StateFormat::LinkMergeState as u32
+        }
+    }
 }
 
 #[lore_macro::test_pub]
@@ -1398,6 +1488,16 @@ pub struct LinkReference {
     pub(crate) unused: u32,
 }
 
+/// What the rows of one linked repository must agree on, which every mount of it shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LinkPinAgreement {
+    /// Branch and flags. A staged state holds the mounts a stage changed at an uncommitted revision
+    /// and the others at the committed pin, until the commit moves them all.
+    Rows,
+    /// Branch, flags and signature, as a committed revision holds them.
+    Pins,
+}
+
 impl LinkReference {
     pub fn resolve_branch(&self, parent_branch: BranchId) -> BranchId {
         if self.branch.is_zero() {
@@ -1413,13 +1513,18 @@ impl LinkReference {
         self.branch.is_zero()
     }
 
+    /// Whether the link follows its parent onto the branches made from it.
+    pub fn auto_follows(&self) -> bool {
+        self.flags & LinkFlags::DisableAutoFollow == 0
+    }
+
     /// The branch to store for this link to resolve to `branch` under a parent on
     /// `parent_branch`.
     ///
     /// An auto-following link on its parent's branch stores zero, so it follows the parent onto
     /// every branch made from it. Any other link stores `branch`.
     pub fn branch_to_store(&self, branch: BranchId, parent_branch: BranchId) -> BranchId {
-        if branch == parent_branch && self.flags & LinkFlags::DisableAutoFollow == 0 {
+        if branch == parent_branch && self.auto_follows() {
             BranchId::default()
         } else {
             branch
@@ -1449,18 +1554,200 @@ impl LinkReference {
     pub fn flags(&self) -> u32 {
         self.flags
     }
+
+    /// The same row pinned at `signature`, which the tree node carries
+    /// alongside the registry and is the copy a comparison reads.
+    pub(crate) fn with_signature(mut self, signature: Hash) -> Self {
+        self.signature = signature;
+        self
+    }
+
+    /// Whether this row and `other`, rows of one repository, agree as `agreement` requires.
+    pub(crate) fn agrees(&self, other: &Self, agreement: LinkPinAgreement) -> bool {
+        match agreement {
+            LinkPinAgreement::Rows => self.branch == other.branch && self.flags == other.flags,
+            LinkPinAgreement::Pins => self.stores_same(other),
+        }
+    }
+
+    /// The linked branch this row follows under a parent on `parent_branch`, or `None` where an
+    /// auto-following row follows that same branch, so rows following their own parents compare
+    /// equal across parent branches.
+    #[lore_macro::test_pub]
+    pub(crate) fn foreign_branch(&self, parent_branch: BranchId) -> Option<BranchId> {
+        let branch = self.resolve_branch(parent_branch);
+        (branch != parent_branch || self.flags & LinkFlags::DisableAutoFollow != 0)
+            .then_some(branch)
+    }
+
+    /// Whether both carry the same pin, flags and branch, each row read under its own parent's
+    /// branch, which is all a merge carries of a row.
+    #[lore_macro::test_pub]
+    pub(crate) fn same_row(
+        &self,
+        parent_branch: BranchId,
+        other: &Self,
+        other_parent_branch: BranchId,
+    ) -> bool {
+        self.signature == other.signature
+            && self.flags == other.flags
+            && self.foreign_branch(parent_branch) == other.foreign_branch(other_parent_branch)
+    }
+
+    /// Whether both store the same pin, branch and flags, as rows of one parent do.
+    pub(crate) fn stores_same(&self, other: &Self) -> bool {
+        self.signature == other.signature
+            && self.branch == other.branch
+            && self.flags == other.flags
+    }
+
+    /// This row as a parent on `parent_branch` stores it, carried from one on `from_branch`.
+    #[lore_macro::test_pub]
+    pub(crate) fn carried(&self, from_branch: BranchId, parent_branch: BranchId) -> Self {
+        let branch = self.foreign_branch(from_branch).unwrap_or(parent_branch);
+        Self {
+            branch: self.branch_to_store(branch, parent_branch),
+            ..*self
+        }
+    }
 }
 
-/// Tracks a single link's merge state for rollback.
+/// What a [`LinkMergeEntry`] records, and for a conflict which side was chosen.
+#[repr(u32)]
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum LinkMergeResolution {
+    /// A pre-merge row kept only so abort can roll it back.
+    Rollback = 0,
+    /// A divergent row waiting on the user's choice.
+    Unresolved = 1,
+    /// Resolved to the row this branch held.
+    Mine = 2,
+    /// Resolved to the row the merged branch held.
+    Theirs = 3,
+}
+
+impl LinkMergeResolution {
+    fn from_raw(raw: u32) -> Self {
+        match raw {
+            1 => Self::Unresolved,
+            2 => Self::Mine,
+            3 => Self::Theirs,
+            _ => Self::Rollback,
+        }
+    }
+}
+
+/// Tracks a single link's merge state for rollback and conflict resolution.
 #[repr(C)]
 #[derive(Copy, Clone, Default, IntoBytes, FromBytes, Immutable)]
 pub struct LinkMergeEntry {
     /// Link path node ID (correlates with `LinkReference.local_node`)
     pub local_node: u32,
-    /// Reserved for future use
-    pub reserved: u32,
+    /// See [`LinkMergeResolution`].
+    pub resolution: u32,
     /// Pre-merge (base) link reference snapshot for rollback
     pub base: LinkReference,
+    /// The merged branch's row, for a divergent link
+    pub source: LinkReference,
+    /// This branch's row, for a divergent link
+    pub target: LinkReference,
+    /// The node of `source`'s pin the merged branch mounts, for a divergent link
+    pub source_mount: NodeID,
+    /// The node of `target`'s pin this branch mounts, for a divergent link
+    pub target_mount: NodeID,
+}
+
+impl LinkMergeEntry {
+    /// The pre-merge row of a link the merge changed, for abort to restore.
+    pub fn rollback(base: LinkReference) -> Self {
+        Self {
+            local_node: base.local_node,
+            resolution: LinkMergeResolution::Rollback as u32,
+            base,
+            ..Default::default()
+        }
+    }
+
+    /// `base` stays the row this branch held, so abort rolls a conflicted link
+    /// back the same way it rolls back a merged one.
+    pub fn conflict(
+        source: LinkReference,
+        source_mount: NodeID,
+        target: LinkReference,
+        target_mount: NodeID,
+    ) -> Self {
+        Self {
+            local_node: target.local_node,
+            resolution: LinkMergeResolution::Unresolved as u32,
+            base: target,
+            source,
+            target,
+            source_mount,
+            target_mount,
+        }
+    }
+
+    /// What the entry records, and for a conflict the side chosen.
+    pub fn resolution(&self) -> LinkMergeResolution {
+        LinkMergeResolution::from_raw(self.resolution)
+    }
+
+    /// Records the side a resolve chose.
+    pub fn set_resolution(&mut self, resolution: LinkMergeResolution) {
+        self.resolution = resolution as u32;
+    }
+
+    /// A divergent row no resolve has settled yet, which refuses a commit.
+    pub fn is_unresolved(&self) -> bool {
+        self.resolution() == LinkMergeResolution::Unresolved
+    }
+
+    /// A divergent row, settled or not. A settled one still matches a resolve,
+    /// so a user can change the side they picked.
+    pub fn is_conflict(&self) -> bool {
+        self.resolution() != LinkMergeResolution::Rollback
+    }
+
+    /// Moves each auto-following row of a repository in `followed` onto the zero branch, as a
+    /// branch create moves the rows it cascades to, and answers whether any row moved.
+    pub(crate) fn follow_parent_branch(&mut self, followed: &[RepositoryId]) -> bool {
+        let mut moved = false;
+        for row in [&mut self.base, &mut self.source, &mut self.target] {
+            if followed.contains(&row.repository)
+                && row.flags & LinkFlags::DisableAutoFollow == 0
+                && !row.branch.is_zero()
+            {
+                row.branch = BranchId::default();
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// The row the chosen side names and the node of its pin it mounts, or `None` while the
+    /// entry is unresolved.
+    pub fn resolved_reference(&self) -> Option<(LinkReference, NodeID)> {
+        match self.resolution() {
+            LinkMergeResolution::Mine => Some((self.target, self.target_mount)),
+            LinkMergeResolution::Theirs => Some((self.source, self.source_mount)),
+            _ => None,
+        }
+    }
+}
+
+/// Abort reads `base` out of this blob to undo a merge, so another layout is
+/// refused rather than parsed into rollback data for the wrong revisions.
+const LINK_MERGE_STATE_VERSION: u32 = 1;
+
+/// The layout a merge started by an earlier build wrote, holding rollback rows
+/// only. Still read so that merge can be finished or aborted after an upgrade.
+#[lore_macro::test_pub]
+#[repr(C)]
+#[derive(Copy, Clone, IntoBytes, FromBytes, Immutable)]
+struct LinkMergeEntryV0 {
+    local_node: u32,
+    reserved: u32,
+    base: LinkReference,
 }
 
 /// Header for the serialized link merge state blob.
@@ -1469,9 +1756,52 @@ pub struct LinkMergeEntry {
 pub struct LinkMergeState {
     /// Number of `LinkMergeEntry` items following this header
     pub count: u32,
-    /// Flags (reserved for future use)
-    pub flags: u32,
+    /// See [`LINK_MERGE_STATE_VERSION`]
+    pub version: u32,
 }
+#[lore_macro::test_pub]
+fn parse_link_merge_state(raw: &[u8]) -> Result<Vec<LinkMergeEntry>, StateError> {
+    let Ok((header, entry_bytes)) = LinkMergeState::read_from_prefix(raw) else {
+        return Err(StateError::internal("Link merge state is truncated"));
+    };
+
+    match header.version {
+        0 => Ok(read_records::<LinkMergeEntryV0>(entry_bytes, header.count)?
+            .into_iter()
+            .map(|entry| LinkMergeEntry::rollback(entry.base))
+            .collect()),
+        LINK_MERGE_STATE_VERSION => {
+            let entries: Vec<LinkMergeEntry> = read_records(entry_bytes, header.count)?;
+            if entries
+                .iter()
+                .any(|entry| entry.resolution > LinkMergeResolution::Theirs as u32)
+            {
+                return Err(StateError::internal(
+                    "Link merge state holds a row this build cannot read",
+                ));
+            }
+            Ok(entries)
+        }
+        version => Err(StateError::internal(format!(
+            "Link merge state version {version} cannot be read by this build (expected \
+             {LINK_MERGE_STATE_VERSION}). Complete or abort the merge with the build that started \
+             it"
+        ))),
+    }
+}
+
+/// `count` records laid end to end. Fewer is an error rather than a shorter list, since a missing
+/// conflict row would let a commit through.
+fn read_records<T: FromBytes>(bytes: &[u8], count: u32) -> Result<Vec<T>, StateError> {
+    let truncated = || StateError::internal("Link merge state is truncated");
+    bytes
+        .get(..count as usize * size_of::<T>())
+        .ok_or_else(truncated)?
+        .chunks_exact(size_of::<T>())
+        .map(|record| T::read_from_bytes(record).ok().ok_or_else(truncated))
+        .collect()
+}
+
 const MAX_BLOCK_CACHE: usize = 5000;
 /// How many file metadata blocks a state keeps from checking recycled slots, at 65,568 bytes
 /// each. Adds land in the few blocks with free slots, so a handful is the usual working set.
@@ -1513,6 +1843,8 @@ struct StateRuntime {
     block_file_metadata_checked_next: usize,
     /// Link list
     link_list: Option<Vec<LinkReference>>,
+    /// The linked repositories whose rows an edit changed, whose rows every save checks
+    link_touched: Vec<RepositoryId>,
     /// Name table (read only, for old data formats)
     name_table_deprecated: Option<Arc<NameTable>>,
     /// Rehash node names
@@ -1541,6 +1873,7 @@ impl StateRuntime {
             block_file_metadata_checked: vec![],
             block_file_metadata_checked_next: 0,
             link_list: None,
+            link_touched: Vec::new(),
             name_table_deprecated: None,
             rehash_node_names,
             unswept: Vec::new(),
@@ -1660,7 +1993,8 @@ pub struct ChainMark {
 impl ChainMark {
     /// Counts a prepend to the directory the mark's holder made itself, which the walks since
     /// the mark cover as they cover any other, so the holder's own adds never make a search
-    /// stale. A holder counting a prepend that did not land would hide a reattach.
+    /// stale. A holder counting a prepend that did not land would hide a reattach, or another
+    /// writer's add from [`Self::unchanged`].
     pub fn count_own_prepend(&mut self) {
         self.changes = self.changes.wrapping_add(1);
     }
@@ -1673,6 +2007,17 @@ impl ChainMark {
             .chain_changes(Node::index(self.parent))
             .wrapping_sub(self.changes)
             >= REATTACH_CHANGES
+    }
+
+    /// Whether the directory's count stands where the mark and the holder's own prepends
+    /// ([`Self::count_own_prepend`]) put it, with no sweep of `state`, the mark's State, freeing a
+    /// slot since: every child ahead of the mark's head is then one the holder prepended, since
+    /// every other change linking a child into a chain a listing reaches is counted (C5). The mark
+    /// holds its block, so the block stays the one `state` holds at its index, and the count read
+    /// is the directory's. Two Acquire loads, no lock.
+    pub fn unchanged(&self, state: &State) -> bool {
+        self.reclaims == state.reclaims()
+            && self.block.chain_changes(Node::index(self.parent)) == self.changes
     }
 }
 
@@ -1860,6 +2205,36 @@ impl State {
         );
     }
 
+    /// Notes that a C API move takes a node not staged for addition into a directory staged for
+    /// addition ([`Self::node_move_staged`]), before the move lands.
+    ///
+    /// Relaxed, as the moves permit orders it: the move notes it under the permit, and a C API
+    /// delete reads it under the permit; the C API commit clears it under its exclusive claim.
+    pub fn note_tracked_below_added(&self) {
+        self.tracked_below_added.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a node not staged for addition may stand below a directory staged for addition. On
+    /// a State only the C API's verbs change, unset means none does: such a node stands there only
+    /// where a C API move put it, into the directory or into a node below it that one put there,
+    /// or where a restore took it back after one put it there and a delete staged it, and the move
+    /// that first put one there noted it ([`Self::note_tracked_below_added`]), before any mark.
+    /// Set from that move until the C API commit, which leaves no node staged for addition.
+    ///
+    /// A C API delete checks a subtree for a tracked node below an added directory only while it
+    /// is set, and then walks every directory of it. Neither rests on the staged marks of the
+    /// directories above an added node, which a climb that failed or was dropped leaves incomplete
+    /// (C12): unset, no subtree can hold one whatever those marks.
+    pub fn may_hold_tracked_below_added(&self) -> bool {
+        self.tracked_below_added.load(Ordering::Relaxed)
+    }
+
+    /// Forgets the moves below added directories noted, for the C API commit once its in-memory
+    /// commit published the tree it froze, which holds no node staged for addition.
+    pub fn clear_tracked_below_added(&self) {
+        self.tracked_below_added.store(false, Ordering::Relaxed);
+    }
+
     /// For a `writer` changing chains or names past the primitives, which neither count nor log,
     /// so a served State's listings would never see the change.
     #[track_caller]
@@ -1914,9 +2289,11 @@ impl State {
                 runtime: _,
                 served: _,
                 unfinished_change: _,
+                tracked_below_added: _,
                 unused: _,
                 moves: _,
                 pending: _,
+                promoted: _,
                 find_restarts: _,
                 attach_retries: _,
                 served_refusals: _,
@@ -1932,6 +2309,7 @@ impl State {
                 #[cfg(feature = "state-hooks")]
                     hooks: _,
                 base: _,
+                staged_on: _,
             } = state;
         };
         let state = Arc::<Self>::new_uninit();
@@ -1947,9 +2325,11 @@ impl State {
             )));
             (&raw mut (*fields).served).write(AtomicBool::new(false));
             (&raw mut (*fields).unfinished_change).write(AtomicBool::new(false));
+            (&raw mut (*fields).tracked_below_added).write(AtomicBool::new(false));
             (&raw mut (*fields).unused).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).moves).write(tokio::sync::Semaphore::new(1));
             (&raw mut (*fields).pending).write(std::sync::OnceLock::new());
+            (&raw mut (*fields).promoted).write(std::sync::OnceLock::new());
             (&raw mut (*fields).find_restarts).write(AtomicU64::new(0));
             (&raw mut (*fields).attach_retries).write(AtomicU64::new(0));
             (&raw mut (*fields).served_refusals).write(AtomicU64::new(0));
@@ -1965,6 +2345,7 @@ impl State {
             #[cfg(feature = "state-hooks")]
             (&raw mut (*fields).hooks).write(crate::state::node::hooks::StateHooks::new());
             (&raw mut (*fields).base).write(parking_lot::Mutex::new(None));
+            (&raw mut (*fields).staged_on).write(std::sync::OnceLock::new());
             state.assume_init()
         }
     }
@@ -1985,7 +2366,8 @@ impl State {
     /// Load current and optionally staged states, plus the current branch.
     ///
     /// Returns `(current_state, staged_state, branch)` where `staged_state`
-    /// is `None` when nothing is staged.
+    /// is `None` when nothing is staged. A staged state built on the current revision holds it as
+    /// its base ([`Self::hold_current_where_staged_on`]).
     pub async fn deserialize_current_and_staged(
         repository: Arc<RepositoryContext>,
     ) -> Result<(Arc<Self>, Option<Arc<Self>>, BranchId), StateError> {
@@ -1999,13 +2381,31 @@ impl State {
             .ok()
             .flatten()
         {
-            Some(staged_revision) if staged_revision != current_revision => {
-                Some(State::deserialize(repository.clone(), staged_revision).await?)
-            }
+            Some(staged_revision) if staged_revision != current_revision => Some(
+                State::deserialize_staged(repository.clone(), staged_revision, current_revision)
+                    .await?,
+            ),
             _ => None,
         };
+        if let Some(staged) = &state_staged {
+            staged.hold_current_where_staged_on(&state_current);
+        }
 
         Ok((state_current, state_staged, branch))
+    }
+
+    /// The state of `staged`, the staged revision of an instance whose current revision is
+    /// `current`, or of `current` itself where nothing is staged. A merge revision staged on
+    /// `current`, as a sync of divergent history stages one, is built on it ([`Self::built_on`]),
+    /// which only its signature tells.
+    pub async fn deserialize_staged(
+        repository: Arc<RepositoryContext>,
+        staged: Hash,
+        current: Hash,
+    ) -> Result<Arc<Self>, StateError> {
+        let state = Self::deserialize(repository, staged).await?;
+        state.note_staged_on(current);
+        Ok(state)
     }
 
     /// The state of revision `signature`, empty for a zero signature.
@@ -2032,8 +2432,8 @@ impl State {
 
         if !data.has_state_magic() {
             Err(StateError::internal("Corrupt header"))
-        } else if data.format == 0 || data.format > StateFormat::LowerCaseHash as u32 {
-            if data.format > StateFormat::LowerCaseHash as u32 && data.format < 0xFFF {
+        } else if data.format == 0 || data.format > StateFormat::LinkMergeState as u32 {
+            if data.format > StateFormat::LinkMergeState as u32 && data.format < 0xFFF {
                 Err(StateError::internal(format!(
                     "Upgrade format: {}",
                     data.format
@@ -2090,16 +2490,36 @@ impl State {
     /// parent block imaged after a publish can name a child whose block was imaged before it, and
     /// a block threaded onto the unused chain behind a fresh head this save does not write is
     /// reached in the next save alone.
-    pub async fn serialize_keeping(
+    ///
+    /// The rows of each linked repository an edit changed must agree on branch and flags
+    /// ([`LinkPinAgreement::Rows`]), or the save fails with [`LinkPinsDiverge`].
+    pub fn serialize_keeping<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+        keep: impl FnOnce(SerializedBlocks) + Send + 'a,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.serialize_agreeing(repository, token, keep, LinkPinAgreement::Rows)
+    }
+
+    /// [`Self::serialize_keeping`], with the rows of each linked repository an edit changed agreeing
+    /// as `agreement` requires.
+    async fn serialize_agreeing(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
         _token: &RepositoryWriteToken,
         keep: impl FnOnce(SerializedBlocks) + Send,
+        agreement: LinkPinAgreement,
     ) -> Result<Hash, StateError> {
         debug_assert!(
             self.runtime_read().fresh_blocks_from.is_none(),
             "a State taking new nodes from fresh blocks is never serialized: its stored unused \
              chain would leave out the tree's free slots"
+        );
+        debug_assert!(
+            !self.holds_promoted_moves(),
+            "a State is serialized with a move a staged climb promoted still queued: the route \
+             that staged it stages each whole move first (`stage_promoted_moves_of_call`)"
         );
         let is_dirty = self.is_dirty();
         if !is_dirty {
@@ -2190,8 +2610,13 @@ impl State {
             .await?;
         }
 
-        let link_list = { self.runtime_read().link_list.clone() };
+        let (link_list, link_touched) = {
+            let runtime = self.runtime_read();
+            (runtime.link_list.clone(), runtime.link_touched.clone())
+        };
         if let Some(link_list) = link_list {
+            self.check_link_rows_agree(&repository, &link_list, &link_touched, agreement)
+                .await?;
             let list_hash = hash::hash_slice(link_list.as_bytes());
             if list_hash != self.data_read().hash_link {
                 let rehashed_list = if link_list.is_empty() {
@@ -2228,7 +2653,7 @@ impl State {
             let buffer = {
                 let mut data = self.data_write();
                 data.flags &= !StateFlags::Dirty;
-                data.format = StateFormat::LowerCaseHash as u32;
+                data.format = data.format_to_write();
                 data.magic = STATE_MAGIC;
 
                 Bytes::copy_from_slice(data.as_bytes())
@@ -2867,23 +3292,47 @@ impl State {
         .forward::<StateError>("Failed to deserialize delta block")
     }
 
-    pub async fn node_delta(
+    /// The entry the delta of this revision records for `node`, a node it holds: one that isn't a
+    /// deletion. A revision whose tree was started from another revision records a deletion under
+    /// its first parent's node ID and every other change under its own, so one ID can carry both.
+    pub async fn node_change(
         &self,
         repository: Arc<RepositoryContext>,
         node: NodeID,
+    ) -> Result<Option<NodeDelta>, StateError> {
+        self.node_delta(repository, node, false).await
+    }
+
+    /// The deletion the delta of this revision records for `node`, a node of its first parent
+    /// ([`Self::node_change`]).
+    pub async fn node_deletion(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<Option<NodeDelta>, StateError> {
+        self.node_delta(repository, node, true).await
+    }
+
+    /// The entry the delta of this revision records for `node` that is a deletion where `deletion`
+    /// says, and one that isn't otherwise.
+    async fn node_delta(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        deletion: bool,
     ) -> Result<Option<NodeDelta>, StateError> {
         let delta_block = self
             .delta_block(repository.clone())
             .await?
             .to_aligned::<NodeDelta>();
 
-        for node_delta in delta_block.as_type_slice::<NodeDelta>().iter() {
-            if node_delta.node == node {
-                return Ok(Some(*node_delta));
-            }
-        }
-
-        Ok(None)
+        Ok(delta_block
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .find(|entry| {
+                entry.node == node && (entry.action == FileAction::Delete as u16) == deletion
+            })
+            .copied())
     }
 
     /// Node blocks the tree has, whether or not any of them is in memory.
@@ -3163,6 +3612,7 @@ impl State {
     /// before it is loaded: the blocks load in turn, and each name table loads while the walk
     /// goes on.
     #[lore_macro::test_pub]
+    #[cfg(any(target_os = "linux", feature = "test-util"))]
     pub(crate) async fn load_children_with_nametables(
         self: &Arc<Self>,
         repository: Arc<RepositoryContext>,
@@ -3188,7 +3638,7 @@ impl State {
                 );
             }
         }
-        lore_drain_tasks!(
+        lore_base::lore_drain_tasks!(
             nametables,
             StateError::internal("Failed to load a node name table")
         )?;
@@ -3444,7 +3894,7 @@ impl State {
     ///
     /// Serialize writes the list from this, so a State that loaded no block still writes the
     /// stored address of every block it did not change.
-    async fn node_block_addresses(
+    pub(crate) async fn node_block_addresses(
         &self,
         repository: &Arc<RepositoryContext>,
         hash_node: Hash,
@@ -3494,6 +3944,24 @@ impl State {
             self.node_block_addresses(&repository, hash_node, block_count),
             self.file_metadata_addresses(&repository, hash_file_metadata, block_count),
         )
+    }
+
+    /// Every node block's address hash, by block index, read once per state: the node block list
+    /// of [`Self::block_address_lists`], without the file-metadata one. For a state changed since
+    /// it was read, the list holds the addresses as last stored: a block changed since keeps its
+    /// stored address, and one added since is zero or past the list's end.
+    #[lore_macro::test_pub]
+    pub(crate) async fn node_block_address_list(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<Bytes, StateError> {
+        let Tree {
+            block_count,
+            hash_node,
+            ..
+        } = self.tree(repository.clone()).await?;
+        self.node_block_addresses(&repository, hash_node, block_count as usize)
+            .await
     }
 
     /// Reads the node block address list `hash_node` names, padded with zero addresses to
@@ -3597,10 +4065,10 @@ impl State {
     /// holds is only marked, as an add or a copy is, and the ignore rules apply to it
     /// ([ADR-00027](../../docs/developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
     ///
-    /// A tree shares its node IDs with the revision it was built on, so a node that revision
-    /// holds sits at the same ID, with the same type, in the revision's tree. The revision is read
-    /// apart from this tree, which a walk may be adding nodes to, the first time it is asked, and
-    /// kept for as long as this tree is built on it.
+    /// A tree shares its node IDs with the revision it was built on ([`Self::built_on`]), so a node
+    /// that revision holds sits at the same ID, with the same type, in the revision's tree. The
+    /// revision is read apart from this tree, which a walk may be adding nodes to, the first time
+    /// it is asked, and kept for as long as this tree is built on it.
     pub async fn tracks(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -3612,8 +4080,17 @@ impl State {
         }
         // Boxed: a walk reaches this only where the ignore rules would leave a node out, and
         // unboxed the revision's read would sit in every walk future that asks.
-        Box::pin(self.base_holds(repository, self.committed_revision(), id, flags.node_type()))
-            .await
+        Box::pin(self.base_holds(repository, self.built_on(), id, flags.node_type())).await
+    }
+
+    /// The revision this tree was built on, which it shares its node IDs with: for a staged merge
+    /// revision built on its second parent, as a sync of divergent history stages one, that
+    /// revision ([`Self::note_staged_on`]), and its committed revision otherwise.
+    pub(crate) fn built_on(&self) -> Hash {
+        match self.staged_on.get() {
+            Some(&revision) if self.revision_number() == 0 => revision,
+            _ => self.committed_revision(),
+        }
     }
 
     /// Whether `base`, a revision this tree shares its node IDs with, holds a node of `node_type`
@@ -3739,14 +4216,61 @@ impl State {
             || (flags.contains(NodeFlags::Dirty) && self.tracks(repository, id, flags).await?))
     }
 
+    /// Holds `current`, the state of the revision the working tree holds, as the base this tree
+    /// shares its node IDs with where this tree is built on it ([`Self::built_on`]).
+    pub(crate) fn hold_current_where_staged_on(&self, current: &Arc<State>) {
+        if self.built_on() == current.revision() {
+            self.hold_base(current.clone());
+        }
+    }
+
     /// Holds `base`, the State of a revision this tree shares its node IDs with, as the one
-    /// [`Self::base`] answers for that revision, for a caller that has read it already.
+    /// [`Self::base`] answers for that revision, for a caller that has read it already, and notes
+    /// a merge revision staged on it ([`Self::note_staged_on`]).
     pub(crate) fn hold_base(&self, base: Arc<State>) {
+        self.note_staged_on(base.revision());
         *self.base.lock() = Some((base.revision(), base));
+    }
+
+    /// Notes `current`, the revision the working tree holds, as the revision this tree was built
+    /// on where this tree is a merge revision staged on it, as a sync of divergent history stages
+    /// one ([`Self::built_on`]).
+    fn note_staged_on(&self, current: Hash) {
+        if self.reconciles_divergent_history(current) {
+            let _ = self.staged_on.set(current);
+        }
+    }
+
+    /// Notes `directory`, marked dirty as moved, whose move a staged climb from a node below it
+    /// staged ([`Self::node_mark`]), for its caller to stage the whole move.
+    pub(in crate::state) fn note_promoted_move(&self, directory: NodeID) {
+        self.promoted
+            .get_or_init(|| Box::new(crossbeam_queue::SegQueue::new()))
+            .push(directory);
+    }
+
+    /// Whether a staged climb staged the move of a directory marked dirty as moved since the last
+    /// [`Self::take_promoted_moves`].
+    pub fn holds_promoted_moves(&self) -> bool {
+        self.promoted.get().is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// The directories marked dirty as moved whose move a staged climb staged since the last
+    /// call, each once, sorted by node ID. A caller stages each whole move, as a stage inside the
+    /// directory does (`stage_directory_move`).
+    pub fn take_promoted_moves(&self) -> Vec<NodeID> {
+        let Some(queue) = self.promoted.get() else {
+            return Vec::new();
+        };
+        let mut promoted: Vec<NodeID> = std::iter::from_fn(|| queue.pop()).collect();
+        promoted.sort_unstable();
+        promoted.dedup();
+        promoted
     }
 
     /// The State of `revision`, a revision this tree shares its node IDs with, read once for as
     /// long as it is the one asked for.
+    #[lore_macro::test_pub]
     async fn base(
         &self,
         repository: &Arc<RepositoryContext>,
@@ -3782,6 +4306,22 @@ impl State {
             .is_some_and(|(node, _)| !node.is_discarded() && node.node_type() == node_type))
     }
 
+    /// The record of the live node of `node_type` this tree holds at `id`, as [`Self::holds_node`]
+    /// answers whether it holds one. That one reads the slot itself rather than await this, which
+    /// would grow its future and its callers'.
+    pub(crate) async fn held_node(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        id: NodeID,
+        node_type: crate::interface::LoreNodeType,
+    ) -> Result<Option<Node>, StateError> {
+        Ok(self
+            .node_in_use(repository, id)
+            .await?
+            .map(|(node, _)| node)
+            .filter(|node| !node.is_discarded() && node.node_type() == node_type))
+    }
+
     /// The record this tree holds at `id`, with its block; `None` where the slot holds no node.
     async fn node_in_use(
         &self,
@@ -3801,26 +4341,32 @@ impl State {
         Ok(node.map(|node| (node, block)))
     }
 
-    /// Moves `id`, which this tree holds marked dirty as moved and not staged, back to the parent
-    /// and name `base` holds it at, `base` being the revision this tree shares its node IDs with,
-    /// and answers what became of it, with the path it stood at where `want_path` asks for it and
-    /// it does not stand there already. `name` is a buffer the caller keeps across nodes.
+    /// Moves `id`, which this tree holds moved, back to the parent and name `base` holds it at,
+    /// `base` being the revision this tree shares its node IDs with, and answers what became of it,
+    /// with the path it stood at where `options` asks for it and it does not stand there already.
+    /// `name` is a buffer the caller keeps across nodes. The node's flags do not change.
     ///
-    /// Where a node that may still leave holds the name, the node waits under the parent by a name
-    /// of its own ([`Return::Parked`]), so its own place, or a directory that is to be discarded,
-    /// holds it no longer. Asked again, it goes back once the name is free. A directory marked
-    /// dirty as added and not staged is such a holder: the caller discards it, unless it holds a
-    /// staged node, which stages it. A staged node holding the name, or a parent that is no live
-    /// directory, keeps the node out for good ([`Return::Displaced`]). A file marked dirty as added
-    /// and not staged does not keep it out: the caller discards each such file before it asks of
-    /// the name there again, so the two hold one name only until then.
+    /// Where a node that may still leave holds the name and `options` parks, the node waits under
+    /// the parent by a name of its own ([`Return::Parked`]), so its own place, or a directory that
+    /// is to be discarded, holds it no longer. Asked again, it goes back once the name is free. A
+    /// directory marked dirty as added and not staged is such a holder: the caller discards it,
+    /// unless it holds a staged node, which stages it. A file marked dirty as added and not staged
+    /// does not keep it out: the caller discards each such file before it asks of the name there
+    /// again, so the two hold one name only until then. Without parking, any such holder, and a
+    /// parent inside the node's own subtree, leave the node where it stands ([`Return::Held`]). A
+    /// staged node holding the name, or a parent that is no live directory, keeps the node out for
+    /// good ([`Return::Displaced`]). A node staged for deletion holds no name: the node goes back
+    /// beside it.
     ///
-    /// The caller asks of a node that holds no staged node, once it has asked of every node below
-    /// it. Each of those then stands under the directory `base` holds it in, is no node of `base`,
-    /// or has left the tree: only a move takes a node from that directory, and none below is
-    /// staged, so each moved one has gone back, waits there, or has left the tree. So the parent,
-    /// which `base` holds above the node, lies inside the node's subtree only where `base` holds a
-    /// cycle, which is an internal error.
+    /// Where `options` asks for it, the node goes back beside a node holding the name, staged or not,
+    /// for the caller to mark it deleted there.
+    ///
+    /// A caller that parks asks of a node that holds no staged node, once it has asked of every
+    /// node below it. Each of those then stands under the directory `base` holds it in, is no node
+    /// of `base`, or has left the tree: only a move takes a node from that directory, and none
+    /// below is staged, so each moved one has gone back, waits there, or has left the tree. So the
+    /// parent, which `base` holds above the node, lies inside the node's subtree only where `base`
+    /// holds a cycle, which is an internal error.
     ///
     /// Nothing else changes the tree while this runs, so what the checks read stands when the
     /// node moves ([`Self::node_move`] checks nothing). Only a node that does not stand where
@@ -3832,7 +4378,7 @@ impl State {
         base: Hash,
         id: NodeID,
         name: &mut String,
-        want_path: bool,
+        options: ReturnOptions,
     ) -> Result<(Return, Option<RelativePath>), StateError> {
         let (parent, name_hash, flags, context) = {
             let node = self.node(repository.clone(), id).await?;
@@ -3852,12 +4398,31 @@ impl State {
         else {
             return Ok((Return::Stays, None));
         };
+        self.node_return_into(
+            repository,
+            (id, parent, name_hash, flags),
+            (committed, name),
+            options,
+        )
+        .await
+    }
+
+    /// [`Self::node_return_unstaged_move`] of `id`, standing under `parent` by a name of hash
+    /// `name_hash` and carrying `flags`, once the place `base` holds it at is found: `committed`,
+    /// its parent and name hash, and `name`, its name there.
+    pub(crate) async fn node_return_into(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (id, parent, name_hash, flags): (NodeID, NodeID, u64, NodeFlags),
+        (committed, name): ((NodeID, u64), &str),
+        options: ReturnOptions,
+    ) -> Result<(Return, Option<RelativePath>), StateError> {
         let renamed =
             name_hash != committed.1 || !self.node_name_is(repository.clone(), id, name).await?;
         if parent == committed.0 && !renamed {
             return Ok((Return::Stays, None));
         }
-        let path = if want_path {
+        let path = if options.want_path {
             self.node_path_below(repository.clone(), id, ROOT_NODE)
                 .await?
         } else {
@@ -3865,38 +4430,98 @@ impl State {
         };
         let is_directory = !flags.intersects(NodeFlags::File | NodeFlags::Link);
         let moved = (id, parent, is_directory);
-        let name = renamed.then_some(name.as_str());
-        let returned = Box::pin(self.node_return_to(repository, moved, committed, name)).await?;
+        let name = renamed.then_some(name);
+        let returned =
+            Box::pin(self.node_return_to(repository, moved, committed, (name, options))).await?;
         Ok((returned, path))
     }
 
+    /// Returns each of `nodes`, unstaged dirty moves the working tree no longer holds, to the place
+    /// `current`, the revision this tree is staged on, holds it at, and marks it deleted there
+    /// ([`Self::node_return_removed_move`]). Call once the walks that found `nodes` have ended:
+    /// nothing else may change the tree while one returns.
+    pub(crate) async fn nodes_return_removed_moves(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        current: &Arc<State>,
+        nodes: &[NodeID],
+    ) -> Result<(), StateError> {
+        if !std::ptr::eq(self, Arc::as_ptr(current)) {
+            self.hold_base(current.clone());
+        }
+        let mut name = String::new();
+        for &node in nodes {
+            self.node_return_removed_move(repository, current, node, &mut name)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Returns `node`, an unstaged dirty move the working tree no longer holds, to the place
+    /// `current`, the revision this tree is staged on, holds it at, marks it deleted there
+    /// ([`Self::node_return_unstaged_move`]), and answers what became of it. One `current` holds
+    /// no node of its kind at is marked deleted where it stands. One whose place another node
+    /// holds keeps its move, for the commit to return it once the place frees. One that cannot go
+    /// back, as a staged node holds its place or its committed parent is gone, keeps its move too.
+    /// One no longer in the tree is passed over. `name` is a buffer the caller keeps across nodes.
+    ///
+    /// Not an `async fn`: its future chains the return's and the mark's, with no second copy of
+    /// the arguments the return takes, so a loop awaiting it holds little more than the return.
+    pub(crate) fn node_return_removed_move<'a>(
+        &'a self,
+        repository: &'a Arc<RepositoryContext>,
+        current: &State,
+        node: NodeID,
+        name: &'a mut String,
+    ) -> impl Future<Output = Result<Return, StateError>> + Send + 'a {
+        futures::FutureExt::then(
+            self.node_return_unstaged_move(
+                repository,
+                current.revision(),
+                node,
+                name,
+                ReturnOptions::default(),
+            ),
+            move |returned| async move {
+                let (returned, _) = returned?;
+                if matches!(returned, Return::Stays | Return::Back) {
+                    self.node_mark(repository, node, Mark::DIRTY_DELETE).await?;
+                }
+                Ok(returned)
+            },
+        )
+    }
+
     /// Whether `id`, this tree's node `node`, stands where `base`, the revision this tree shares
-    /// its node IDs with, holds it, under the same parent by the same name, or `base` holds no
-    /// node of its kind and context at `id`, as [`Self::node_return_unstaged_move`] finds a node
-    /// that stays. `name` is a buffer the caller keeps across nodes.
-    pub(crate) async fn stands_at_base_place(
+    /// its node IDs with, holds it, under the same parent by the same name, or `None` where `base`
+    /// holds no node of its kind and context at `id`. `name` is a buffer the caller keeps across
+    /// nodes.
+    pub(crate) async fn at_base_place(
         &self,
         repository: &Arc<RepositoryContext>,
         base: Hash,
         (id, node): (NodeID, &Node),
         name: &mut String,
-    ) -> Result<bool, StateError> {
+    ) -> Result<Option<bool>, StateError> {
         let flags = NodeFlags::from_bits_retain(node.flags);
         let Some(committed) = self
             .base_place(repository, (base, id), (flags, node.address.context), name)
             .await?
         else {
-            return Ok(true);
+            return Ok(None);
         };
-        Ok(node.parent == committed.0
-            && node.name_hash == committed.1
-            && self.node_name_is(repository.clone(), id, name).await?)
+        Ok(Some(
+            node.parent == committed.0
+                && node.name_hash == committed.1
+                && self.node_name_is(repository.clone(), id, name).await?,
+        ))
     }
 
     /// Moves `node` to the directory `parent`, renamed to `name` where one is given, or parks it
-    /// there, as [`Self::node_return_unstaged_move`] describes. `from` is the directory that holds
-    /// the node now, `is_directory` whether the node is one, and `name_hash` the hash of the name
-    /// it takes.
+    /// there, or puts it beside a node holding the name, where `options` asks for it, as
+    /// [`Self::node_return_unstaged_move`] describes. `from` is the
+    /// directory that holds the node now, `is_directory` whether the node is one, and `name_hash`
+    /// the hash of the name it takes.
     ///
     /// Flags neither directory, where the unserved tier's reattach ([`Self::node_reattach`]) flags
     /// both before it moves a node: the node goes back to the place the base revision holds it at,
@@ -3907,8 +4532,9 @@ impl State {
         repository: &Arc<RepositoryContext>,
         (node, from, is_directory): (NodeID, NodeID, bool),
         (parent, name_hash): (NodeID, u64),
-        name: Option<&str>,
+        (name, options): (Option<&str>, ReturnOptions),
     ) -> Result<Return, StateError> {
+        let park = options.park;
         if !self.is_live_directory(repository, parent).await? {
             return Ok(Return::Displaced);
         }
@@ -3918,17 +4544,24 @@ impl State {
                 .is_inside_subtree(repository.clone(), parent, node)
                 .await?
         {
+            if !park {
+                return Ok(Return::Held);
+            }
             return Err(StateError::internal(
                 "A move marked dirty would return into its own subtree",
             ));
         }
-        let holder = match self
-            .find_subnode(repository.clone(), parent, name_hash)
-            .await
-        {
-            Ok(holder) => (holder != node).then_some(holder),
-            Err(error) if error.is_node_not_found() => None,
-            Err(error) => return Err(error),
+        let holder = if options.beside {
+            None
+        } else {
+            match self
+                .find_live_subnode(repository.clone(), parent, name_hash)
+                .await
+            {
+                Ok((holder, deleted)) => (holder != node && !deleted).then_some(holder),
+                Err(error) if error.is_node_not_found() => None,
+                Err(error) => return Err(error),
+            }
         };
         if let Some(holder) = holder {
             let (staged, added_file) = {
@@ -3940,6 +4573,9 @@ impl State {
             };
             if staged {
                 return Ok(Return::Displaced);
+            }
+            if !park {
+                return Ok(Return::Held);
             }
             if !added_file {
                 let parked = ParkedName::of(node);
@@ -3964,6 +4600,30 @@ impl State {
         self.node_move(repository.clone(), node, parent, change, Mark::NONE)
             .await?;
         Ok(Return::Back)
+    }
+
+    /// Where `base`, the revision this tree shares its node IDs with, holds `id`, a node of this
+    /// tree carrying `flags` and the address `context`: its parent and name hash, with its name
+    /// copied into `name`, and its path below `below` in `base`'s tree. `None` where `base` holds
+    /// no node of the same kind and context at `id`, or holds it outside `below`.
+    pub(crate) async fn base_place_below(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        (base, id, below): (Hash, NodeID, NodeID),
+        (flags, context): (NodeFlags, Context),
+        name: &mut String,
+    ) -> Result<Option<((NodeID, u64), RelativePath)>, StateError> {
+        let Some(place) = self
+            .base_place(repository, (base, id), (flags, context), name)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let base = self.base(repository, base).await?;
+        Ok(base
+            .node_path_below(repository.clone(), id, below)
+            .await?
+            .map(|path| (place, path)))
     }
 
     /// Where `base` holds `id`, a node of this tree carrying `flags` and the address `context`: its
@@ -4000,7 +4660,7 @@ impl State {
     }
 
     /// Whether `node` is a directory this tree holds, not discarded.
-    async fn is_live_directory(
+    pub(crate) async fn is_live_directory(
         &self,
         repository: &Arc<RepositoryContext>,
         node: NodeID,
@@ -4624,16 +5284,16 @@ impl State {
         Ok(name_hashes)
     }
 
-    /// The first child of `parent_node` carrying `name_hash` ahead of `stop_at` in its chain. A
-    /// child is prepended, so one linked after `stop_at` lies ahead of it. `None` where
+    /// The first child of `parent_node` carrying `name_hash` but `beside`, on either side of it in
+    /// the chain, that `matches`, with its node: one scan of the chain. `None` where
     /// `parent_node` is no directory.
-    pub(crate) async fn find_subnode_ahead_of(
+    pub(crate) async fn find_subnode_beside(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
-        stop_at: NodeID,
-        name_hash: u64,
-    ) -> Result<Option<NodeID>, StateError> {
+        (beside, name_hash): (NodeID, u64),
+        matches: impl Fn(&Node) -> bool,
+    ) -> Result<Option<(NodeID, Node)>, StateError> {
         let block = self
             .block(repository.clone(), NodeBlock::index(parent_node))
             .await?;
@@ -4646,8 +5306,11 @@ impl State {
                 repository,
                 parent.child(),
                 ChainWalk::new(parent_node, block, changes),
-                Some(stop_at),
-                |child_id, child| (child.name_hash == name_hash).then_some(child_id),
+                None,
+                |child_id, child| {
+                    (child_id != beside && child.name_hash == name_hash && matches(child))
+                        .then_some((child_id, *child))
+                },
             )
             .await?;
         Ok(walked.answer)
@@ -4808,6 +5471,61 @@ impl State {
         parent_node: NodeID,
     ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
         self.holds_child(repository, parent_node, Node::is_staged)
+    }
+
+    /// Whether a child of the directory `parent_node` carries no Staged flag, as
+    /// [`Self::holds_child`] reads it.
+    pub(crate) fn node_has_unstaged_children(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+    ) -> impl Future<Output = Result<bool, StateError>> + Send + '_ {
+        self.holds_child(repository, parent_node, |child| !child.is_staged())
+    }
+
+    /// Whether the directory `directory` holds a node staged in its own right below it, through
+    /// directories staged only for what lies below them ([`is_staged_for_descendants_only`]): a
+    /// bare staged bit that a node since gone carried up holds no staged content. Each directory is
+    /// read as [`Self::holds_child`] reads one, from a worklist, so a deep tree takes no recursion.
+    pub(crate) async fn holds_staged_content(
+        &self,
+        repository: Arc<RepositoryContext>,
+        directory: NodeID,
+    ) -> Result<bool, StateError> {
+        let mut pending = vec![directory];
+        while let Some(parent) = pending.pop() {
+            let block = self
+                .block(repository.clone(), NodeBlock::index(parent))
+                .await?;
+            let (node, changes) = block.node_with_chain_head(parent);
+            if !node.is_directory() {
+                continue;
+            }
+            let walked = self
+                .walk_children(
+                    repository.clone(),
+                    node.child(),
+                    ChainWalk::new(parent, block, changes),
+                    None,
+                    |child_id, child| {
+                        if !child.is_staged() {
+                            return None;
+                        }
+                        if !is_staged_for_descendants_only(child) {
+                            return Some(());
+                        }
+                        if child.is_directory() {
+                            pending.push(child_id);
+                        }
+                        None
+                    },
+                )
+                .await?;
+            if walked.answer.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Whether a child of the directory `parent_node` carries the Dirty flag, as
@@ -4974,12 +5692,12 @@ impl State {
                 // them. --force bypasses the filter. The ignore slot has no say
                 // over a node the tree tracks, only over one it only marks, as
                 // an add or a copy.
-                let mode = if force {
-                    FilterMode::TRACKED
+                let (child_states, reason) = if force {
+                    (FilterStates::ROOT, None)
                 } else {
                     repository
                         .filter
-                        .tracked_mode(
+                        .child_tracked_reason(
                             states,
                             &child_path,
                             !child.is_file(),
@@ -4995,14 +5713,7 @@ impl State {
                         )
                         .await?
                 };
-                let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
-                    force,
-                    states,
-                    &child_path,
-                    !child.is_file(),
-                    mode,
-                );
-                if excluded {
+                if reason.is_some() {
                     continue;
                 }
 
@@ -5060,31 +5771,63 @@ impl State {
         parent_node: NodeID,
         name_hash: u64,
     ) -> impl Future<Output = Result<NodeID, StateError>> + Send + '_ {
-        self.find_subnode_in(repository, parent_node, name_hash)
+        self.find_subnode_in::<false, NodeID>(repository, parent_node, name_hash)
     }
 
-    /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
-    /// chain change count, and its chain walked.
-    async fn find_subnode_in(
+    /// [`Self::find_subnode`], preferring a node not marked deleted, staged or dirty, where the
+    /// directory holds two of the name, as it does while a new node of the name stands beside a
+    /// deleted one until a commit drops that one. Where it holds no other, answers a node only
+    /// marked dirty as deleted before one staged for deletion, with whether the node it answers is
+    /// staged for deletion.
+    pub fn find_live_subnode(
         &self,
         repository: Arc<RepositoryContext>,
         parent_node: NodeID,
         name_hash: u64,
-    ) -> Result<NodeID, StateError> {
+    ) -> impl Future<Output = Result<(NodeID, bool), StateError>> + Send + '_ {
+        self.find_subnode_in::<true, (NodeID, bool)>(repository, parent_node, name_hash)
+    }
+
+    /// [`Self::find_live_subnode`], answering `None` where that answers [`NodeNotFound`], which
+    /// allocates.
+    pub fn find_live_subnode_if_present(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        name_hash: u64,
+    ) -> impl Future<Output = Result<Option<(NodeID, bool)>, StateError>> + Send + '_ {
+        self.find_subnode_in::<true, Option<(NodeID, bool)>>(repository, parent_node, name_hash)
+    }
+
+    /// The find of [`Self::find_subnode`]: the parent's block loaded, its head read with its
+    /// chain change count, and its chain walked; past a deleted node where `LIVE`, a parameter so
+    /// the plain find carries no test of it. Answers `T`, so a caller that takes the node alone
+    /// holds no wrapper of the future.
+    async fn find_subnode_in<const LIVE: bool, T: FoundSubnode>(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        name_hash: u64,
+    ) -> Result<T, StateError> {
         let mut block = self
             .block(repository.clone(), NodeBlock::index(parent_node))
             .await?;
         let mut search = {
             let (parent, changes) = block.node_with_chain_changes(Node::index(parent_node));
             if !parent.is_directory() {
-                return Err(NodeNotFound.into());
+                return T::absent();
             }
             NameSearch::new(parent_node, &parent, block.clone(), changes, name_hash)
         };
         let mut iblock = NodeBlock::index(parent_node);
+        let (mut deleted, mut staged_delete) = (INVALID_NODE, false);
         loop {
             let Some(node_id) = search.next(self)? else {
-                return Err(NodeNotFound.into());
+                return if deleted == INVALID_NODE {
+                    T::absent()
+                } else {
+                    Ok(T::found(deleted, staged_delete))
+                };
             };
             #[cfg(feature = "state-hooks")]
             crate::state::node::hooks::reached(crate::state::node::hooks::Point::FindStep).await;
@@ -5094,9 +5837,51 @@ impl State {
             }
             let node = *block.read().node(Node::index(node_id));
             if search.found(node_id, &node)? {
-                return Ok(node_id);
+                if !LIVE || !node.is_deleted() {
+                    return Ok(T::found(node_id, false));
+                }
+                if deleted == INVALID_NODE || (staged_delete && !node.is_staged_delete()) {
+                    (deleted, staged_delete) = (node_id, node.is_staged_delete());
+                }
+                search.pass(&node);
             }
         }
+    }
+
+    /// `found`, a child of a directory a listing answered for a name, or, where it is marked
+    /// deleted, the other of `carrying`, the children the listing holds carrying that name's hash
+    /// in sibling order, that [`Self::find_live_subnode`] prefers. Reads a node only where the
+    /// listing holds two such children.
+    pub(crate) async fn live_among(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        carrying: impl Iterator<Item = NodeID> + Clone,
+        found: NodeID,
+    ) -> Result<NodeID, StateError> {
+        if !found.is_valid_node_id() || carrying.clone().nth(1).is_none() {
+            return Ok(found);
+        }
+        let (first_deleted, first_staged_delete) = {
+            let first = self.node(repository.clone(), found).await?;
+            (first.is_deleted(), first.is_staged_delete())
+        };
+        if !first_deleted {
+            return Ok(found);
+        }
+        let (mut deleted, mut staged_delete) = (found, first_staged_delete);
+        for child in carrying {
+            if child == found {
+                continue;
+            }
+            let node = self.node(repository.clone(), child).await?;
+            if !node.is_deleted() {
+                return Ok(child);
+            }
+            if staged_delete && !node.is_staged_delete() {
+                (deleted, staged_delete) = (child, false);
+            }
+        }
+        Ok(deleted)
     }
 
     /// [`Self::find_subnode`] through blocks in memory only, for a request that reads nothing
@@ -5171,7 +5956,8 @@ impl State {
         self.clears_found_gone.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Resolves `path` below `root`, entering links on the way.
+    /// Resolves `path` below `root`, entering the links the link read policy of `repository`
+    /// admits. A path through a link it denies resolves to nothing.
     ///
     /// A component naming the repository's own directory resolves to nothing: no node carries
     /// that name, and a revision holding one anyway is not reached through it, whichever case
@@ -5216,7 +6002,9 @@ impl State {
         root: NodeID,
         path: &str,
     ) -> Result<(NodeLink, Option<LinkedState>), StateError> {
-        let stop = self.find_to_link(&repository, root, path, false).await?;
+        let stop = self
+            .find_to_link::<true>(&repository, root, path, false)
+            .await?;
         self.find_relative_from(repository, path, stop).await
     }
 
@@ -5247,21 +6035,44 @@ impl State {
             }
             Stop::Link(link) => link,
         };
+        if !repository.can_read_link(link.repository) {
+            lore_debug!(
+                "Path resolution stops at unauthorized repository {}",
+                link.repository,
+            );
+            return futures::future::Either::Left(std::future::ready(Err(NodeNotFound.into())));
+        }
         let rest = path.get(stop.length + 1..).unwrap_or_default();
         futures::future::Either::Right(async move {
             let repository = repository.to_link_context(link.repository).await;
             let link_state = State::deserialize(repository.clone(), link.revision).await?;
-            let (found, held) =
-                Box::pin(link_state.find_relative(repository.clone(), link.node, rest)).await?;
+            let (found, held) = link_state
+                .find_relative_boxed(repository.clone(), link.node, rest)
+                .await?;
             Ok((found, held.or(Some((repository, link_state)))))
         })
+    }
+
+    /// [`Self::find_relative`] for [`Self::find_relative_from`] to recurse into, boxed as a trait
+    /// object outside it. Its own type would hold `find_relative_from`'s, so proving that one
+    /// `Send` would never end.
+    fn find_relative_boxed<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        root: NodeID,
+        path: &'a str,
+    ) -> crate::BoxFuture<'a, Result<(NodeLink, Option<LinkedState>), StateError>> {
+        Box::pin(self.find_relative(repository, root, path))
     }
 
     /// Where a walk of `path` below `root` stops: at its end, at the first link it crosses, or
     /// at a link it ends at where `ends_at_links` says, or at the deepest node it reaches where
     /// the tree holds nothing at the next component or the component is a name no node may
-    /// carry.
-    pub(crate) async fn find_to_link(
+    /// carry. Each component prefers a node not marked deleted beside one that is
+    /// ([`Self::find_live_subnode`]): one below goes on under the live directory, and a path names
+    /// the live node. Where not `LIVE`, the last component stops at the first node of its name, for
+    /// a caller that asks only whether the path is held, as that search ends at a deleted node.
+    pub(crate) async fn find_to_link<const LIVE: bool>(
         &self,
         repository: &Arc<RepositoryContext>,
         root: NodeID,
@@ -5280,7 +6091,13 @@ impl State {
             // Under `state-hooks` the log borrows the find's answer; the block ends that borrow
             // before the awaits after it.
             let found = {
-                let found = self.find_subnode(repository.clone(), node, name_hash).await;
+                let found = if LIVE || !tail.is_empty() {
+                    self.find_subnode_in::<true, NodeID>(repository.clone(), node, name_hash)
+                        .await
+                } else {
+                    self.find_subnode_in::<false, NodeID>(repository.clone(), node, name_hash)
+                        .await
+                };
                 #[cfg(feature = "state-hooks")]
                 crate::state::node::hooks::log::hop(&self.hooks, (node, name_hash), &found);
                 found
@@ -5964,6 +6781,33 @@ impl State {
         Ok(RevisionMetadata::from_metadata(metadata))
     }
 
+    /// Serialize a state that is becoming a committed revision.
+    ///
+    /// A merge's flags and its link rows are bookkeeping for the operation in progress and must
+    /// not reach a committed revision, so every commit drops both here. The rows of each linked
+    /// repository an edit changed must also agree on their signature ([`LinkPinAgreement::Pins`]).
+    pub fn serialize_committed<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.serialize_committed_keeping(repository, token, drop::<SerializedBlocks>)
+    }
+
+    /// [`Self::serialize_committed`], handing `keep` the blocks it wrote, as
+    /// [`Self::serialize_keeping`] does.
+    pub fn serialize_committed_keeping<'a>(
+        self: &'a Arc<Self>,
+        repository: Arc<RepositoryContext>,
+        token: &'a RepositoryWriteToken,
+        keep: impl FnOnce(SerializedBlocks) + Send + 'a,
+    ) -> impl Future<Output = Result<Hash, StateError>> + Send + 'a {
+        self.reset_merge_conflict_flags();
+        self.clear_link_merge_state();
+
+        self.serialize_agreeing(repository, token, keep, LinkPinAgreement::Pins)
+    }
+
     pub fn link_merge_hash(&self) -> Hash {
         self.data_read().hash_link_merge
     }
@@ -5989,14 +6833,19 @@ impl State {
         }
     }
 
+    /// Stores `entries` as the state's link merge state, clearing it where there are none.
     pub async fn serialize_link_merge_state(
         &self,
         repository: Arc<RepositoryContext>,
         entries: &[LinkMergeEntry],
     ) -> Result<Hash, StateError> {
+        if entries.is_empty() {
+            self.clear_link_merge_state();
+            return Ok(Hash::default());
+        }
         let header = LinkMergeState {
             count: entries.len() as u32,
-            flags: 0,
+            version: LINK_MERGE_STATE_VERSION,
         };
 
         let mut bytes =
@@ -6006,11 +6855,13 @@ impl State {
             bytes.extend_from_slice(entry.as_bytes());
         }
 
+        // No committed revision references this blob, so uploading it would only leave garbage.
         let address = immutable::write(
             repository.clone(),
             Context::default(),
             Bytes::from(bytes),
             immutable::write_options_from_repository(repository)
+                .no_remote_write()
                 .with_local_cache_priority()
                 .with_max_size_chunk(),
         )
@@ -6019,6 +6870,17 @@ impl State {
 
         self.set_link_merge_hash(address.hash);
         Ok(address.hash)
+    }
+
+    /// The mount path of the link a [`LinkMergeEntry`] tracks.
+    pub async fn link_merge_entry_path(
+        &self,
+        repository: Arc<RepositoryContext>,
+        entry: &LinkMergeEntry,
+    ) -> Result<String, StateError> {
+        self.node_path(repository, entry.local_node)
+            .await
+            .forward::<StateError>("Failed resolving link node path")
     }
 
     pub async fn deserialize_link_merge_state(
@@ -6040,31 +6902,7 @@ impl State {
         .await
         .forward::<StateError>("Failed to read link merge state")?;
 
-        let raw = data.as_ref();
-        let header_size = std::mem::size_of::<LinkMergeState>();
-        if raw.len() < header_size {
-            return Ok(vec![]);
-        }
-
-        let Ok(header) = LinkMergeState::read_from_bytes(&raw[..header_size]) else {
-            return Ok(vec![]);
-        };
-
-        let mut entries = Vec::with_capacity(header.count as usize);
-        let entry_bytes = &raw[header_size..];
-        for chunk in entry_bytes
-            .as_chunks::<{ size_of::<LinkMergeEntry>() }>()
-            .0
-            .iter()
-            .take(header.count as usize)
-        {
-            let Ok(entry) = LinkMergeEntry::read_from_bytes(chunk) else {
-                break;
-            };
-            entries.push(entry);
-        }
-
-        Ok(entries)
+        parse_link_merge_state(data.as_ref())
     }
 
     /// The link registry as the state was last serialized with, ignoring the runtime copy.
@@ -6120,9 +6958,13 @@ impl State {
     /// stored in the meantime. The serialized list is loaded before the lock is taken, because
     /// reading it awaits; an edit that then finds the registry already populated discards what it
     /// loaded, since the populated copy is the one carrying edits.
+    ///
+    /// `edit` changes the rows of `link_id` alone, which are noted for the next save to check
+    /// ([`Self::check_link_rows_agree`]) where it changed them.
     async fn edit_link_list(
         &self,
         repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
         edit: impl FnOnce(&mut Vec<LinkReference>) -> Result<(), StateError>,
     ) -> Result<(), StateError> {
         let populated = self.runtime_read().link_list.is_some();
@@ -6133,7 +6975,57 @@ impl State {
         };
 
         let mut runtime = self.runtime_write();
-        edit(runtime.link_list.get_or_insert(loaded))
+        let runtime = &mut *runtime;
+        let link_list = runtime.link_list.get_or_insert(loaded);
+        if runtime.link_touched.contains(&link_id) {
+            return edit(link_list);
+        }
+        let before: Vec<_> = link_list
+            .iter()
+            .filter(|row| row.repository == link_id)
+            .copied()
+            .collect();
+        let result = edit(link_list);
+        let after = link_list.iter().filter(|row| row.repository == link_id);
+        // Removing rows leaves the others as they were, so it can't make them disagree.
+        let changed = after.clone().count() >= before.len()
+            && !after
+                .map(IntoBytes::as_bytes)
+                .eq(before.iter().map(IntoBytes::as_bytes));
+        if changed {
+            runtime.link_touched.push(link_id);
+        }
+        result
+    }
+
+    /// Fails with [`LinkPinsDiverge`] where the rows in `link_list` of one of `repositories`
+    /// disagree as `agreement` requires.
+    pub(crate) async fn check_link_rows_agree(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        link_list: &[LinkReference],
+        repositories: &[RepositoryId],
+        agreement: LinkPinAgreement,
+    ) -> Result<(), StateError> {
+        for &linked in repositories {
+            let mut rows = link_list.iter().filter(|row| row.repository == linked);
+            let Some(first) = rows.next() else {
+                continue;
+            };
+            if rows.all(|row| row.agrees(first, agreement)) {
+                continue;
+            }
+            let mut mounts = Vec::new();
+            for row in link_list.iter().filter(|row| row.repository == linked) {
+                mounts.push(self.node_path(repository.clone(), row.local_node).await?);
+            }
+            return Err(LinkPinsDiverge {
+                repository: linked.to_string(),
+                mounts: mounts.join(", "),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     pub async fn link_find(
@@ -6188,13 +7080,8 @@ impl State {
         local_node: NodeID,
         link_flags: LinkFlags,
     ) -> Result<(), StateError> {
-        self.edit_link_list(repository, |link_list| {
-            // Ensure link is not referenced by other revision anywhere
+        self.edit_link_list(repository, link_id, |link_list| {
             for link in link_list.iter_mut() {
-                if link.repository == link_id && link.signature != signature {
-                    // TODO(vri): Link revision divergence
-                    return Err(StateError::internal("Link divergence"));
-                }
                 if link.repository == link_id && link.local_node == local_node {
                     link.signature = signature;
                     return Ok(());
@@ -6227,18 +7114,95 @@ impl State {
             "Update link with ID {link_id}, local node {local_node}, new signature {signature}, new branch {branch}"
         );
 
-        self.edit_link_list(repository, |link_list| {
-            for link in link_list.iter_mut() {
-                if link.repository == link_id && link.local_node == local_node {
-                    link.branch = branch;
-                    link.signature = signature;
-                    return Ok(());
-                }
-            }
-
-            Err(LinkNotFound.into())
+        self.edit_link_row(repository, &link_id, &local_node, |link| {
+            link.branch = branch;
+            link.signature = signature;
         })
         .await
+    }
+
+    /// Pins every row of `link_id` at `signature` on `branch`, keeping their flags, and answers
+    /// those rows.
+    #[lore_macro::test_pub]
+    pub(crate) async fn link_repin(
+        &self,
+        repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
+        branch: BranchId,
+        signature: Hash,
+    ) -> Result<Vec<LinkReference>, StateError> {
+        let mut rows = Vec::new();
+        self.edit_link_list(repository, link_id, |link_list| {
+            for link in link_list
+                .iter_mut()
+                .filter(|link| link.repository == link_id)
+            {
+                link.branch = branch;
+                link.signature = signature;
+                rows.push(*link);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(rows)
+    }
+
+    /// Sets `branch` and `flags` on every row of `link_id`.
+    pub(crate) async fn link_rebranch(
+        &self,
+        repository: Arc<RepositoryContext>,
+        link_id: RepositoryId,
+        branch: BranchId,
+        flags: u32,
+    ) -> Result<(), StateError> {
+        self.edit_link_list(repository, link_id, |link_list| {
+            for link in link_list
+                .iter_mut()
+                .filter(|link| link.repository == link_id)
+            {
+                link.branch = branch;
+                link.flags = flags;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Replaces the registry row of `reference`'s repository and node with `reference`, or fails
+    /// with [`LinkNotFound`] where the registry holds no such row.
+    pub async fn link_replace(
+        &self,
+        repository: Arc<RepositoryContext>,
+        reference: LinkReference,
+    ) -> Result<(), StateError> {
+        self.edit_link_row(
+            repository,
+            &reference.repository,
+            &reference.local_node,
+            |link| *link = reference,
+        )
+        .await
+    }
+
+    /// Applies `edit` to the registry row of `link_id` at `local_node`, or fails with
+    /// [`LinkNotFound`] where the registry holds no such row.
+    ///
+    /// Not an `async fn`, so its callers hold the future of [`Self::edit_link_list`] alone.
+    fn edit_link_row<'a>(
+        &'a self,
+        repository: Arc<RepositoryContext>,
+        link_id: &'a RepositoryId,
+        local_node: &'a NodeID,
+        edit: impl FnOnce(&mut LinkReference) + 'a,
+    ) -> impl Future<Output = Result<(), StateError>> + 'a {
+        self.edit_link_list(repository, *link_id, |link_list| {
+            let link = link_list
+                .iter_mut()
+                .find(|link| link.repository == *link_id && link.local_node == *local_node)
+                .ok_or(LinkNotFound)?;
+            edit(link);
+            Ok(())
+        })
     }
 
     pub async fn link_remove(
@@ -6249,7 +7213,7 @@ impl State {
     ) -> Result<(), StateError> {
         lore_debug!("Remove link with ID {link_id}, local node {local_node}");
 
-        self.edit_link_list(repository, |link_list| {
+        self.edit_link_list(repository, link_id, |link_list| {
             if let Some(index) = link_list
                 .iter()
                 .position(|link| link.repository == link_id && link.local_node == local_node)
@@ -6485,7 +7449,7 @@ pub(crate) async fn rebase_staged_state_in(
     }
 
     let root = RelativePath::default();
-    let (source, paths, mask) = match layer {
+    let (mount, source, paths, mask) = match layer {
         None => {
             let paths = dirty_paths
                 .into_iter()
@@ -6495,7 +7459,7 @@ pub(crate) async fn rebase_staged_state_in(
                 .await
                 .forward::<StateError>("Failed to list layers")?;
             let mask = (!layers.is_empty()).then(|| Arc::new(crate::layer::mount_paths(&layers)));
-            (&root, paths, mask)
+            (&root, &root, paths, mask)
         }
         // A path outside the source is one the layer does not draw into the working tree.
         Some(layer) => {
@@ -6509,7 +7473,7 @@ pub(crate) async fn rebase_staged_state_in(
                     ))
                 })
                 .collect::<Vec<_>>();
-            (layer.source, paths, None)
+            (layer.mount, layer.source, paths, None)
         }
     };
 
@@ -6519,7 +7483,7 @@ pub(crate) async fn rebase_staged_state_in(
         repository,
         state_current.clone(),
         state_current,
-        source,
+        (mount, source),
         &paths,
         mask,
         realized,
@@ -6593,10 +7557,27 @@ pub(crate) enum Return {
     Back,
     /// It waits under its committed parent, by a name of its own, for the name there to come free.
     Parked,
+    /// It stays where it stands, as a node that may still leave holds the name, for a caller that
+    /// does not park.
+    Held,
     /// It cannot go back: a staged node holds its name, or its committed parent is gone.
     Displaced,
     /// It is no longer in the tree.
     Gone,
+}
+
+/// What [`State::node_return_unstaged_move`] answers besides what became of a node, and what it
+/// does with one a node that may still leave keeps from its place.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ReturnOptions {
+    /// Answers the path the node stood at, where it does not stand at its place already.
+    pub(crate) want_path: bool,
+    /// Parks the node by a name of its own ([`Return::Parked`]), rather than leave it where it
+    /// stands ([`Return::Held`]).
+    pub(crate) park: bool,
+    /// Moves the node back where a node holds its name too, staged or not, for a caller that marks
+    /// it deleted there beside that node ([`Return::Back`]).
+    pub(crate) beside: bool,
 }
 
 /// The name a node waits under while another node holds its own, which its ID spells, so no other
@@ -6711,6 +7692,13 @@ pub(crate) trait DirtyPathSink: Send {
     /// Records `node`, `id`, found at `path`, in a tree the walk reached through a link where
     /// `linked` says so.
     fn record(&mut self, path: &RelativePathBuf, id: NodeID, node: &Node, linked: bool);
+
+    /// Notes `node`, `id`, a new directory whose children carry it, which the walk records no path
+    /// of ([`marked_directory_carried_by_children`]), in a tree the walk reached through a link
+    /// where `linked` says so. Nothing by default.
+    fn carried_by_children(&mut self, id: NodeID, node: &Node, linked: bool) {
+        let _ = (id, node, linked);
+    }
 }
 
 impl DirtyPathSink for Vec<RelativePath> {
@@ -6950,12 +7938,12 @@ async fn collect_dirty_paths_linked<S: DirtyPathSink>(
         // never materializes them. --force bypasses the filter. The ignore
         // slot has no say over a node the tree tracks, only over one it only
         // marks, as in `State::collect_dirty_paths`.
-        let mode = if options.force {
-            FilterMode::TRACKED
+        let (child_states, reason) = if options.force {
+            (FilterStates::ROOT, None)
         } else {
             repository
                 .filter
-                .tracked_mode(
+                .child_tracked_reason(
                     level_states,
                     &*parent_path,
                     !child.is_file(),
@@ -6972,18 +7960,13 @@ async fn collect_dirty_paths_linked<S: DirtyPathSink>(
                 )
                 .await?
         };
-        let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
-            options.force,
-            level_states,
-            &*parent_path,
-            !child.is_file(),
-            mode,
-        );
 
         let mut descended = false;
-        if !excluded {
+        if reason.is_none() {
             if contributes {
                 paths.record(parent_path, child_id, &child, link_depth > 0);
+            } else if marked_directory_carried_by_children(&child) {
+                paths.carried_by_children(child_id, &child, link_depth > 0);
             }
 
             if descends {
@@ -7210,9 +8193,11 @@ impl TreeAttribution {
 
     /// Attributes each listed entry the walked revision changed to it, merges included, so a merge
     /// stands for what it merged in. Matches the walked revision's delta against a set built from
-    /// the smaller of the two: the listed entries, or the delta. A delta that fails to read leaves
-    /// every listed entry unattributed, as which of them it changed is unknown. A read refused as
-    /// `SlowDown` fails the walk.
+    /// the smaller of the two: the listed entries, or the delta. A deletion in the delta changes no
+    /// listed entry: it names a node of the first parent ([`State::node_deletion`]), whose ID the
+    /// walked tree can hold for another node. A delta that fails to read leaves every listed entry
+    /// unattributed, as which of them it changed is unknown. A read refused as `SlowDown` fails the
+    /// walk.
     async fn finish(self, walk: &mut TreeWalk) -> Result<(), StateError> {
         if self.listed.is_empty() {
             return Ok(());
@@ -7234,7 +8219,10 @@ impl TreeAttribution {
                 return walk.attribution_failures.failed_unless_refused(err);
             }
         };
-        let deltas = delta.as_type_slice::<NodeDelta>();
+        let deltas = delta
+            .as_type_slice::<NodeDelta>()
+            .iter()
+            .filter(|delta| delta.action != FileAction::Delete as u16);
         let walked = self.state.revision();
         let mut index = 0;
         let mut attribute = |walk: &mut TreeWalk, entry: u32| {
@@ -7257,7 +8245,7 @@ impl TreeAttribution {
                 }
             }
         } else {
-            let changed: HashSet<NodeID> = deltas.iter().map(|delta| delta.node).collect();
+            let changed: HashSet<NodeID> = deltas.map(|delta| delta.node).collect();
             for &(entry, node) in &self.listed {
                 if changed.contains(&node) {
                     attribute(walk, entry);
@@ -7283,19 +8271,22 @@ pub fn allow_all_repositories() -> CanReadRepository {
     Arc::new(|_| true)
 }
 
+pub fn no_link_traversal() -> CanReadRepository {
+    Arc::new(|_| false)
+}
+
 /// Maximum number of link hops a tree walk follows before giving up. Bounds
 /// both unbounded link chains and link cycles so a walk terminates.
 pub const MAX_LINK_DEPTH: usize = 8;
 
 /// The entries of the tree of `state` below `path`, `max_depth` levels deep or all of them for 0,
-/// descending the links `can_read` admits. With `include_last_revision`, each entry is attributed
-/// to the revision that last changed it.
+/// descending the links the link read policy of `repository` admits. With `include_last_revision`,
+/// each entry is attributed to the revision that last changed it.
 pub async fn gather_tree_paths(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
     path: RelativePath,
     max_depth: usize,
-    can_read: CanReadRepository,
     include_last_revision: bool,
 ) -> Result<TreeWalk, StateError> {
     let (walk_state, walk_repository, parent_node_id, starts_linked) = if path.is_empty() {
@@ -7305,13 +8296,6 @@ pub async fn gather_tree_paths(
             .find_node_link(repository.clone(), path.as_str())
             .await?;
         if !node_link.is_valid() {
-            return Err(NodeNotFound.into());
-        }
-        if !can_read(node_link.repository) {
-            lore_debug!(
-                "Path resolution stops at unauthorized repository {}",
-                node_link.repository,
-            );
             return Err(NodeNotFound.into());
         }
         if node_link.revision == state.revision() {
@@ -7336,7 +8320,6 @@ pub async fn gather_tree_paths(
         0,
         max_depth,
         0,
-        can_read,
         &mut walk,
         include_last_revision,
     )
@@ -7364,7 +8347,6 @@ async fn enumerate_children(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &mut TreeWalk,
     include_last_revision: bool,
 ) -> Result<(), StateError> {
@@ -7390,7 +8372,6 @@ async fn enumerate_children(
         depth,
         max_depth,
         link_depth,
-        can_read,
         walk,
         &mut cycle,
         attribution.as_deref_mut(),
@@ -7446,7 +8427,6 @@ async fn gather_tree_paths_node(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &mut TreeWalk,
     cycle: &mut SiblingCycleGuard,
     mut attribution: Option<&mut TreeAttribution>,
@@ -7528,7 +8508,6 @@ async fn gather_tree_paths_node(
             depth + 1,
             max_depth,
             link_depth,
-            can_read,
             walk,
             &mut child_cycle,
             attribution,
@@ -7536,7 +8515,7 @@ async fn gather_tree_paths_node(
         .await?;
     } else if node.is_link() && depth_remaining && link_depth < MAX_LINK_DEPTH {
         let link = node.linked_node();
-        if !can_read(link.repository) {
+        if !repository.can_read_link(link.repository) {
             lore_debug!(
                 "Skipping linked subtree: caller not authorized for repository {}",
                 link.repository,
@@ -7554,7 +8533,6 @@ async fn gather_tree_paths_node(
                         depth + 1,
                         max_depth,
                         link_depth + 1,
-                        can_read,
                         walk,
                         attribution.is_some(),
                     )
@@ -7596,7 +8574,6 @@ fn gather_tree_paths_node_recurse<'a>(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
-    can_read: CanReadRepository,
     walk: &'a mut TreeWalk,
     cycle: &'a mut SiblingCycleGuard,
     mut attribution: Option<&'a mut TreeAttribution>,
@@ -7613,7 +8590,6 @@ fn gather_tree_paths_node_recurse<'a>(
                 depth,
                 max_depth,
                 link_depth,
-                can_read.clone(),
                 walk,
                 cycle,
                 attribution.as_deref_mut(),
@@ -7752,7 +8728,8 @@ fn emit_change(
     )
 }
 
-/// [`add_change_where`] walking every child of a directory added or deleted as a whole.
+/// [`add_change_where`] walking every child of a directory added or deleted as a whole, except a
+/// directory deleted as a whole to a `changes` emitting [subtrees](ChangeSender::subtrees).
 #[allow(clippy::too_many_arguments)]
 fn add_change(
     from: NodeChangeState,
@@ -7781,9 +8758,10 @@ fn add_change(
 /// ([`diff::versioned_on_a_working_tree`]), as it does in a filesystem State.
 ///
 /// Only a directory added or deleted as a whole is walked: a caller emitting a
-/// modification walks the directory itself. The walk is boxed, one allocation per
-/// such directory: inline, it would make this future and every future above it
-/// larger.
+/// modification walks the directory itself, and a directory deleted as a whole to a
+/// `changes` emitting [subtrees](ChangeSender::subtrees) is one change, not walked. The
+/// walk is boxed, one allocation per such directory: inline, it would make this future
+/// and every future above it larger.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -7828,9 +8806,14 @@ fn add_change_where(
                 None
             };
             let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
+            let subtree =
+                changes.subtrees() && action == FileAction::Delete && recursion_node.is_directory();
 
             // Compute flags and create change record
-            let flags = compute_change_flags(&node) | measured;
+            let mut flags = compute_change_flags(&node) | measured;
+            if subtree {
+                flags |= change::Flags::Subtree;
+            }
 
             emit(changes, || NodeChange {
                 action,
@@ -7840,7 +8823,7 @@ fn add_change_where(
             })
             .await?;
 
-            if !recursion_node.is_directory() {
+            if !recursion_node.is_directory() || subtree {
                 return Ok(());
             }
         }
@@ -8075,17 +9058,17 @@ pub(crate) struct DiffSide {
 
 impl DiffSide {
     /// Where `path` below this side's node stops.
-    async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
+    pub(crate) async fn stop(&self, path: &str) -> Result<PathStop, StateError> {
         if !self.node.is_valid_or_root_node_id() {
             return Ok(PathStop::NONE);
         }
         self.state
-            .find_to_link(&self.repository, self.node, path, true)
+            .find_to_link::<true>(&self.repository, self.node, path, true)
             .await
     }
 
     /// This side entering a link at `linked`, the node of the linked tree it mounts.
-    async fn enter(self, linked: &NodeLink) -> Result<DiffSide, StateError> {
+    pub(crate) async fn enter(self, linked: &NodeLink) -> Result<DiffSide, StateError> {
         let (repository, state) = linked.resolve(self.repository, self.state).await?;
         Ok(DiffSide {
             repository,
@@ -8365,6 +9348,10 @@ async fn scoped_roots(
 /// Answers with what the walk did rather than what it found, for a caller
 /// measuring it; the changes are the `changes` channel's. `diff_collect`
 /// discards it.
+///
+/// A diff of the whole trees fetches the node blocks they differ in ahead of
+/// its walk where the walk reads them (`may_warm_differing_blocks`), and
+/// answers once the fetches in flight when its walk ended have ended.
 #[allow(clippy::too_many_arguments)]
 pub async fn diff(
     repository_from: Arc<RepositoryContext>,
@@ -8409,38 +9396,134 @@ pub async fn diff(
 
         diff::diff_subtree(from, to, path, graft, changes, filter_mode).await
     } else {
-        diff::diff_subtree(
-            NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository_from,
-                    state: state_from,
-                    path: RelativePath::new(),
-                    node: ROOT_NODE,
-                },
-                observed: None,
-                flags: NodeFlags::NoFlags,
-                address: Address::default(),
-                mode: 0,
-            },
-            NodeChangeState {
-                mapping: NodeMapping {
-                    repository: repository_to,
-                    state: state_to,
-                    path: RelativePath::new(),
-                    node: ROOT_NODE,
-                },
-                observed: None,
-                flags: NodeFlags::NoFlags,
-                address: Address::default(),
-                mode: 0,
-            },
-            RelativePath::new(),
+        diff_whole_trees(
+            repository_from,
+            state_from,
+            repository_to,
+            state_to,
             graft,
+            DiffFlags::empty(),
             changes,
             filter_mode,
         )
         .await
     }
+}
+
+/// The diff of the whole of `state_to` against the whole of `state_from`, two trees of
+/// `repository`, as a revision's delta records it: through no filter, with a link whose pin
+/// differs reported as a change of the link node, the walk not descending into the linked
+/// repository.
+pub(crate) fn diff_for_delta<'a>(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    changes: &'a ChangeSender,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> + 'a {
+    diff_whole_trees(
+        repository.clone(),
+        state_from,
+        repository,
+        state_to,
+        None,
+        DiffFlags::ReportsLinkNodes,
+        changes,
+        FilterMode::empty(),
+    )
+}
+
+/// The walk of a whole-tree diff from the two roots, with `flags` joined to the flags the sides
+/// derive, beside the warm-up of the node blocks the trees differ in where the walk reads them
+/// ([`may_warm_differing_blocks`]) and the context can fetch. The warm-up is started before the
+/// walk, so that the blocks deep in the trees are on their way while the walk still lists the
+/// directories above them, rather than each fetched as it is reached, and is finished once the
+/// walk ends.
+///
+/// Not an `async fn`, and the walk's future carries the warm-up, so that [`diff`]'s future holds
+/// the walk's alone: held in its body, the warm-up through the walk and the walk's answer through
+/// the warm-up's end would each take a place of their own in it.
+#[allow(clippy::too_many_arguments)]
+fn diff_whole_trees<'a>(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    graft: Option<Arc<GraftOracle>>,
+    flags: DiffFlags,
+    changes: &'a ChangeSender,
+    filter_mode: FilterMode,
+) -> impl Future<Output = Result<DiffWalkStats, StateError>> + 'a {
+    let warm_up = (immutable::may_cache(&repository_from)
+        && may_warm_differing_blocks(
+            &repository_from,
+            &repository_to,
+            graft.as_deref(),
+            filter_mode,
+        ))
+    .then(|| {
+        prefetch::DifferingBlocksWarmUp::start(
+            repository_from.clone(),
+            state_from.clone(),
+            state_to.clone(),
+        )
+    });
+    let side = |repository, state| NodeChangeState {
+        mapping: NodeMapping {
+            repository,
+            state,
+            path: RelativePath::new(),
+            node: ROOT_NODE,
+        },
+        observed: None,
+        flags: NodeFlags::NoFlags,
+        address: Address::default(),
+        mode: 0,
+    };
+    futures::FutureExt::then(
+        diff::diff_subtree_flagged(
+            side(repository_from, state_from),
+            side(repository_to, state_to),
+            RelativePath::new(),
+            graft,
+            flags,
+            changes,
+            filter_mode,
+        ),
+        |walked| async move {
+            if let Some(warm_up) = warm_up {
+                warm_up.finish().await;
+            }
+            walked
+        },
+    )
+}
+
+/// Whether a whole-tree diff between the two sides reads the node blocks whose addresses differ
+/// between their trees, so that those fetched ahead of its walk are blocks it reads: the trees are
+/// in one repository, whose commits keep a node at the block index it had in the revision before;
+/// the filter of each side takes in the whole tree for `filter_mode`, so the walk prunes no subtree;
+/// and `graft`, if any, adopts no subtree whole. Between two revisions of one line of commits the
+/// walk then reads nearly every such block, as it lists each directory holding a changed node; a
+/// block that only freed nodes may go unread. Between revisions of two lines that merged, the nodes
+/// one line took from the other sit at other block indices, and the blocks holding them differ
+/// though the walk passes over them.
+#[lore_macro::test_pub]
+fn may_warm_differing_blocks(
+    repository_from: &RepositoryContext,
+    repository_to: &RepositoryContext,
+    graft: Option<&GraftOracle>,
+    filter_mode: FilterMode,
+) -> bool {
+    repository_from.id == repository_to.id
+        && graft.is_none_or(GraftOracle::adopts_nothing)
+        && [repository_from, repository_to].iter().all(|repository| {
+            repository.filter.covers_subtree(
+                FilterStates::ROOT,
+                &RelativePath::new(),
+                0,
+                filter_mode,
+            )
+        })
 }
 
 /// The node `node_id` of `state` at `path`, as one side of a change, carrying the flags and
@@ -8473,6 +9556,22 @@ pub(crate) async fn node_change_state(
         address,
         mode,
     }
+}
+
+/// The changes between the subtree `from` names and the subtree `to` names, spelled from `path`,
+/// as [`diff_collect_subtree`] finds them but with a move left as the delete and the add it is
+/// made of, for a caller that settles each path on its own.
+pub(crate) async fn diff_subtree_paths(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    path: RelativePath,
+    filter_mode: FilterMode,
+) -> Result<Vec<NodeChange>, StateError> {
+    ChangeStream::spawn(async move |changes| {
+        diff::diff_subtree(from, to, path, None, &changes, filter_mode).await
+    })
+    .collect()
+    .await
 }
 
 /// The changes between the subtree `from` names and the subtree `to` names, spelled from `path`.
@@ -8508,7 +9607,33 @@ pub async fn diff_collect(
     path: Option<RelativePath>,
     filter_mode: FilterMode,
 ) -> Result<Vec<NodeChange>, StateError> {
-    let mut changes = ChangeStream::spawn(async move |changes| {
+    let mut changes = collect_diff(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        path,
+        filter_mode,
+        Deletes::Each,
+    )
+    .await?;
+    detect_and_coalesce_moves(&mut changes);
+    crate::change::sort_by_path(&mut changes);
+    Ok(changes)
+}
+
+/// Every change [`diff`] emits below `path`, in the order it emits them, with a directory deleted as
+/// a whole emitted as `deletes` says.
+async fn collect_diff(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    path: Option<RelativePath>,
+    filter_mode: FilterMode,
+    deletes: Deletes,
+) -> Result<Vec<NodeChange>, StateError> {
+    let walk = async move |changes: ChangeSender| {
         diff(
             repository_from,
             state_from,
@@ -8520,12 +9645,207 @@ pub async fn diff_collect(
             filter_mode,
         )
         .await
-    })
-    .collect()
+    };
+    let changes = match deletes {
+        Deletes::Each => ChangeStream::spawn(walk),
+        Deletes::Whole => ChangeStream::spawn_subtrees(walk),
+    };
+    changes.collect().await
+}
+
+/// [`diff_collect`] where a directory deleted as a whole is one change carrying
+/// [`Flags::Subtree`](change::Flags::Subtree), which the caller expands as it gets to it through
+/// the [`Subtrees`] answered beside the changes.
+///
+/// A file below such a directory that shares its file identity with a listed add is listed on its
+/// own, where move coalescing may pair it with the add, and [`Subtrees`] claims it so no expansion
+/// repeats it.
+#[lore_macro::test_pub]
+pub(crate) async fn diff_collect_subtrees(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    filter_mode: FilterMode,
+) -> Result<(Vec<NodeChange>, Arc<Subtrees>), StateError> {
+    let mut changes = collect_diff(
+        repository_from,
+        state_from,
+        repository_to,
+        state_to,
+        None,
+        filter_mode,
+        Deletes::Whole,
+    )
     .await?;
+    let claimed = claim_subtree_moves(&mut changes, filter_mode).await?;
     detect_and_coalesce_moves(&mut changes);
     crate::change::sort_by_path(&mut changes);
-    Ok(changes)
+    Ok((
+        changes,
+        Arc::new(Subtrees {
+            claimed: Arc::new(claimed),
+            filter_mode,
+        }),
+    ))
+}
+
+/// Lists on their own the files below the deleted directories in `changes` that share a file
+/// identity with a listed add, so the move pairs, and answers their identities, sorted.
+///
+/// Runs where `changes` holds a directory deleted as a whole and an add with a file identity, and
+/// costs one walk of each deleted directory's tree in the State before any change is verified: the
+/// walk reads no working tree, takes the deleted directories one after another, each on every
+/// core as [`add_change_hierarchy`] does, and holds
+/// the identities of the listed adds (16 bytes each) and the files it lists. No expansion repeats
+/// them. A directory moved whole lists every file below it, as the full list does, gathered in
+/// chunks so the list is built once at its final length.
+async fn claim_subtree_moves(
+    changes: &mut Vec<NodeChange>,
+    filter_mode: FilterMode,
+) -> Result<Vec<Context>, StateError> {
+    if !changes.iter().any(|change| change.flags.is_subtree()) {
+        return Ok(Vec::new());
+    }
+    let mut adds: Vec<Context> = changes
+        .iter()
+        .filter(|change| change.action == FileAction::Add)
+        .map(NodeChange::move_identity)
+        .filter(|identity| !identity.is_zero())
+        .collect();
+    if adds.is_empty() {
+        return Ok(Vec::new());
+    }
+    adds.sort_unstable();
+    adds.dedup();
+
+    let unclaimed = Arc::new(Subtrees {
+        claimed: Arc::default(),
+        filter_mode,
+    });
+    let mut listed = ChunkedChanges::default();
+    let mut claimed = Vec::new();
+    for change in changes.iter().filter(|change| change.flags.is_subtree()) {
+        let mut walk = unclaimed.walk(change);
+        while let Some(below) = walk.next().await {
+            let identity = below.move_identity();
+            if adds.binary_search(&identity).is_ok() {
+                claimed.push(identity);
+                listed.push(below);
+            }
+        }
+        walk.finish().await?;
+    }
+    claimed.sort_unstable();
+    claimed.dedup();
+    *changes = listed.append_to(std::mem::take(changes));
+    Ok(claimed)
+}
+
+/// Expands the subtree changes [`diff_collect_subtrees`] answers with.
+#[lore_macro::test_pub]
+pub(crate) struct Subtrees {
+    /// The identities of the files below a subtree change that are listed on their own, sorted.
+    claimed: Arc<Vec<Context>>,
+    filter_mode: FilterMode,
+}
+
+impl Subtrees {
+    /// Every change below the subtree change `change`, a directory's before those below it, but
+    /// for the ones listed on their own. Reports each path the filter excludes below it.
+    #[lore_macro::test_pub]
+    pub(crate) fn expand(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Realize)
+    }
+
+    /// [`expand`](Self::expand), reporting no path the filter excludes.
+    fn walk(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Quiet)
+    }
+
+    /// The changes directly below the subtree change `change`, a directory among them being a
+    /// subtree change in turn, but for the ones listed on their own. Reports no path the filter
+    /// excludes.
+    #[lore_macro::test_pub]
+    pub(crate) fn expand_level(self: &Arc<Self>, change: &NodeChange) -> SubtreeExpansion {
+        self.expansion(change, ExpansionWalk::Level)
+    }
+
+    fn expansion(self: &Arc<Self>, change: &NodeChange, kind: ExpansionWalk) -> SubtreeExpansion {
+        debug_assert!(
+            change.flags.is_subtree() && change.action == FileAction::Delete,
+            "{change:?} is not a subtree change"
+        );
+        let (from, to) = (change.from.clone(), change.to.clone());
+        let filter_mode = self.filter_mode;
+        let walk = async move |changes: ChangeSender| {
+            let Some(side) = delete_hierarchy_side(from.clone(), &to) else {
+                return Ok(());
+            };
+            let states = side
+                .mapping
+                .repository
+                .filter
+                .exclusion_states(&side.mapping.path);
+            add_change_hierarchy(
+                from,
+                to,
+                FileAction::Delete,
+                &changes,
+                filter_mode,
+                states,
+                false,
+            )
+            .await
+        };
+        let claimed = self.claimed.clone();
+        SubtreeExpansion {
+            changes: match kind {
+                ExpansionWalk::Realize => {
+                    ChangeStream::spawn_below(Deletes::Each, true, claimed, walk)
+                }
+                ExpansionWalk::Quiet => ChangeStream::spawn_quiet(Deletes::Each, walk),
+                ExpansionWalk::Level => {
+                    ChangeStream::spawn_below(Deletes::Whole, false, claimed, walk)
+                }
+            },
+        }
+    }
+}
+
+/// Which walk [`Subtrees::expansion`] runs.
+enum ExpansionWalk {
+    /// Every change below, reporting each path the filter excludes.
+    Realize,
+    /// Every change below, reporting none.
+    Quiet,
+    /// The changes directly below, reporting none.
+    Level,
+}
+
+/// The changes below one subtree change, as [`Subtrees::expand`] walks them.
+#[lore_macro::test_pub]
+pub(crate) struct SubtreeExpansion {
+    changes: ChangeStream<()>,
+}
+
+impl SubtreeExpansion {
+    /// The next change, or `None` once the walk has no more; see [`ChangeStream::next`].
+    #[lore_macro::test_pub]
+    pub(crate) async fn next(&mut self) -> Option<NodeChange> {
+        self.changes.next().await
+    }
+
+    /// Whether the walk succeeded; see [`ChangeStream::finish`].
+    #[lore_macro::test_pub]
+    pub(crate) async fn finish(self) -> Result<(), StateError> {
+        self.changes.finish().await
+    }
+
+    /// Stops the walk; see [`ChangeStream::abandon`].
+    pub(crate) async fn abandon(self) {
+        self.changes.abandon().await;
+    }
 }
 
 /// A state's node mapped to its path in the repository instance's file system.
@@ -8595,7 +9915,8 @@ pub struct FilesystemDiffStats {
     pub file_hash: AtomicU64,
     /// Files a recorded modified time answered for, sparing them a hash check.
     pub file_mtime_match: AtomicU64,
-    /// Adds the tree no longer holds, discarded from the tree diffed against it.
+    /// Adds the tree no longer holds, discarded from the tree diffed against it, but for a
+    /// directory holding a committed node, which leaves only once that node is out.
     pub discarded: AtomicU64,
     /// Where the provider diff met its filesystem State changed since it listed a directory, as
     /// the walk's `DiffWalkStats::moved_under_walk` counts it. For tests.
@@ -8605,6 +9926,10 @@ pub struct FilesystemDiffStats {
     /// `DiffWalkStats::finds_after_change` counts them. For tests.
     #[doc(hidden)]
     pub finds_after_change: AtomicU64,
+    /// One directory that cannot be listed, or file or name that cannot be read, which the walk
+    /// passed over, where it passed over any. A file that cannot be read compares as unmodified,
+    /// so this is all that tells a caller removing it that it may hold work.
+    pub unreadable: parking_lot::Mutex<Option<RelativePath>>,
 }
 
 impl FilesystemDiffStats {
@@ -8635,6 +9960,14 @@ impl FilesystemDiffStats {
             stats.finds_after_change.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        if let Some(path) = stats.unreadable.into_inner() {
+            self.record_unreadable(path);
+        }
+    }
+
+    /// Record an entry the walk could not read, where it has recorded none yet.
+    pub(crate) fn record_unreadable(&self, path: RelativePath) {
+        self.unreadable.lock().get_or_insert(path);
     }
 
     /// Record what settled a file's comparison. A size mismatch counts as neither.
@@ -8931,29 +10264,132 @@ pub(crate) async fn diff_filesystem_queuing(
     ))
 }
 
+/// The key a directory's address is hashed under in BLAKE3's keyed mode. A revision may also hold
+/// unkeyed directory addresses, hashed from the children without their names, and the key keeps
+/// the two apart.
+const DIRECTORY_HASH_KEY: [u8; 32] = *b"lore directory exact child names";
+
+/// What a child contributes to its directory's address besides its name.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable)]
+pub(crate) struct NodeHashData {
+    name_hash: u64,
+    mode: u32,
+    address: Address,
+    /// A link's mount source, which its address does not express. Zero for
+    /// every other node and for a link mounting the repository root, so only a
+    /// subtree mount reaches a hash it did not before.
+    mount_source: u32,
+    size: u64,
+}
+
+impl NodeHashData {
+    pub(crate) fn from_node(node: &Node) -> Self {
+        NodeHashData {
+            name_hash: node.name_hash,
+            mode: node.mode as u32,
+            address: node.address,
+            mount_source: node.mount_source().unwrap_or(ROOT_NODE),
+            size: node.size,
+        }
+    }
+
+    /// The size of the node it describes.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+}
+
+/// A child of a directory whose address [`directory_hash`] derives: what it contributes besides
+/// its name, and where its name lies among the names read for the directory.
+pub(crate) struct ChildHashData {
+    pub(crate) data: NodeHashData,
+    pub(crate) name: std::ops::Range<u32>,
+}
+
+/// The address hash of a directory whose children are `children`, each name in `names`: every
+/// child in the order of their name hashes, which this sorts them into, each its [`NodeHashData`],
+/// then the length and the bytes of its name, hashed in BLAKE3's keyed mode.
+pub(crate) fn directory_hash(children: &mut [ChildHashData], names: &[u8]) -> Hash {
+    children.sort_unstable_by_key(|child| child.data.name_hash);
+    let mut hasher = blake3::Hasher::new_keyed(&DIRECTORY_HASH_KEY);
+    for child in children.iter() {
+        // Assumes little endian
+        hasher.update(child.data.as_bytes());
+        hasher.update(&(child.name.end - child.name.start).to_le_bytes());
+        hasher.update(&names[child.name.start as usize..child.name.end as usize]);
+    }
+    Hash::from(*hasher.finalize().as_bytes())
+}
+
+/// Whether a staged move took a child the base revision holds in `directory` out of it: the tree
+/// holds that node elsewhere, staged, so the commit moves it and rehashes `directory`, which keeps
+/// its bare staged bit for that, and a commit that finds it gone deletes it. A child moved only by a
+/// move marked dirty, or renamed in place, leaves the bit to clear, as the commit takes neither.
+/// One walk of the base's children of `directory`, each read in this tree by its ID, with no names.
+/// Boxed by its caller, which takes it only for a bare staged bit it would clear.
+async fn left_by_staged_move(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    directory: NodeID,
+) -> Result<bool, StateError> {
+    let revision = state.built_on();
+    if revision.is_zero() {
+        return Ok(false);
+    }
+    let base = state.base(repository, revision).await?;
+    let Some((held, _)) = base.node_in_use(repository, directory).await? else {
+        return Ok(false);
+    };
+    if held.is_discarded() || !held.is_directory() {
+        return Ok(false);
+    }
+    let mut children = StateNodeChildrenIterator::new(base, repository.clone(), directory).await?;
+    while let Some((child, committed)) = children.next().await? {
+        let Some((node, _)) = state.node_in_use(repository, child).await? else {
+            continue;
+        };
+        if node.is_staged()
+            && !node.is_discarded()
+            && node.parent != directory
+            && node.node_type() == committed.node_type()
+            && node.address.context == committed.address.context
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `node` is staged only because something below it is: the bare `Staged` bit
-/// [`State::node_mark`] carries up to the ancestors of the node it marks. An action bit can be the
-/// node's own staged action or its dirty one, so a node carrying one, a merge flag, or a link is
-/// taken to be staged in its own right.
-fn is_staged_for_descendants_only(node: &Node) -> bool {
+/// [`State::node_mark`] carries up to the ancestors of the node it marks. The action bits under a
+/// `Staged` bit are the node's staged action, so a node carrying one, a merge flag, or a link is
+/// staged in its own right.
+pub(crate) fn is_staged_for_descendants_only(node: &Node) -> bool {
     node.is_staged()
         && !node.is_link()
         && node.flags & (NodeFlags::ActionBits.bits() | NodeFlags::MergeBits.bits()) == 0
 }
 
-/// Whether `node` is marked dirty for a change of its own, an action bit with no staged change to
-/// claim it, as a directory marked dirty as added or moved is, rather than by the bare `Dirty` bit
-/// a mark below carries up.
-fn is_dirty_in_own_right(node: &Node) -> bool {
-    node.is_dirty() && !node.is_staged() && node.flags & NodeFlags::ActionBits.bits() != 0
+/// Whether `node` is staged only for what lies below it ([`is_staged_for_descendants_only`]), or as
+/// a merge stages the directories above an add or a move it takes in: with no staged action of its
+/// own and no merge flag but the merge bit.
+pub(crate) fn staged_for_below(node: &Node) -> bool {
+    let own = NodeFlags::ActionBits.bits()
+        | (NodeFlags::MergeBits.bits() & !NodeFlags::StagedMerge.bits());
+    node.is_staged() && !node.is_link() && node.flags & own == 0
 }
 
 /// Clear the `Dirty` and `Staged` bits that marking a node carried up to `ancestor` and the nodes
-/// above it, for a node that has since left the tree, in one walk up the chain. `Dirty` is cleared
-/// up to the first node that still has a dirty child or is [dirty in its own
-/// right](is_dirty_in_own_right), as a directory marked dirty as added is however little it holds,
-/// `Staged` up to the first that still has a staged child or is not [staged for descendants
-/// only](is_staged_for_descendants_only).
+/// above it, for a node that has since left the tree, which carried `departed`, in one walk up the
+/// chain. `Dirty` is cleared up to the first node that still has a dirty child or is [dirty in its
+/// own right](Node::is_dirty_in_own_right), as a directory marked dirty as added is however little
+/// it holds. `Staged` is cleared up to the first that still has a staged child, is not [staged for
+/// descendants only](is_staged_for_descendants_only), or that a staged move took a committed child
+/// out of ([`left_by_staged_move`]), which the commit must rehash. A node that left unstaged carried
+/// no staged bit up, so its leaving keeps every one above it. Each ancestor's children are walked
+/// once, until they show what keeps both bits, and the base's children of one whose bare bit would
+/// clear once more.
 ///
 /// Must not run while a walk reads or marks the tree. Marking stops at the first ancestor already
 /// carrying the bit, so a node marked between this checking an ancestor's children and clearing its
@@ -8962,8 +10398,9 @@ pub(crate) async fn clear_propagation(
     state: &Arc<State>,
     repository: &Arc<RepositoryContext>,
     mut ancestor: NodeID,
+    departed: u16,
 ) -> Result<(), StateError> {
-    let (mut dirty, mut staged) = (true, true);
+    let (mut dirty, mut staged) = (true, departed & NodeFlags::Staged.bits() != 0);
     while ancestor.is_valid_or_root_node_id() {
         let block_index = NodeBlock::index(ancestor);
         let node_index = Node::index(ancestor);
@@ -8976,7 +10413,7 @@ pub(crate) async fn clear_propagation(
                 block.clone(),
             );
             staged &= is_staged_for_descendants_only(&node);
-            dirty &= !is_dirty_in_own_right(&node);
+            dirty &= !node.is_dirty_in_own_right();
             (node.parent, children)
         };
         while (dirty || staged)
@@ -8984,6 +10421,10 @@ pub(crate) async fn clear_propagation(
         {
             dirty &= !child.is_dirty();
             staged &= !child.is_staged();
+        }
+        drop(children);
+        if staged && ancestor != ROOT_NODE {
+            staged = !Box::pin(left_by_staged_move(state, repository, ancestor)).await?;
         }
         if !dirty && !staged {
             break;
@@ -9028,19 +10469,40 @@ pub async fn diff_filesystem_subtree(
     intent: FilesystemDiffIntent,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
+    let link_mounts = collect_link_mounts(
+        &[
+            (&from.state, &from.repository, ROOT_NODE),
+            (&current.state, &current.repository, ROOT_NODE),
+        ],
+        &RelativePath::new(),
+    )
+    .await?;
+    Ok(diff_filesystem_with_mounts(
+        operation,
+        from,
+        current,
+        filesystem_path,
+        filter_mode,
+        intent,
+        layer_mounts,
+        link_mounts,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_filesystem_with_mounts(
+    operation: &Arc<InstanceOperationImpl>,
+    from: NodeMapping,
+    current: NodeMapping,
+    filesystem_path: RelativePath,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+    link_mounts: Vec<LinkMountInfo>,
+) -> ChangeStream<FilesystemDiffStats> {
     let filter_mode = walk_filter_mode(filter_mode, intent);
-    let link_mounts = Arc::new(
-        collect_link_mounts(
-            &[
-                (&from.state, &from.repository, ROOT_NODE),
-                (&current.state, &current.repository, ROOT_NODE),
-            ],
-            &RelativePath::new(),
-        )
-        .await?,
-    );
     let states = from.repository.filter.exclusion_states(&filesystem_path);
-    Ok(diff_with(
+    diff_with(
         operation,
         FilesystemDiffContext {
             operation: operation.clone(),
@@ -9053,10 +10515,374 @@ pub async fn diff_filesystem_subtree(
             filter_mode,
             intent,
             layer_mounts,
+            link_mounts: Arc::new(link_mounts),
+            discards: None,
+        },
+    )
+}
+
+/// How many of the files a refusal names before it counts the rest.
+const NAMED_LOCAL_WORK: usize = 3;
+
+/// What removing a link's mount would lose from the working tree: the content of the files the
+/// link tracks that differ from it. What the link does not track stays when the mount goes, as it
+/// does in a directory a sync deletes, so none of it counts.
+#[lore_macro::test_pub]
+#[derive(Debug, Default)]
+pub(crate) struct LinkMountWork {
+    /// The files that differ in path order, the first [`NAMED_LOCAL_WORK`] of them, or all where
+    /// the caller keeps them.
+    pub modified: Vec<RelativePath>,
+    /// How many files differ.
+    pub modified_count: usize,
+    /// An entry that cannot be read, or the mount itself where the linked revision cannot be
+    /// opened, so what it holds is unknown.
+    pub unknown: Option<RelativePath>,
+}
+
+impl LinkMountWork {
+    /// The modified files, the first [`NAMED_LOCAL_WORK`] by path and the rest by count.
+    pub(crate) fn named(&self) -> String {
+        let named = self
+            .modified
+            .iter()
+            .take(NAMED_LOCAL_WORK)
+            .map(RelativePath::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self.modified_count.saturating_sub(NAMED_LOCAL_WORK) {
+            0 => named,
+            rest => format!("{named} and {rest} more"),
+        }
+    }
+}
+
+/// What removing the mount at `mount` of the tree `linked` maps there would lose
+/// ([`LinkMountWork`]), naming every modified file where `names_all`, and sparing those `spares`
+/// answers for, which the removal keeps. `linked` is `None` where the link's revision cannot be
+/// opened.
+///
+/// A mount the working tree holds as a symbolic link loses nothing: the removal leaves it, rather
+/// than following it out of the tree.
+#[lore_macro::test_pub]
+pub(crate) async fn link_mount_work(
+    operation: &Arc<InstanceOperationImpl>,
+    linked: Option<(NodeID, crate::link::LinkedState)>,
+    mount: &RelativePath,
+    names_all: bool,
+    spares: impl Fn(&RelativePath) -> bool,
+) -> Result<LinkMountWork, StateError> {
+    let mut work = LinkMountWork::default();
+    if holds_untracked_kind(operation, mount).await {
+        return Ok(work);
+    }
+    let Some((node, (repository, state))) = linked else {
+        if holds_anything(operation, mount).await {
+            work.unknown = Some(mount.clone());
+        }
+        return Ok(work);
+    };
+    let link_mounts = collect_link_mounts(&[(&state, &repository, node)], mount).await?;
+    let mapping = NodeMapping {
+        repository,
+        state,
+        path: mount.clone(),
+        node,
+    };
+    let mut changes = diff_filesystem_with_mounts(
+        operation,
+        mapping.clone(),
+        mapping,
+        mount.clone(),
+        FilterMode::Full,
+        FilesystemDiffIntent::Report,
+        Arc::new(Vec::new()),
+        link_mounts,
+    );
+    while let Some(change) = changes.next().await {
+        // A merge conflict's file holds what the merge wrote there, or the resolution it staged,
+        // which the staged node marks rather than holds.
+        let modified = !matches!(change.action, FileAction::Add | FileAction::Delete)
+            && change.from.flags.contains(NodeFlags::File)
+            && !change.from.flags.contains(NodeFlags::StagedMergeConflict)
+            && !change.is_case_variant()
+            && !spares(change.path());
+        if modified {
+            work.modified_count += 1;
+            if names_all {
+                work.modified.push(change.path().clone());
+            } else {
+                // The diff yields the files in no path order, so only the first in that order are
+                // held, as few as the refusal names.
+                let at = work
+                    .modified
+                    .partition_point(|named| named.as_str() < change.path().as_str());
+                if at < NAMED_LOCAL_WORK {
+                    work.modified.insert(at, change.path().clone());
+                    work.modified.truncate(NAMED_LOCAL_WORK);
+                }
+            }
+        }
+    }
+    if names_all {
+        work.modified
+            .sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    }
+    work.unknown = changes.finish().await?.unreadable.into_inner();
+    Ok(work)
+}
+
+/// Whether the working tree holds anything at `path` but an empty directory: an incoming
+/// revision writing there could overwrite it.
+async fn holds_anything(operation: &InstanceOperationImpl, path: &RelativePath) -> bool {
+    match operation.read_directory(path).await {
+        Ok(mut listing) => listing.next_with_untracked().await.is_some(),
+        Err(_) => !matches!(operation.file_info(path).await, Ok(info) if !info.exists()),
+    }
+}
+
+/// Whether the working tree holds a symbolic link or a special file at `path`, which reading or
+/// removing what `path` holds would follow out of the tree. Read from the listing of the parent,
+/// which names a link as what it is.
+pub(crate) async fn holds_untracked_kind(
+    operation: &InstanceOperationImpl,
+    path: &RelativePath,
+) -> bool {
+    let Ok(mut listing) = operation.read_directory(&path.parent_path()).await else {
+        return false;
+    };
+    loop {
+        match listing.next_with_untracked().await {
+            None => return false,
+            Some(Ok(ListedEntry::Untracked(name))) if name.eq_ignore_ascii_case(path.name()) => {
+                return true;
+            }
+            Some(_) => {}
+        }
+    }
+}
+
+/// Diffs the filesystem at `paths` alone against `from`, through `operation`, rather than walking
+/// the whole tree: for a filesystem that already knows which paths changed.
+///
+/// A path stands for what is under it, so a path with a listed ancestor is covered by that
+/// ancestor's walk and not walked again. A path nothing holds is a path that was deleted.
+///
+/// A path the filesystem lists that has not changed reports nothing, so a list may name more
+/// than changed but must not name less.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff_filesystem_listed(
+    operation: &Arc<InstanceOperationImpl>,
+    from: FilesystemDiffTree,
+    current: FilesystemDiffTree,
+    paths: Vec<RelativePath>,
+    filter_mode: FilterMode,
+    intent: FilesystemDiffIntent,
+    layer_mounts: Arc<Vec<LayerMountInfo>>,
+) -> Result<ChangeStream<FilesystemDiffStats>, StateError> {
+    let link_mounts = Arc::new(
+        collect_link_mounts(
+            &[
+                (&from.state, &from.repository, ROOT_NODE),
+                (&current.state, &current.repository, ROOT_NODE),
+            ],
+            &RelativePath::new(),
+        )
+        .await?,
+    );
+    Ok(diff_paths(
+        FilesystemDiffContext {
+            operation: operation.clone(),
+            from: NodeMapping::root(from.repository, from.state),
+            current: NodeMapping::root(current.repository, current.state),
+            filesystem_path: RelativePath::new(),
+            states: FilterStates::ROOT,
+            from_states: FilterStates::ROOT,
+            named_path: None,
+            filter_mode: walk_filter_mode(filter_mode, intent),
+            intent,
+            layer_mounts,
             link_mounts,
             discards: None,
         },
+        paths,
     ))
+}
+
+/// [`diff_filesystem_listed`] for a whole-tree `diff` already built, walking each of `paths`
+/// through the filesystem the way a walk of the whole tree would reach it.
+pub(crate) fn diff_paths(
+    diff: FilesystemDiffContext,
+    paths: Vec<RelativePath>,
+) -> ChangeStream<FilesystemDiffStats> {
+    ChangeStream::spawn(move |changes| async move {
+        // A marking walk holds what it finds stale until every walk over the tree has drained,
+        // which is all of these.
+        let owned = (diff.discards.is_none() && diff.intent.marks_dirty())
+            .then(|| Arc::new(WalkDiscards::default()));
+        let discards = diff.discards.clone().or_else(|| owned.clone());
+
+        let mut stats = FilesystemDiffStats::default();
+        for path in outermost_paths(paths) {
+            let Some(context) = diff_context_at(&diff, path, discards.clone()).await? else {
+                continue;
+            };
+            let walked = if let Some((parent, item)) =
+                new_directory_entry(&diff, &context, discards.clone()).await?
+            {
+                os_diff::diff_filesystem_new_entry(&parent, item, &changes).await?
+            } else {
+                // A directory an earlier scan marked added, which `from` therefore holds, is
+                // reported here: the walk below starts inside it.
+                os_diff::report_uncommitted_directory(&context, &changes).await?;
+                os_diff::diff_os_filesystem(context, &changes).await?
+            };
+            stats.append(walked);
+        }
+        if let Some(owned) = owned.filter(|discards| !discards.is_empty()) {
+            Box::pin(owned.apply()).await?;
+        }
+        Ok(stats)
+    })
+}
+
+/// The directory holding `context`'s path and the entry it names, where the path is a directory
+/// the filesystem holds that `context.from` has no node for.
+///
+/// Such a directory is reported by the walk of the directory above it, which is where its add is
+/// emitted and where layers, links and nested repositories are told from an ordinary directory.
+/// A walk that starts at the directory itself reports what is in it and not the directory.
+async fn new_directory_entry(
+    base: &FilesystemDiffContext,
+    context: &FilesystemDiffContext,
+    discards: Option<Arc<WalkDiscards>>,
+) -> Result<Option<(FilesystemDiffContext, crate::fs::os::FileListItem)>, StateError> {
+    if context.from.node.is_valid_or_root_node_id() {
+        return Ok(None);
+    }
+    let name = context.filesystem_path.name();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let parent_path = context.filesystem_path.parent_path();
+    // Asked of the operation, as the walk asks it: an SWFS mount answers without being read.
+    let Ok(info) = context.operation.file_info(&context.filesystem_path).await else {
+        return Ok(None);
+    };
+    if !info.is_dir() {
+        return Ok(None);
+    }
+    let Some(parent) = diff_context_at(base, parent_path, discards).await? else {
+        return Ok(None);
+    };
+    if !parent.from.node.is_valid_or_root_node_id() {
+        return Ok(None);
+    }
+    let name = name.to_owned();
+    let name_hash = crate::hash::hash_string(&name);
+    Ok(Some((
+        parent,
+        crate::fs::os::FileListItem {
+            name,
+            info,
+            name_hash,
+        },
+    )))
+}
+
+/// `paths` without any that has an ancestor in it, in path order.
+fn outermost_paths(mut paths: Vec<RelativePath>) -> Vec<RelativePath> {
+    paths.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    paths.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut outermost: Vec<RelativePath> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let covered = outermost.last().is_some_and(|ancestor| {
+            path.as_str()
+                .strip_prefix(ancestor.as_str())
+                .is_some_and(|rest| ancestor.is_empty() || rest.starts_with('/'))
+        });
+        if !covered {
+            outermost.push(path);
+        }
+    }
+    outermost
+}
+
+/// The context to diff `path` on its own, given the whole-tree context `base`. `None` where the
+/// filter leaves the path out.
+async fn diff_context_at(
+    base: &FilesystemDiffContext,
+    path: RelativePath,
+    discards: Option<Arc<WalkDiscards>>,
+) -> Result<Option<FilesystemDiffContext>, StateError> {
+    let (from, current, states) = if path.is_empty() {
+        (base.from.clone(), base.current.clone(), FilterStates::ROOT)
+    } else {
+        let filter = &base.from.repository.filter;
+        let parent_states = filter.parent_exclusion_states(&path);
+        let from = mapping_at(&base.from, &path).await?;
+        // A path the tree tracks is past the ignore slot, as in a walk, whatever the rules match.
+        let (is_directory, tracked) = if from.node.is_valid_or_root_node_id() {
+            let node = from.state.node(from.repository.clone(), from.node).await?;
+            let is_directory = node.is_directory();
+            let tracked = from
+                .state
+                .tracks_as(
+                    &from.repository,
+                    from.node,
+                    NodeFlags::from_bits_retain(node.flags),
+                    is_directory,
+                )
+                .await?;
+            (is_directory, tracked)
+        } else {
+            (true, false)
+        };
+        let mode = (base.filter_mode | FilterMode::KeepTracked).at(tracked);
+        let (states, excluded) =
+            filter.child_emit_excludes(parent_states, &path, is_directory, mode);
+        if excluded {
+            return Ok(None);
+        }
+        (from, mapping_at(&base.current, &path).await?, states)
+    };
+    Ok(Some(FilesystemDiffContext {
+        operation: base.operation.clone(),
+        from,
+        current,
+        filesystem_path: path,
+        states,
+        from_states: states,
+        named_path: None,
+        filter_mode: base.filter_mode,
+        intent: base.intent,
+        layer_mounts: base.layer_mounts.clone(),
+        link_mounts: base.link_mounts.clone(),
+        discards,
+    }))
+}
+
+/// What the tree `side` names holds at `path`, through any link on the way: an invalid node where
+/// it holds nothing there.
+async fn mapping_at(side: &NodeMapping, path: &RelativePath) -> Result<NodeMapping, StateError> {
+    let node_link = side
+        .state
+        .find_node_link(side.repository.clone(), path.as_str())
+        .await
+        .unwrap_or(NodeLink {
+            node: INVALID_NODE,
+            repository: side.repository.id,
+            revision: side.state.revision(),
+        });
+    let (repository, state) = node_link
+        .resolve(side.repository.clone(), side.state.clone())
+        .await?;
+    Ok(NodeMapping {
+        repository,
+        state,
+        path: path.clone(),
+        node: node_link.node,
+    })
 }
 
 /// Hands one diff to `operation`, which answers with the walk behind a stream.
@@ -9479,8 +11305,10 @@ pub enum NodeComparison {
 /// several nodes passes one across them and the file is read no more than the answers require; a
 /// caller asking once passes a fresh one.
 ///
-/// Reads no recorded modification time and records none: a recorded time speaks for the current
-/// revision's node, and this answers about any node. Reads the operation's clock floor
+/// Reads no recorded modification time: a recorded time speaks for the current revision's node,
+/// and this answers about any node. `file_mtime` is the modification time the caller read for the
+/// file, 0 where it read none, which a provider serving a matching file from the store records for
+/// it ([`InstanceOperation::file_holds_content`]). Reads the operation's clock floor
 /// ([`InstanceOperationImpl::clock_floor`]) before reading the file, so a time recorded from what
 /// the read establishes is compared against a clock read before it.
 ///
@@ -9490,6 +11318,7 @@ pub fn file_matches_node<'a>(
     repository: Arc<RepositoryContext>,
     node: &'a Node,
     file_size: u64,
+    file_mtime: u64,
     file_path: &'a impl WalkPath,
     operation: &'a InstanceOperationImpl,
     established: &'a lore_storage::ContentHashes,
@@ -9510,6 +11339,7 @@ pub fn file_matches_node<'a>(
             .file_holds_content(
                 repository,
                 &file_path.to_path(),
+                file_mtime,
                 node.address,
                 node.size,
                 established,
@@ -9588,7 +11418,9 @@ impl FileModification {
 /// Size and the recorded modification time answer first where they can, and comparing the
 /// content answers the rest. A recorded time speaks for the node the current revision holds
 /// and no other, so a caller asking about a different node sets `force_check_hash`, or else
-/// knows that no time can have been recorded for the path.
+/// knows that no time can have been recorded for the path. A provider that holds its state
+/// ([`InstanceOperationImpl::holds_state`]) is compared by content alone, which it answers from
+/// addresses where it can: its recorded times are the times its mount reports.
 ///
 /// Records nothing. Whether an observed match is worth recording depends on which node was
 /// asked about, which only the caller knows.
@@ -9610,12 +11442,13 @@ pub async fn file_modification(
         return Ok(FileModification::ModifiedBySize);
     }
 
-    let node_mtime = if !force_check_hash {
+    let by_time = !force_check_hash && !operation.holds_state();
+    let node_mtime = if by_time {
         file_modified_time(repository.clone(), file_path).await
     } else {
         0
     };
-    if file_mtime == node_mtime {
+    if by_time && file_mtime == node_mtime {
         lore_trace!("File {file_path} unmodified, size {file_size} and mtime {file_mtime} match");
         return Ok(FileModification::UnmodifiedByMtime);
     }
@@ -9629,6 +11462,7 @@ pub async fn file_modification(
             repository,
             node,
             file_size,
+            file_mtime,
             file_path,
             operation,
             established,
@@ -9650,7 +11484,8 @@ pub async fn file_modification(
 /// answer for any other node nor be written from a match against one. Recording here is what
 /// spares the next scan the hash check this one just paid for. A time not older than the
 /// filesystem clock the operation read before reading the file is not recorded: a write after
-/// the read may share it ([`InstanceOperationImpl::clock_floor`]).
+/// the read may share it ([`InstanceOperationImpl::clock_floor`]). Nothing is recorded through a
+/// provider that holds its state, which keeps the times its own diffs compare by.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -9679,6 +11514,7 @@ pub fn file_modified_against_node<'a>(
 
         if node_is_current
             && matches!(modification, FileModification::UnmodifiedByHash)
+            && !operation.holds_state()
             && file_mtime < operation.clock_floor(&repository).await
         {
             file_modified_time_store(repository, file_path, file_mtime).await;
@@ -9753,7 +11589,9 @@ impl RecordedModifiedTimes {
     /// none of them can be shared by a write that follows — bounded, so a filesystem that does not
     /// appear to move on is left with times a following write can still share rather than being
     /// waited on forever. See [`wait_until_settled`]. A collector with a floor holds only times
-    /// older than a stamp the filesystem has already given, so it has nothing to wait for.
+    /// older than a stamp the filesystem has already given, so it has nothing to wait for. A
+    /// provider that holds its state waits on the filesystem holding its local files, as it serves
+    /// the files a commit stored.
     pub async fn store(&self, repository: Arc<RepositoryContext>) {
         let store = match repository.try_mutable_store_arc() {
             Some(store) if !execution_context().globals().dry_run() => store,
@@ -9821,8 +11659,12 @@ impl RecordedModifiedTimes {
             }
         }
 
-        if self.floor == u64::MAX && mtime_max != 0 {
-            wait_until_settled(&repository, mtime_max).await;
+        if self.floor == u64::MAX
+            && mtime_max != 0
+            && !repository.file_system().holds_state()
+            && let Ok(dot_dir) = repository.dot_dir_path()
+        {
+            wait_until_settled(dot_dir, mtime_max).await;
         }
     }
 
@@ -9933,6 +11775,27 @@ pub(crate) async fn read_clock_floor(repository: &RepositoryContext) -> u64 {
     filesystem_stamp_now(repository).await.unwrap_or(0)
 }
 
+/// [`read_clock_floor`] of the filesystem that holds `dir`, stamped with a probe of its own in
+/// `dir`, so several readers can stamp there at once.
+#[cfg(target_os = "linux")]
+pub(crate) async fn read_clock_floor_in(dir: &std::path::Path) -> u64 {
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return 0;
+    }
+    stamp_and_remove_probe(&probe_of_its_own(dir))
+        .await
+        .unwrap_or(0)
+}
+
+/// A probe path in `dir` no other stamp in this process takes, so stamps made there at once each
+/// read their own probe.
+#[cfg(any(target_os = "linux", feature = "test-util"))]
+fn probe_of_its_own(dir: &std::path::Path) -> std::path::PathBuf {
+    static PROBES: AtomicU64 = AtomicU64::new(0);
+    let probe = PROBES.fetch_add(1, Ordering::Relaxed);
+    dir.join(format!("{MODIFIED_TIME_PROBE}-{probe}"))
+}
+
 /// The time the working copy's filesystem is currently stamping writes with.
 ///
 /// A file's modified time comes from a clock the filesystem advances on its own schedule and
@@ -9957,15 +11820,17 @@ async fn stamp_and_remove_probe(path: &std::path::Path) -> Option<u64> {
 }
 
 /// A time older than the modified time of any file written from now on to the filesystem that
-/// holds `dir`: one millisecond before the stamp a probe written in `dir` gets. The probe is
-/// removed once read.
+/// holds `dir`: one millisecond before the stamp a probe of its own written in `dir` gets
+/// ([`probe_of_its_own`]), so reads made at once each stamp their own. The probe is removed once
+/// read.
 ///
 /// The process clock where `dir` is `None` or cannot be stamped. A file written within the
 /// filesystem's clock tick can then carry the time returned.
 #[lore_macro::test_pub]
+#[cfg(any(target_os = "linux", feature = "test-util"))]
 pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64 {
     let stamp = match dir {
-        Some(dir) => stamp_and_remove_probe(&dir.join(MODIFIED_TIME_PROBE)).await,
+        Some(dir) => stamp_and_remove_probe(&probe_of_its_own(dir)).await,
         None => None,
     };
     match stamp {
@@ -9974,7 +11839,7 @@ pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64
     }
 }
 
-/// Waits until the working copy's filesystem stamps later than `mtime_max`.
+/// Waits until the filesystem holding `dir` stamps later than `mtime_max`, probed in `dir`.
 ///
 /// A file carrying the stamp the filesystem is still handing out can be written again without
 /// that stamp changing, so a time recorded for it cannot tell the two states apart. Holding
@@ -9988,14 +11853,9 @@ pub(crate) async fn time_before_next_write(dir: Option<&std::path::Path>) -> u64
 /// wait that cannot get an answer.
 ///
 /// The probe is removed on the way out however the wait ended, so a stamp file is not left
-/// behind in the dot directory.
-///
-/// Returns without waiting when the working copy cannot be stamped, which leaves no way to
-/// tell whether the times have settled.
-pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) {
-    let Some(path) = modified_time_probe_path(repository) else {
-        return;
-    };
+/// behind in `dir`.
+pub async fn wait_until_settled(dir: &std::path::Path, mtime_max: u64) {
+    let path = dir.join(MODIFIED_TIME_PROBE);
     let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
         while stamp_probe(&path)
             .await
@@ -10081,7 +11941,8 @@ async fn store_modified_time(repository: &RepositoryContext, path: &impl WalkPat
 }
 
 /// The modification time stored under `key` in `repository`'s mutable store, 0 for none.
-pub(crate) async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
+#[lore_macro::test_pub]
+async fn stored_modified_time(repository: &RepositoryContext, key: Hash) -> u64 {
     match repository
         .read_mutable_store()
         .load(repository.root_id(), key, KeyType::Untyped)
@@ -10520,29 +12381,23 @@ async fn collect_file_metadata_blocks(
     Ok(addresses)
 }
 
+/// The name tables of the node `blocks`, each read in the format its size names
+/// ([`read_stored_node_block`], [`stored_name_table`]). The first error a read meets, once every
+/// read has ended.
+#[lore_macro::test_pub]
 async fn collect_name_fragments(
     repository: Arc<RepositoryContext>,
     blocks: Vec<Address>,
 ) -> Result<Vec<Address>, StateError> {
     let mut tasks = JoinSet::new();
     for address in blocks {
-        lore_spawn!(tasks, {
-            let repository = repository.clone();
-            async move {
-                if let Ok(block_data) =
-                    NodeBlockData::read_box_from_immutable(repository.clone(), address, true).await
-                {
-                    Ok(block_data.name_table)
-                } else {
-                    // Make sure block can be read even though it has no local name table
-                    let _block_data =
-                        NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true)
-                            .await
-                            .forward::<StateError>("Failed to deserialize node block")?;
-                    Ok(Hash::default())
-                }
-            }
-        });
+        lore_spawn!(
+            tasks,
+            futures::FutureExt::map(
+                read_stored_node_block(repository.clone(), address),
+                stored_name_table,
+            )
+        );
     }
     let mut name = Vec::with_capacity(tasks.len());
     let mut failure = None;
@@ -10568,6 +12423,20 @@ async fn collect_name_fragments(
     }
 
     Ok(name)
+}
+
+/// The name table of the node block `stored` read: a current or V2 block's, and none for a V0
+/// block, whose names its State's name table holds.
+pub(crate) fn stored_name_table(
+    stored: Result<StoredNodeBlock, ImmutableError>,
+) -> Result<Hash, StateError> {
+    Ok(
+        match stored.forward::<StateError>("Failed to deserialize node block")? {
+            StoredNodeBlock::Current(block) => block.name_table,
+            StoredNodeBlock::V2(block) => block.name_table,
+            StoredNodeBlock::V0(_) => Hash::default(),
+        },
+    )
 }
 
 fn collect_diff_addresses(from: Vec<Address>, to: Vec<Address>) -> Vec<Address> {
@@ -11595,39 +13464,43 @@ fn fragment_list_child_sizes(references: &[FragmentReference], list: Fragment) -
 }
 
 /// Whether the remote holds `address` as a list of fragments. `false` without a remote, or when
-/// the remote cannot answer. The remote read counts as a fragment lookup of `tracker`.
-async fn remote_lists_fragments(
-    repository: &Arc<RepositoryContext>,
+/// the remote cannot answer. A remote that holds it has it recorded in the local store as the
+/// metadata read records it ([`lore_storage::read::fetch_metadata`]). The remote read counts as a
+/// fragment lookup of `tracker`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn remote_lists_fragments<'a>(
+    repository: &'a Arc<RepositoryContext>,
     address: Address,
-    tracker: &StoreRequestTracker,
-) -> bool {
-    let Some(session) = immutable::resolve_session(repository) else {
-        return false;
-    };
-    let _request = tracker.track_lookup();
-    session
-        .get_metadata(&address)
+    tracker: &'a StoreRequestTracker,
+) -> impl Future<Output = bool> + 'a {
+    async move {
+        let Some(session) = immutable::resolve_session(repository) else {
+            return false;
+        };
+        let _request = tracker.track_lookup();
+        lore_storage::read::fetch_metadata(
+            repository.immutable_store_ref(),
+            &repository.id,
+            &address,
+            immutable::read_options_from_repository(repository),
+            &session,
+        )
         .await
         .is_ok_and(|fragment| fragment.flags & FragmentFlags::PayloadFragmented != 0)
+    }
 }
 
-/// Applies a set of node-level changes to a state tree without touching the filesystem.
-///
-/// This is used for server-side merge operations where there is no working directory.
-/// Changes are applied purely at the state tree level: nodes are added, modified, or
-/// deleted in the target state based on the diff result.
-///
-/// The `target_state` is the state being modified (e.g., the current branch head).
-/// Each `NodeChange` carries source node data in its `to` field, which is copied into
-/// the target state tree with the mode `to` states.
-///
-/// A move deletes the node at its source and stages the moved node at its destination. The
-/// destination of a move that only changes case resolves to the node at its source, so that node
-/// is renamed in place instead, keeping its children. A renamed directory keeps the rest of the
-/// target's node, since its address derives from its children, which the changes below it reach.
-/// A renamed file or link takes the moved node's content only where the move modifies it, and
-/// otherwise keeps the target's: the 3-way diff folds a change the target made at the source into
-/// a move that leaves the content as it was.
+/// Applies the changes of a 3-way diff to `target_state`, the tree of the revision they merge onto,
+/// staging them as `lore branch merge` stages them in a working tree, without touching any
+/// filesystem: the changes sorted by path, the deletes staged first, deepest first
+/// ([`stage_realized_delete`]), the directories above each destination staged
+/// ([`stage_destination_ancestors`]), every other change staged in path order
+/// ([`stage_realized_change`]), and each changed path given the file metadata of the node of
+/// `source`, the revision merged in, that the change takes ([`merged_node`]), or of the node
+/// `source` holds at the path ([`crate::branch::merge::merge_metadata_task`]).
 ///
 /// Preconditions:
 /// - The changes must be conflict-free (no entries with `Flags::Conflict`)
@@ -11636,127 +13509,63 @@ async fn remote_lists_fragments(
 pub(crate) async fn apply_tree_changes(
     repository: Arc<RepositoryContext>,
     target_state: Arc<State>,
-    changes: &[NodeChange],
+    source: &Arc<State>,
+    changes: &mut [NodeChange],
 ) -> Result<(), StateError> {
-    let stats = Arc::new(crate::stage::StageStats::default());
+    crate::change::sort_by_path(changes);
 
-    // Process deletes first, in reverse path order (deepest paths first) so that
-    // children are deleted before parent directories
-    let mut delete_changes: Vec<&NodeChange> = changes
+    for change in changes
         .iter()
-        .filter(|c| c.action == FileAction::Delete)
-        .collect();
-    delete_changes.sort_by_key(|b| std::cmp::Reverse(b.path().as_str().len()));
-
-    for change in &delete_changes {
-        let node_link = match target_state
-            .find_node_link(repository.clone(), change.path().as_str())
+        .rev()
+        .filter(|change| change.action == FileAction::Delete)
+    {
+        stage_realized_delete(&repository, &target_state, change, true)
             .await
-        {
-            Ok(node_link) => node_link,
-            Err(e) if e.is_node_not_found() => continue,
-            Err(err) => return Err(err),
-        };
-
-        if node_link.is_valid() {
-            crate::stage::stage_delete(
-                repository.clone(),
-                target_state.clone(),
-                change.path().clone(),
-                node_link.node,
-                NodeFlags::StagedMerge,
-                stats.clone(),
-                None,
-            )
-            .await
-            .forward::<StateError>("Node not found")?;
-        }
+            .forward_any::<StateError>("staging a merged delete")?;
     }
 
-    // Process add/modify/move changes
-    for change in changes {
-        if change.action == FileAction::Delete {
+    stage_destination_ancestors(&repository, &target_state, changes, true)
+        .await
+        .forward_any::<StateError>("staging the parents of the merged changes")?;
+
+    for change in changes
+        .iter()
+        .filter(|change| change.action != FileAction::Delete)
+    {
+        if !change.to.mapping.node.is_valid_node_id() {
             continue;
         }
-
-        if change.action == FileAction::Move
-            && let Some(from_path) = change.move_source()
-        {
-            let node_link = match target_state
-                .find_node_link(repository.clone(), from_path.as_str())
-                .await
-            {
-                Ok(node_link) => node_link,
-                Err(e) if e.is_node_not_found() => NodeLink::invalid(),
-                Err(err) => return Err(err),
-            };
-
-            if node_link.is_valid() {
-                if change.is_case_only_move() {
-                    let renamed_directory = target_state
-                        .node(repository.clone(), node_link.node)
-                        .await?
-                        .is_directory();
-                    target_state
-                        .node_rename(
-                            repository.clone(),
-                            node_link.node,
-                            NameChange::Rename(change.path().name()),
-                        )
-                        .await?;
-                    if renamed_directory || !change.flags.contains(change::Flags::Modify) {
-                        target_state
-                            .node_mark(
-                                &repository,
-                                node_link.node,
-                                Mark::staged(NodeFlags::Staged, true),
-                            )
-                            .await?;
-                        continue;
-                    }
-                } else {
-                    crate::stage::stage_delete(
-                        repository.clone(),
-                        target_state.clone(),
-                        from_path.clone(),
-                        node_link.node,
-                        NodeFlags::StagedMerge,
-                        stats.clone(),
-                        None,
-                    )
-                    .await
-                    .forward::<StateError>("Node not found")?;
-                }
-            }
-        }
-
-        // Get the source node data from the change
-        let source_state = &change.to.mapping.state;
-        let source_node_id = change.to.mapping.node;
-        if !source_node_id.is_valid_node_id() {
-            continue;
-        }
-
-        let mut node = source_state
-            .node(change.to.mapping.repository.clone(), source_node_id)
-            .await?;
+        let mut node = change.to.get_node().await?;
         node.mode = change.to.mode;
+        stage_realized_change(&repository, &target_state, change, node, true)
+            .await
+            .forward_any::<StateError>("staging a merged change")?;
+    }
 
-        // Stage the node into the target state at the change path
-        crate::stage::stage_single_node(
+    let mut held = None;
+    for change in changes
+        .iter()
+        .filter(|change| change.action != FileAction::Delete)
+    {
+        held = crate::branch::merge::merge_metadata_task(
             repository.clone(),
-            target_state.clone(),
             change.path().clone(),
-            node,
-            stats.clone(),
-            None,
-            crate::filter::FilterMode::Full,
+            source.clone(),
+            merged_node(change, source),
+            target_state.clone(),
         )
         .await
-        .forward::<StateError>("Node not found")?;
+        .forward_any::<StateError>("merging file metadata")?
+        .or(held);
     }
 
     Ok(())
+}
+
+/// The node of `source`, the revision merged in, that `change` takes, where its `to` side names
+/// one of `source`. A change both sides made alike names the node of the revision merged onto.
+fn merged_node(change: &NodeChange, source: &State) -> Option<NodeID> {
+    (change.to.mapping.state.revision() == source.revision()).then_some(change.to.mapping.node)
 }
 
 /// Load a node based on the determined source.
@@ -11929,7 +13738,10 @@ impl CollectedChildren {
     }
 }
 
-/// Emits a change for every node under a directory added or deleted as a whole.
+/// Emits a change for every node under a directory added or deleted as a whole, or, for a delete
+/// to a `changes` emitting [subtrees](ChangeSender::subtrees), for every node directly under it, a
+/// directory among them as a subtree change. Each path the filter excludes is reported where
+/// `changes` [announces](ChangeSender::announces) them.
 ///
 /// A delete enumerates the side [`delete_hierarchy_side`] answers with, and emits nothing, with a
 /// warning, where that node cannot be read; an add enumerates `to`, and fails where it cannot be
@@ -12093,8 +13905,8 @@ async fn walk_hierarchy(
         let appended = !child_name.is_empty();
         path.push(child_name);
         let filter = &side.mapping.repository.filter;
-        let mode = filter
-            .tracked_mode(
+        let (child_states, reason) = filter
+            .child_tracked_reason(
                 level.states,
                 &path,
                 child_node.is_directory(),
@@ -12111,10 +13923,16 @@ async fn walk_hierarchy(
                 },
             )
             .await?;
-        let (child_states, excluded) =
-            filter.child_emit_excludes(level.states, &path, child_node.is_directory(), mode);
+        let excluded = if changes.announces() {
+            Filter::emit(&path, reason)
+        } else {
+            reason.is_some()
+        };
 
-        if !excluded {
+        let subtree =
+            changes.subtrees() && action == FileAction::Delete && child_node.is_directory();
+        let listed = !child_node.is_link() && changes.lists(&child_node.address.context);
+        if !excluded && !listed {
             let child_path = path.clone().freeze();
             emit(changes, || {
                 let absent = other.invalid(child_path.clone());
@@ -12123,9 +13941,13 @@ async fn walk_hierarchy(
                     FileAction::Delete => (child, absent),
                     _ => (absent, child),
                 };
+                let mut flags = compute_change_flags(&child_node);
+                if subtree {
+                    flags |= change::Flags::Subtree;
+                }
                 NodeChange {
                     action,
-                    flags: compute_change_flags(&child_node),
+                    flags,
                     from,
                     to,
                 }
@@ -12136,7 +13958,7 @@ async fn walk_hierarchy(
         // TODO(UCS-11623): Check if the target link repository has no local changes - if so,
         // do not iterate and show each link file as added. Otherwise, recurse in and compare
         // against file system and/or staged state in link
-        if !excluded && child_node.is_directory() {
+        if !excluded && child_node.is_directory() && !subtree {
             if let Ok(permit) = hierarchy_task_semaphore().clone().try_acquire_owned() {
                 let child = side.from_child(child_id, &child_node, path.clone().freeze());
                 let absent = other.invalid(child.mapping.path.clone());
@@ -12212,6 +14034,14 @@ fn delete_hierarchy_side(from: NodeChangeState, to: &NodeChangeState) -> Option<
 #[cfg(feature = "test-util")]
 pub mod test_util {
     use super::*;
+
+    impl StateData {
+        /// The same data holding link merge state at `hash`. For tests.
+        pub fn with_link_merge_hash(mut self, hash: Hash) -> Self {
+            self.hash_link_merge = hash;
+            self
+        }
+    }
 
     impl State {
         /// The hash of the link list the State was serialized with. For tests.

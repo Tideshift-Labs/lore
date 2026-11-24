@@ -77,11 +77,12 @@ pub struct LoreStorageOpenArgs {
     /// never hashed. Payloads the local store holds are never hashed either way.
     pub skip_verify: u8,
     /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
-    /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
-    /// inherit the first opener's value
+    /// incremental background GC for the handle; `0` then selects the default. A store this
+    /// process already has open takes these targets; a shared store keeps its own instead
     pub cache_target_bytes: u64,
     /// Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
-    /// incremental background GC for the handle; `0` then selects the default
+    /// incremental background GC for the handle; `0` then selects the default. A store this
+    /// process already has open takes these targets; a shared store keeps its own instead
     pub cache_target_fragments: u64,
 }
 
@@ -159,12 +160,12 @@ fn build_create_options(
 /// `{handle}` before `Complete` with `status` `0`. On failure, no
 /// `STORAGE_OPENED` and no `LORE_EVENT_ERROR` fire; `Complete` carries the
 /// error code in `status` and the full detail in its `error` field.
-pub async fn open(
+pub fn open(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, open_local).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, open_local)
 }
 
 fn open_local(
@@ -228,7 +229,13 @@ fn open_local(
                 // path on failure so the dotpath check below surfaces the real error. The store
                 // caches resolve whichever spelling arrives to the directory it names.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-                let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
+                let dotpath = get_dot_lore_path(&absolute).map_err(|err| {
+                    if !err.is_invalid_path() {
+                        return StorageError::internal_with_context(
+                            err,
+                            "finding the Lore directory of the repository",
+                        );
+                    }
                     StorageError::from(InvalidArguments {
                         reason: format!(
                             "unable to find .lore directory for repository at {}",

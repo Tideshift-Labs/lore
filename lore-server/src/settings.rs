@@ -23,6 +23,7 @@ use lore_storage::hash;
 use lore_storage::hash::StringHash;
 use lore_telemetry::TelemetryConfig;
 use lore_telemetry::TraceConfigError;
+use lore_transport::quic::client::CongestionAlgorithm;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
@@ -684,6 +685,10 @@ pub struct QuicSettings {
     /// the peer's first acknowledgements arrive. When unset, the internal endpoint uses 1 MiB and
     /// the public endpoint its congestion controller's own default.
     pub initial_cwnd_bytes: Option<InitialCwndBytes>,
+    /// Congestion controller a connection runs when the endpoint accepts it, which paces what the
+    /// server sends on it: `bbr` or `cubic`. When unset, the public endpoint uses BBR and the
+    /// internal endpoint Cubic.
+    pub congestion_algorithm: Option<CongestionAlgorithm>,
     /// Keep below a threshold for whatever Load Balancer sits infront of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
@@ -700,10 +705,18 @@ pub struct QuicSettings {
     /// How long a request may wait for one of the `stream_message_limit` permits before the
     /// server answers `SlowDown`. Defaults to roughly one round trip, 100ms.
     pub permit_timeout_ms: Option<u64>,
+    /// How long a response may wait for its stream, or take to write, before the server logs it
+    /// as slow. Unset, no response is logged. The log is rate limited; the response metrics
+    /// record every response either way.
+    pub slow_send_threshold_ms: Option<u64>,
 }
 
 /// Only Lore servers connect to the internal endpoint, so its connections start with the window
-/// known to suit the path between peers rather than the controller's default.
+/// known to suit the path between peers rather than the controller's default. Unless configured,
+/// they run Cubic, which shrinks the window only on packet loss, so a peer that goes quiet between
+/// replication bursts doesn't come back to a window BBR has drained and stall the next large get.
+/// What a peer sends here, such as the content it replicates, follows the controller its
+/// replicated store's `congestion_algorithm` names.
 fn deserialize_quic_internal<'de, D>(deserializer: D) -> Result<Option<QuicSettings>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -713,6 +726,9 @@ where
         settings
             .initial_cwnd_bytes
             .get_or_insert(DEFAULT_PEER_INITIAL_CWND_BYTES);
+        settings
+            .congestion_algorithm
+            .get_or_insert(CongestionAlgorithm::Cubic);
     }
     Ok(settings)
 }
@@ -1081,6 +1097,12 @@ pub struct RemoteStoreSettings {
     /// read, and a heal they ask for reaches the upstream.
     #[serde(default)]
     pub verify: bool,
+    /// Congestion controller of the storage connections the store establishes to the upstream,
+    /// which paces what the server sends there, such as the content it writes through: `bbr` or
+    /// `cubic`. A connection to the upstream already established is reused as it is. Defaults to
+    /// BBR.
+    #[serde(default)]
+    pub congestion_algorithm: CongestionAlgorithm,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1105,6 +1127,17 @@ pub struct ReplicatedStoreSettings {
     /// refreshed.
     #[serde(default = "default_peer_initial_cwnd_bytes")]
     pub initial_cwnd_bytes: InitialCwndBytes,
+    /// Congestion controller of each connection a client establishes to the remote's internal QUIC
+    /// endpoint, which paces what this server sends there, such as the content it replicates:
+    /// `bbr` or `cubic`. Defaults to Cubic, which shrinks the window only on packet loss, so a
+    /// connection that sits quiet between replication bursts keeps its window rather than having
+    /// it drained.
+    #[serde(default = "default_replicated_store_congestion_algorithm")]
+    pub congestion_algorithm: CongestionAlgorithm,
+}
+
+fn default_replicated_store_congestion_algorithm() -> CongestionAlgorithm {
+    CongestionAlgorithm::Cubic
 }
 
 fn default_replicated_store_num_clients() -> NonZeroUsize {

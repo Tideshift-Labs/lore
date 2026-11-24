@@ -112,12 +112,12 @@ fn withdraw_if_parent_closed(store: LoreStore, revision_tree: LoreRevisionTree) 
 /// the new handle id before `Complete {status: 0}`. On failure, one
 /// `LORE_EVENT_ERROR` fires followed by `Complete {status: 1}` and no
 /// handle is registered.
-pub async fn load(
+pub fn load(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeLoadArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    dispatch_call(globals, args, callback, load_impl).await
+) -> impl Future<Output = i32> {
+    dispatch_call(globals, args, callback, load_impl)
 }
 
 fn load_impl(
@@ -140,7 +140,6 @@ fn load_impl(
 
         let internal = Arc::new(RevisionTreeInternal::new(
             store_internal,
-            args.store.handle_id,
             args.repository,
             repository_context,
             state,
@@ -157,4 +156,32 @@ fn load_impl(
         .send();
         Ok::<(), LoadError>(())
     })
+}
+
+/// Loads an empty revision tree on `store` for `repository`, as a fixture for tests, and returns
+/// its handle. Panics if the load fails.
+#[cfg(feature = "test-util")]
+pub async fn load_empty_for_tests(store: LoreStore, repository: Partition) -> LoreRevisionTree {
+    let loaded: Arc<parking_lot::Mutex<Option<u64>>> = Arc::default();
+    let sink = loaded.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeLoaded(data) = event {
+            *sink.lock() = Some(data.handle_id);
+        }
+    }));
+    let status = load(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeLoadArgs {
+            store,
+            repository,
+            revision_hash: Hash::default(),
+        },
+        callback,
+    )
+    .await;
+    assert_eq!(status, 0, "loading the revision tree fixture must succeed");
+    let reported = *loaded.lock();
+    LoreRevisionTree {
+        handle_id: reported.expect("load must report the revision tree it loaded"),
+    }
 }

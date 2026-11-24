@@ -65,6 +65,8 @@ struct Holds {
 #[lore_macro::test_pub]
 pub struct EventDispatcher {
     pub correlation_id: String,
+    /// Cancelled at construction where there is no callback, once the forwarder has sent `End`, or
+    /// by [`Self::hand_back`] before the channel closes, after which the forwarder sends no `End`.
     pub completed: CancellationToken,
     weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
     strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
@@ -76,7 +78,7 @@ pub struct EventDispatcher {
     /// than only the token it cancels. A runtime torn down under an in-flight
     /// call drops the task, which leaves the token uncancelled forever, but the
     /// join still resolves.
-    forwarder: Mutex<Option<JoinHandle<()>>>,
+    forwarder: Mutex<Option<JoinHandle<LoreEventCallback>>>,
     /// The event filter set by [`with_event_filter`](Self::with_event_filter). `None` sends
     /// every event.
     pass: Option<fn(&LoreEvent) -> bool>,
@@ -119,8 +121,12 @@ impl EventDispatcher {
                     // `_keepalive` drops here — the referenced buffer
                     // is released after the callback has finished.
                 }
+                if completed.is_cancelled() {
+                    return Some(callback);
+                }
                 callback(&LoreEvent::End(LoreEndEventData::default()));
                 completed.cancel();
+                None
             }))
         } else {
             completed.cancel();
@@ -248,6 +254,15 @@ impl EventDispatcher {
         }
     }
 
+    /// Closes, without `End`, the channel of a dispatcher no event went through, and answers its
+    /// forwarder's callback for a call run elsewhere; `None` where there is none.
+    pub async fn hand_back(&self) -> LoreEventCallback {
+        self.completed.cancel();
+        drop(self.strong_sender.lock().await.take());
+        let forwarder = self.forwarder.lock().await.take()?;
+        forwarder.await.ok().flatten()
+    }
+
     /// Sends `Complete` with `error` without consulting the event filter, then drains the channel
     /// as [`drain`](Self::drain) does. A failing `error` is logged with its trace first. Returns
     /// `error.error_code`, the status the event carries.
@@ -265,13 +280,15 @@ impl EventDispatcher {
         status
     }
 
-    /// Completes a command from its `Result`: builds the detail and returns the
+    /// Completes a command from its `Result`: builds the detail at the call and returns
+    /// [`Self::complete`]'s future, which holds the detail and not `result` and resolves to the
     /// status the `Complete` event carries.
-    pub async fn complete_result<T, E>(&self, result: Result<T, E>) -> i32
+    #[inline]
+    pub fn complete_result<T, E>(&self, result: Result<T, E>) -> impl Future<Output = i32> + '_
     where
         E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
     {
-        self.complete(LoreErrorDetail::from_result(result)).await
+        self.complete(LoreErrorDetail::from_result(&result))
     }
 
     pub fn make_log(level: LoreLogLevel, message: String) -> LoreLogEventData {

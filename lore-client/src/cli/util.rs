@@ -21,11 +21,13 @@ use lore::interface::LoreRevisionResolveEventData;
 use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
+use lore_base::timestamp;
 use parking_lot::Mutex;
 
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
+use crate::styling::LogStyles;
 
 /// Discover the repository root by walking up from the process working
 /// directory, when `--repository` named none.
@@ -315,6 +317,13 @@ pub fn merge_result_display(progress: &LoreRevisionSyncProgressEventData) -> Str
     )
 }
 
+/// `millis`, read as signed milliseconds from the Unix epoch, as an RFC 2822 date and time in
+/// UTC, such as `Sun, 22 Nov 2026 12:45:20 +0000`, or `None` for a time outside the years 0 to
+/// 9999.
+pub fn rfc2822_display(millis: u64) -> Option<String> {
+    timestamp::from_unix_millis(millis as i64).and_then(timestamp::rfc2822)
+}
+
 /// The termination signals, registered separately from the wait on them.
 ///
 /// A signal ends the process outright until a handler is in place, so a caller
@@ -445,5 +454,22 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+/// Prints why the remote latest revision could not be read, followed by `consequence`.
+pub fn print_remote_unread(unauthenticated: bool, consequence: &str) {
+    let reason = if unauthenticated {
+        "Not logged in to the remote"
+    } else {
+        "Could not read the remote revision (not authorized or unavailable)"
+    };
+    println!(
+        "{}{reason}{consequence}{}",
+        LogStyles::WARNING,
+        anstyle::Reset
+    );
+    if unauthenticated {
+        println!("Log in with `lore auth login`");
     }
 }

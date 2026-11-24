@@ -690,8 +690,7 @@ impl StubLockService {
             .metadata()
             .get_bin("urc-repository-id-bin")
             .and_then(|value| value.to_bytes().ok())
-            .map(|bytes| bytes.to_vec())
-            .unwrap_or_default();
+            .map_or_default(|bytes| bytes.to_vec());
         let attempt = request
             .metadata()
             .get(ATTEMPT_ID_METADATA_KEY)

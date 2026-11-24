@@ -86,7 +86,8 @@ pub struct SwapPlan {
     pub orphaned: Vec<u64>,
     /// Kernel-known directories whose entry set changed; their inode takes the swap time.
     pub touched_directories: Vec<u64>,
-    /// Live file inodes whose content the swap changed, with what they now hold.
+    /// Live file inodes whose content the swap changed, with what they now hold; each takes the
+    /// swap time.
     pub rewritten: Vec<(u64, NodeChangeState)>,
     spellings: Vec<(u64, Spellings)>,
     live: Vec<u64>,
@@ -179,7 +180,8 @@ fn plan_swap_into(
 /// Plans the name at `path`, which holds `after` once the swap is published (nothing when
 /// `None`). A file whose content changes keeps its inode, which takes the new content: where
 /// it holds other content than `after`, or where `rewrites`, the change's own content differs,
-/// whatever the inode holds now. A directory whose node is in `kept` stays as it is.
+/// whatever the inode holds now. A directory whose node is in `kept` stays as it is; one that
+/// turns into a file goes.
 fn plan_path(
     plan: &mut SwapPlan,
     inodes: &InodeTable,
@@ -362,6 +364,7 @@ fn writes_file(change: &NodeChange) -> bool {
 const KEEP_LOCAL: HoldOptions = HoldOptions {
     overwrite_local: false,
     keep_local: true,
+    reset_local: false,
     dry_run: false,
 };
 
@@ -437,10 +440,51 @@ async fn swap_through(
         return Ok(());
     }
     let same_view = same_view(&served.repository, &repository);
-    let unsettled = plan.unsettled.clone();
     let held = (&served.repository, &served.state);
+    let mut paths = hold::Resolver::new(held);
+    let mut unsettled = plan.unsettled.clone();
+    let mut read = None;
+    let mut respelled = Vec::new();
+    if options.reset_local {
+        let deleted = match fs.deletions() {
+            Some(deletions) => deletions
+                .read()
+                .internal("reading the deletion list for a reset")?,
+            None => Vec::new(),
+        };
+        let revision = fs
+            .scoped(State::deserialize(
+                served.repository.clone(),
+                served.state.revision(),
+            ))
+            .await
+            .forward_any::<FsError>("reading the served revision for a reset")?;
+        respelled = fs
+            .scoped(hold::add_reset_paths(
+                &mut paths,
+                (&served.repository, &revision),
+                (&repository, &target),
+                &deleted,
+                &mut unsettled,
+            ))
+            .await
+            .forward_any::<FsError>("listing the local changes a reset discards")?;
+        if !respelled.is_empty() && !options.dry_run {
+            for (from, to) in &respelled {
+                operation.rename(from, to).await?;
+            }
+            // The renames changed names the resolver indexed.
+            paths = hold::Resolver::new(held);
+        }
+        read = Some(revision);
+    }
     let (applied, before) = fs
-        .scoped(hold::changes(held, (&repository, &target), &unsettled))
+        .scoped(hold::changes(
+            held,
+            (&repository, &target),
+            &unsettled,
+            read,
+        ))
         .await
         .forward_any::<FsError>("diffing the served revision against the target")?;
     let changes = hold::in_view(&repository, &applied);
@@ -455,12 +499,12 @@ async fn swap_through(
                 .forward_any::<FsError>("diffing what the served and the target views show")?,
         )
     };
-    let mut paths = hold::Resolver::new(held);
-    let host = Host {
+    let mut host = Host {
         fs,
         served: &served,
         operation,
         repository: fs.provider_repository(&repository),
+        now: None,
     };
     let matching = fs
         .scoped(hold::check((&host, &mut paths), &shown, options))
@@ -474,14 +518,14 @@ async fn swap_through(
 
     // The time is recorded for content served from the store. A copy-up later stamps the
     // content's host file in the staging directory and moves it under `write/`, so the time is
-    // probed there: an edit of the same size compares as unchanged where the host file's stamp
-    // matches it. A read-only mount writes no host file, so its time is probed in the dot
-    // directory.
+    // probed there: a file written after the swap reports a later time than the swap's. A
+    // read-only mount writes no host file, so its time is probed in the dot directory.
     let probe_dir = match fs.local_files() {
         Some(local) => Some(local.staging_dir()),
         None => repository.dot_dir_path().ok(),
     };
     let now = crate::state::time_before_next_write(probe_dir).await;
+    host.now = Some(now);
     let mut directories: Vec<RelativePath> = Vec::new();
     for change in applied.iter().filter(|change| changes_entry_set(change)) {
         directories.push(change.path().parent_path());
@@ -491,18 +535,13 @@ async fn swap_through(
     }
     directories.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
     directories.dedup_by(|a, b| a.as_str() == b.as_str());
-    let recorded = || {
-        applied
-            .iter()
-            .filter(|change| writes_file(change))
-            .map(NodeChange::path)
-            .chain(directories.iter())
-    };
-    for path in recorded() {
-        operation.record_modified_time(&repository, path, now);
-    }
+    let recorded = applied
+        .iter()
+        .filter(|change| writes_file(change))
+        .map(NodeChange::path)
+        .chain(directories.iter());
     fs.recorded_times()
-        .store(&repository, recorded(), now)
+        .store(&repository, recorded, now)
         .await?;
 
     fs.mark_published();
@@ -523,6 +562,7 @@ async fn swap_through(
     }
     let mut reconciled = Vec::new();
     let mut overwritten = Vec::new();
+    let mut kept = Vec::new();
     let result = fs
         .scoped(Box::pin(hold::apply(
             (&host, paths),
@@ -530,11 +570,14 @@ async fn swap_through(
             (options, &matching),
             &mut applying.changed,
             reads,
-            (&unsettled, &mut reconciled, &mut overwritten),
+            (&unsettled, &mut reconciled, &mut overwritten, &mut kept),
             fs.swap_hook(),
         )))
         .await
         .forward_any::<FsError>("applying the target revision to the served State");
+    if !kept.is_empty() {
+        Box::pin(clear_kept_times(fs, &repository, &kept)).await;
+    }
     let tree = match result {
         Ok(()) => target
             .tree(repository.clone())
@@ -551,6 +594,8 @@ async fn swap_through(
             settled.extend(change.move_source().map(RelativePath::parent_path));
         }
         settled.extend(reconciled.iter().map(RelativePath::parent_path));
+        // A directory the reset respelled settles clean where nothing in it changed.
+        settled.extend(respelled.iter().map(|(_, respelled)| respelled.clone()));
         settled.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         settled.dedup_by(|a, b| a.as_str() == b.as_str());
         let spelled_by = match &before {
@@ -619,6 +664,7 @@ async fn swap_through(
             *address = written.address;
             *size = written.size;
             *executable = is_executable(after);
+            entry.mtime = now;
         }
     }
     rewritten.clear();
@@ -723,6 +769,23 @@ impl Drop for Applying<'_> {
     }
 }
 
+/// Clears the time a swap recorded for each of `kept`, the local files its apply left in place,
+/// which report their own time, and writes the records back, so a diff reads each file rather than
+/// compare it by the swap's time. A failed write-back is logged, as the swap has applied.
+async fn clear_kept_times(
+    fs: &FuseFilesystem,
+    repository: &RepositoryContext,
+    kept: &[RelativePath],
+) {
+    let times = fs.recorded_times();
+    for path in kept {
+        times.set(repository, path, 0).await;
+    }
+    if let Err(error) = times.write_back(repository).await {
+        lore_warn!("FUSE writing back the records of the local files a swap kept failed: {error}");
+    }
+}
+
 /// The directory nodes, sorted, of the inodes the kernel holds at the paths `changes` delete,
 /// move away or turn into files, and at `reconciled`, which the State still holds after the
 /// apply, as where they hold local content. Each parent directory is resolved once.
@@ -812,12 +875,15 @@ async fn send(plan: &mut SwapPlan, pending: Pending<'_>) {
 }
 
 /// The host side of a hold on a mount: the files under `write/` beside the served State, compared
-/// through `operation` under `repository`, the provider's context.
+/// through `operation` under `repository`, the provider's context, and overwritten at `now`.
 struct Host<'a> {
     fs: &'a FuseFilesystem,
     served: &'a Served,
     operation: &'a InstanceOperationImpl,
     repository: Arc<RepositoryContext>,
+    /// The time the swap records, read after the check, so a dry run, which ends at the check,
+    /// reads none. `None` until then.
+    now: Option<u64>,
 }
 
 impl HoldHost for Host<'_> {
@@ -836,13 +902,16 @@ impl HoldHost for Host<'_> {
         place: (NodeID, u64),
         wanted: &Node,
     ) -> Result<bool, FsError> {
+        let now = self
+            .now
+            .ok_or_else(|| FsError::internal("overwriting a local file before the swap's time"))?;
         let target = StoredContent {
             address: wanted.address,
             size: wanted.size,
             mode: wanted.mode,
         };
         self.fs
-            .overwrite_local_file(self.served, path, node, place, &target)
+            .overwrite_local_file(self.served, path, node, place, &target, now)
             .await
             .forward_any::<FsError>("overwriting a local file")
     }
@@ -856,7 +925,7 @@ impl HoldHost for Host<'_> {
     ) -> Result<bool, FsError> {
         let compared = self
             .operation
-            .file_holds_content(self.repository.clone(), path, address, size, established)
+            .file_holds_content(self.repository.clone(), path, 0, address, size, established)
             .await?;
         Ok(matches!(compared, NodeComparison::Matches))
     }
@@ -866,8 +935,11 @@ impl HoldHost for Host<'_> {
 /// [`InstanceOperationImpl::hold_state`] asks. The served State takes the unfiltered diff from
 /// the served revision ([`hold::changes`]); after an apply that failed or was cancelled, the
 /// State may stand anywhere between the served revision and the targets of those applies, so
-/// the next swap also re-places each path they changed. The kernel is told of the changes the
-/// target's view shows. Forwards `swap_through`'s future.
+/// the next swap also re-places each path they changed. A hold resetting local changes re-places
+/// each tracked path holding one as well ([`hold::add_reset_paths`]), after it gives each
+/// directory renamed in case alone the served revision's spelling back through an instance
+/// rename, which a dry run leaves. The kernel is told of the changes the target's view shows.
+/// Forwards `swap_through`'s future.
 #[inline]
 pub fn hold_mounted(
     fs: &FuseFilesystem,

@@ -186,7 +186,7 @@ fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
         assert!(enabled.contains(field), "activation omitted {field}");
     }
     assert!(enabled.contains(
-        "FragmentProviderActivation::new(\n                coordinator,\n                process_pool_inventory,\n                expected_database_identity,\n            )"
+        "FragmentProviderActivation::new(\n            coordinator,\n            process_pool_inventory,\n            expected_database_identity,\n        )"
     ));
 
     let legacy = between(
@@ -195,7 +195,7 @@ fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
         // The tuple gained WP-114 CD-7's staging handle, so it is now formatted
         // across lines. The pin follows the shape rather than relaxing to a
         // substring that would also match the enabled arm above it.
-        "                configured_domain,\n            )\n        };",
+        "            configured_domain,\n        )\n    };",
     );
     assert_precedes(
         legacy,

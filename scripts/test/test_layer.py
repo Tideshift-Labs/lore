@@ -19,7 +19,11 @@ from lore_parsers import (
     parse_status_summary_json,
 )
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
-from test_utils import revision_metadata_keys, status_by_path
+from test_utils import (
+    commit_unstaged_below_a_staged_deletion,
+    revision_metadata_keys,
+    status_by_path,
+)
 
 pytestmark = pytest.mark.own_vfs(
     "layers repositories, which a virtual clone does not hold"
@@ -228,6 +232,31 @@ def test_layer_stage_status_commit(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_commit_of_a_directory_replacing_a_file_marked_deleted(new_lore_repo):
+    """A file in a layer replaced by a directory, marked dirty and the directory staged, commits as
+    the directory alone, after which status is clean: the layer's revision holds one node at the
+    name, which an instance of the layer repository syncs as a directory."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    replaced = os.path.join(repo.path, LAYER_FILE)
+    os.remove(replaced)
+    os.makedirs(replaced)
+    with open(os.path.join(replaced, "x.txt"), "wb") as out:
+        out.write(b"below")
+    repo.dirty(LAYER_FILE)
+    repo.stage(LAYER_FILE)
+    repo.commit("Replaced by a directory")
+    repo.push()
+    status = parse_status_json(repo.status(json=True))
+    assert status == [], f"status is clean after the commit, got {status}"
+
+    layer_repo.sync()
+    assert os.path.isdir(os.path.join(layer_repo.path, LAYER_FILE))
+    with open(os.path.join(layer_repo.path, LAYER_FILE, "x.txt"), "rb") as held:
+        assert held.read() == b"below"
+
+
+@pytest.mark.smoke
 def test_layer_branch_create(new_lore_repo):
     """
     An repo repository with layers can have branches created
@@ -257,8 +286,8 @@ def test_layer_branch_create(new_lore_repo):
     repo.branch_create("test-branch")
     repo.push()
 
-    repo_branch_list = repo.branch_list()
-    second_branch_list = second_repo.branch_list()
+    repo_branch_list = repo.branch_list(remote=True)
+    second_branch_list = second_repo.branch_list(remote=True)
 
     print(str(repo_branch_list))
     print(str(second_branch_list))
@@ -277,18 +306,18 @@ def test_layer_branch_archive_leaves_layers_by_default(new_lore_repo):
 
     repo.branch_create("feature")
     repo.push()
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
         "Expected branch create to cascade into the layer repository"
     )
 
     repo.branch_switch("main")
     repo.branch_archive("feature")
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -299,22 +328,24 @@ def test_layer_branch_archive_include_layers(new_lore_repo):
     """
     repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
 
-    branches_before = sorted(layer_repo.branch_list().remote_branches)
+    branches_before = sorted(layer_repo.branch_list(remote=True).remote_branches)
 
     repo.branch_create("feature")
     repo.push()
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
         "Expected branch create to cascade into the layer repository"
     )
 
     repo.branch_switch("main")
     repo.branch_archive("feature", include_layers=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
-    assert sorted(layer_repo.branch_list().remote_branches) == branches_before, (
-        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list()}"
+    assert (
+        sorted(layer_repo.branch_list(remote=True).remote_branches) == branches_before
+    ), (
+        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -326,7 +357,7 @@ def test_layer_branch_archive_multiple_layers(new_lore_repo):
     repo.branch_create("feature")
     repo.push()
     for layer in (second_repo, third_repo):
-        assert layer.branch_list().has_remote_branch("feature"), (
+        assert layer.branch_list(remote=True).has_remote_branch("feature"), (
             f"Expected branch create to cascade into {layer.name}"
         )
 
@@ -334,8 +365,8 @@ def test_layer_branch_archive_multiple_layers(new_lore_repo):
     repo.branch_archive("feature", include_layers=True)
 
     for layer in (second_repo, third_repo):
-        assert sorted(layer.branch_list().remote_branches) == ["main"], (
-            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list()}"
+        assert sorted(layer.branch_list(remote=True).remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list(remote=True)}"
         )
 
 
@@ -350,11 +381,11 @@ def test_layer_branch_archive_single_layer(new_lore_repo):
 
     repo.branch_archive("feature", layer="sec")
 
-    assert not second_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the scoped layer to be archived, got: {second_repo.branch_list()}"
+    assert not second_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the scoped layer to be archived, got: {second_repo.branch_list(remote=True)}"
     )
-    assert third_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the other layer to be left alone, got: {third_repo.branch_list()}"
+    assert third_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the other layer to be left alone, got: {third_repo.branch_list(remote=True)}"
     )
 
 
@@ -404,8 +435,8 @@ def test_layer_branch_archive_local_keeps_layer_remote(new_lore_repo):
     assert not repo.branch_list().has_local_branch("feature"), (
         f"Expected the local branch to be archived, got: {repo.branch_list()}"
     )
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -430,8 +461,8 @@ def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
     repo.branch_switch("main")
 
     repo.layer_add("lay", layer_repo, "lay/")
-    assert not layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list()}"
+    assert not layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list(remote=True)}"
     )
 
     output = repo.branch_archive("feature", include_layers=True)
@@ -439,8 +470,8 @@ def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
     assert "not found" not in output.lower(), (
         f"Expected the missing layer branch to be skipped quietly, got: {output}"
     )
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
 
 
@@ -458,8 +489,8 @@ def test_layer_branch_archive_tolerates_already_archived_layer(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True)
 
-    assert sorted(repo.branch_list().remote_branches) == ["main"], (
-        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    assert sorted(repo.branch_list(remote=True).remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list(remote=True)}"
     )
 
 
@@ -494,11 +525,11 @@ def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert second_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the protected layer branch to survive, got: {second_repo.branch_list()}"
+    assert second_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the protected layer branch to survive, got: {second_repo.branch_list(remote=True)}"
     )
-    assert not third_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list()}"
+    assert not third_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list(remote=True)}"
     )
 
 
@@ -512,8 +543,8 @@ def test_layer_branch_archive_current_leaves_layers(new_lore_repo):
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list()}"
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -532,12 +563,12 @@ def test_layer_branch_archive_converges_after_partial_archive(new_lore_repo):
     repo.branch_switch("main")
 
     repo.branch_archive("feature", local=True, include_layers=True)
-    assert layer_repo.branch_list().has_remote_branch("feature")
+    assert layer_repo.branch_list(remote=True).has_remote_branch("feature")
 
     repo.branch_archive("feature", include_layers=True, check=False)
 
-    assert not layer_repo.branch_list().has_remote_branch("feature"), (
-        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list()}"
+    assert not layer_repo.branch_list(remote=True).has_remote_branch("feature"), (
+        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list(remote=True)}"
     )
 
 
@@ -612,7 +643,7 @@ def test_layer_branch_switch_creates_missing_branch(new_lore_repo):
     repo.layer_add("lay", layer_repo, "lay/")
 
     # Verify the branch does NOT exist in the layer yet
-    layer_branch_list = layer_repo.branch_list()
+    layer_branch_list = layer_repo.branch_list(remote=True)
     assert not layer_branch_list.has_remote_branch("new-feature"), (
         "Branch should not exist in layer before switch"
     )
@@ -623,7 +654,7 @@ def test_layer_branch_switch_creates_missing_branch(new_lore_repo):
     repo.push()
 
     # The branch should now exist in the layer repo
-    layer_branch_list = layer_repo.branch_list()
+    layer_branch_list = layer_repo.branch_list(remote=True)
     assert layer_branch_list.has_remote_branch("new-feature"), (
         f"Expected 'new-feature' branch in layer repo, got: {layer_branch_list}"
     )
@@ -1307,6 +1338,10 @@ def test_status_unstaged_after_layer_add(new_lore_repo):
     assert status_entries == [], (
         "Expected `status --unstaged` to be empty immediately after "
         f"`layer add`, got: {status_entries}"
+    )
+    summary = parse_status_summary_json(status_output)
+    assert summary["hashChecks"] == 0, (
+        f"`layer add` must record the times of the files it writes, got {summary}"
     )
 
 
@@ -3351,6 +3386,76 @@ def test_layer_reset_mount_path_differs_from_source_path(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_reset_puts_back_the_layer_spelling_below_its_mount(new_lore_repo):
+    """`reset` of a layer file the working tree spells in another case puts back the
+    spelling the layer's revision holds, while a reset naming the mount keeps the mount's
+    own name, which the layer's source directory does not share.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {os.path.join("src", "Nested.txt"): b"nested v1"}
+    )
+    repo.layer_add("mnt", layer_repo, "src/")
+
+    variant = os.path.join("mnt", "nested.txt")
+    repo.move(os.path.join("mnt", "Nested.txt"), os.path.join("mnt", "nested.tmp"))
+    repo.move(os.path.join("mnt", "nested.tmp"), variant)
+    with repo.open_file(variant, mode="wb") as out:
+        out.write(b"nested v2")
+
+    repo.reset(variant)
+
+    mount = Path(repo.path) / "mnt"
+    assert os.listdir(mount) == ["Nested.txt"], (
+        f"reset should put back the layer's spelling, left {os.listdir(mount)}"
+    )
+    assert (mount / "Nested.txt").read_bytes() == b"nested v1"
+
+    repo.reset("mnt")
+
+    entries = os.listdir(repo.path)
+    assert "mnt" in entries and "src" not in entries, (
+        f"a reset of the mount should keep its name, left {entries}"
+    )
+    assert os.listdir(mount) == ["Nested.txt"]
+
+
+@pytest.mark.smoke
+def test_layer_reset_keeps_the_spelling_of_a_directory_holding_a_mount(new_lore_repo):
+    """`reset` leaves a directory the working tree holds in another case than the
+    revision where a layer is mounted below it, as the rename would carry the mount away
+    from the path the layer names, and restores what the directory holds where it stands.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {os.path.join("Dir", "a.txt"): b"committed"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(None, {os.path.join("src", "x.txt"): b"layer"})
+
+    repo.move("Dir", "dir.tmp")
+    repo.move("dir.tmp", "dir")
+    repo.layer_add(os.path.join("dir", "mnt"), layer_repo, "src/")
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="wb") as out:
+        out.write(b"edited")
+
+    repo.reset(".")
+
+    entries = sorted(entry for entry in os.listdir(repo.path) if entry != ".lore")
+    assert entries == ["dir"], (
+        f"reset should keep the directory's spelling, left {entries}"
+    )
+    with repo.open_file(os.path.join("dir", "a.txt"), mode="rb") as f:
+        assert f.read() == b"committed"
+    with repo.open_file(os.path.join("dir", "mnt", "x.txt"), mode="rb") as f:
+        assert f.read() == b"layer"
+
+
+@pytest.mark.smoke
 def test_layer_unstage_and_reset_leave_a_clean_layer_unpinned(new_lore_repo):
     """`unstage .` and `reset .` still act on the parent's own files, and pin nothing.
 
@@ -3479,3 +3584,46 @@ def _marked(repo: Lore) -> list[tuple[str, str, bool]]:
         (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
         for entry in parse_status_json(repo.status(json=True))
     ]
+
+
+@pytest.mark.smoke
+def test_layer_commit_deletes_a_staged_file_gone_from_its_mount_and_keeps_the_mount(
+    new_lore_repo,
+):
+    """A commit of a staged edit of a layer's file, the layer's whole mount removed from the
+    working tree since, deletes that file from the layer and keeps the rest of what it draws in,
+    the layer mounted: the commit of a layer never deletes the directory it draws from."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push("Base", {"root.txt": "root\n"})
+    layer_repo.write_commit_push(
+        "Layer base", {"third/a.txt": "a\n", "third/o.txt": "o\n"}
+    )
+    repo.layer_add("thr", layer_repo, "third/")
+
+    repo.write_files({os.path.join("thr", "a.txt"): "edited\n"})
+    repo.stage(os.path.join("thr", "a.txt"))
+    repo.rmtree("thr")
+    repo.commit("Remove the layer's files")
+
+    assert "third -> thr" in repo.layer_list()
+    repo.file_reset("thr")
+    assert repo.file_exists(os.path.join("thr", "o.txt"))
+    assert not repo.file_exists(os.path.join("thr", "a.txt"))
+
+
+@pytest.mark.smoke
+def test_layer_unstage_below_a_staged_deletion_keeps_the_path(new_lore_repo):
+    """Unstaging a path below a directory of a layer staged for deletion keeps the
+    path and each directory above it in the layer's revision, as in the repository's
+    own tree."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.write_commit_push(
+        None,
+        {"lay/r/a/y": b"y\n", "lay/r/a/z": b"z\n", "lay/r/keep": b"keep\n"},
+    )
+    repo.layer_add("lay", layer_repo, "lay/")
+
+    commit_unstaged_below_a_staged_deletion(repo, "lay/r")

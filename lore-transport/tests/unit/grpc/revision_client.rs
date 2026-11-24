@@ -397,7 +397,33 @@ mod branch_list_collection {
     use lore_proto::lore::model::v1 as model;
     use lore_proto::lore::revision::v1 as proto;
     use lore_transport::grpc::revision_client::collect_branch_list;
+    use lore_transport::grpc::revision_client::first_throttle_reason;
     use tokio_stream::StreamExt;
+    use tonic::Status;
+
+    /// The first throttled answer of a call gives the remote's reason. A later answer of the same
+    /// call, an answer with no reason, and an answer with another code give none.
+    #[test]
+    fn first_throttle_reason_is_given_once_and_only_with_a_reason() {
+        let mut retry = lore_transport::util::retry(1, 1, 3);
+        let throttled = Status::resource_exhausted("use branch info");
+
+        assert_eq!(
+            first_throttle_reason(&retry, &throttled),
+            Some("use branch info")
+        );
+        assert_eq!(
+            first_throttle_reason(&retry, &Status::resource_exhausted("")),
+            None
+        );
+        assert_eq!(
+            first_throttle_reason(&retry, &Status::internal("use branch info")),
+            None
+        );
+
+        retry.next_interval();
+        assert_eq!(first_throttle_reason(&retry, &throttled), None);
+    }
 
     fn branch(index: usize) -> Result<proto::BranchListResponse, tonic::Status> {
         Ok(proto::BranchListResponse {
@@ -484,6 +510,8 @@ mod branch_list_collection {
 mod branch_records {
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use lore_base::types::RepositoryId;
     use lore_proto::lore::model::v1 as model;
@@ -504,6 +532,8 @@ mod branch_records {
     struct BranchServer {
         branch: model::Branch,
         listed: Arc<Mutex<Vec<proto::BranchListRequest>>>,
+        /// The number of branch listing requests still to answer with `RESOURCE_EXHAUSTED`.
+        throttles: AtomicUsize,
     }
 
     #[tonic::async_trait]
@@ -535,7 +565,8 @@ mod branch_records {
             }))
         }
 
-        type BranchListStream = tokio_stream::Empty<Result<proto::BranchListResponse, Status>>;
+        type BranchListStream =
+            tokio_stream::Iter<std::vec::IntoIter<Result<proto::BranchListResponse, Status>>>;
 
         async fn branch_list(
             &self,
@@ -545,7 +576,19 @@ mod branch_records {
                 .lock()
                 .expect("the listed requests' lock")
                 .push(request.into_inner());
-            Ok(Response::new(tokio_stream::empty()))
+            let throttled = self
+                .throttles
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                });
+            // As Lore Server does, a throttled listing answers with a stream that carries the
+            // status.
+            let items = if throttled.is_ok() {
+                vec![Err(Status::resource_exhausted("use branch info"))]
+            } else {
+                Vec::new()
+            };
+            Ok(Response::new(tokio_stream::iter(items)))
         }
 
         async fn branch_push(
@@ -582,9 +625,19 @@ mod branch_records {
     async fn start_branch_service(
         branch: model::Branch,
     ) -> (RevisionService, Arc<Mutex<Vec<proto::BranchListRequest>>>) {
+        start_throttled_branch_service(branch, 0).await
+    }
+
+    /// [`start_branch_service`] with a server that answers its first `throttles` branch listing
+    /// requests with a stream that carries `RESOURCE_EXHAUSTED`.
+    async fn start_throttled_branch_service(
+        branch: model::Branch,
+        throttles: usize,
+    ) -> (RevisionService, Arc<Mutex<Vec<proto::BranchListRequest>>>) {
         let server = BranchServer {
             branch,
             listed: Arc::default(),
+            throttles: AtomicUsize::new(throttles),
         };
         let listed = server.listed.clone();
         let (_, channel) =
@@ -634,6 +687,21 @@ mod branch_records {
             .expect("the created branch's record");
 
         assert_eq!(record, expected);
+    }
+
+    /// A throttled branch listing is sent again, and the call answers with the list of the next
+    /// answer.
+    #[tokio::test]
+    async fn branch_list_sends_a_throttled_listing_again() {
+        let (service, listed) = start_throttled_branch_service(model::Branch::default(), 1).await;
+
+        let list = service
+            .branch_list(None, false)
+            .await
+            .expect("the listing after the throttled answer");
+
+        assert!(list.list.is_empty());
+        assert_eq!(listed.lock().expect("the listed requests' lock").len(), 2);
     }
 
     #[tokio::test]

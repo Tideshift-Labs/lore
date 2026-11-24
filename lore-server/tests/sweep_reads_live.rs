@@ -204,6 +204,7 @@ impl Fixture {
             immutable.clone(),
             mutable.clone(),
             repository_id,
+            lore_revision::state::allow_all_repositories(),
         ));
         let metadata_hash = repository::metadata_store(
             repository.clone(),

@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
 use lore::call_delegation::run_command;
@@ -16,6 +15,7 @@ use lore::file::DEFAULT_MAX_REVISIONS;
 use lore::file::LoreFileAuditArgs;
 use lore::file::LoreFileObliterateArgs;
 use lore::interface::*;
+use lore_base::timestamp;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
@@ -739,13 +739,12 @@ pub fn print_metadata(
         }
         LoreMetadata::Numeric(value) => {
             if metadata.key.as_str() == metadata::TIMESTAMP
-                && let Some(timestamp) = DateTime::from_timestamp_millis(*value as i64)
+                && let Some(timestamp) = util::rfc2822_display(*value)
             {
                 println!(
-                    "{}{key:<10}:{} {}",
+                    "{}{key:<10}:{} {timestamp}",
                     CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    timestamp.to_rfc2822()
+                    anstyle::Reset
                 );
                 return;
             }
@@ -1578,13 +1577,12 @@ fn audit_span(line_first: u32, line_last: u32) -> String {
     }
 }
 
-/// The day a revision was committed, and `-` where it records no timestamp.
+/// The day a revision was committed, and `-` where it records no timestamp or one outside the
+/// years -9999 to 9999.
 #[lore_macro::test_pub]
-fn audit_date(timestamp: u64) -> String {
-    match DateTime::from_timestamp_millis(timestamp as i64) {
-        Some(timestamp) if timestamp.timestamp_millis() != 0 => {
-            timestamp.format("%Y-%m-%d").to_string()
-        }
+fn audit_date(millis: u64) -> String {
+    match timestamp::from_unix_millis(millis as i64) {
+        Some(time) if millis != 0 => timestamp::date(time),
         _ => "-".to_string(),
     }
 }
@@ -2016,8 +2014,7 @@ pub fn handle_file_dependency_add(globals: LoreGlobalArgs, args: &FileDependency
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let add_args = dependency::LoreFileDependencyAddArgs {
         paths: LoreArray::from_vec(vec![LoreString::from(args.source.as_str())]),
@@ -2069,8 +2066,7 @@ pub fn handle_file_dependency_remove(
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let remove_args = dependency::LoreFileDependencyRemoveArgs {
         paths: LoreArray::from_vec(vec![LoreString::from(args.source.as_str())]),
@@ -2109,13 +2105,11 @@ pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependenc
     let paths: Vec<LoreString> = args
         .paths
         .as_ref()
-        .map(|p| p.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|p| p.iter().map(|s| LoreString::from(s.as_str())).collect());
     let tags: Vec<LoreString> = args
         .tags
         .as_ref()
-        .map(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect())
-        .unwrap_or_default();
+        .map_or_default(|t| t.iter().map(|s| LoreString::from(s.as_str())).collect());
 
     let list_args = dependency::LoreFileDependencyListArgs {
         paths: LoreArray::from_vec(paths),

@@ -185,6 +185,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         _: Partition,
         _: usize,
         _: &Arc<SuppliedCredentials>,
+        _: lore_transport::quic::client::CongestionAlgorithm,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         not_scripted()
     }
@@ -258,6 +259,7 @@ async fn stale_session(scheme: &str, peer: &Arc<Peer>) -> Arc<StorageSession> {
         "",
         "",
         lore_transport::auth::AuthMode::Auto,
+        None,
     )
     .await
     .expect("connect builds a connection without reaching any service");

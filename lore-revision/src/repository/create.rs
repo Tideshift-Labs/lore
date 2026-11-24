@@ -24,6 +24,7 @@ use crate::interface::LoreString;
 use crate::lore::Context;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
+use crate::lore_warn;
 use crate::protocol;
 use crate::repository;
 use crate::util;
@@ -43,6 +44,7 @@ pub struct LoreRepositoryCreateEventData {
 
 #[error_set]
 pub enum CreateError {
+    LinkPinsDiverge,
     RepositoryAlreadyExists,
     InvalidPath,
     Disconnected,
@@ -226,7 +228,8 @@ pub(crate) async fn create_with_metadata(
     } else {
         repository::refuse_nesting_in_swfs_mount(path)?;
     }
-    let existing_dot_dir = get_dot_lore_path(path)?;
+    let existing_dot_dir =
+        get_dot_lore_path(path).forward::<CreateError>("finding the Lore directory")?;
     if existing_dot_dir.exists() {
         if call.force() && repository::force_may_replace(path, &existing_dot_dir) {
             if call.dry_run() {
@@ -379,12 +382,14 @@ pub(crate) async fn create_with_metadata(
     }
 
     // The create command goes through dispatch_call, not repository_call,
-    // so the normal spawn_flush_stores path that flushes dirty mutable store
-    // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are written
-    // before the process exits — synced to disk only under `--sync-data`, as
-    // every other command's flush is.
-    let _ = repository.flush(call.flush_options()).await;
+    // so the post-command flush of the stores and the instance records
+    // (`RepositoryContext::try_spawn_post_command_flush`) does not run. Flush
+    // explicitly to ensure branch creation, instance registration, and
+    // metadata are written before the process exits — synced to disk only
+    // under `--sync-data`, as every other command's flush is.
+    if let Err(err) = repository.flush(call.flush_options()).await {
+        lore_warn!("Failed to flush the created repository's stores: {err}");
+    }
 
     drop(repository);
     drop(connection);

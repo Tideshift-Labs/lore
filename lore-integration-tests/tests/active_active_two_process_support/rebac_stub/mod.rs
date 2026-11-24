@@ -834,8 +834,7 @@ impl RebacStub {
         self.state
             .authorized
             .lock()
-            .map(|authorized| authorized.clone())
-            .unwrap_or_default()
+            .map_or_default(|authorized| authorized.clone())
     }
 
     /// How many authorizations this stub issued for one principal, family and
@@ -862,8 +861,7 @@ impl RebacStub {
         self.state
             .refusals
             .lock()
-            .map(|refusals| refusals.clone())
-            .unwrap_or_default()
+            .map_or_default(|refusals| refusals.clone())
     }
 
     /// How many times `AuthorizeDirectRepositoryOperation` was called at all.

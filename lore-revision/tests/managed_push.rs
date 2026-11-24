@@ -325,6 +325,112 @@ async fn cancelled_stage_keeps_body_unproven_and_stops_later_stages() {
     );
 }
 
+/// FORK-LOCAL (Tideshift, SYNC5): `run_unlatched` is the guard upstream's killed-push record runs
+/// behind. It runs before any stage and between settled stages, waits for a running stage, and is
+/// refused, without polling its future, once a stage stays unresolved.
+#[tokio::test]
+async fn run_unlatched_runs_between_stages_and_waits_for_a_running_stage() {
+    let directory = worktree();
+    let repository = RepositoryId::from([6; 16]);
+    let guard = Arc::new(
+        RepositoryMutationGuard::acquire(directory.path())
+            .await
+            .unwrap(),
+    );
+    let runner = ManagedPushRunner::new(guard.clone(), None);
+    assert_eq!(
+        runner
+            .run_unlatched(async { Ok::<_, ProtocolError>(1) })
+            .await
+            .unwrap(),
+        1,
+        "runs before any stage"
+    );
+
+    let started = tokio::sync::Notify::new();
+    let release = tokio::sync::Notify::new();
+    let ran_during_stage = AtomicBool::new(false);
+    let stage = runner.run_stage(repository, "slow", async {
+        let (_, attempt) = record_stage(repository).await;
+        started.notify_one();
+        release.notified().await;
+        guard
+            .store()
+            .resolve(&attempt, AttemptResolution::Applied)
+            .await?;
+        Ok::<_, ProtocolError>(())
+    });
+    let record = async {
+        started.notified().await;
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            runner.run_unlatched(async {
+                ran_during_stage.store(true, Ordering::SeqCst);
+                Ok::<_, ProtocolError>(())
+            }),
+        )
+        .await;
+        assert!(waiting.is_err(), "must wait while a stage is running");
+        release.notify_one();
+    };
+    let (stage_result, ()) = tokio::join!(stage, record);
+    stage_result.unwrap();
+    assert!(!ran_during_stage.load(Ordering::SeqCst));
+
+    assert_eq!(
+        runner
+            .run_unlatched(async { Ok::<_, ProtocolError>(2) })
+            .await
+            .unwrap(),
+        2,
+        "runs after a settled stage"
+    );
+}
+
+#[tokio::test]
+async fn run_unlatched_is_refused_past_an_unresolved_stage() {
+    let directory = worktree();
+    let repository = RepositoryId::from([7; 16]);
+    let guard = Arc::new(
+        RepositoryMutationGuard::acquire(directory.path())
+            .await
+            .unwrap(),
+    );
+    let runner = ManagedPushRunner::new(guard.clone(), None);
+    let error = runner
+        .run_stage(repository, "unknown", async {
+            let (_, attempt) = record_stage(repository).await;
+            Err::<(), _>(lore_transport::outcome::outcome_unknown(
+                "RevisionService.BranchPush",
+                &attempt,
+            ))
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.ffi_code(), 248);
+
+    let polled = AtomicBool::new(false);
+    let refused = runner
+        .run_unlatched(async {
+            polled.store(true, Ordering::SeqCst);
+            Ok::<_, ProtocolError>(())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("previous push stage remains unresolved")
+            || format!("{refused:?}").contains("previous push stage remains unresolved"),
+        "{refused:?}"
+    );
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "nothing writes past the latch"
+    );
+    assert_eq!(guard.store().unresolved().await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn observer_body_failure_cannot_replace_unknown_attempt_with_decisive_error() {
     let directory = worktree();

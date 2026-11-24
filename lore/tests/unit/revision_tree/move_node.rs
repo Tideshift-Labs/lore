@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 
-use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -18,18 +16,12 @@ use lore::revision_tree::delete::delete;
 use lore::revision_tree::handle as rt_handle;
 use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::handle::RevisionTreeInternal;
-use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
-use lore::revision_tree::list_children::list_children;
-use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
-use lore::revision_tree::load::load;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
 use lore::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
 use lore::revision_tree::metadata_set::metadata_set;
 use lore::revision_tree::move_node::*;
-use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
-use lore::revision_tree::node_info::node_info;
-use lore::storage::handle as storage_handle;
-use lore::storage::store::in_memory_for_tests;
+use lore_base::error::InvalidArguments;
+use lore_base::error::Oversized;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -37,7 +29,6 @@ use lore_base::types::Partition;
 use lore_revision::change::FileAction;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
-use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreMetadata;
 use lore_revision::interface::LoreNodeStagedAction;
@@ -46,88 +37,39 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::BRANCH;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::MAX_NODE_NAME_LEN;
 use lore_revision::node::NodeBlock;
 use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
+
+use crate::call::test_support::Recorded;
+use crate::call::test_support::complete_message;
+use crate::call::test_support::completes;
+use crate::call::test_support::recording_callback;
+use crate::call::test_support::take_recorded;
+use crate::revision_tree::support::add_outcome;
+use crate::revision_tree::support::added_nodes;
+use crate::revision_tree::support::batch_outcomes;
+use crate::revision_tree::support::children_of;
+use crate::revision_tree::support::fetch_node_info;
+use crate::revision_tree::support::load_handle;
+use crate::revision_tree::support::release;
+use crate::revision_tree::support::settle;
 
 /// Call-level id every test batch is submitted under, distinct from the
 /// per-entry ids so the two cannot be confused in an assertion.
 const CALL_ID: u64 = 800;
 
-#[derive(Debug, Clone, PartialEq)]
-enum CapturedEvent {
-    Complete(i32, String),
-    RevisionTreeLoaded(u64),
-    AddComplete(u64, NodeID, LoreErrorCode),
-    MoveComplete(u64, NodeID, LoreErrorCode),
-    BatchComplete(u64, LoreErrorCode),
-    Child(NodeID, u32),
-    NodeInfo(Box<LoreRevisionTreeNodeInfoEventData>),
-    Other(u32),
-}
-
-impl CapturedEvent {
-    fn from_event(event: &LoreEvent) -> Self {
-        match event {
-            LoreEvent::Complete(data) => {
-                Self::Complete(data.status, data.error.message.as_str().to_string())
-            }
-            LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
-            LoreEvent::RevisionTreeAddComplete(data) => {
-                Self::AddComplete(data.entry_id, data.node_id, data.error_code)
-            }
+fn move_outcomes(events: &[LoreEvent]) -> Vec<(u64, NodeID, LoreErrorCode)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
             LoreEvent::RevisionTreeMoveComplete(data) => {
-                Self::MoveComplete(data.entry_id, data.node_id, data.error_code)
+                Some((data.entry_id, data.node_id, data.error_code))
             }
-            LoreEvent::RevisionTreeBatchComplete(data) => {
-                Self::BatchComplete(data.batch_id, data.error_code)
-            }
-            LoreEvent::RevisionTreeChild(data) => Self::Child(data.node_id, data.staged_action),
-            LoreEvent::RevisionTreeNodeInfo(data) => Self::NodeInfo(Box::new(data.clone())),
-            other => Self::Other(other.discriminant()),
-        }
-    }
-}
-
-fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-    Some(Box::new(move |event: &LoreEvent| {
-        sink.lock().unwrap().push(CapturedEvent::from_event(event));
-    }))
-}
-
-fn move_outcomes(events: &[CapturedEvent]) -> Vec<(u64, NodeID, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::MoveComplete(id, node_id, code) => Some((*id, *node_id, *code)),
             _ => None,
         })
         .collect()
-}
-
-/// Every batch terminal in emission order, so a test can pin that exactly one
-/// fired and what it carried.
-fn batch_outcomes(events: &[CapturedEvent]) -> Vec<(u64, LoreErrorCode)> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::BatchComplete(id, code) => Some((*id, *code)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// The rejection reason the call completed with, which is the only place the
-/// offending entry's batch index and the rule it broke are reported — the
-/// per-entry terminal carries an error code alone.
-fn rejection_reason(events: &[CapturedEvent]) -> String {
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::Complete(_, message) => Some(message.clone()),
-            _ => None,
-        })
-        .expect("the call must complete")
 }
 
 fn file_id() -> Context {
@@ -155,46 +97,12 @@ fn entry(
     }
 }
 
-async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
-    let store = in_memory_for_tests(label).await;
-    let store_handle = storage_handle::register(store);
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = load(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeLoadArgs {
-            store: store_handle,
-            repository,
-            revision_hash: Hash::default(),
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "load fixture must succeed");
-    let id = sink
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
-            _ => None,
-        })
-        .expect("load fixture must emit RevisionTreeLoaded");
-    (LoreRevisionTree { handle_id: id }, store_handle.handle_id)
-}
-
-fn release(handle: LoreRevisionTree, store_handle_id: u64) {
-    rt_handle::unregister(handle);
-    storage_handle::unregister(lore::storage::handle::LoreStore {
-        handle_id: store_handle_id,
-    });
-}
-
 /// Run one add batch, returning what the call reported.
 async fn run_add(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeAddEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = add(
         LoreGlobalArgs::default(),
         LoreRevisionTreeAddArgs {
@@ -202,10 +110,10 @@ async fn run_add(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
@@ -226,39 +134,20 @@ async fn seed(handle: LoreRevisionTree, parent: NodeID, name: &str, kind: LoreNo
     )
     .await;
     assert_eq!(status, 0, "seeding {name} must succeed");
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .expect("seeding must report a node id")
-}
-
-/// Commit-free stand-in for a node the loaded revision holds: seed it, then
-/// clear the staging flags the add left behind, which is what commit does to
-/// everything it writes.
-async fn settle(handle: LoreRevisionTree, node_ids: &[NodeID]) {
-    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
-    for node_id in node_ids {
-        let block_index = lore_revision::node::NodeBlock::index(*node_id);
-        let block = internal
-            .state_for_tests()
-            .block(internal.repository_context.clone(), block_index)
-            .await
-            .expect("the block must be readable");
-        let mut writer = block.write_for_tests();
-        writer
-            .node(lore_revision::node::Node::index(*node_id))
-            .clear_all_change_flags();
-    }
+    let (node_id, error_code) = add_outcome(&events, 1).expect("seeding must report a node id");
+    assert_eq!(
+        error_code,
+        LoreErrorCode::None,
+        "seeding {name} must report no error"
+    );
+    node_id
 }
 
 async fn run_move(
     handle: LoreRevisionTree,
     entries: Vec<LoreRevisionTreeMoveEntry>,
-) -> (i32, Vec<CapturedEvent>) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+) -> (i32, Recorded) {
+    let (sink, callback) = recording_callback();
     let status = move_node(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMoveArgs {
@@ -266,15 +155,39 @@ async fn run_move(
             handle,
             entries: LoreArray::from_vec(entries),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     (status, events)
 }
 
+/// Rewrites file `node_id` to `size` bytes at content `hash`, in a call that must succeed.
+async fn run_modify(handle: LoreRevisionTree, node_id: NodeID, size: u64, hash: u64) {
+    use lore::revision_tree::modify::LoreRevisionTreeModifyArgs;
+    use lore::revision_tree::modify::LoreRevisionTreeModifyEntry;
+    use lore::revision_tree::modify::modify;
+
+    let status = modify(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeModifyArgs {
+            batch_id: CALL_ID,
+            handle,
+            entries: LoreArray::from_vec(vec![LoreRevisionTreeModifyEntry {
+                entry_id: 1,
+                node_id,
+                mode: 0o644,
+                size,
+                address: address(hash, Context::default()),
+            }]),
+        },
+        None,
+    )
+    .await;
+    assert_eq!(status, 0, "modifying {node_id} must succeed");
+}
+
 async fn run_delete(handle: LoreRevisionTree, node_id: NodeID) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let status = delete(
         LoreGlobalArgs::default(),
         LoreRevisionTreeDeleteArgs {
@@ -285,7 +198,7 @@ async fn run_delete(handle: LoreRevisionTree, node_id: NodeID) {
                 node_id,
             }]),
         },
-        make_callback(sink.clone()),
+        None,
     )
     .await;
     assert_eq!(status, 0, "deleting the fixture node must succeed");
@@ -294,7 +207,6 @@ async fn run_delete(handle: LoreRevisionTree, node_id: NodeID) {
 /// Name the branch a commit publishes on. A handle loaded from the zero revision has
 /// no parent revision to read one from and must be told.
 async fn set_branch(handle: LoreRevisionTree, branch: Context) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let status = metadata_set(
         LoreGlobalArgs::default(),
         LoreRevisionTreeMetadataSetArgs {
@@ -306,14 +218,14 @@ async fn set_branch(handle: LoreRevisionTree, branch: Context) {
                 value: LoreMetadata::Context(branch),
             }]),
         },
-        make_callback(sink.clone()),
+        None,
     )
     .await;
     assert_eq!(status, 0, "naming the branch must succeed");
 }
 
 async fn run_commit(handle: LoreRevisionTree, id: u64) {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let status = commit(
         LoreGlobalArgs::default(),
         LoreRevisionTreeCommitArgs {
@@ -321,60 +233,11 @@ async fn run_commit(handle: LoreRevisionTree, id: u64) {
             handle,
             options: LoreRevisionTreeCommitOptions::default(),
         },
-        make_callback(sink.clone()),
+        callback,
     )
     .await;
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(status, 0, "committing must succeed, got {events:?}");
-}
-
-/// Every child the listing reports for `parent`, as `(node_id, staged_action)`.
-async fn children_of(handle: LoreRevisionTree, parent: NodeID) -> Vec<(NodeID, u32)> {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    let status = list_children(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeListChildrenArgs {
-            id: 5,
-            handle,
-            parent_node_id: parent,
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    assert_eq!(status, 0, "listing children must succeed");
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::Child(node_id, staged_action) => Some((*node_id, *staged_action)),
-            _ => None,
-        })
-        .collect()
-}
-
-async fn fetch_node_info(
-    handle: LoreRevisionTree,
-    node_id: NodeID,
-) -> LoreRevisionTreeNodeInfoEventData {
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-    node_info(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeNodeInfoArgs {
-            id: 7,
-            handle,
-            node_id,
-        },
-        make_callback(sink.clone()),
-    )
-    .await;
-    let events = sink.lock().unwrap().clone();
-    events
-        .iter()
-        .find_map(|event| match event {
-            CapturedEvent::NodeInfo(data) => Some((**data).clone()),
-            _ => None,
-        })
-        .expect("node_info must emit a record")
 }
 
 /// The common move: a node the loaded revision holds leaves one directory for
@@ -501,7 +364,7 @@ async fn move_rejects_a_link_destination() {
 
     let (status, events) = run_move(handle, vec![entry(10, node_id, link, "data.bin")]).await;
     assert_ne!(status, 0, "a link destination must be refused");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("is a link"),
         "the link must be refused on its own terms, got {reason:?}"
@@ -510,7 +373,8 @@ async fn move_rejects_a_link_destination() {
 }
 
 /// The name rules are the name table's own, applied here so a name it would refuse
-/// fails before the batch moves anything rather than part-way through.
+/// fails before the batch moves anything rather than part-way through: a name over the
+/// length bound as oversized, any other as an invalid argument.
 #[tokio::test]
 async fn move_rejects_a_name_the_name_table_would_refuse() {
     let partition = Partition::from([0x79u8; 16]);
@@ -523,20 +387,39 @@ async fn move_rejects_a_name_the_name_table_would_refuse() {
     let (status, events) = run_move(handle, vec![entry(10, node_id, destination, "")]).await;
     assert_ne!(status, 0, "an empty name must be refused");
     assert!(
-        rejection_reason(&events).contains("must not be empty"),
+        complete_message(&events).contains("must not be empty"),
         "the empty name must be refused on its own terms"
     );
 
-    let (status, _events) =
+    let (status, events) =
         run_move(handle, vec![entry(11, node_id, destination, "with/slash")]).await;
-    assert_ne!(
-        status, 0,
+    assert_eq!(
+        (status, move_outcomes(&events)),
+        (
+            InvalidArguments::FFI_CODE,
+            vec![(11, INVALID_NODE, LoreErrorCode::InvalidArguments)]
+        ),
         "a name the name table would refuse must be refused"
+    );
+
+    let long = "n".repeat(MAX_NODE_NAME_LEN + 1);
+    let (status, events) = run_move(handle, vec![entry(12, node_id, destination, &long)]).await;
+    assert_eq!(
+        (status, move_outcomes(&events)),
+        (
+            Oversized::FFI_CODE,
+            vec![(12, INVALID_NODE, LoreErrorCode::Oversized)]
+        ),
+        "a name over the length bound must be refused as oversized"
+    );
+    assert!(
+        complete_message(&events).contains("entry 0"),
+        "the reason names the entry, got {events:?}"
     );
     assert_eq!(
         fetch_node_info(handle, node_id).await.parent_id,
         ROOT_NODE,
-        "neither rejection may move anything"
+        "no rejection may move anything"
     );
     release(handle, store_handle_id);
 }
@@ -574,13 +457,7 @@ async fn move_moves_more_nodes_than_one_block_holds() {
     )
     .await;
     assert_eq!(status, 0, "seeding the batch must succeed");
-    let seeded: Vec<NodeID> = events
-        .iter()
-        .filter_map(|event| match event {
-            CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-            _ => None,
-        })
-        .collect();
+    let seeded: Vec<NodeID> = added_nodes(&events);
     assert_eq!(seeded.len(), BATCH, "every entry must have been created");
     assert!(
         seeded.iter().any(|node_id| NodeBlock::index(*node_id) > 0),
@@ -651,7 +528,7 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
     let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
     settle(handle, &[destination, node_id]).await;
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let args = LoreRevisionTreeMoveArgs {
         batch_id: CALL_ID,
         handle,
@@ -659,7 +536,7 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
     };
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         args,
         move_node,
@@ -702,7 +579,7 @@ async fn an_entry_that_vanishes_after_validation_fails_the_batch_as_internal() {
         status, 0,
         "an entry whose node vanished after validation must fail the call"
     );
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         move_outcomes(&events),
         vec![(10, INVALID_NODE, LoreErrorCode::Internal)],
@@ -731,7 +608,7 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     settle(handle, &[a, b]).await;
     let long_name = "n".repeat(1000);
 
-    let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let (sink, callback) = recording_callback();
     let args = LoreRevisionTreeMoveArgs {
         batch_id: CALL_ID,
         handle,
@@ -742,7 +619,7 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     };
     let status = revision_tree_call(
         LoreGlobalArgs::default(),
-        make_callback(sink.clone()),
+        callback,
         handle,
         args,
         move_node,
@@ -783,7 +660,7 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     .await;
 
     assert_ne!(status, 0, "both entries fail");
-    let events = sink.lock().unwrap().clone();
+    let events = take_recorded(&sink);
     assert_eq!(
         move_outcomes(&events),
         vec![
@@ -813,6 +690,129 @@ async fn a_move_after_a_failed_entry_walks_its_destination_again() {
     release(handle, store_handle_id);
 }
 
+/// The C API verb that stages a change inside a directory `lore dirty move` moved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedInside {
+    Moved,
+    Added,
+    Modified,
+    Deleted,
+}
+
+/// A change any C API verb stages inside a directory `lore dirty move` moved stages that
+/// directory's whole move, as a stage inside it does: each file that moves with it alone takes a
+/// staged move.
+#[tokio::test]
+async fn a_staged_change_inside_a_dirty_moved_directory_stages_its_whole_move() {
+    use lore_revision::node::NodeExtFlags;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::state::Ext;
+    use lore_revision::state::Mark;
+    use lore_revision::state::NameChange;
+
+    for (index, inside) in [
+        StagedInside::Moved,
+        StagedInside::Added,
+        StagedInside::Modified,
+        StagedInside::Deleted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let partition = Partition::from([0x5d + index as u8; 16]);
+        let (handle, store_handle_id) = load_handle("staged-inside-dirty-moved", partition).await;
+        let p = seed(handle, ROOT_NODE, "p", LoreNodeType::Directory).await;
+        let f1 = seed(handle, p, "f1", LoreNodeType::File).await;
+        let f2 = seed(handle, p, "f2", LoreNodeType::File).await;
+        let x = seed(handle, ROOT_NODE, "x", LoreNodeType::File).await;
+        set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+        run_commit(handle, 1).await;
+
+        let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+        let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+        let marked = internal.clone();
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let state = marked.state_for_tests();
+                let repository = marked.repository_context.clone();
+                let moved =
+                    Mark::dirty(NodeFlags::DirtyMove, Ext::Set(NodeExtFlags::NoFlags), true);
+                state
+                    .node_move(
+                        repository.clone(),
+                        p,
+                        ROOT_NODE,
+                        NameChange::Rename("r"),
+                        moved,
+                    )
+                    .await
+                    .expect("the dirty move of p");
+                for child in [f1, f2] {
+                    state
+                        .node_mark(&repository, child, moved)
+                        .await
+                        .expect("the dirty move of a child");
+                }
+            })
+            .await;
+
+        match inside {
+            StagedInside::Moved => {
+                let (status, _events) = run_move(handle, vec![entry(10, x, p, "x")]).await;
+                assert_eq!(status, 0, "moving x into r must succeed");
+            }
+            StagedInside::Added => {
+                let (status, _events) = run_add(
+                    handle,
+                    vec![LoreRevisionTreeAddEntry {
+                        entry_id: 10,
+                        parent_node_id: p,
+                        parent_entry_index: 0,
+                        name: LoreString::from_str("n"),
+                        kind: LoreNodeType::File as u32,
+                        mode: 0o644,
+                        size: 10,
+                        address: address(2, file_id()),
+                    }],
+                )
+                .await;
+                assert_eq!(status, 0, "adding n into r must succeed");
+            }
+            StagedInside::Modified => run_modify(handle, f1, 20, 9).await,
+            StagedInside::Deleted => run_delete(handle, f1).await,
+        }
+
+        let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+        let flags = lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let state = internal.state_for_tests();
+                let mut flags = Vec::new();
+                for node in [p, f1, f2] {
+                    let record = state
+                        .node(internal.repository_context.clone(), node)
+                        .await
+                        .expect("the node");
+                    flags.push((record.is_staged_move(), record.is_dirty()));
+                }
+                flags
+            })
+            .await;
+        assert!(
+            flags[0].0,
+            "{inside:?}: r takes its move staged, flags {flags:?}"
+        );
+        let moved_with: &[(bool, bool)] = match inside {
+            StagedInside::Moved | StagedInside::Added => &flags[1..],
+            StagedInside::Modified | StagedInside::Deleted => &flags[2..],
+        };
+        assert!(
+            moved_with.iter().all(|&flags| flags == (true, false)),
+            "{inside:?}: the files moved with r alone take staged moves, flags {flags:?}"
+        );
+        release(handle, store_handle_id);
+    }
+}
+
 /// What keeping the node buys: the delta the commit writes names it under a move
 /// action, so the revision graph carries its history across the change rather than
 /// reading as a deletion and an unrelated addition.
@@ -840,7 +840,7 @@ async fn a_committed_move_is_recorded_as_a_move_in_the_revision_delta() {
         .scope(execution, async move {
             internal
                 .state_for_tests()
-                .node_delta(internal.repository_context.clone(), node_id)
+                .node_change(internal.repository_context.clone(), node_id)
                 .await
         })
         .await
@@ -850,6 +850,50 @@ async fn a_committed_move_is_recorded_as_a_move_in_the_revision_delta() {
         delta.action,
         FileAction::Move as u16,
         "the delta must record a move, not a deletion and an addition"
+    );
+    release(handle, store_handle_id);
+}
+
+/// A moved file rewritten before the commit is recorded as a move with its new content, as the
+/// working-tree staging path records an edited moved file: the history carries the move.
+#[tokio::test]
+async fn a_moved_file_modified_before_the_commit_is_recorded_as_a_move() {
+    let partition = Partition::from([0xe6u8; 16]);
+    let (handle, store_handle_id) = load_handle("move-modify-delta", partition).await;
+
+    let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
+    let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    run_commit(handle, 1).await;
+
+    let (status, _events) =
+        run_move(handle, vec![entry(10, node_id, destination, "data.bin")]).await;
+    assert_eq!(status, 0, "moving a committed file must succeed");
+    run_modify(handle, node_id, 20, 2).await;
+    run_commit(handle, 2).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let delta = lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            internal
+                .state_for_tests()
+                .node_change(internal.repository_context.clone(), node_id)
+                .await
+        })
+        .await
+        .expect("the published revision must carry a delta")
+        .expect("the moved file must be named in it");
+    assert_eq!(
+        delta.action,
+        FileAction::Move as u16,
+        "the delta must record the move, not a modification"
+    );
+    let info = fetch_node_info(handle, node_id).await;
+    assert_eq!(
+        (info.parent_id, info.size, info.address.hash),
+        (destination, 20, Hash::from_u64(2)),
+        "the file is committed at its new place with its new content"
     );
     release(handle, store_handle_id);
 }
@@ -976,7 +1020,7 @@ async fn move_rejects_a_destination_inside_the_moved_subtree() {
         vec![(10, INVALID_NODE, LoreErrorCode::InvalidArguments)],
         "the entry must be refused as a bad argument"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("descendants"),
         "the loop must be refused on its own terms, got {reason:?}"
@@ -1001,7 +1045,7 @@ async fn move_rejects_a_destination_that_is_not_a_directory() {
 
     let (status, events) = run_move(handle, vec![entry(10, node_id, file, "data.bin")]).await;
     assert_ne!(status, 0, "a file destination must be refused");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("not a directory"),
         "the destination must be refused for its kind, got {reason:?}"
@@ -1020,7 +1064,7 @@ async fn move_rejects_the_root() {
 
     let (status, events) = run_move(handle, vec![entry(10, ROOT_NODE, destination, "root")]).await;
     assert_ne!(status, 0, "the root must not be movable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("the root is the revision itself"),
         "the root must be refused on its own terms, got {reason:?}"
@@ -1045,7 +1089,7 @@ async fn move_rejects_an_unknown_node_and_an_unknown_destination() {
     .await;
     assert_ne!(status, 0, "an unknown node must be refused");
     assert!(
-        rejection_reason(&events).contains("node id is unknown"),
+        complete_message(&events).contains("node id is unknown"),
         "the node must be refused as unknown"
     );
 
@@ -1053,7 +1097,7 @@ async fn move_rejects_an_unknown_node_and_an_unknown_destination() {
         run_move(handle, vec![entry(11, node_id, INVALID_NODE, "data.bin")]).await;
     assert_ne!(status, 0, "an unknown destination must be refused");
     assert!(
-        rejection_reason(&events).contains("destination parent id is unknown"),
+        complete_message(&events).contains("destination parent id is unknown"),
         "the destination must be refused as unknown"
     );
     release(handle, store_handle_id);
@@ -1074,7 +1118,7 @@ async fn move_rejects_a_name_the_destination_already_holds() {
     let (status, events) =
         run_move(handle, vec![entry(10, node_id, destination, "data.bin")]).await;
     assert_ne!(status, 0, "a taken name must be refused");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("already holds that name"),
         "the collision must be refused on its own terms, got {reason:?}"
@@ -1088,7 +1132,8 @@ async fn move_rejects_a_name_the_destination_already_holds() {
 }
 
 /// A child staged for deletion leaves the revision at the commit that freezes the
-/// tree, so the name it carries until then is not a name to collide with.
+/// tree, so the name it carries until then is not a name to collide with: the commit
+/// records the child's deletion and the move.
 #[tokio::test]
 async fn move_takes_a_name_only_a_deleted_child_holds() {
     let partition = Partition::from([0x6bu8; 16]);
@@ -1097,7 +1142,8 @@ async fn move_takes_a_name_only_a_deleted_child_holds() {
     let destination = seed(handle, ROOT_NODE, "dst", LoreNodeType::Directory).await;
     let occupant = seed(handle, destination, "data.bin", LoreNodeType::File).await;
     let node_id = seed(handle, ROOT_NODE, "data.bin", LoreNodeType::File).await;
-    settle(handle, &[destination, occupant, node_id]).await;
+    set_branch(handle, Context::from(uuid::Uuid::now_v7())).await;
+    run_commit(handle, 1).await;
     run_delete(handle, occupant).await;
 
     let (status, _events) =
@@ -1110,6 +1156,44 @@ async fn move_takes_a_name_only_a_deleted_child_holds() {
         fetch_node_info(handle, node_id).await.parent_id,
         destination,
         "the move must have landed"
+    );
+    run_commit(handle, 2).await;
+
+    let internal = rt_handle::lookup(handle).expect("the handle must resolve");
+    let execution = lore::call::setup_execution(LoreGlobalArgs::default(), None);
+    let actions = lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            let state = internal.state_for_tests();
+            let mut actions = Vec::new();
+            for node in [occupant, node_id] {
+                let change = state
+                    .node_change(internal.repository_context.clone(), node)
+                    .await
+                    .expect("the published revision must carry a delta");
+                let delta = match change {
+                    Some(change) => Some(change),
+                    None => state
+                        .node_deletion(internal.repository_context.clone(), node)
+                        .await
+                        .expect("the published revision must carry a delta"),
+                };
+                actions.push(delta.map(|delta| delta.action));
+            }
+            actions
+        })
+        .await;
+    assert_eq!(
+        actions,
+        [
+            Some(FileAction::Delete as u16),
+            Some(FileAction::Move as u16)
+        ],
+        "the delta must record the child's deletion and the move"
+    );
+    assert_eq!(
+        children_of(handle, destination).await.len(),
+        1,
+        "the revision holds one child of the name"
     );
     release(handle, store_handle_id);
 }
@@ -1126,7 +1210,7 @@ async fn move_rejects_a_node_already_where_it_is_asked_to_go() {
 
     let (status, events) = run_move(handle, vec![entry(10, node_id, ROOT_NODE, "data.bin")]).await;
     assert_ne!(status, 0, "a move that changes nothing must be refused");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("already under that parent by that name"),
         "the no-op must be refused on its own terms, got {reason:?}"
@@ -1294,7 +1378,7 @@ async fn move_rejects_a_repeated_caller_id_but_accepts_repeated_zeros() {
     .await;
     assert_ne!(status, 0, "a repeated caller id must be refused");
     assert!(
-        rejection_reason(&events).contains("two entries share one caller id"),
+        complete_message(&events).contains("two entries share one caller id"),
         "the repeat must be refused on its own terms"
     );
 
@@ -1430,27 +1514,36 @@ async fn move_reports_entries_then_the_batch_terminal_then_complete() {
     .await;
     assert_eq!(status, 0, "the batch must succeed");
 
-    let order: Vec<&CapturedEvent> = events
+    let order: Vec<&str> = events
         .iter()
-        .filter(|event| {
-            matches!(
-                event,
-                CapturedEvent::MoveComplete(..)
-                    | CapturedEvent::BatchComplete(..)
-                    | CapturedEvent::Complete(..)
-            )
+        .filter_map(|event| match event {
+            LoreEvent::RevisionTreeMoveComplete(_) => Some("move"),
+            LoreEvent::RevisionTreeBatchComplete(_) => Some("batch"),
+            LoreEvent::Complete(_) => Some("complete"),
+            _ => None,
         })
         .collect();
     assert_eq!(
         order,
-        vec![
-            &CapturedEvent::MoveComplete(10, first, LoreErrorCode::None),
-            &CapturedEvent::MoveComplete(11, second, LoreErrorCode::None),
-            &CapturedEvent::BatchComplete(CALL_ID, LoreErrorCode::None),
-            &CapturedEvent::Complete(0, String::new()),
-        ],
-        "entries report in batch order, then the batch, then the call"
+        ["move", "move", "batch", "complete"],
+        "entries report in batch order, then the batch, then the call, got {events:?}"
     );
+    assert_eq!(
+        move_outcomes(&events),
+        vec![
+            (10, first, LoreErrorCode::None),
+            (11, second, LoreErrorCode::None)
+        ],
+        "entries report in batch order"
+    );
+    assert_eq!(
+        batch_outcomes(&events),
+        vec![(CALL_ID, LoreErrorCode::None)]
+    );
+    let completes = completes(&events);
+    assert_eq!(completes.len(), 1, "exactly one Complete event");
+    assert_eq!(completes[0].status, 0);
+    assert!(completes[0].error.message.is_empty());
     release(handle, store_handle_id);
 }
 
@@ -1469,7 +1562,7 @@ async fn move_rejects_a_node_staged_for_deletion() {
     let (status, events) =
         run_move(handle, vec![entry(10, node_id, destination, "data.bin")]).await;
     assert_ne!(status, 0, "a node staged for deletion must not be movable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("staged for deletion"),
         "the deletion must be the reason given, got {reason:?}"
@@ -1495,7 +1588,7 @@ async fn move_rejects_a_destination_staged_for_deletion() {
         status, 0,
         "a destination staged for deletion must be refused"
     );
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("would go with it"),
         "the destination must be refused for where it is heading, got {reason:?}"
@@ -1527,7 +1620,7 @@ async fn move_rejects_a_discarded_node() {
     let (status, events) =
         run_move(handle, vec![entry(10, node_id, destination, "fresh.bin")]).await;
     assert_ne!(status, 0, "a discarded node must not be movable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("has been deleted"),
         "the discard must be the reason given, got {reason:?}"
@@ -1535,7 +1628,7 @@ async fn move_rejects_a_discarded_node() {
 
     let (status, events) = run_move(handle, vec![entry(11, other, node_id, "other.bin")]).await;
     assert_ne!(status, 0, "and must not be a destination either");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("destination parent has been deleted"),
         "the destination end must be refused for the discard too, got {reason:?}"
@@ -1557,7 +1650,7 @@ async fn move_rejects_ids_on_an_unallocated_slot() {
 
     let (status, events) = run_move(handle, vec![entry(10, 400, destination, "data.bin")]).await;
     assert_ne!(status, 0, "an unallocated slot must not be movable");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("node id does not resolve to a named node"),
         "the node end must be refused as unnamed, got {reason:?}"
@@ -1565,7 +1658,7 @@ async fn move_rejects_ids_on_an_unallocated_slot() {
 
     let (status, events) = run_move(handle, vec![entry(11, node_id, 400, "data.bin")]).await;
     assert_ne!(status, 0, "an unallocated slot must not be a destination");
-    let reason = rejection_reason(&events);
+    let reason = complete_message(&events);
     assert!(
         reason.contains("destination parent id does not resolve to a named node"),
         "the destination end must be refused as unnamed too, got {reason:?}"
@@ -1602,7 +1695,7 @@ async fn move_rejects_a_taken_name_through_the_destination_snapshot() {
         "the entry that took it is the one refused"
     );
     assert!(
-        rejection_reason(&events).contains("already holds that name"),
+        complete_message(&events).contains("already holds that name"),
         "the collision must be refused on its own terms"
     );
     assert_eq!(
@@ -1632,7 +1725,7 @@ async fn move_rejects_a_name_a_child_holds_in_another_case() {
         "a name differing only in case must still collide"
     );
     assert!(
-        rejection_reason(&events).contains("already holds that name"),
+        complete_message(&events).contains("already holds that name"),
         "the collision must be refused on its own terms"
     );
     release(handle, store_handle_id);

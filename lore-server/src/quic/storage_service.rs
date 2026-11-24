@@ -631,7 +631,9 @@ impl QuicService for StorageService {
         // Upstream v0.13 (483c96ff): every partition write also asks the shared authorizer for its
         // explicit action. Runs after the fork gates above, so their refusals answer first.
         if let Some(action) = request.required_action()
-            && connection_permits(&context, self.repository_authorizer.as_ref(), action).await
+            && connection_permits(&context, self.repository_authorizer.as_ref(), action)
+                .await
+                .map_err(MessageHandleError::from_authorization)?
                 == Some(false)
         {
             return Err(MessageHandleError::AuthorizationFailure(

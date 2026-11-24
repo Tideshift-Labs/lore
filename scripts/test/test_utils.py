@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: MIT
 """Shared test utility functions."""
 
-import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +22,19 @@ def posix_join(*parts: str) -> str:
     mismatches in path comparisons and regex patterns against Lore output.
     """
     return "/".join(parts)
+
+
+def commit_and_push_files(
+    repo: "Lore", files: list[str], directories: tuple[str, ...] = ()
+) -> None:
+    """Commits and pushes `files`, each holding its own path, and the empty
+    `directories`."""
+    repo.write_files({path: path for path in files})
+    for path in directories:
+        repo.make_dirs(path)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
 
 
 def working_tree_files(
@@ -62,6 +74,19 @@ def unstaged_entries(repo: "Lore") -> list[dict]:
     )
 
 
+def view_file(scratch_dir, name: str, rules: list[str]) -> str:
+    """A view filter file holding `rules`, one per line, beside the repositories.
+
+    Outside every working tree, since a file inside one would be part of the tree
+    the view change carries.
+    """
+    directory = scratch_dir("view", create=True)
+    path = os.path.join(directory, name + ".txt")
+    with open(path, "w+") as output_file:
+        output_file.writelines(rule + "\n" for rule in rules)
+    return path
+
+
 def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     """The `status` entries keyed by path."""
     return {
@@ -69,18 +94,23 @@ def status_by_path(repo: "Lore", **kwargs) -> dict[str, dict]:
     }
 
 
+def status_revisions(repo: "Lore") -> dict:
+    """What `repo` reports of the revisions it stands on."""
+    entries = parse_jsonl(
+        repo.status(json=True, offline=True, revision_only=True),
+        "repositoryStatusRevision",
+    )
+    return entries[-1]
+
+
+def staged_revision(repo: "Lore") -> str:
+    """The staged state `repo` holds, which is zero while it holds none."""
+    return status_revisions(repo)["revisionStaged"]
+
+
 def has_staged_anchor(repo: "Lore") -> bool:
     """Whether `status` reports a staged revision, the state every staged or dirty mark lives in."""
-    zero_hash = "0" * 64
-    for line in repo.status(json=True, offline=True).splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        revision_staged = event.get("data", {}).get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
+    return staged_revision(repo) != "0" * 64
 
 
 def get_unstage_counts(output: str) -> dict:
@@ -102,3 +132,30 @@ def registered_links(repo: "Lore") -> dict[str, str]:
         entry["linkPath"]: entry["link"]
         for entry in parse_jsonl(repo.link_list(json=True), "linkEntry")
     }
+
+
+def commit_unstaged_below_a_staged_deletion(repo: "Lore", r: str) -> None:
+    """Removes the committed directory `r`, holding `a/y`, `a/z` and `keep`, stages its
+    deletion, unstages `r/a` below it and commits. Asserts that status shows `r/keep` staged
+    for deletion and `r/a` as a deletion not staged before the commit, and that a scan after
+    it finds the rest of `r` deleted against the revision but `r/keep`, which the commit
+    deleted."""
+    repo.rmtree(r)
+    repo.stage(r, scan=True)
+    repo.unstage(posix_join(r, "a"))
+
+    entries = parse_status_json(repo.status(json=True))
+    assert sorted(
+        (to_posix(e["path"]), e["action"], e["flagStaged"]) for e in entries
+    ) == [
+        (posix_join(r, "a"), "delete", False),
+        (posix_join(r, "keep"), "delete", True),
+    ]
+    repo.commit("Delete all but a")
+    scanned = parse_status_json(repo.status(json=True, scan=True))
+    assert sorted(to_posix(e["path"]) for e in scanned if e["action"] == "delete") == [
+        r,
+        posix_join(r, "a"),
+        posix_join(r, "a", "y"),
+        posix_join(r, "a", "z"),
+    ]

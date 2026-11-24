@@ -1304,7 +1304,11 @@ mod live {
         // that was never written.
         let mut repository_id = RepositoryId::default();
         *repository_id.data_mut() = [0x6cu8; 16];
-        let base = RepositoryContext::new_null_context(immutable, mutable.clone());
+        let base = RepositoryContext::new_null_context(
+            immutable,
+            mutable.clone(),
+            lore_revision::state::no_link_traversal(),
+        );
         let (key, key_type) =
             repository::mutable_key(base.salt(), repository::METADATA, repository_id);
         let write_result = mutable

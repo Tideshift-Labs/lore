@@ -144,7 +144,7 @@ mod tests {
             let _ = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(immutable.clone(), immutable)
+                .with_immutable_store(immutable.clone(), immutable, None)
                 .with_mutable_store(mutable)
                 .with_lock_store(None)
                 .with_domain_context(None)

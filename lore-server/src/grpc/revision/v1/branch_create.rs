@@ -12,6 +12,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::no_link_traversal;
 use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
@@ -235,7 +236,7 @@ pub(crate) async fn governed_branch_create(
         .cloned()
         .map(BranchPoint::from)
         .collect();
-    let latest = stack.first().map(|p| p.revision).unwrap_or_default();
+    let latest = stack.first().map_or_default(|p| p.revision);
     let created = util::time::timestamp();
     let mut metadata = Metadata::new();
     branch::metadata_populate(
@@ -494,6 +495,7 @@ pub async fn handler_with_domain(
             immutable_store,
             mutable_store,
             caller_context.repository_id,
+            no_link_traversal(),
         ));
         let execution = setup_execution(
             module_path!(),
@@ -634,6 +636,7 @@ pub async fn branch_create_implementation(
         immutable_store,
         mutable_store,
         context.repository_id,
+        no_link_traversal(),
     ));
 
     LORE_CONTEXT

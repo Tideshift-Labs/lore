@@ -387,6 +387,7 @@ impl Scenario {
             &identity_token,
             "",
             lore_transport::auth::AuthMode::Auto,
+            None,
         )
         .await
         .expect("connect must succeed against the in-process test server");
