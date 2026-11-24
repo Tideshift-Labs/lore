@@ -4,6 +4,7 @@
 #[cfg(all(test, feature = "integration_tests"))]
 mod replicated_store_tests {
     use std::net::SocketAddr;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::Weak;
     use std::sync::atomic::AtomicUsize;
@@ -127,6 +128,7 @@ mod replicated_store_tests {
         let store = ReplicatedStore::new(
             Arc::new(factory),
             container_config,
+            NonZeroUsize::new(2).expect("2 is not zero"),
             Duration::from_secs(60),
             Duration::from_secs(60),
         )
@@ -328,6 +330,7 @@ mod replicated_store_tests {
                             .build(),
                         connection_lost_sleep: Duration::from_millis(1),
                     },
+                    std::num::NonZeroUsize::MIN,
                     Duration::from_secs(60),
                     Duration::from_secs(60),
                 )
@@ -444,7 +447,10 @@ mod replicated_store_tests {
             unreachable!("the outcome-unknown fixture only drives mutable writes")
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             unreachable!("the outcome-unknown fixture only drives mutable writes")
         }
     }

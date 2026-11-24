@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -54,9 +55,11 @@ use crate::filter;
 use crate::filter::Filter;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
+use crate::fs::filesystem_provider::with_operation;
 use crate::fs::mount_manager_state::MountManagerState;
 use crate::fs::os::OsFilesystem;
 use crate::global::GlobalConfig;
+use crate::global::external_dir::external_dir_for_instance;
 use crate::hash;
 use crate::instance::InstanceId;
 use crate::interface::LoreBranchLocation;
@@ -73,6 +76,7 @@ use crate::lore_debug;
 use crate::lore_warn;
 use crate::metadata::Metadata;
 use crate::protocol;
+use crate::protocol::RemoteEndpoint;
 use crate::protocol::RemoteFuture;
 use crate::revision;
 use crate::revision::sync;
@@ -194,7 +198,8 @@ pub struct RepositoryConfig {
 
 impl RepositoryConfig {
     pub fn validate(&self) -> Result<(), RepositoryError> {
-        if self.is_swfs()
+        let vfs = self.vfs_type();
+        if vfs.is_virtual()
             && !matches!(
                 self.shared_store_to_use.as_ref(),
                 Some(SharedStoreToUseConfig {
@@ -203,17 +208,28 @@ impl RepositoryConfig {
                 })
             )
         {
-            return Err(RepositoryError::internal(
-                "Using SWFS without using a shared store",
-            ));
+            return Err(RepositoryError::internal(format!(
+                "Using the {vfs} VFS without a shared store"
+            )));
         }
         Ok(())
     }
 
-    pub fn is_swfs(&self) -> bool {
+    /// The VFS serving the instance's working tree. A config without a `[vfs]` section names
+    /// none, which is what [`VfsType::None`] says, not a fallback.
+    pub fn vfs_type(&self) -> VfsType {
         self.vfs
             .as_ref()
-            .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
+            .map_or(VfsType::None, |vfs_config| vfs_config.vfs_type)
+    }
+
+    /// The time a virtual clone's files show where no swap has recorded one: the config's, or now
+    /// where the config holds none.
+    pub fn vfs_base_time(&self) -> u64 {
+        self.vfs
+            .as_ref()
+            .and_then(|vfs_config| vfs_config.base_time)
+            .unwrap_or_else(util::time::timestamp)
     }
 }
 
@@ -224,6 +240,11 @@ pub struct StoreConfig {
     pub max_size: Option<usize>,
     pub compaction_delay: Option<usize>,
     pub verify_write: Option<bool>,
+    /// Keep the content of files commands fetch from the remote, and of those they write, in the
+    /// store. Instances that share a store with others want this, so a second instance at the same
+    /// revision reads content locally rather than fetching all of it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_payloads: Option<bool>,
 }
 
 impl StoreConfig {
@@ -235,6 +256,7 @@ impl StoreConfig {
             max_size: Some(10 * 1024 * 1024 * 1024),
             compaction_delay: Some(50),
             verify_write: None,
+            cache_payloads: None,
         }
     }
 
@@ -245,6 +267,7 @@ impl StoreConfig {
             max_size: Some(10 * 1024 * 1024 * 1024),
             compaction_delay: Some(50),
             verify_write: None,
+            cache_payloads: None,
         }
     }
 
@@ -266,16 +289,29 @@ impl StoreConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, Clone)]
+#[derive(Serialize, Deserialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VfsType {
     #[default]
     None,
     Swfs,
+    Fuse,
+}
+
+impl std::fmt::Display for VfsType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            VfsType::None => "none",
+            VfsType::Swfs => "swfs",
+            VfsType::Fuse => "fuse",
+        })
+    }
 }
 
 impl VfsType {
-    pub fn is_swfs(&self) -> bool {
-        matches!(self, VfsType::Swfs)
+    /// Whether the working tree is a mount the service makes, SWFS or FUSE, whose `.lore`
+    /// directory lives outside it, rather than a plain directory.
+    pub fn is_virtual(self) -> bool {
+        matches!(self, VfsType::Swfs | VfsType::Fuse)
     }
 }
 
@@ -285,6 +321,8 @@ pub enum VfsConfigError {}
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
 pub struct VfsConfig {
     pub vfs_type: VfsType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_time: Option<u64>,
 }
 
 /// Decides whether the automatic incremental background GC (evictor + compactor) is
@@ -366,6 +404,25 @@ pub enum LoreSharedStoreMode {
 }
 
 lore_base::carries_no_text!(LoreSharedStoreMode);
+
+impl LoreSharedStoreMode {
+    /// The mode a repository whose working tree `vfs` serves is made with. A virtual one always
+    /// uses a shared store: an SWFS instance keeps its content there, and the service finds the
+    /// FUSE instances it mounts through the shared stores when it starts. So
+    /// [`Inherit`](Self::Inherit) enables one for it, and [`Disabled`](Self::Disabled) is refused.
+    pub fn for_vfs(self, vfs: VfsType) -> Result<Self, InvalidArguments> {
+        match self {
+            _ if !vfs.is_virtual() => Ok(self),
+            Self::Disabled => Err(InvalidArguments {
+                reason: format!(
+                    "An instance with the {vfs} VFS always uses a shared store, so it can't be \
+                     made with the shared store disabled"
+                ),
+            }),
+            Self::Inherit | Self::Enabled => Ok(Self::Enabled),
+        }
+    }
+}
 
 impl SharedStoreToUseConfig {
     pub fn from_api_args(
@@ -626,6 +683,22 @@ pub enum MountKind {
     Layer,
 }
 
+/// How the reads that take their options from a [`RepositoryContext`]
+/// ([`read_options_from_repository`](crate::immutable::read_options_from_repository)) use the
+/// local store.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalReads {
+    /// The local store first, a failed local read taken as a miss.
+    Probe,
+    /// Not the local store: nothing is read from it or stored in it
+    /// ([`RepositoryContext::reading_remote_only`]).
+    Skip,
+    /// The local store first, a failed local read reported as an error where no remote is in
+    /// reach ([`RepositoryContext::strict_local_reads`]).
+    Strict,
+}
+
 #[lore_macro::test_pub]
 pub struct RepositoryContext {
     /// Working-tree path for this repository. `None` for path-less contexts
@@ -664,9 +737,14 @@ pub struct RepositoryContext {
     /// once the pool is stale, as after a reconnect rotated the server's session map.
     session_pool: parking_lot::RwLock<Option<Arc<SessionPool>>>,
     /// Whether this context is the only holder of its session pool, so the pool's sessions
-    /// stop with the context, as a revision tree handle's do. Otherwise the connection pins
-    /// the pool as well, for later calls under the same correlation id to take.
+    /// stop with the context, as a revision tree handle's do. Otherwise, where no endpoint is set
+    /// ([`Self::with_remote_endpoint`]), the connection pins the pool as well, for later calls
+    /// under the same correlation id to take.
     holds_its_sessions: bool,
+    /// The endpoint the session pool is resolved through in place of the connection, if set.
+    endpoint: Option<Arc<RemoteEndpoint>>,
+    /// Set by [`Self::reading_remote_only()`] and [`Self::strict_local_reads()`].
+    pub(crate) local_reads: LocalReads,
     /// The lazy storage session this context's reads and writes carry, with the correlation id
     /// it was built for. Held strongly: a pending session re-resolves after invalidation, so one
     /// serves every operation against this context's partition under that correlation id, until
@@ -693,9 +771,24 @@ impl RemoteState {
     }
 }
 
-fn remote_arc(state: RemoteState) -> Arc<tokio::sync::RwLock<RemoteState>> {
+fn remote_arc(state: RemoteState) -> SharedRemote {
     Arc::new(tokio::sync::RwLock::new(state))
 }
+
+/// Whether the current command's mutable writes are discarded: true in a client's dry run, where
+/// [`RepositoryContext::new_with_state`] wraps the mutable store of each context it builds in a
+/// [`WriteDiscardingMutableStore`](crate::store::write_discarding::WriteDiscardingMutableStore),
+/// which contexts derived from those keep. A read after a discarded write answers what the store
+/// held before it. A context built otherwise, such as by [`RepositoryContext::new_server_context`],
+/// keeps its store as it is given.
+pub(crate) fn discards_mutable_writes() -> bool {
+    crate::runtime::try_execution_context()
+        .is_some_and(|context| context.is_client() && context.globals().dry_run())
+}
+
+/// A context's remote, which contexts made from it share: the connection, its pending connect,
+/// or why there is none.
+pub(crate) type SharedRemote = Arc<tokio::sync::RwLock<RemoteState>>;
 
 pub struct RepositoryContextCreationArgs {
     pub paths: Option<RepositoryPaths>,
@@ -734,11 +827,12 @@ impl RepositoryContext {
         filter: Arc<Filter>,
         filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
-        let mutable_store: Arc<dyn MutableStore> = match crate::runtime::try_execution_context() {
-            Some(context) if context.is_client() && context.globals().dry_run() => Arc::new(
+        let mutable_store: Arc<dyn MutableStore> = if discards_mutable_writes() {
+            Arc::new(
                 crate::store::write_discarding::WriteDiscardingMutableStore::new(mutable_store),
-            ),
-            _ => mutable_store,
+            )
+        } else {
+            mutable_store
         };
         let file_system = filesystem_provider.unwrap_or_else(|| {
             Self::default_filesystem(
@@ -764,6 +858,8 @@ impl RepositoryContext {
             own_stores: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
+            endpoint: None,
+            local_reads: LocalReads::Probe,
             lazy_session: Default::default(),
             file_system,
         }
@@ -777,7 +873,7 @@ impl RepositoryContext {
     /// across a mount doing two-view work for a view that has not changed.
     ///
     /// The session cells are the exception, starting empty rather than adopting sessions that
-    /// belong to another partition.
+    /// belong to another partition. The endpoint is kept, as it answers per partition.
     fn inherited(&self) -> Self {
         RepositoryContext {
             link_read: self.link_read.clone(),
@@ -796,6 +892,8 @@ impl RepositoryContext {
             own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             holds_its_sessions: self.holds_its_sessions,
+            endpoint: self.endpoint.clone(),
+            local_reads: self.local_reads,
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
@@ -850,6 +948,27 @@ impl RepositoryContext {
         self.path().ok_or_else(|| crate::errors::InvalidArguments {
             reason: "repository context has no working-tree path".to_string(),
         })
+    }
+
+    /// The modified times this instance has recorded in its dot directory, where this context
+    /// holds the instance's repository lock and the instance keeps them there. Other contexts
+    /// keep them in the mutable store.
+    pub fn instance_records(&self) -> Option<&Arc<crate::records::InstanceRecords>> {
+        self.repo_lock.as_deref().and_then(RepositoryLock::records)
+    }
+
+    /// Writes the instance's records back to its Lore directory now, as the flush that ends a
+    /// command does. Does nothing where this context holds no records or no write token.
+    ///
+    /// # Errors
+    ///
+    /// The first error writing a shard. A shard that failed stays changed, so the next write-back
+    /// tries it again.
+    pub(crate) async fn write_back_instance_records(&self) -> std::io::Result<()> {
+        match (&self.repo_lock, &self.write_token) {
+            (Some(lock), Some(token)) => lock.write_back_records(token).await,
+            _ => Ok(()),
+        }
     }
 
     pub fn dot_dir_path(&self) -> Result<&Path, crate::errors::InvalidArguments> {
@@ -913,6 +1032,95 @@ impl RepositoryContext {
         self
     }
 
+    /// Attach store claims this context shares with other contexts, released once the last of
+    /// them drops: a mounted filesystem shares its claims with every context it serves through,
+    /// so work done through any of them keeps the claims until it ends. `None` attaches nothing.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn with_shared_store_hold(
+        mut self,
+        stores: Option<Arc<lore_storage::local::store_lock::StoreHold>>,
+    ) -> Self {
+        self.own_stores = stores;
+        self
+    }
+
+    /// A remote for a holder that serves past the command that built this context, a mounted
+    /// filesystem: its connect started now, in this call's execution context, from the instance's
+    /// configuration, whatever the command was told about going offline, since content the holder
+    /// serves later may be stored on the remote alone. None where the configuration names no
+    /// remote or cannot be read.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn serving_remote(&self) -> SharedRemote {
+        let config = self
+            .paths
+            .as_ref()
+            .and_then(|paths| load_config(paths.dot_path.join(CONFIG)).ok());
+        let correlation_id = crate::runtime::try_execution_context()
+            .map(|context| context.globals().correlation_id.to_string())
+            .unwrap_or_default();
+        remote_arc(match config {
+            Some(config) => {
+                match connect_remote(self.id, correlation_id, &config, config.identity.clone()) {
+                    Ok(future) => RemoteState::Pending(future),
+                    Err(error) => RemoteState::from_result(Err(error)),
+                }
+            }
+            None => RemoteState::Offline,
+        })
+    }
+
+    /// Gives `remote`, a holder's shared remote ([`Self::serving_remote`]), this context's
+    /// connection, or its connect under way, where `remote` failed or never connected: a holder
+    /// whose own connect failed, as a remount before the network is up does, reaches the remote
+    /// again through the next command that does. Takes no lock another holds.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn repair_shared_remote(&self, remote: &SharedRemote) {
+        if Arc::ptr_eq(&self.remote, remote) {
+            return;
+        }
+        let Ok(mut shared) = remote.try_write() else {
+            return;
+        };
+        if !matches!(*shared, RemoteState::Failed(_) | RemoteState::Offline) {
+            return;
+        }
+        let Ok(own) = self.remote.try_read() else {
+            return;
+        };
+        match &*own {
+            RemoteState::Connected(connection) => {
+                *shared = RemoteState::Connected(connection.clone());
+            }
+            RemoteState::Pending(connect) => *shared = RemoteState::Pending(connect.clone()),
+            RemoteState::Offline | RemoteState::Failed(_) => {}
+        }
+    }
+
+    /// This context over `remote`, which the contexts of one holder share
+    /// ([`Self::serving_remote`]).
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn with_shared_remote(&self, remote: &SharedRemote) -> Self {
+        RepositoryContext {
+            remote: remote.clone(),
+            ..self.inherited()
+        }
+    }
+
+    /// Claims this context's stores as [`claim_stores`] does, for a holder that uses them outside
+    /// any command: a mounted filesystem.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] if either store's claim cannot be taken.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn hold_stores(
+        &self,
+    ) -> Result<lore_storage::local::store_lock::StoreHold, RepositoryError> {
+        claim_stores(&self.immutable_store, &self.mutable_store).await
+    }
+
     /// Attach a [`RepositoryWriteToken`] to this context. The token carries
     /// the per-path write-mutex guard, so the caller must have already
     /// obtained it via [`RepositoryWriteToken::acquire`] (fresh mint +
@@ -930,6 +1138,27 @@ impl RepositoryContext {
         self
     }
 
+    /// This context reading from the remote alone, in place of strict local reads: the reads that
+    /// take their options from it
+    /// ([`read_options_from_repository`](crate::immutable::read_options_from_repository)) skip the
+    /// local store and store nothing in it, whatever the cache setting or a fragment's local cache
+    /// priority asks.
+    #[must_use]
+    pub fn reading_remote_only(mut self) -> Self {
+        self.local_reads = LocalReads::Skip;
+        self
+    }
+
+    /// This context telling a failed local read from a miss, in place of reading from the remote
+    /// alone: in the reads that take their options from it, where no remote is in reach, a local
+    /// read that fails or finds a corrupt fragment reports an error, and only an address the local
+    /// store does not hold reports `AddressNotFound`.
+    #[must_use]
+    pub fn strict_local_reads(mut self) -> Self {
+        self.local_reads = LocalReads::Strict;
+        self
+    }
+
     /// Spawn a background task that flushes pending store writes to disk.
     /// Called by the client dispatcher after a command completes.
     ///
@@ -941,8 +1170,15 @@ impl RepositoryContext {
     /// cross-process concurrent flushes are safe at the data-structure
     /// level.
     ///
-    /// The mutable store is only flushed when the context holds a write
-    /// token — read-only commands cannot have dirtied it.
+    /// The mutable store, and the instance's records, are only flushed when the
+    /// context holds a write token. A read-only command cannot have dirtied the
+    /// mutable store. It can change the records, by adopting times read from the
+    /// store and by marking a shard it could not read to be replaced. The flush
+    /// of a later command with a write token that shares the repository lock
+    /// writes those changes, and otherwise they are dropped with the lock; the
+    /// next command reads them again. The records are written alongside the
+    /// store flushes, under a sibling of the token, which is released once they
+    /// are written.
     ///
     /// The `Arc<RepositoryLock>` is cloned into the task, so the repository
     /// flock and the store claims it contains outlive the caller's
@@ -955,23 +1191,36 @@ impl RepositoryContext {
     /// the repository flock while it claims a store again — the reverse of the
     /// order every command takes them in, and a deadlock against a command in
     /// another process holding that store and waiting for the repository.
-    pub fn try_spawn_post_command_flush(&self, sync_data: bool) {
+    pub fn try_spawn_post_command_flush(&self, options: lore_storage::FlushOptions) {
         let immutable_store = self.immutable_store.clone();
         let mutable_store = self
             .write_token
             .is_some()
             .then(|| self.mutable_store.clone());
         let repo_lock = self.repo_lock.clone();
+        let records_token = self
+            .instance_records()
+            .is_some_and(|records| records.is_dirty())
+            .then(|| self.write_token.as_ref().map(RepositoryWriteToken::share))
+            .flatten();
         let own_stores = self.own_stores.clone();
         lore_base::runtime::LORE_CONTEXT.sync_scope(
             Arc::new(crate::interface::ExecutionContext::default())
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    let _ = immutable_store.flush(sync_data).await;
-                    if let Some(mutable_store) = mutable_store {
-                        let _ = mutable_store.flush(sync_data).await;
-                    }
+                    let records = async {
+                        if let (Some(lock), Some(token)) = (&repo_lock, records_token) {
+                            lock.write_back_records_or_warn(&token).await;
+                        }
+                    };
+                    let stores = async {
+                        let _ = immutable_store.flush(options).await;
+                        if let Some(mutable_store) = mutable_store {
+                            let _ = mutable_store.flush(options).await;
+                        }
+                    };
+                    tokio::join!(records, stores);
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
                     drop(own_stores);
@@ -993,6 +1242,11 @@ impl RepositoryContext {
 
     pub fn immutable_store(&self) -> Arc<dyn ImmutableStore> {
         self.immutable_store.clone()
+    }
+
+    /// The immutable store, borrowed, for a caller that needs no ownership of it.
+    pub fn immutable_store_ref(&self) -> &Arc<dyn ImmutableStore> {
+        &self.immutable_store
     }
 
     /// Read-only view of the mutable store. Always available; bound to the
@@ -1079,6 +1333,8 @@ impl RepositoryContext {
             own_stores: None,
             session_pool: Default::default(),
             holds_its_sessions: false,
+            endpoint: None,
+            local_reads: LocalReads::Probe,
             lazy_session: Default::default(),
         }
     }
@@ -1116,6 +1372,44 @@ impl RepositoryContext {
             file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
             ..self.inherited()
         }
+    }
+
+    /// A context over this context's stores for the instance mounted at `root` whose `.lore` is
+    /// `dot_path`, as the service serves it when remounting: the instance's view, a remote
+    /// connected on first use, and no write token. Reads nothing inside `root`.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mounted_instance_context(
+        &self,
+        root: &Path,
+        dot_path: &Path,
+        instance_id: InstanceId,
+        config: &RepositoryConfig,
+    ) -> Result<Self, RepositoryError> {
+        let id = read_id_from_file(dot_path.join(ID)).internal("Repository not found")?;
+        let filter = Arc::new(
+            filter::load_view(dot_path.join(VIEW_FILTER))
+                .forward::<RepositoryError>("Failed to load repository view")?,
+        );
+        let context = execution_context();
+        let remote = match connect(id, context.globals(), config, config.identity.clone()) {
+            Ok(future) => RemoteState::Pending(future),
+            Err(error) => RemoteState::from_result(Err(error)),
+        };
+        let mounted = Self::new_with_state(
+            Some(RepositoryPaths::new(
+                root.to_path_buf(),
+                dot_path.to_path_buf(),
+            )),
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
+            id,
+            instance_id,
+            remote,
+            filter,
+            None,
+        );
+        mounted.set_disable_cache(cache_disabled(context.globals(), config));
+        Ok(mounted)
     }
 
     /// Rebuild this context with a different filter view and remote connection,
@@ -1210,16 +1504,26 @@ impl RepositoryContext {
             .store(prefetch, Ordering::Relaxed);
     }
 
-    pub async fn flush(&self, sync_data: bool) -> Result<(), RepositoryError> {
-        let immutable_store = self.immutable_store.clone();
-        let immutable_result = immutable_store.flush(sync_data).await;
+    /// Writes back the instance's records, where this context holds a write token, alongside
+    /// the immutable store's flush and then the mutable store's. A failed write-back is logged
+    /// and does not fail the flush: the records are advisory.
+    pub async fn flush(&self, options: lore_storage::FlushOptions) -> Result<(), RepositoryError> {
+        let records = async {
+            if let (Some(lock), Some(token)) = (&self.repo_lock, &self.write_token) {
+                lock.write_back_records_or_warn(token).await;
+            }
+        };
+        let stores = async {
+            let immutable_store = self.immutable_store.clone();
+            let immutable_result = immutable_store.flush(options).await;
 
-        let mutable_store = self.mutable_store.clone();
-        let mutable_result = mutable_store.flush(sync_data).await;
+            let mutable_store = self.mutable_store.clone();
+            let mutable_result = mutable_store.flush(options).await;
 
-        immutable_result
-            .and(mutable_result)
-            .forward::<RepositoryError>("Failed to flush stores to disk")
+            immutable_result.and(mutable_result)
+        };
+        let ((), result) = tokio::join!(records, stores);
+        result.forward::<RepositoryError>("Failed to flush stores to disk")
     }
 
     /// Returns the remote connection, awaiting the pending connect task on first call.
@@ -1287,31 +1591,67 @@ async fn resolve_remote(
 
 impl RepositoryContext {
     /// The storage session pool for this repository under `correlation_id`, resolved once and
-    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id.
+    /// reused for as long as it [`serves`](SessionPool::serves) that correlation id. Resolved
+    /// through the endpoint [`Self::with_remote_endpoint`] set where there is one, and through
+    /// the context's connection otherwise.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments.
     #[lore_macro::test_pub]
-    pub(crate) async fn session_pool(
-        &self,
-        correlation_id: &str,
-    ) -> Result<Arc<SessionPool>, ProtocolError> {
-        if let Some(pool) = self.cached_session_pool(correlation_id) {
-            return Ok(pool);
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn session_pool<'a>(
+        &'a self,
+        correlation_id: &'a str,
+    ) -> impl Future<Output = Result<Arc<SessionPool>, ProtocolError>> + 'a {
+        async move {
+            if let Some(pool) = self.cached_session_pool(correlation_id) {
+                return Ok(pool);
+            }
+            let pool = if let Some(endpoint) = &self.endpoint {
+                endpoint.session_pool(&self.id, correlation_id).await?
+            } else {
+                self.connection_session_pool(correlation_id).await?
+            };
+            *self.session_pool.write() = Some(pool.clone());
+            Ok(pool)
         }
-        let remote = self.remote().await?;
-        let pool = if self.holds_its_sessions {
-            remote
-                .unpinned_session_pool(self.id, correlation_id)
-                .await?
-        } else {
-            remote.session_pool(self.id, correlation_id).await?
-        };
-        *self.session_pool.write() = Some(pool.clone());
-        Ok(pool)
+    }
+
+    /// The session pool for this repository under `correlation_id` from the context's connection:
+    /// one the connection does not pin where the context holds its sessions, and one it pins
+    /// otherwise.
+    ///
+    /// A future of its own, so that the connection, borrowed across either await, is held by this
+    /// future alone and not by every state of [`Self::session_pool`]'s. Not an `async fn`, which
+    /// would hold a second copy of its arguments.
+    #[allow(clippy::manual_async_fn)]
+    fn connection_session_pool<'a>(
+        &'a self,
+        correlation_id: &'a str,
+    ) -> impl Future<Output = Result<Arc<SessionPool>, ProtocolError>> + 'a {
+        async move {
+            let remote = self.remote().await?;
+            if self.holds_its_sessions {
+                remote.unpinned_session_pool(self.id, correlation_id).await
+            } else {
+                remote.session_pool(self.id, correlation_id).await
+            }
+        }
     }
 
     /// This context as the only holder of its session pools, so their sessions stop with it
     /// rather than stay pinned on the connection.
     pub fn holding_its_sessions(mut self) -> Self {
         self.holds_its_sessions = true;
+        self
+    }
+
+    /// This context taking its session pools from `endpoint` in place of its connection, so the
+    /// endpoint holds them and [`Self::holding_its_sessions`] does not apply. The endpoint is
+    /// asked only when a remote read or write needs a session under a correlation id that no pool
+    /// held here serves.
+    #[must_use]
+    pub fn with_remote_endpoint(mut self, endpoint: Arc<RemoteEndpoint>) -> Self {
+        self.endpoint = Some(endpoint);
         self
     }
 
@@ -1502,6 +1842,9 @@ pub const CONFIG: &str = "config.toml";
 pub const SERVICE: &str = "service";
 pub const DOT_URCIGNORE: &str = ".urcignore";
 pub const DOT_LOREIGNORE: &str = ".loreignore";
+/// The instance's own ignore rules, in its Lore directory. They only exclude, and are never
+/// committed.
+pub const INSTANCE_IGNORE: &str = "ignore";
 
 /// Whether `name` is the repository's own directory: in any ASCII case, with the trailing dots and
 /// spaces Windows drops, as the 8.3 short name Windows gives it, such as `LORE~1`, or with a stream
@@ -1571,6 +1914,81 @@ pub const MINE_SUFFIX: &str = "~mine";
 /// automerge removes the ones it wrote.
 pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
 
+/// Refuses another SWFS instance once the service mounts as many as SWFS supports
+/// ([`SwfsMountManager::MOUNT_LIMIT`](crate::fs::swfs::mount_manager::SwfsMountManager::MOUNT_LIMIT)).
+///
+/// An early check, so a create or clone that would be refused fails before any of the instance is
+/// made rather than after the setup work. It claims nothing: two instances can both pass it, and
+/// [`SwfsMountManager::create_mount`](crate::fs::swfs::mount_manager::SwfsMountManager::create_mount)
+/// checks again under a lock as it mounts, which is what keeps the count within the limit. Outside
+/// a service there is no mount to count, and creating the instance is refused there anyway.
+pub(crate) fn refuse_swfs_past_mount_limit() -> Result<(), NotSupported> {
+    match MountManagerState::mount_manager() {
+        Some(manager) => manager.swfs().refuse_past_mount_limit(),
+        None => Ok(()),
+    }
+}
+
+/// Refuses a repository at `path` inside an SWFS instance's mount, whether or not it is an SWFS
+/// instance itself.
+///
+/// A nested repository is an instance with its own state whose working tree lies in the parent's,
+/// unknown to it: inside a mount, its files would live in the parent's SWFS write cache. Links and
+/// layers are a separate kind of nesting, the parent's own content its operations realize, and
+/// are not refused here.
+pub(crate) fn refuse_nesting_in_swfs_mount(
+    path: &std::path::Path,
+) -> Result<(), crate::errors::InvalidArguments> {
+    if let Some(mount) =
+        MountManagerState::mount_manager().and_then(|manager| manager.swfs().mount_containing(path))
+    {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put a repository at {} inside the SWFS instance at {}: an SWFS \
+                 instance holds no nested repository with its own state",
+                path.display(),
+                mount.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a new instance at `path` nested in another: inside another repository's working tree,
+/// where it would be a tree the parent's walks cross, or inside an SWFS or FUSE instance's mount,
+/// whose Lore directory is outside its tree and whose files the mount presents.
+pub(crate) fn refuse_instance_nested_at(
+    path: &std::path::Path,
+) -> Result<(), crate::errors::InvalidArguments> {
+    refuse_nesting_in_swfs_mount(path)?;
+    #[cfg(target_os = "linux")]
+    if let Some((mount, _)) = crate::fs::fuse::discover::lore_mount_containing(path) {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put an instance at {} inside the FUSE instance at {}: a virtual \
+                 instance holds no nested instance",
+                path.display(),
+                mount.display()
+            ),
+        });
+    }
+    if let Some(parent) = path
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| ancestor.join(DOT_LORE).is_dir() || ancestor.join(DOT_URC).is_dir())
+    {
+        return Err(crate::errors::InvalidArguments {
+            reason: format!(
+                "unable to put an instance at {} inside the repository at {}: an instance \
+                 cannot be nested in another repository",
+                path.display(),
+                parent.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
         match mount_manager.check_for_external_lore_dir(path) {
@@ -1585,6 +2003,10 @@ pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath>
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Ok(Some(dot_lore)) = crate::fs::fuse::discover::discover_external_dot_lore(path) {
+        return Ok(dot_lore);
+    }
     let legacy = path.join(DOT_URC);
     Ok(if legacy.is_dir() {
         legacy
@@ -1666,13 +2088,28 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
     load_repository_config_from_dot_dir(&get_dot_lore_path(path.as_ref())?)
 }
 
-/// Process-local holder for the repository directory `FSLock`. Lifetime is
-/// managed via an `Arc` + weak-ref cache so overlapping commands share one
-/// acquisition; the underlying flock drops when the last strong reference is
-/// released.
+/// Whether the repository at `path`, whose Lore directory [`get_dot_lore_path`] finds at
+/// `dot_path`, may be removed to put a new one in its place. Only an ordinary repository may. A
+/// Lore directory outside `path` belongs to a mounted virtual clone whatever its config holds, and
+/// a config that names a VFS marks one inside it.
+#[lore_macro::test_pub]
+pub(crate) fn force_may_replace(path: &Path, dot_path: &Path) -> bool {
+    dot_path.parent() == Some(path)
+        && !load_repository_config_from_dot_dir(dot_path)
+            .is_ok_and(|config| config.vfs_type().is_virtual())
+}
+
+/// Process-local holder for the repository directory `FSLock`. Lifetime is managed via an `Arc`
+/// and a weak-ref cache, so overlapping commands that share the lock take one acquisition between
+/// them, and an exclusive holder is shared with none; the underlying flock drops when the last
+/// strong reference is released.
 #[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
-    /// Declared first so it drops first. Rust drops fields in declaration order,
+    /// The instance's recorded modified times, which this lock protects, or `None` where the
+    /// instance keeps them in the mutable store. Written back by the context's flush, before
+    /// the lock is released.
+    records: Option<Arc<crate::records::InstanceRecords>>,
+    /// Declared before the store locks so it drops before them. Rust drops fields in declaration order,
     /// so the repository flock is released before the store locks that contain
     /// it — the reverse of acquisition, which is what containment means on the
     /// way out.
@@ -1693,6 +2130,119 @@ pub(crate) struct RepositoryLock {
     /// Repository creation takes no repository lock, so it builds none of this: its
     /// writes go through the stores, each taking its own claim.
     _stores: lore_storage::local::store_lock::StoreHold,
+    /// This holder's place in its directory's [`RepositoryLockGate`]: shared with the other
+    /// holders of the process, or alone. Declared last, so the flock is released before an
+    /// exclusive holder in this process can be created for the directory.
+    admission: LockAdmission,
+}
+
+impl RepositoryLock {
+    /// The instance's recorded modified times, which this lock protects, or `None` where the
+    /// instance keeps them in the mutable store.
+    pub(crate) fn records(&self) -> Option<&Arc<crate::records::InstanceRecords>> {
+        self.records.as_ref()
+    }
+
+    /// Writes back the instance's records, keeping this lock until every write has landed.
+    ///
+    /// # Errors
+    ///
+    /// The first error writing a shard. A shard that failed stays changed, so the next write-back
+    /// tries it again.
+    async fn write_back_records(
+        self: &Arc<Self>,
+        token: &RepositoryWriteToken,
+    ) -> std::io::Result<()> {
+        match &self.records {
+            Some(records) => records.write_back(token, Arc::clone(self)).await,
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::write_back_records`], logging a failure: the records are advisory.
+    ///
+    /// Not an `async fn`, which would hold a second copy of its arguments beside the write-back's
+    /// future, in every flush; the write-back's future is mapped rather than awaited in a block,
+    /// which would hold it twice.
+    fn write_back_records_or_warn<'a>(
+        self: &'a Arc<Self>,
+        token: &'a RepositoryWriteToken,
+    ) -> impl Future<Output = ()> + 'a {
+        futures::FutureExt::map(self.write_back_records(token), |written| {
+            if let Err(err) = written {
+                lore_warn!("Failed to write modified time records: {err}");
+            }
+        })
+    }
+
+    /// Whether a command can share this holder, which it can unless the holder is held alone or
+    /// a command waits to hold the lock alone. A command turned away waits for its turn at the
+    /// gate, behind the one waiting to hold the lock alone, so commands that keep a shared holder
+    /// alive never keep that one out for good.
+    fn admits_sharing(&self) -> bool {
+        match &self.admission {
+            LockAdmission::Shared {
+                exclusive_waiting, ..
+            } => exclusive_waiting.load(Ordering::Acquire) == 0,
+            LockAdmission::Exclusive { .. } => false,
+        }
+    }
+}
+
+/// How a command holds an instance's repository lock against the other commands of its process,
+/// which take the flock once between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[lore_macro::test_pub]
+pub(crate) enum LockSharing {
+    /// Shares one holder with the other commands of the process.
+    Shared,
+    /// Holds the lock alone: waits for every other command of the process on the instance to
+    /// release it, and keeps them out until it is done.
+    Exclusive,
+}
+
+/// The per-directory state that orders holders of one repository lock within the process.
+#[derive(Default)]
+struct RepositoryLockGate {
+    /// Serializes taking the flock, so only one caller at a time reaches into it.
+    init: tokio::sync::Mutex<()>,
+    /// Read by every shared holder for its life and written by an exclusive one, so an exclusive
+    /// holder exists only while no shared one does.
+    admission: Arc<tokio::sync::RwLock<()>>,
+    /// The callers waiting to hold the lock alone. While any waits, a shared holder admits no more
+    /// commands, which queue at `admission` behind it instead.
+    exclusive_waiting: Arc<AtomicUsize>,
+    /// The callers waiting at `admission` to share the lock, which tests read to tell a caller
+    /// waiting there from one waiting on the flock.
+    shared_waiting: Arc<AtomicUsize>,
+}
+
+/// A caller counted in one of the counts of a [`RepositoryLockGate`]'s waiting callers until it is
+/// dropped, as it is once the caller is admitted or gives up.
+struct Waiting(Arc<AtomicUsize>);
+
+impl Waiting {
+    fn new(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+enum LockAdmission {
+    Shared {
+        _guard: tokio::sync::OwnedRwLockReadGuard<()>,
+        /// The gate's count of callers waiting to hold the lock alone.
+        exclusive_waiting: Arc<AtomicUsize>,
+    },
+    Exclusive {
+        _guard: tokio::sync::OwnedRwLockWriteGuard<()>,
+    },
 }
 
 /// Claims `immutable` and then `mutable` for a use of the repository they belong to, which
@@ -1769,27 +2319,82 @@ where
 
 static REPOSITORY_LOCK_CACHE: OnceLock<DashMap<PathBuf, Weak<RepositoryLock>>> = OnceLock::new();
 
-/// Per-path init mutexes used to serialize first-time flock acquisition for a
-/// given repository path. Held only during the double-checked-locking init
-/// dance in `get_or_create_repository_lock`. The sync `RwLock` around the map
-/// is held only briefly to read or insert a per-path `tokio::sync::Mutex`; it
-/// is never held across an `.await`.
-static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
-    std::sync::RwLock<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+/// Per-path gates that serialize first-time flock acquisition for a repository path and order
+/// shared and exclusive holders of it; see [`RepositoryLockGate`]. The sync `RwLock` around the
+/// map is held only briefly to read or insert a gate; it is never held across an `.await`.
+static REPOSITORY_LOCK_GATES: OnceLock<
+    std::sync::RwLock<HashMap<PathBuf, Arc<RepositoryLockGate>>>,
 > = OnceLock::new();
+
+/// How many callers wait at the gate to share the repository lock of the Lore directory at
+/// `dot_path`.
+#[cfg(feature = "test-util")]
+pub fn shared_callers_waiting(dot_path: &Path) -> usize {
+    let key = dot_path
+        .canonicalize()
+        .unwrap_or_else(|_| dot_path.to_path_buf());
+    repository_lock_gate(&key)
+        .shared_waiting
+        .load(Ordering::Acquire)
+}
+
+/// How many callers wait to hold the repository lock of the Lore directory at `dot_path` alone.
+#[cfg(feature = "test-util")]
+pub fn exclusive_callers_waiting(dot_path: &Path) -> usize {
+    let key = dot_path
+        .canonicalize()
+        .unwrap_or_else(|_| dot_path.to_path_buf());
+    repository_lock_gate(&key)
+        .exclusive_waiting
+        .load(Ordering::Acquire)
+}
+
+/// The gate of the directory `key` names.
+fn repository_lock_gate(key: &Path) -> Arc<RepositoryLockGate> {
+    let gates = REPOSITORY_LOCK_GATES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
+    if let Some(existing) = gates
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+    {
+        return existing.clone();
+    }
+    gates
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// Whether an instance of `config` keeps its modified-time records in its dot directory. An SWFS
+/// mount presents the recorded times, which it reads from the store. In-memory stores end with
+/// the process, and records kept on disk would outlive the revision they describe.
+#[lore_macro::test_pub]
+fn keeps_records_on_disk(config: &RepositoryConfig, in_memory: bool) -> bool {
+    config.vfs_type() != VfsType::Swfs && !in_memory
+}
 
 /// Acquire (or reuse, via weak-ref cache) the process-local `RepositoryLock`
 /// for a repository's dot-directory (`.lore/` or `.urc/`).
 ///
-/// Overlapping commands in the same process share one `Arc<RepositoryLock>` —
-/// the OS-level flock is acquired once and released when the last strong
-/// reference drops. Concurrent first-time initializers are serialized via a
-/// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
-/// for a given path at a time; others wait, then observe the cached entry.
+/// With [`LockSharing::Shared`], overlapping commands in the same process share one
+/// `Arc<RepositoryLock>` — the OS-level flock is acquired once and released when the last strong
+/// reference drops. With [`LockSharing::Exclusive`], the caller waits until no other holder for
+/// the directory is alive in the process and gets one of its own, which no other caller joins;
+/// they wait for it instead. An exclusive caller waits for the holders alive when it comes; while
+/// it waits, a shared holder admits no more commands, which queue behind it at the gate.
+/// Concurrent first-time initializers are serialized per directory so only one thread calls into
+/// the OS flock for a given path at a time; others wait, then observe the cached entry.
+///
+/// A holder this call creates keeps the instance's modified-time records in the dot directory
+/// where `instance_records` is set. A cached holder keeps the choice it was created with.
 #[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
     stores: lore_storage::local::store_lock::StoreHold,
+    instance_records: bool,
+    sharing: LockSharing,
 ) -> Result<
     (
         Arc<RepositoryLock>,
@@ -1805,7 +2410,10 @@ pub(crate) async fn get_or_create_repository_lock(
     // guards its creator supplied, on whichever store objects that command was using;
     // dropping this caller's would leave it holding the repository flock with no claim
     // of its own, which is the shape the containment exists to prevent.
-    if let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade()) {
+    if sharing == LockSharing::Shared
+        && let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade())
+        && holder.admits_sharing()
+    {
         return Ok((holder, stores));
     }
 
@@ -1813,33 +2421,44 @@ pub(crate) async fn get_or_create_repository_lock(
     // take a second flock on it, which excludes the first inside this very process. Bound
     // before the insert below, so no shard guard from the lookup is still held by then.
     let key = dot_path.canonicalize().unwrap_or_else(|_| dot_path.clone());
-    let cached = cache.get(&key).and_then(|w| w.upgrade());
-    if let Some(holder) = cached {
+    if let Some(holder) = cache
+        .get(&key)
+        .and_then(|w| w.upgrade())
+        .filter(|holder| sharing == LockSharing::Shared && holder.admits_sharing())
+    {
         cache.insert(dot_path, Arc::downgrade(&holder));
         return Ok((holder, stores));
     }
 
-    // Slow path: serialize init attempts per directory so only one of them calls
-    // into the OS flock.
-    let mutexes =
-        REPOSITORY_LOCK_INIT_MUTEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
-    let init_mutex = {
-        if let Some(existing) = mutexes.read().unwrap().get(&key) {
-            existing.clone()
-        } else {
-            let mut w = mutexes.write().unwrap();
-            w.entry(key.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+    let gate = repository_lock_gate(&key);
+    let admission = match sharing {
+        LockSharing::Shared => {
+            let _waiting = Waiting::new(&gate.shared_waiting);
+            LockAdmission::Shared {
+                _guard: gate.admission.clone().read_owned().await,
+                exclusive_waiting: Arc::clone(&gate.exclusive_waiting),
+            }
+        }
+        LockSharing::Exclusive => {
+            let _waiting = Waiting::new(&gate.exclusive_waiting);
+            LockAdmission::Exclusive {
+                _guard: gate.admission.clone().write_owned().await,
+            }
         }
     };
 
-    let _guard = init_mutex.lock().await;
+    // Serialize init attempts per directory so only one of them calls into the OS flock.
+    let _guard = gate.init.lock().await;
 
-    // Re-check the cache — another task may have finished initializing while
-    // we were waiting on the init mutex.
-    let cached = cache.get(&key).and_then(|w| w.upgrade());
-    if let Some(holder) = cached {
+    // Re-check the cache: another task may have finished initializing while this caller waited at
+    // the gate. A shared caller admitted at the gate joins any holder alive, whether or not a
+    // caller now waits to hold the lock alone: its admission proves no holder is held alone, and
+    // a holder of its own would take a second flock on the directory.
+    let admitted = cache
+        .get(&key)
+        .and_then(|w| w.upgrade())
+        .filter(|_| sharing == LockSharing::Shared);
+    if let Some(holder) = admitted {
         cache.insert(dot_path, Arc::downgrade(&holder));
         return Ok((holder, stores));
     }
@@ -1850,9 +2469,16 @@ pub(crate) async fn get_or_create_repository_lock(
         .await
         .internal("Failed to get exclusive access to repository")?;
 
+    let records = if instance_records {
+        Some(crate::records::InstanceRecords::open(&dot_path).await)
+    } else {
+        None
+    };
     let holder = Arc::new(RepositoryLock {
+        records,
         _lock: lock,
         _stores: stores,
+        admission,
     });
     if key != dot_path {
         cache.insert(key, Arc::downgrade(&holder));
@@ -2360,7 +2986,22 @@ fn connect(
     if globals.offline() {
         return Err(ProtocolError::from(NoRemote));
     }
+    connect_remote(
+        repository,
+        globals.correlation_id.to_string(),
+        config,
+        identity,
+    )
+}
 
+/// [`connect`] whatever the command was told about going offline, for a holder that serves past
+/// the command that built it.
+fn connect_remote(
+    repository: RepositoryId,
+    correlation_id: String,
+    config: &RepositoryConfig,
+    identity: Option<String>,
+) -> Result<RemoteFuture, ProtocolError> {
     let remote_url = config.remote_url.clone();
     remote_url.as_ref().inspect(|url| {
         lore_debug!("Using repository config remote: {url}",);
@@ -2372,7 +3013,6 @@ fn connect(
     let remote_url = remote_url.as_deref().unwrap_or_default().to_string();
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
-    let correlation_id = globals.correlation_id.to_string();
     // FORK-LOCAL (Tideshift, WP-124): the connect keeps the managed deadline of the command that
     // opened the repository, so the pre-warm's QUIC reconnect is bounded per command, as the
     // command's own would be. Decided here, in the spawning task: task-locals do not cross the
@@ -2465,14 +3105,75 @@ pub async fn load_and_connect(
 /// command and hand siblings (via [`RepositoryWriteToken::share`]) to each
 /// construction, keeping the per-path write mutex held across the whole
 /// flow without deadlocking on re-acquisition.
+pub fn load_and_connect_with_token(
+    path: &Path,
+    access: RepositoryAccess,
+    write_token: Option<RepositoryWriteToken>,
+) -> impl Future<Output = Result<Arc<RepositoryContext>, RepositoryError>> + '_ {
+    open_repository(path, access, write_token, LockSharing::Shared)
+}
+
+/// Opens the instance at `path` for writing where its Lore directory holds no instance file, which
+/// recovers its instance ID from the store, or gives it a new one, as a write command's open does,
+/// so that it can then be opened without its stores. Does nothing where the file is there, and in a
+/// dry run, which writes no file.
+///
+/// # Errors
+///
+/// [`RepositoryError`] where the instance cannot be opened.
+pub async fn recover_missing_instance_file(path: &Path) -> Result<(), RepositoryError> {
+    let instance_file = get_dot_lore_path(path)?.join(INSTANCE);
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    match lore_io::IoDriver::global()
+        .symlink_stat(&instance_file)
+        .await
+    {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Any other failure is the plan's own open to report.
+        _ => return Ok(()),
+    }
+    let token = RepositoryWriteToken::acquire(path).await;
+    let repository = Box::pin(load_and_connect_with_token(
+        path,
+        RepositoryAccess::ReadWrite,
+        Some(token),
+    ))
+    .await?;
+    repository
+        .flush(lore_storage::FlushOptions::default())
+        .await?;
+    Ok(())
+}
+
+/// [`load_and_connect_with_token`] for a write command that holds the instance's repository lock
+/// alone, keeping out the other commands of its process as well as those of other processes: it
+/// waits for the commands of its process that hold the lock, and while it waits, or holds the lock,
+/// commands of its process that open the instance wait for it.
+pub fn load_and_connect_exclusive(
+    path: &Path,
+    write_token: RepositoryWriteToken,
+) -> impl Future<Output = Result<Arc<RepositoryContext>, RepositoryError>> + '_ {
+    open_repository(
+        path,
+        RepositoryAccess::ReadWrite,
+        Some(write_token),
+        LockSharing::Exclusive,
+    )
+}
+
+/// Opens the repository at `path` as [`load_and_connect_with_token`] describes, holding its
+/// repository lock as `sharing` says.
 ///
 /// Instance ID recovery and instance registration are boxed. They run only for
 /// an instance missing its ID file or its registration, and inline they would
 /// make every command's future as large as theirs.
-pub async fn load_and_connect_with_token(
+async fn open_repository(
     path: &Path,
     access: RepositoryAccess,
     write_token: Option<RepositoryWriteToken>,
+    sharing: LockSharing,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     require_text_root(path)?;
     debug_assert!(
@@ -2642,7 +3343,15 @@ pub async fn load_and_connect_with_token(
     // the path that runs most often. The one write this function makes to it waits for
     // the lock, below.
     let repo_lock = match stores {
-        Some(stores) => Some(get_or_create_repository_lock(dot_path.clone(), stores).await?),
+        Some(stores) => Some(
+            get_or_create_repository_lock(
+                dot_path.clone(),
+                stores,
+                keeps_records_on_disk(&config, global.in_memory()),
+                sharing,
+            )
+            .await?,
+        ),
         None => None,
     };
 
@@ -2654,7 +3363,13 @@ pub async fn load_and_connect_with_token(
         let _ = save_config(config_path.as_path(), &persisted).await;
     }
 
-    let filter = load_filter(path)?;
+    // A FUSE working tree is the service's own mount, which the service never reads through: its
+    // ignore file is read from the provider serving it, once the mount is found below.
+    let filter = if config.vfs_type() == VfsType::Fuse {
+        None
+    } else {
+        Some(load_filter(path)?)
+    };
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2797,18 +3512,27 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
-    // Load the mounted filesystem if this is a SWFS-backed instance
-    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
-        let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
-            "Loading a SWFS repository without using the service",
-        ))?;
-        Some(
-            mount_manager
-                .get_mount_filesystem_provider(path)
-                .forward::<RepositoryError>("Unable to find mount for SWFS repository")?,
-        )
-    } else {
-        None
+    // Load the mounted filesystem if this is a virtually-backed instance (SWFS or FUSE)
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> =
+        if config.vfs_type().is_virtual() {
+            let mount_manager = MountManagerState::mount_manager().ok_or_else(|| {
+                RepositoryError::internal(format!(
+                    "Loading a {} repository without using the service; run `lore service start`",
+                    config.vfs_type()
+                ))
+            })?;
+            Some(
+                mount_manager
+                    .filesystem_provider(path)
+                    .forward_any::<RepositoryError>("Unable to find mount for repository")?,
+            )
+        } else {
+            None
+        };
+
+    let filter = match filter {
+        Some(filter) => filter,
+        None => load_held_filter(filesystem.as_deref(), &dot_path).await?,
     };
 
     // Keep the remote pending so local-only commands finish without waiting on the
@@ -2841,7 +3565,7 @@ pub async fn load_and_connect_with_token(
     // Commit command will look at the global flag and set this explicitly
     repository.set_disable_upload(true);
 
-    repository.set_disable_cache(!(global.cache() || config.is_swfs()));
+    repository.set_disable_cache(cache_disabled(global, &config));
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
     repository.set_prefetch_tree(
@@ -2948,7 +3672,9 @@ async fn register_instance_and_migrate_anchors(
     }
 
     if migrated_current || migrated_staged {
-        repository.flush(true).await?;
+        repository
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await?;
     }
 
     if migrated_current {
@@ -2999,32 +3725,77 @@ pub fn is_valid_name(name: &str) -> bool {
             .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
+/// Whether a context for an instance with `config` leaves fetched content out of the local
+/// store: unless the command asks to cache or the config's `[store] cache_payloads` does, only
+/// virtual instances keep it, since their files are read back through the store rather than
+/// from disk.
+#[lore_macro::test_pub]
+fn cache_disabled(global: &LoreGlobalArgs, config: &RepositoryConfig) -> bool {
+    let cache_payloads = config
+        .store
+        .as_ref()
+        .and_then(|store| store.cache_payloads)
+        .unwrap_or_default();
+    !(global.cache() || config.vfs_type().is_virtual() || cache_payloads)
+}
+
 pub async fn create_local(
     path: &Path,
     token: &RepositoryWriteToken,
     repository: RepositoryId,
     default_branch: BranchId,
     default_branch_name: String,
-    config: RepositoryConfig,
+    mut config: RepositoryConfig,
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     require_text_root(path)?;
     let instance_id = InstanceId::generate();
+    #[cfg(target_os = "linux")]
+    let mount_point_preexisted = path.exists();
+
+    // A FUSE mount serves the instance's stores, so it is mounted once they hold the instance.
+    let fuse_mount_manager = if config.vfs_type() == VfsType::Fuse {
+        if !cfg!(target_os = "linux") {
+            return Err(RepositoryError::internal(
+                "FUSE instances are only supported on Linux",
+            ));
+        }
+        if let Some(vfs) = config.vfs.as_mut()
+            && vfs.base_time.is_none()
+        {
+            vfs.base_time = Some(util::time::timestamp());
+        }
+        Some(
+            MountManagerState::mount_manager().ok_or(RepositoryError::internal(
+                "Attempting to create a virtual-filesystem instance outside the service",
+            ))?,
+        )
+    } else {
+        None
+    };
 
     let dotpath;
     let filesystem_provider: Option<Arc<dyn FilesystemProvider + 'static>>;
-    if config.is_swfs() {
+    if fuse_mount_manager.is_some() {
+        dotpath = external_dir_for_instance(instance_id)
+            .forward::<RepositoryError>("Unable to get external directory")?
+            .join(DOT_LORE);
+        filesystem_provider = None;
+    } else if config.vfs_type().is_virtual() {
         let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
-            "Attempting to create an SWFS instance outside the service",
+            "Attempting to create a virtual-filesystem instance outside the service",
         ))?;
         dotpath = mount_manager
+            .swfs()
             .create_mount(path, &config, repository, instance_id)
             .await
-            .forward::<RepositoryError>("Failed to create mount for SWFS instance")?;
+            .forward_any::<RepositoryError>("Failed to create mount for instance")?;
         filesystem_provider = Some(
             mount_manager
-                .get_mount_filesystem_provider(path)
-                .forward::<RepositoryError>("Failed to get filesystem provider for fresh mount")?,
+                .filesystem_provider(path)
+                .forward_any::<RepositoryError>(
+                    "Failed to get filesystem provider for fresh mount",
+                )?,
         );
     } else {
         dotpath = path.join(DOT_LORE);
@@ -3073,6 +3844,11 @@ pub async fn create_local(
     // the same duration: creation takes no repository lock, and the writes
     // below run inside this claim rather than each taking one of its own.
     let in_memory = no_tracking || execution_context().globals().in_memory();
+    if keeps_records_on_disk(&config, in_memory) {
+        crate::records::mark_new_instance(&dotpath, token)
+            .await
+            .internal("Failed to write local repository state: failed to mark the records")?;
+    }
     let (immutable_store, mutable_store, stores) = if in_memory {
         let (imm, mut_) = create_client_memory_stores().await?;
         if !no_tracking {
@@ -3124,7 +3900,7 @@ pub async fn create_local(
     // Register instance in the mutable store
     crate::instance::register_instance(&repository, instance_id, &path.display().to_string())
         .await
-        .forward::<RepositoryError>("Failed to create local store")?;
+        .forward::<RepositoryError>("registering the new instance")?;
 
     // Generate default branch. When using a shared global mutable store, the
     // branch may already exist from another instance — skip creation in that case.
@@ -3160,10 +3936,51 @@ pub async fn create_local(
 
     // Written before returning, since clone drops this handle and loads the
     // repository afresh from disk; synced only under `--sync-data`.
-    let sync_data = crate::runtime::try_execution_context()
-        .is_some_and(|context| context.globals().sync_data());
-    repository.flush(sync_data).await?;
+    let options = crate::runtime::try_execution_context()
+        .map(|context| context.globals().flush_options())
+        .unwrap_or_default();
+    repository.flush(options).await?;
 
+    #[cfg(target_os = "linux")]
+    if let Some(mount_manager) = fuse_mount_manager {
+        // The mount serves reads through this context until its first swap.
+        repository.set_disable_cache(cache_disabled(execution_context().globals(), &config));
+        if let Err(error) = mount_manager
+            .fuse()
+            .create_mount(repository.clone(), path, &config, instance_id)
+            .await
+        {
+            // The caller gets no instance id to undo, so the instance is undone here.
+            if let Err(abandon) = mount_manager
+                .fuse()
+                .abandon_clone(path, instance_id, !mount_point_preexisted)
+                .await
+            {
+                lore_warn!(
+                    "Failed to undo the FUSE instance at {}: {abandon}",
+                    path.display()
+                );
+            }
+            return Err(error)
+                .forward_any::<RepositoryError>("Failed to create mount for instance");
+        }
+        let provider = mount_manager
+            .filesystem_provider(path)
+            .forward_any::<RepositoryError>("Failed to get filesystem provider for fresh mount")?;
+        return Ok(Arc::new(
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                paths: repository.paths.clone(),
+                immutable_store: repository.immutable_store.clone(),
+                mutable_store: repository.mutable_store.clone(),
+                id: repository.id,
+                instance_id,
+                remote: Err(ProtocolError::from(NoRemote)),
+                filter: Arc::default(),
+                filesystem_provider: Some(provider),
+            })
+            .with_write_token(token.share()),
+        ));
+    }
     Ok(repository)
 }
 
@@ -3184,9 +4001,49 @@ pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryEr
         }
     }
 
-    let view_path = get_dot_lore_path(root_path)?.join(VIEW_FILTER);
-    let filter = filter::load(&ignore_path, &view_path)
-        .forward::<RepositoryError>("Failed to load repository filter")?;
+    let dot_path = get_dot_lore_path(root_path)?;
+    let filter = filter::load_with_instance_ignore(
+        &ignore_path,
+        dot_path.join(INSTANCE_IGNORE),
+        dot_path.join(VIEW_FILTER),
+    )
+    .forward::<RepositoryError>("Failed to load repository filter")?;
+    Ok(Arc::new(filter))
+}
+
+/// The filter of a virtual clone whose working tree `provider` serves: its ignore file read from
+/// the provider, since the service never reads through its own mount, then the instance's own
+/// ignore rules and its view from `dot_path`, as [`load_filter`] loads an ordinary clone's. An
+/// ignore file the provider holds and cannot read fails the load, as one that cannot be understood
+/// does: without its rules a walk would take in everything it keeps out. Its content is made
+/// local whenever the provider takes a revision, so a command run offline reads it.
+async fn load_held_filter(
+    provider: Option<&dyn FilesystemProvider>,
+    dot_path: &Path,
+) -> Result<Arc<filter::Filter>, RepositoryError> {
+    let mut ignore = None;
+    if let Some(provider) = provider {
+        for name in [DOT_LOREIGNORE, DOT_URCIGNORE] {
+            if let Some(bytes) = provider
+                .read_held_file(&RelativePath::new_from_clean_parts(name, ""))
+                .await
+                .forward_any_with::<RepositoryError, _>(|| {
+                    format!("Failed to read the virtual clone's {name}")
+                })?
+            {
+                ignore = Some((bytes, name));
+                break;
+            }
+        }
+    }
+    let filter = filter::load_with_instance_ignore_from(
+        ignore
+            .as_ref()
+            .map(|(bytes, name)| (bytes.as_ref(), Path::new(*name))),
+        dot_path.join(INSTANCE_IGNORE),
+        dot_path.join(VIEW_FILTER),
+    )
+    .forward::<RepositoryError>("Failed to load repository filter")?;
     Ok(Arc::new(filter))
 }
 
@@ -3305,6 +4162,7 @@ pub async fn branch_switch(
     let context = execution_context();
     let global = context.globals();
 
+    let by_id = Context::from_str(&branch).is_ok();
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
         .forward::<RepositoryError>("Invalid branch")?;
@@ -3359,6 +4217,10 @@ pub async fn branch_switch(
         }
     }
 
+    if by_id && !global.dry_run() {
+        branch::cache_name_mapping(repository.clone(), branch.id, branch_name).await;
+    }
+
     if !options.bare {
         // Synchronize state to the current local branch latest
         let sync_options = SyncOptions {
@@ -3402,31 +4264,27 @@ pub async fn branch_switch(
             .await
             .forward::<RepositoryError>("Failed to serialize repository anchor")?;
 
+        // The sync above rebased the staged anchor. A bare switch runs none, and leaves the working
+        // tree on the previous revision.
         if global.force() {
             let _ = crate::instance::delete_staged_anchor(&repository).await;
-        } else {
-            state::rebase_staged_anchor(repository.clone(), branch_signature, false)
+        } else if options.bare {
+            with_operation::<_, RepositoryError, _>(repository.file_system(), async |operation| {
+                state::rebase_staged_anchor(
+                    repository.clone(),
+                    &operation,
+                    branch_signature,
+                    false,
+                    false,
+                )
                 .await
-                .forward::<RepositoryError>("Failed to rebase staged anchor")?;
+                .forward::<RepositoryError>("Failed to rebase staged anchor")
+            })
+            .await?;
         }
 
         if branch_location == LoreBranchLocation::Remote {
             branch::store_last_sync(repository.clone(), branch.id, branch_latest_local).await;
-        }
-
-        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
-        let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
-            .await
-            .unwrap_or_default();
-        if mapped != Context::default() && mapped != branch.id && !global.force() {
-            return Err(RepositoryError::internal(
-                "Given branch's name is already used by another branch",
-            ));
-        }
-        if mapped == Context::default() || global.force() {
-            branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
-                .await
-                .forward::<RepositoryError>("restoring name-to-id mapping")?;
         }
 
         if !options.bare {
@@ -3751,6 +4609,7 @@ async fn layer_branch_switch(
     let global = context.globals();
 
     let mut layer_updates: Vec<(RepositoryId, String, Hash)> = Vec::new();
+    let mut layer_times = Vec::new();
 
     for (layer, layer_repository) in layers {
         // Check for uncommitted staged changes in layer
@@ -3938,9 +4797,9 @@ async fn layer_branch_switch(
                 ..Default::default()
             };
 
-            if let Err(err) = Box::pin(layer::sync(
+            let modified_times = match Box::pin(layer::sync(
                 layer_repository.clone(),
-                layer_repository,
+                layer_repository.clone(),
                 layer_current,
                 layer_target,
                 mount_path.clone(),
@@ -3949,11 +4808,15 @@ async fn layer_branch_switch(
             ))
             .await
             {
-                lore_warn!("Failed to sync layer {}: {err}", layer.repository);
-                continue;
-            }
+                Ok(modified_times) => modified_times,
+                Err(err) => {
+                    lore_warn!("Failed to sync layer {}: {err}", layer.repository);
+                    continue;
+                }
+            };
 
             layer_updates.push((layer.repository, layer.target_path.clone(), layer_revision));
+            layer_times.push((layer_repository, modified_times));
         }
     }
 
@@ -3965,6 +4828,9 @@ async fn layer_branch_switch(
     layer::store_layer_current_batch(repository.clone(), token, &batch)
         .await
         .forward::<RepositoryError>("Failed to switch branch in layer")?;
+    for (layer_repository, modified_times) in layer_times {
+        modified_times.store(layer_repository).await;
+    }
 
     Ok(())
 }

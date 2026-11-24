@@ -9,17 +9,7 @@ Durable, recurring testing lessons grouped by topic.
 - **Timing-sensitive tests**: Rerun failures in isolation; they might be scheduling flakes under load.
 - **Protobufs**: Regenerate instead of hand-splicing. Box large `prost` oneofs to avoid large enum variants and pin the boxed shapes.
 - **Clippy**: Check crate-local `clippy.toml` which shadows workspace configs.
-- **A restored file can still test red**: after a mutation-probe restore (or any rapid overwrite of a
-  source file) under heavy concurrent `cargo` activity in a shared `target/` dir, a rerun can reuse a
-  stale compiled test binary and silently reproduce the reverted mutation — no `Compiling <crate>`
-  line appears in the output, only `Finished`. Confirm the on-disk source first (`Read` it back), and
-  if a rerun after a confirmed-correct restore still fails, bump the file's mtime
-  (`(Get-Item $f).LastWriteTime = Get-Date`) to force a real recompile before trusting the result.
-  Same trap without concurrency (WP-120, 2026-10-12, `lore-server`): a byte-identical restore can
-  carry an OLDER mtime than the mutated build, so cargo sees nothing to rebuild and the tests run
-  against the mutated binary. Do not wait for a red rerun. After every mutation probe, touch the
-  restored file to a new mtime or run `cargo clean -p <crate>`, and confirm a `Compiling <crate>`
-  line before trusting results.
+- **A restored file can still test red** (stale binary): after a mutation-probe restore cargo can reuse the mutated build, with no `Compiling <crate>` line, only `Finished`. Causes: heavy concurrent `cargo` in a shared `target/`, or a byte-identical restore that carries an OLDER mtime (`Copy-Item`; `lore-server`, WP-120). Restore by writing the bytes back, then touch the file (`(Get-Item $f).LastWriteTime = Get-Date`) or `cargo clean -p <crate>`, and confirm a `Compiling <crate>` line before trusting a result.
 
 - **`LNK1140: limit exceeded for program database`** linking `lore-transport`'s `--test unit` on
   Windows: the debug PDB is too big. Not a code fault. Build with `CARGO_PROFILE_DEV_DEBUG=0` and a
@@ -148,10 +138,6 @@ Durable, recurring testing lessons grouped by topic.
   `begin_parent` refuses a second open parent, so build an incomplete one by editing `complete` in
   the root. `cargo clippy -p lore-revision --all-features` fails on `lore-storage`'s `oodle`
   (`OODLE_LIB_DIR not set`); list the other features explicitly.
-- **Mutation probes and cargo freshness**: restore a mutated source by writing its bytes back, never
-  with PowerShell `Copy-Item` from a backup. `Copy-Item` keeps the backup's old mtime, so cargo sees
-  the mutated build as newer and later runs test a stale binary that still holds the mutation. A
-  shared-tree test run read a red regression this way (2026-10-22). If in doubt, touch the file.
 - **A regression test must be forced red**: a regression test can pass without the fix (vacuous: it never reaches the broken path). Before trusting one, remove or mutate the fix and watch the test fail, then restore (freshness rule above). `a_repeat_finish_on_the_same_instance_does_not_trust_an_evicted_damaged_child` (`tests/attempt_prune.rs`, `0816351d`) was shown red without the cache eviction and green with it. Two corollaries: a test that disables the production bound (slot limit, cap, throttle) to reach the fault measures a configuration we do not ship, so keep the shipped bound on and drive the fault another way; and if red and green fail at the same rate, the test cannot discriminate (seen on the Put in-flight regression, `6dc5bad2`).
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 - **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
@@ -169,10 +155,10 @@ Durable, recurring testing lessons grouped by topic.
   connection keeps the listener up): `drop(server)` and read the clone with an `offline: 1`
   `ExecutionContext` + `load_and_connect(path, ReadOnly)` instead. A full `remote_get_retry` pass
   on SlowDown is 61 gets and ~55 s wall (50 ms to 1 s backoff, 60 attempts), so a "outlasts one
-  pass" test costs about a minute. Save a fix hunk for revert with `cmd /c "git diff -- f > p"`:
-  PowerShell `Set-Content` adds CRLF and `git apply -R` then fails. A file restored with
-  `Copy-Item` keeps its old mtime, so cargo reuses the build of the reverted source: set
-  `LastWriteTime` to now after any restore, or a "red" result may be a stale binary.
+  pass" test costs about a minute.
+- **Governed handler without Postgres**: carried admission (`carriage(true)` headers + a `lorehub-control-plane` service-account token) is a pure projection, so `RepositoryCreateScriptedStore` / `ScriptedDomainStore` serve the whole delete or v1-create handler. To prove its follow-ups survive a dropped request, use a `NotificationSender` that signals `entered`, awaits a `Notify`, then bumps `finished`; `select!` the handler against `entered`, drop it, release, wait for a post hook, assert `finished == 1` (`p12_tests.rs`, `a_dropped_governed_branch_*`).
+- **Race between a push's name check and its publish**: `PausedStore` (`membership_tests/paused_store.rs`) pauses at `branch_push_commit`, after the check. Move `lore_domain_repositories.default_branch_id` first (a delete refuses the default), then commit a real `branch_delete` or a SQL generation bump. A tombstone answers `TOMBSTONED_V1` (`NOT_FOUND`) before the generation compare; only a bump reaches `CAS_MISMATCH_V1` (`ABORTED`).
+- **Feature-gated test files rot silently**: `grpc_mutation_dispatch_loss_test.rs` and `replication_service_test.rs` need `--features grpc_integration_tests`; a default-feature filter reads "0 passed" and hides an API change (`lore_transport::connect` gained `AuthMode`). Build with it after a transport merge.
 - **Live QUIC server-side probes** (`quic_declared_session_test.rs`): symptom, a client-side count
   stands in for what the server holds. Cause, `StorageServiceV4.session_map` is private. Do: add
   `features = ["test-util"]` to `lore-server` in `lore-integration-tests` dev-deps, wrap the service
@@ -259,7 +245,6 @@ Durable, recurring testing lessons grouped by topic.
   `to_wire(snapshot.generation)` in `lore-server/src/domain/read_generation.rs` to `.min(1)`.
 - **A runner with a prefix-policed non-exact target** (`ExactPrefixes = @('wp120_')`) lets a new live
   case in a shared integration-test file join the inventory without claiming the whole file.
-- **`Remove-Item Env:X` is blocked by the tool sandbox**: clear a probe variable with `$env:X = $null`.
 - **Formatting without touching a concurrent lane's files**: `rustup run nightly rustfmt --edition 2024 <your files>`
   instead of `cargo fmt -p`, then `cargo +nightly fmt -p <crate> -- --check` to confirm.
 

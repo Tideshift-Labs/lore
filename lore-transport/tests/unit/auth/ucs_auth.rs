@@ -330,7 +330,7 @@ async fn refresh_answered_permission_denied_is_not_disconnected() {
         .await
         .expect_err("the stub refuses the refresh");
     assert!(!error.is_disconnected(), "got {error:?}");
-    assert!(error.is_refusal(), "got {error:?}");
+    assert!(lore_base::error::is_refusal(&error), "got {error:?}");
 }
 
 /// Nothing listening: the connect fails fast with an error rather than hanging.

@@ -8,6 +8,7 @@ mod health_check;
 mod lb_health;
 mod presign_token;
 mod presigned;
+mod range;
 mod repositories;
 mod security_headers;
 mod server;

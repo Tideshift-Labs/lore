@@ -3442,7 +3442,10 @@ impl ImmutableStore for PostgresImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        _options: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
 

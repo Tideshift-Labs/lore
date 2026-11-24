@@ -2318,7 +2318,7 @@ async fn repository_delete_preflight_checks_snapshot_and_loads_branch_metadata()
                 )
                 .unwrap();
                 let branch_hash = metadata.serialize(repository.clone()).await.unwrap();
-                branch::store_name_to_id(repository.clone(), branch_id, "main")
+                branch::claim_name(repository.clone(), "main", Context::default(), branch_id)
                     .await
                     .unwrap();
                 let store = Arc::new(RepositoryCreateScriptedStore {
@@ -2386,6 +2386,7 @@ async fn repository_delete_preflight_checks_snapshot_and_loads_branch_metadata()
     }
 }
 
+#[derive(Clone)]
 struct DeleteTestInstruments;
 impl lore_telemetry::InstrumentProvider for DeleteTestInstruments {
     fn namespace(&self) -> &'static str {
@@ -2507,7 +2508,7 @@ async fn branch_delete_handlers_refuse_internal_admission_and_carried_forwarding
         let domain =
             Arc::new(context(true).with_operation_verifier(Some(Arc::new(DeleteMustNotVerify))));
         let notifications = Arc::new(crate::notification::testing::MockNotificationSender::new());
-        let hooks = lore_server::hooks::HookDispatcher::empty();
+        let hooks = Arc::new(lore_server::hooks::HookDispatcher::empty());
         let authorizer = crate::util::test_support::allow_all_authorizer();
         let forward: Option<Arc<dyn lore_server::grpc::forwarded_requests::ForwardedRequests>> =
             Some(Arc::new(DeleteForwardMustNotConnect(
@@ -2823,4 +2824,495 @@ async fn ungoverned_delete_by_the_same_non_creator_is_refused_on_both_handlers()
         assert!(status.message().contains("Not repository owner"), "v1={v1}");
         assert!(input.is_none(), "v1={v1}: no commit on a refused delete");
     }
+}
+
+// ---------------------------------------------------------------------------
+// SYNC4 Q2: an admitted governed branch delete or create commits in the request,
+// and its follow-ups (counter, notification, post hooks) run in a task of their
+// own. A request dropped after the commit (a deadline, a client that left) must
+// not cancel them: the receipt reconciles the outcome, but nothing replays a
+// notification.
+//
+// The seam is a sender that stops inside `branch_deleted` / `branch_created`.
+// The test drives the real handler, drops its future while the sender is
+// stopped, then lets the sender go. Before the follow-ups ran detached, the drop
+// cancelled the sender at its await point: `finished` stayed 0 and no post hook
+// ran.
+// ---------------------------------------------------------------------------
+
+/// A sender that stops in `branch_created` and `branch_deleted` until the test releases it.
+struct HeldNotifier {
+    entered: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    release: Arc<tokio::sync::Notify>,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl HeldNotifier {
+    async fn hold(&self, kind: &'static str) {
+        self.entered.send(kind).ok();
+        self.release.notified().await;
+        self.finished
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl lore_revision::notification::NotificationSender for HeldNotifier {
+    async fn branch_created(
+        &self,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+    ) {
+        self.hold("created").await;
+    }
+
+    async fn branch_pushed(
+        &self,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+        _user_id: &str,
+        _revision: Hash,
+        _revision_number: u64,
+    ) {
+        unreachable!("a branch delete or create sends no push notification");
+    }
+
+    async fn branch_deleted(
+        &self,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+    ) {
+        self.hold("deleted").await;
+    }
+
+    async fn resource_locked(
+        &self,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+        _user_id: &str,
+        _resources: &[lore_base::types::LockResource],
+    ) {
+        unreachable!("a branch delete or create sends no lock notification");
+    }
+
+    async fn resource_unlocked(
+        &self,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+        _user_id: &str,
+        _resources: &[lore_base::types::LockResource],
+    ) {
+        unreachable!("a branch delete or create sends no lock notification");
+    }
+
+    async fn obliterate(
+        &self,
+        _repository: RepositoryId,
+        _address: lore_base::types::Address,
+    ) -> Result<(), lore_revision::notification::NotificationError> {
+        unreachable!("a branch delete or create sends no obliterate notification");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn compliance_check(
+        &self,
+        _stream_name: &str,
+        _repository: RepositoryId,
+        _branch: lore_revision::lore::BranchId,
+        _user_id: &str,
+        _revision: Hash,
+        _revision_number: u64,
+        _ip_addr: Option<String>,
+    ) {
+        unreachable!("a branch delete or create sends no compliance check");
+    }
+}
+
+/// What a test sees of a [`HeldNotifier`].
+struct Held {
+    sender: Arc<HeldNotifier>,
+    entered: tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+    release: Arc<tokio::sync::Notify>,
+    finished: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn held_notifier() -> Held {
+    let (entered_tx, entered) = tokio::sync::mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Held {
+        sender: Arc::new(HeldNotifier {
+            entered: entered_tx,
+            release: release.clone(),
+            finished: finished.clone(),
+        }),
+        entered,
+        release,
+        finished,
+    }
+}
+
+fn control_plane_request<T>(body: T) -> Request<T> {
+    let mut request = Request::new(body);
+    let mut metadata = carriage(true);
+    metadata.insert_bin(
+        lore_transport::grpc::REPOSITORY_ID_KEY,
+        BinaryMetadataValue::from_bytes(&[0x61; 16]),
+    );
+    *request.metadata_mut() = metadata;
+    let mut principal = token("lorehub-control-plane", Some(true));
+    principal.identity = Some("lorehub-control-plane".to_string());
+    request.extensions_mut().insert(principal);
+    request
+        .extensions_mut()
+        .insert(lore_server::authnz::repository_authorizer::RawToken(
+            "raw.jwt".to_string(),
+        ));
+    request
+}
+
+/// Drives `handler` until the held sender is entered, asserts the commit already happened and
+/// nothing after the sender ran, then drops the handler's future.
+async fn drop_while_held<T: std::fmt::Debug>(
+    handler: impl Future<Output = Result<T, Status>>,
+    held: &mut Held,
+    expected: &'static str,
+) {
+    let mut handler = Box::pin(handler);
+    tokio::select! {
+        ended = handler.as_mut() => panic!("the handler ended while its notification was held: {ended:?}"),
+        kind = held.entered.recv() => assert_eq!(kind, Some(expected)),
+    }
+    assert_eq!(
+        held.finished.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the sender is still held"
+    );
+    drop(handler);
+}
+
+#[tokio::test]
+async fn a_dropped_governed_branch_delete_still_notifies_and_spawns_its_post_hooks() {
+    for v1 in [false, true] {
+        let (immutable, mutable, execution) = crate::store::test_support::test_store_create()
+            .await
+            .unwrap();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable.clone(),
+                    mutable.clone(),
+                    RepositoryId::from([0x61; 16]),
+                ));
+                let id = Context::from([0x62; 16]);
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                branch::metadata_populate(
+                    &mut metadata,
+                    id,
+                    "feature",
+                    "default",
+                    "fixture",
+                    0,
+                    vec![lore_base::types::BranchPoint {
+                        branch: Context::from([0x60; 16]),
+                        revision: Hash::from([0x64; 32]),
+                    }],
+                )
+                .unwrap();
+                let metadata_hash = metadata.serialize(repository.clone()).await.unwrap();
+                let captured = Arc::new(Mutex::new(None));
+                let store = Arc::new(RepositoryCreateScriptedStore {
+                    result: MutationResult {
+                        outcome: DomainOutcome::Applied,
+                        repository_generation: Some(1),
+                        branch_generation: Some(2),
+                        observed_pointer: None,
+                    },
+                    snapshot: None,
+                    captured_input: Arc::new(Mutex::new(None)),
+                    captured_delete: Arc::new(Mutex::new(None)),
+                    captured_branch_delete: Arc::clone(&captured),
+                    delete_branch_snapshot: Some(BranchSnapshot {
+                        repository_id: vec![0x61; 16],
+                        branch_id: vec![0x62; 16],
+                        live: true,
+                        generation: 1,
+                        repository_generation: 1,
+                        name: "feature".into(),
+                        metadata_hash: metadata_hash.as_ref().to_vec(),
+                        latest_hash: vec![0x63; 32],
+                    }),
+                });
+                let domain = Arc::new(DomainContext::new(store, true));
+                let authorizer = crate::util::test_support::allow_all_authorizer();
+                let (hooks, mut post_hooks) =
+                    crate::util::hook_recorder::post_recording_dispatcher(&[
+                        lore_server::hooks::HookPoint::BranchDelete,
+                    ]);
+                let mut held = held_notifier();
+                let sender: Arc<dyn lore_revision::notification::NotificationSender> =
+                    held.sender.clone();
+
+                if v1 {
+                    let request = control_plane_request(
+                        lore_proto::lore::revision::v1::BranchDeleteRequest {
+                            id: bytes::Bytes::from_static(&[0x62; 16]),
+                        },
+                    );
+                    drop_while_held(
+                        lore_server::grpc::revision::v1::branch_delete::handler(
+                            request,
+                            &authorizer,
+                            immutable,
+                            mutable,
+                            sender,
+                            &None,
+                            &hooks,
+                            &DeleteTestInstruments,
+                            Some(&domain),
+                        ),
+                        &mut held,
+                        "deleted",
+                    )
+                    .await;
+                } else {
+                    let request = control_plane_request(lore_proto::BranchDeleteRequest {
+                        branch: bytes::Bytes::from_static(&[0x62; 16]),
+                    });
+                    drop_while_held(
+                        lore_server::grpc::handlers::branch_delete::handler(
+                            request,
+                            &authorizer,
+                            immutable,
+                            mutable,
+                            sender,
+                            &hooks,
+                            &DeleteTestInstruments,
+                            Some(&domain),
+                        ),
+                        &mut held,
+                        "deleted",
+                    )
+                    .await;
+                }
+
+                assert!(
+                    captured.lock().unwrap().is_some(),
+                    "v1={v1}: the governed delete committed before its notification"
+                );
+                assert!(
+                    post_hooks.try_recv().is_err(),
+                    "v1={v1}: the post hook follows the notification"
+                );
+                held.release.notify_one();
+                crate::util::test_support::wait_for_message(
+                    &mut post_hooks,
+                    lore_server::hooks::HookPoint::BranchDelete,
+                    "the dropped governed delete spawns its post hooks",
+                )
+                .await;
+                assert_eq!(
+                    held.finished.load(std::sync::atomic::Ordering::SeqCst),
+                    1,
+                    "v1={v1}: the dropped governed delete finishes its notification"
+                );
+            })
+            .await;
+    }
+}
+
+/// The v1 create fixture: a scripted coordinator whose `branch_create` answers `result`, and
+/// the stores holding the repository metadata its snapshot names.
+async fn governed_create_fixture(
+    replayed: bool,
+) -> (
+    Arc<DomainContext>,
+    Arc<lore_server::domain::test_support::ScriptedDomainStore>,
+    Arc<dyn lore_storage::ImmutableStore>,
+    Arc<dyn lore_storage::MutableStore>,
+    Arc<lore_revision::interface::ExecutionContext>,
+) {
+    use lore_server::domain::test_support::ScriptedDomainStore;
+    use prost::Message;
+
+    let (immutable, mutable, execution) = crate::store::test_support::test_store_create()
+        .await
+        .unwrap();
+    let repository_id = RepositoryId::from([0x61; 16]);
+    let default_branch = Context::from([0x72; 16]);
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable.clone(),
+        mutable.clone(),
+        repository_id,
+    ));
+    let repository_metadata_hash = LORE_CONTEXT
+        .scope(
+            execution.clone(),
+            repository::metadata_store(
+                repository,
+                repository::RepositoryMetadata {
+                    name: "the-repository".to_string(),
+                    creator: "alice".to_string(),
+                    default_branch,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .unwrap();
+
+    let response = lore_proto::lore::revision::v1::BranchCreateResponse {
+        branch: Some(lore_proto::lore::model::v1::Branch {
+            id: vec![0x73; 16].into(),
+            name: "feature".into(),
+            creator: "lorehub-control-plane".into(),
+            category: "default".into(),
+            created: 1234,
+            latest: vec![2; 32].into(),
+            deleted: false,
+            metadata: vec![3; 32].into(),
+            stack: Vec::new(),
+            protected: false,
+        }),
+    };
+    let mut public_result = vec![1];
+    response.encode(&mut public_result).unwrap();
+
+    let script = Arc::new(ScriptedDomainStore::new(MutationResult::rejected(
+        "unexpected",
+    )));
+    *script.create_snapshot.lock().unwrap() = Some(Ok(Some(RepositorySnapshot {
+        repository_id: vec![0x61; 16],
+        live: true,
+        generation: 1,
+        name: "the-repository".to_string(),
+        metadata_hash: repository_metadata_hash.as_ref().to_vec(),
+        default_branch_id: default_branch.data().to_vec(),
+    })));
+    *script.branch_create_result.lock().unwrap() =
+        Some(lore_postgres::domain::coordinator::BranchCreateResult {
+            replayed,
+            outcome: DomainOutcome::Applied,
+            public_result: Some(public_result),
+        });
+    let domain = Arc::new(DomainContext::new(script.clone(), true));
+    (domain, script, immutable, mutable, execution)
+}
+
+fn governed_create_request() -> Request<lore_proto::lore::revision::v1::BranchCreateRequest> {
+    let mut request = control_plane_request(lore_proto::lore::revision::v1::BranchCreateRequest {
+        id: bytes::Bytes::from_static(&[0x73; 16]),
+        name: "feature".into(),
+        category: "default".into(),
+        ..Default::default()
+    });
+    // The v1 lifecycle gate: a declared `outcome_unknown_v1` and an attempt id (UUID v7).
+    request.metadata_mut().insert(
+        lore_server::grpc::caller_capabilities::CAPABILITIES_HEADER,
+        lore_server::grpc::caller_capabilities::REQUIRED_CAPABILITY
+            .parse()
+            .unwrap(),
+    );
+    request.metadata_mut().insert(
+        lore_server::grpc::domain_operation_metadata::ATTEMPT_ID_KEY,
+        Uuid::now_v7().to_string().parse().unwrap(),
+    );
+    request
+}
+
+#[tokio::test]
+async fn a_dropped_governed_branch_create_still_notifies_and_spawns_its_post_hooks() {
+    let (domain, script, immutable, mutable, execution) = governed_create_fixture(false).await;
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let authorizer = crate::util::test_support::allow_all_authorizer();
+            let (hooks, mut post_hooks) = crate::util::hook_recorder::post_recording_dispatcher(&[
+                lore_server::hooks::HookPoint::BranchCreate,
+            ]);
+            let mut held = held_notifier();
+            let sender: Arc<dyn lore_revision::notification::NotificationSender> =
+                held.sender.clone();
+            drop_while_held(
+                lore_server::grpc::revision::v1::branch_create::handler_with_domain(
+                    governed_create_request(),
+                    &authorizer,
+                    immutable,
+                    mutable,
+                    sender,
+                    &None,
+                    &hooks,
+                    &DeleteTestInstruments,
+                    Some(&domain),
+                ),
+                &mut held,
+                "created",
+            )
+            .await;
+
+            assert_eq!(
+                script.branch_create_calls.lock().unwrap().len(),
+                1,
+                "the governed create committed before its notification"
+            );
+            assert!(
+                post_hooks.try_recv().is_err(),
+                "the post hook follows the notification"
+            );
+            held.release.notify_one();
+            crate::util::test_support::wait_for_message(
+                &mut post_hooks,
+                lore_server::hooks::HookPoint::BranchCreate,
+                "the dropped governed create spawns its post hooks",
+            )
+            .await;
+            assert_eq!(
+                held.finished.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the dropped governed create finishes its notification"
+            );
+        })
+        .await;
+}
+
+/// The control for the case above: a create whose receipt is a replay emits nothing, so the
+/// held sender is never entered and the handler answers without waiting for it.
+#[tokio::test]
+async fn a_replayed_governed_branch_create_enters_no_notification() {
+    let (domain, script, immutable, mutable, execution) = governed_create_fixture(true).await;
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let authorizer = crate::util::test_support::allow_all_authorizer();
+            let (hooks, mut post_hooks) = crate::util::hook_recorder::post_recording_dispatcher(&[
+                lore_server::hooks::HookPoint::BranchCreate,
+            ]);
+            let mut held = held_notifier();
+            let sender: Arc<dyn lore_revision::notification::NotificationSender> =
+                held.sender.clone();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                lore_server::grpc::revision::v1::branch_create::handler_with_domain(
+                    governed_create_request(),
+                    &authorizer,
+                    immutable,
+                    mutable,
+                    sender,
+                    &None,
+                    &hooks,
+                    &DeleteTestInstruments,
+                    Some(&domain),
+                ),
+            )
+            .await
+            .expect("a replay must not wait for a notification")
+            .expect("the replayed create answers the stored branch");
+            assert!(response.into_inner().branch.is_some());
+            assert_eq!(script.branch_create_calls.lock().unwrap().len(), 1);
+            assert!(held.entered.try_recv().is_err(), "a replay notifies nobody");
+            assert_eq!(held.finished.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(
+                post_hooks.try_recv().is_err(),
+                "a replay spawns no post hook"
+            );
+        })
+        .await;
 }

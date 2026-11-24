@@ -399,6 +399,7 @@ mod quic_session_rebind_tests {
                         mutable_store.clone(),
                         false,
                         Arc::new(UserAgentFilter::default()),
+                        lore_server::protocol::storage::session::SessionMap::default(),
                     );
                     let service = RecordingStorageServiceV4 {
                         inner,
@@ -553,6 +554,7 @@ mod quic_session_rebind_tests {
                 jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
                 // Upstream v0.10.1 field: no `typ` check (v0.11.0 dropped `identity_claim`).
                 jwt_typ: None,
+                exchange_issuer: None,
             },
         ))
     }

@@ -17,6 +17,7 @@ use crate::filter::Filter;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider;
 use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
+use crate::fs::swfs::callback_counters::CallbackCounters;
 use crate::fs::swfs::file::SwfsFile;
 use crate::fs::swfs::file::SwfsFileArray;
 use crate::fs::swfs::paths::MountPath;
@@ -39,6 +40,7 @@ use crate::repository::RemoteState;
 use crate::repository::RepositoryConfig;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryPaths;
+use crate::repository::VfsType;
 use crate::repository::claim_opened_stores;
 use crate::repository::create_client_immutable_store;
 use crate::repository::create_client_mutable_store;
@@ -128,6 +130,8 @@ pub struct MountResources {
     global_args: LoreGlobalArgs,
     repository: Arc<RepositoryContext>,
     internal_state: RwLock<InternalState>,
+    /// How often SWFS has called back for content and for directories.
+    callbacks: CallbackCounters,
     _instance_id: InstanceId,
     _name: String,
     pub name_nul_terminated: CString,
@@ -171,7 +175,7 @@ impl MountResources {
         mount_path: MountPath,
         config: &RepositoryConfig,
     ) -> Result<MountResources, SwfsMountError> {
-        if !config.is_swfs() {
+        if config.vfs_type() != VfsType::Swfs {
             return Err(SwfsMountError::internal(
                 "Attempting to mount a non-SWFS instance",
             ));
@@ -247,6 +251,7 @@ impl MountResources {
             },
             repository,
             internal_state: RwLock::default(),
+            callbacks: CallbackCounters::default(),
             _instance_id: instance_id,
             name_nul_terminated: CString::new(name.as_str())
                 .internal("Nul terminating mount name")?,
@@ -293,6 +298,10 @@ impl MountResources {
 
     pub fn current_read_state(&self) -> Option<Arc<State>> {
         self.internal_state.read().current_read_state()
+    }
+
+    pub fn callbacks(&self) -> &CallbackCounters {
+        &self.callbacks
     }
 
     pub async fn update_state(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {

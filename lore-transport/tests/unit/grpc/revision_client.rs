@@ -27,6 +27,7 @@ use lore_transport::caller_operation::with_caller_operation;
 use lore_transport::error::ProtocolError;
 use lore_transport::grpc::revision_client::RevisionService;
 use lore_transport::outcome::AttemptId;
+use lore_transport::types::BranchRecord;
 use prost::Message;
 use tonic::Request;
 use tonic::Response;
@@ -273,7 +274,7 @@ impl Fixture {
             task,
         }
     }
-    async fn create(&self, repository: RepositoryId) -> Result<Hash, ProtocolError> {
+    async fn create(&self, repository: RepositoryId) -> Result<BranchRecord, ProtocolError> {
         let operation =
             CallerOperationContext::new(Uuid::now_v7(), repository, self.journal.clone());
         tokio::time::timeout(
@@ -304,7 +305,8 @@ async fn managed_create_records_exact_intent_before_one_dispatch() {
         fixture
             .create(RepositoryId::from([0x11; 16]))
             .await
-            .unwrap(),
+            .unwrap()
+            .latest,
         Hash::from([0x35; 32])
     );
     assert_eq!(fixture.seen.lock().len(), 1);
@@ -474,5 +476,191 @@ mod branch_list_collection {
         .unwrap();
         assert_eq!(result.list.len(), 1);
         assert_eq!(result.list[0].name, "0");
+    }
+}
+
+/// Upstream v0.14 branch-record tests, in their own module so their imports do not collide with
+/// the managed-journal fixture above.
+mod branch_records {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use lore_base::types::RepositoryId;
+    use lore_proto::lore::model::v1 as model;
+    use lore_proto::lore::revision::v1 as proto;
+    use lore_proto::lore::revision::v1::revision_service_server::RevisionService as RevisionServiceV1;
+    use lore_proto::lore::revision::v1::revision_service_server::RevisionServiceServer;
+    use lore_transport::grpc::GRPCAuth;
+    use lore_transport::grpc::revision_client::RevisionService;
+    use tonic::Request;
+    use tonic::Response;
+    use tonic::Status;
+    use tonic::service::Routes;
+
+    use crate::types::full_branch;
+
+    /// A revision server that answers each branch get and create with [`Self::branch`], and records
+    /// each branch listing request and answers it with no branches. It refuses every other request.
+    struct BranchServer {
+        branch: model::Branch,
+        listed: Arc<Mutex<Vec<proto::BranchListRequest>>>,
+    }
+
+    #[tonic::async_trait]
+    impl RevisionServiceV1 for BranchServer {
+        async fn branch_create(
+            &self,
+            _: Request<proto::BranchCreateRequest>,
+        ) -> Result<Response<proto::BranchCreateResponse>, Status> {
+            Ok(Response::new(proto::BranchCreateResponse {
+                branch: Some(self.branch.clone()),
+            }))
+        }
+
+        async fn branch_delete(
+            &self,
+            _: Request<proto::BranchDeleteRequest>,
+        ) -> Result<Response<proto::BranchDeleteResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn branch_get(
+            &self,
+            _: Request<proto::BranchGetRequest>,
+        ) -> Result<Response<proto::BranchGetResponse>, Status> {
+            Ok(Response::new(proto::BranchGetResponse {
+                branch: Some(self.branch.clone()),
+                // FORK-LOCAL (WP-120): no domain generation in this fixture.
+                branch_generation: None,
+            }))
+        }
+
+        type BranchListStream = tokio_stream::Empty<Result<proto::BranchListResponse, Status>>;
+
+        async fn branch_list(
+            &self,
+            request: Request<proto::BranchListRequest>,
+        ) -> Result<Response<Self::BranchListStream>, Status> {
+            self.listed
+                .lock()
+                .expect("the listed requests' lock")
+                .push(request.into_inner());
+            Ok(Response::new(tokio_stream::empty()))
+        }
+
+        async fn branch_push(
+            &self,
+            _: Request<proto::BranchPushRequest>,
+        ) -> Result<Response<proto::BranchPushResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn branch_metadata_get(
+            &self,
+            _: Request<proto::BranchMetadataGetRequest>,
+        ) -> Result<Response<proto::BranchMetadataGetResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn branch_metadata_set(
+            &self,
+            _: Request<proto::BranchMetadataSetRequest>,
+        ) -> Result<Response<proto::BranchMetadataSetResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn revision_list(
+            &self,
+            _: Request<proto::RevisionListRequest>,
+        ) -> Result<Response<proto::RevisionListResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+    }
+
+    /// A revision client over a [`BranchServer`] that answers with `branch`, and the listing requests
+    /// that server records.
+    async fn start_branch_service(
+        branch: model::Branch,
+    ) -> (RevisionService, Arc<Mutex<Vec<proto::BranchListRequest>>>) {
+        let server = BranchServer {
+            branch,
+            listed: Arc::default(),
+        };
+        let listed = server.listed.clone();
+        let (_, channel) =
+            super::super::serve_logged(Routes::new(RevisionServiceServer::new(server))).await;
+        let auth = Arc::new(parking_lot::RwLock::new(GRPCAuth::default()));
+        (
+            RevisionService::new(channel, RepositoryId::default(), auth),
+            listed,
+        )
+    }
+
+    #[tokio::test]
+    async fn branch_query_returns_every_field_of_the_answer() {
+        let (branch, expected) = full_branch();
+        let (service, _) = start_branch_service(branch).await;
+
+        let record = service
+            .branch_query(None, Some("feature"))
+            .await
+            .expect("the branch's record");
+
+        assert_eq!(record, expected);
+    }
+
+    #[tokio::test]
+    async fn a_query_by_id_keeps_the_queried_id_where_the_answer_has_none() {
+        let (mut branch, expected) = full_branch();
+        branch.id = Default::default();
+        let (service, _) = start_branch_service(branch).await;
+
+        let record = service
+            .branch_query(Some(expected.id), None)
+            .await
+            .expect("the branch's record");
+
+        assert_eq!(record, expected);
+    }
+
+    #[tokio::test]
+    async fn branch_create_returns_every_field_of_the_answer() {
+        let (branch, expected) = full_branch();
+        let (service, _) = start_branch_service(branch).await;
+
+        let record = service
+            .branch_create(expected.id, "feature", "release", "alice", &expected.stack)
+            .await
+            .expect("the created branch's record");
+
+        assert_eq!(record, expected);
+    }
+
+    #[tokio::test]
+    async fn branch_list_sends_its_creator_and_include_deleted() {
+        let (service, listed) = start_branch_service(model::Branch::default()).await;
+
+        service
+            .branch_list(Some("alice"), true)
+            .await
+            .expect("a filtered listing");
+        service
+            .branch_list(None, false)
+            .await
+            .expect("an unfiltered listing");
+
+        assert_eq!(
+            *listed.lock().expect("the listed requests' lock"),
+            [
+                proto::BranchListRequest {
+                    creator: Some("alice".to_string()),
+                    include_deleted: true,
+                },
+                proto::BranchListRequest {
+                    creator: None,
+                    include_deleted: false,
+                },
+            ]
+        );
     }
 }

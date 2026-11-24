@@ -47,10 +47,7 @@ pub(crate) async fn info(
 
     let owner_repository = chain.innermost.repository.clone();
     let owner_state = chain.innermost.state.clone();
-    let owner_branch = chain
-        .levels
-        .last()
-        .map_or(parent_branch, |level| level.branch);
+    let owner_branch = chain.owner_branch(parent_branch);
 
     let node_link = owner_state
         .find_relative_node_link(
@@ -125,6 +122,7 @@ pub(crate) async fn info(
             link_node.child,
         )
         .await
+        .count
     } else {
         0
     };

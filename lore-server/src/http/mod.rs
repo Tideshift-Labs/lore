@@ -7,6 +7,7 @@ pub mod health_check;
 pub mod lb_health;
 pub mod presign_token;
 pub mod presigned;
+pub mod range;
 pub mod repositories;
 pub mod security_headers;
 pub mod server;

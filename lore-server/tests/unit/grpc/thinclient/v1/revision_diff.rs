@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_base::types::BranchPoint;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model_v1;
@@ -14,22 +16,29 @@ use lore_proto::lore::thin_client::v1::revision_diff_request::QueryTo;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+use lore_revision::link::LinkFlags;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::Node;
 use lore_revision::node::NodeFlags;
+use lore_revision::node::NodeID;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
 use lore_server::grpc::handlers::branch_push::PushHandler;
 use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::server::RevisionListAcceleration;
+use lore_server::grpc::thinclient::v1::helpers::PartitionTable;
 use lore_server::grpc::thinclient::v1::revision_diff::*;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
 use lore_storage::hash::hash_string;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
 use rand::random;
@@ -75,6 +84,47 @@ async fn push_revision(
     revision_number: u64,
     files: &[(&str, &[u8])],
 ) -> Hash {
+    push_merge_revision(
+        repository,
+        branch_id,
+        parent,
+        Hash::default(),
+        revision_number,
+        files,
+    )
+    .await
+}
+
+/// `push_revision` with a second parent, as a merge revision has.
+async fn push_merge_revision(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+    parent: Hash,
+    parent_other: Hash,
+    revision_number: u64,
+    files: &[(&str, &[u8])],
+) -> Hash {
+    push_linked_revision(
+        repository,
+        branch_id,
+        [parent, parent_other],
+        revision_number,
+        files,
+        None,
+    )
+    .await
+}
+
+/// `push_merge_revision` with a link at path `link.0`, at most one directory
+/// deep, mounting node `link.3` of repository `link.1` at revision `link.2`.
+async fn push_linked_revision(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+    [parent, parent_other]: [Hash; 2],
+    revision_number: u64,
+    files: &[(&str, &[u8])],
+    link: Option<(&str, RepositoryId, Hash, NodeID)>,
+) -> Hash {
     let write_token = get_write_token();
     let mut metadata = Metadata::new();
     metadata.set_branch(branch_id).expect("set branch");
@@ -84,6 +134,7 @@ async fn push_revision(
         .expect("serialize metadata");
     let state = state::State::new();
     state.set_parent_self(parent);
+    state.set_parent_other(parent_other);
     state.set_revision_number(revision_number);
     state.set_metadata_hash(metadata_hash);
     for (name, bytes) in files {
@@ -107,6 +158,47 @@ async fn push_revision(
             .node_add(repository.clone(), ROOT_NODE, node, name)
             .await
             .expect("node_add");
+    }
+    if let Some((path, link_repository, link_revision, mount_source)) = link {
+        let (parent, name) = match path.split_once('/') {
+            Some((directory, name)) => {
+                let node = Node {
+                    name_hash: hash_string(directory),
+                    ..Default::default()
+                };
+                let directory_id = state
+                    .node_add(repository.clone(), ROOT_NODE, node, directory)
+                    .await
+                    .expect("add directory node");
+                (directory_id, name)
+            }
+            None => (ROOT_NODE, path),
+        };
+        let node = Node {
+            flags: NodeFlags::Link.bits(),
+            child: mount_source,
+            address: Address {
+                hash: link_revision,
+                context: link_repository.into(),
+            },
+            name_hash: hash_string(name),
+            ..Default::default()
+        };
+        let node_id = state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("add link node");
+        state
+            .link_add(
+                repository.clone(),
+                link_repository,
+                BranchId::default(),
+                link_revision,
+                node_id,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("register link");
     }
     let serialized = state
         .serialize(repository.clone(), &write_token)
@@ -918,6 +1010,151 @@ async fn three_way_clean_merge_has_base_but_no_conflicts() {
     .await;
 }
 
+/// Builds main with a change after branch B's branch point, then merges B
+/// back into main. Returns B's tip and the merge revision, so B's tip is an
+/// ancestor of the merge only through the merge's second parent (UCS-25014).
+async fn push_branch_merged_into_main(repository: &Arc<RepositoryContext>) -> (Hash, Hash) {
+    let main = create_branch(repository, "main", vec![]).await;
+    let main_rev1 = push_revision(
+        repository,
+        main,
+        Hash::default(),
+        1,
+        &[("shared.txt", b"base".as_slice())],
+    )
+    .await;
+    let branch_b = create_branch(
+        repository,
+        "branch_b",
+        vec![BranchPoint {
+            branch: main,
+            revision: main_rev1,
+        }],
+    )
+    .await;
+    let b_rev = push_revision(
+        repository,
+        branch_b,
+        main_rev1,
+        1,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_b.txt", b"b-content".as_slice()),
+        ],
+    )
+    .await;
+    let main_rev2 = push_revision(
+        repository,
+        main,
+        main_rev1,
+        2,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_main.txt", b"main-content".as_slice()),
+        ],
+    )
+    .await;
+    let merge_rev = push_merge_revision(
+        repository,
+        main,
+        main_rev2,
+        b_rev,
+        3,
+        &[
+            ("shared.txt", b"base".as_slice()),
+            ("only_b.txt", b"b-content".as_slice()),
+            ("only_main.txt", b"main-content".as_slice()),
+        ],
+    )
+    .await;
+    (b_rev, merge_rev)
+}
+
+/// Runs `RevisionDiff(from, to)` over the merge history and returns the
+/// header and each change as `(path, action)`.
+async fn diff_over_merge_history(
+    from: fn(Hash, Hash) -> Hash,
+    to: fn(Hash, Hash) -> Hash,
+) -> (thin_client_v1::RevisionDiffHeader, Vec<(String, i32)>) {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (b_rev, merge_rev) = push_branch_merged_into_main(&repository_context).await;
+
+        let response = handler(
+            make_request(
+                repository,
+                QueryFrom::SignatureFrom(from(b_rev, merge_rev).into()),
+                QueryTo::SignatureTo(to(b_rev, merge_rev).into()),
+                false,
+            ),
+            immutable_store,
+            mutable_store,
+            allow_all(),
+            RevisionDiffConfig::default(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("handler ok");
+
+        let mut items = collect(response)
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item"));
+        let header = match items.next().and_then(|item| item.payload) {
+            Some(Payload::Header(h)) => h,
+            other => panic!("expected header first, got {other:?}"),
+        };
+        let changes = items
+            .filter_map(|item| match item.payload {
+                Some(Payload::Change(c)) => Some((c.path, c.action)),
+                Some(Payload::Conflict(c)) => panic!("unexpected conflict {c:?}"),
+                _ => None,
+            })
+            .collect();
+        (header, changes)
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn from_merged_into_to_diffs_two_way() {
+    let (header, changes) =
+        diff_over_merge_history(|b_rev, _merge| b_rev, |_b_rev, merge| merge).await;
+
+    assert!(header.signature_base.is_none(), "expected 2-way");
+    assert_eq!(
+        changes,
+        vec![(
+            "only_main.txt".to_string(),
+            thin_client_v1::Action::Add as i32
+        )],
+    );
+}
+
+#[tokio::test]
+async fn to_merged_into_from_diffs_two_way() {
+    let (header, changes) =
+        diff_over_merge_history(|_b_rev, merge| merge, |b_rev, _merge| b_rev).await;
+
+    assert!(header.signature_base.is_none(), "expected 2-way");
+    assert_eq!(
+        changes,
+        vec![(
+            "only_main.txt".to_string(),
+            thin_client_v1::Action::Delete as i32
+        )],
+    );
+}
+
 fn make_partition_id() -> RepositoryId {
     RepositoryId::from(uuid::Uuid::now_v7())
 }
@@ -1037,8 +1274,247 @@ async fn partition_table_receiver_dropped_propagates() {
         matches!(outcome, Err(SendOutcome::ReceiverDropped)),
         "got {outcome:?}",
     );
-    assert!(
-        !table.entries.contains_key(&linked),
-        "failed announcement must not poison the table",
-    );
+}
+
+/// Admits the caller to the request's repository and to no repository a link
+/// points into.
+struct HostOnlyAuthorizer;
+
+#[async_trait]
+impl RepositoryAuthorizer for HostOnlyAuthorizer {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Action,
+    ) -> Result<(), Status> {
+        Ok(())
+    }
+}
+
+/// Serializes a revision of a linked repository holding `sub/a.txt`, and
+/// returns it with the node of `sub`. Revisions with the same `contents` mount
+/// the same tree under different signatures.
+async fn write_linked_revision(
+    linked: &Arc<RepositoryContext>,
+    revision_number: u64,
+    contents: &[u8],
+) -> (Hash, NodeID) {
+    let state = state::State::new();
+    state.set_revision_number(revision_number);
+    let address = lore_revision::immutable::write(
+        linked.clone(),
+        lore_storage::Context::default(),
+        bytes::Bytes::copy_from_slice(contents),
+        lore_storage::WriteOptions::default(),
+    )
+    .await
+    .expect("immutable::write");
+    let directory = Node {
+        name_hash: hash_string("sub"),
+        ..Default::default()
+    };
+    let sub = state
+        .node_add(linked.clone(), ROOT_NODE, directory, "sub")
+        .await
+        .expect("add directory node");
+    let node = Node {
+        flags: NodeFlags::File.bits(),
+        name_hash: hash_string("a.txt"),
+        address,
+        ..Default::default()
+    };
+    state
+        .node_add(linked.clone(), sub, node, "a.txt")
+        .await
+        .expect("node_add");
+    let revision = state
+        .serialize(linked.clone(), &get_write_token())
+        .await
+        .expect("serialize linked state");
+    (revision, sub)
+}
+
+/// Pushes main with a link into `linked` at `pins[0]`, as its name, pin and
+/// mount source,
+/// then sibling branches A and B off it with the link at `pins[1]` and
+/// `pins[2]`, `None` meaning no link. A and B also each edit a file of their
+/// own. Returns main's, A's and B's revision.
+async fn push_link_pins(
+    repository: &Arc<RepositoryContext>,
+    linked: RepositoryId,
+    pins: [Option<(&'static str, Hash, NodeID)>; 3],
+) -> [Hash; 3] {
+    let link = |pin: Option<(&'static str, Hash, NodeID)>| {
+        pin.map(|(name, pin, mount_source)| (name, linked, pin, mount_source))
+    };
+    let main = create_branch(repository, "main", vec![]).await;
+    let base = push_linked_revision(
+        repository,
+        main,
+        [Hash::default(); 2],
+        1,
+        &[],
+        link(pins[0]),
+    )
+    .await;
+    let stack = vec![BranchPoint {
+        branch: main,
+        revision: base,
+    }];
+    let branch_a = create_branch(repository, "branch_a", stack.clone()).await;
+    let a = push_linked_revision(
+        repository,
+        branch_a,
+        [base, Hash::default()],
+        1,
+        &[("a.txt", b"a".as_slice())],
+        link(pins[1]),
+    )
+    .await;
+    let branch_b = create_branch(repository, "branch_b", stack).await;
+    let b = push_linked_revision(
+        repository,
+        branch_b,
+        [base, Hash::default()],
+        1,
+        &[("b.txt", b"b".as_slice())],
+        link(pins[2]),
+    )
+    .await;
+    [base, a, b]
+}
+
+/// Runs `RevisionDiff(from, to)` for a caller `authorizer` admits and returns
+/// the repositories the stream announces as partitions.
+async fn announced_partitions(
+    repository: RepositoryId,
+    stores: (Arc<dyn ImmutableStore>, Arc<dyn MutableStore>),
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    from: Hash,
+    to: Hash,
+) -> Vec<RepositoryId> {
+    let response = handler(
+        make_request(
+            repository,
+            QueryFrom::SignatureFrom(from.into()),
+            QueryTo::SignatureTo(to.into()),
+            false,
+        ),
+        stores.0,
+        stores.1,
+        authorizer,
+        RevisionDiffConfig::default(),
+        DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+    )
+    .await
+    .expect("handler ok");
+    collect(response)
+        .await
+        .into_iter()
+        .filter_map(|item| match item.expect("stream item").payload {
+            Some(Payload::Partition(partition)) => {
+                Some(RepositoryId::from(partition.link_partition.as_ref()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every diff that touches a link announces the link's repository, whether or
+/// not the caller may read it, so a stream without a partition is the same
+/// for every caller.
+#[tokio::test]
+async fn touched_link_is_announced_to_every_caller() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let linked_id = random::<RepositoryId>();
+        let linked = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            linked_id,
+        ));
+        let (pin, sub) = write_linked_revision(&linked, 1, b"v1").await;
+        let (same_content, _) = write_linked_revision(&linked, 2, b"v1").await;
+        let (new_content, _) = write_linked_revision(&linked, 3, b"v2").await;
+
+        // `pins` per `push_link_pins`, and the diffs to run over its revisions.
+        let at = |pin| Some(("dir/linked", pin, ROOT_NODE));
+        let cases = [
+            (
+                "source re-pins to the same content",
+                [at(pin), at(same_content), at(pin)],
+                &[(1, 2), (0, 1)][..],
+            ),
+            (
+                "source re-pins to new content",
+                [at(pin), at(new_content), at(pin)],
+                &[(1, 2), (0, 1)],
+            ),
+            (
+                "source renames the link's directory in case and re-pins to the same content",
+                [
+                    at(pin),
+                    Some(("Dir/linked", same_content, ROOT_NODE)),
+                    at(pin),
+                ],
+                &[(1, 2), (0, 1)],
+            ),
+            (
+                "target re-pins to the same content",
+                [at(pin), at(pin), at(same_content)],
+                &[(1, 2), (0, 2)],
+            ),
+            (
+                "target remounts the link at the same pin",
+                [at(pin), at(pin), Some(("dir/linked", pin, sub))],
+                &[(1, 2), (0, 2)],
+            ),
+            (
+                "source adds the link",
+                [None, at(pin), None],
+                &[(1, 2), (0, 1)],
+            ),
+            (
+                "source removes the link",
+                [at(pin), None, at(pin)],
+                &[(1, 2), (0, 1)],
+            ),
+        ];
+        for (case, pins, diffs) in cases {
+            let repository = random::<RepositoryId>();
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let revisions = push_link_pins(&repository_context, linked_id, pins).await;
+            for &(from, to) in diffs {
+                for (caller, authorizer) in [
+                    ("reader", allow_all()),
+                    (
+                        "host-only",
+                        Arc::new(HostOnlyAuthorizer) as Arc<dyn RepositoryAuthorizer>,
+                    ),
+                ] {
+                    assert_eq!(
+                        announced_partitions(
+                            repository,
+                            (immutable_store.clone(), mutable_store.clone()),
+                            authorizer,
+                            revisions[from],
+                            revisions[to],
+                        )
+                        .await,
+                        vec![linked_id],
+                        "{case}: diff {from} -> {to} for the {caller} caller",
+                    );
+                }
+            }
+        }
+    }))
+    .await;
 }

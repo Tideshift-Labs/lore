@@ -12,10 +12,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_transport::quic::QuicErrorStatus;
 use lore_transport::quic::QuicOpCode;
+use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE;
 use lore_transport::quic::command_header::CommandHeader;
 use thiserror::Error;
 use tracing::Span;
+use tracing::debug;
+use tracing::info;
+use tracing::warn;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::quic::quinn::service_store::StreamDataHandlerBuilder;
@@ -208,6 +212,42 @@ pub struct ProtocolErrorInfo {
     pub is_appropriate_for_logging: bool,
 }
 
+// todo(plockhart) differentiate this label value and add to alerting rules
+const HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE: &str = "SlowDown";
+
+impl ProtocolErrorInfo {
+    /// A handler that ran past its time, answered `SlowDown`.
+    pub fn timed_out() -> Self {
+        Self {
+            response_error_code: QuicServiceError::SlowDown as QuicErrorStatus,
+            message_handle_label: HANDLE_MESSAGE_TIMEOUT_LABEL_VALUE,
+            is_internal_error: true,
+            is_appropriate_for_logging: true,
+        }
+    }
+
+    /// Logs the failure of the request `header` names: an internal error at warn and a user's at
+    /// info, or either at debug when the error is not appropriate for logging.
+    pub fn log(&self, header: &CommandHeader) {
+        let label = self.message_handle_label;
+        let code = self.response_error_code;
+        match (self.is_appropriate_for_logging, self.is_internal_error) {
+            (true, true) => {
+                warn!(command_header = ?header, handler_error_label = label, response_error_code = code, "internal error handling message");
+            }
+            (true, false) => {
+                info!(command_header = ?header, handler_error_label = label, response_error_code = code, "non-internal error handling message");
+            }
+            (false, true) => {
+                debug!(command_header = ?header, handler_error_label = label, response_error_code = code, "internal error handling message");
+            }
+            (false, false) => {
+                debug!(command_header = ?header, handler_error_label = label, response_error_code = code, "non-internal error handling message");
+            }
+        }
+    }
+}
+
 /// Compiled for `integration_tests` too, so the suite can stand up a real QUIC storage server.
 #[cfg(any(feature = "test-util", feature = "integration_tests"))]
 pub mod tests {
@@ -292,10 +332,22 @@ pub mod tests {
     pub const TEST_PROTOCOL: &str = "test/0.2";
     pub const TEST_PROTOCOL_V4: &str = "lore-storage/0.4";
 
+    /// Requests each stream of a [`TestHandlerFactory::new`] server handles at once.
+    pub const TEST_PROCESS_LIMIT: usize = 100;
+
     impl TestHandlerFactory {
         pub fn new(
             immutable_store: Arc<dyn ImmutableStore>,
             mutable_store: Arc<dyn MutableStore>,
+        ) -> Self {
+            Self::with_process_limit(immutable_store, mutable_store, TEST_PROCESS_LIMIT)
+        }
+
+        /// [`Self::new`], handling `process_limit` requests on each stream at once.
+        pub fn with_process_limit(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+            process_limit: usize,
         ) -> Self {
             let contexts: ObservedContexts = Arc::default();
             let mut service_store = ServiceStore::default();
@@ -319,7 +371,7 @@ pub mod tests {
                             Arc::new(storage_protocol),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
@@ -344,12 +396,13 @@ pub mod tests {
                             mutable_store.clone(),
                             false,
                             Arc::new(lore_telemetry::user_agent_filter::UserAgentFilter::default()),
+                            crate::protocol::storage::session::SessionMap::default(),
                         );
                         Box::new(StreamHandler::new(
                             Arc::new(v4_service),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,
@@ -374,7 +427,7 @@ pub mod tests {
                             Arc::new(service),
                             context,
                             AdmissionLimits {
-                                process_limit: 100,
+                                process_limit,
                                 inflight_limit: 800,
                                 handler_timeout: None,
                                 permit_timeout: None,

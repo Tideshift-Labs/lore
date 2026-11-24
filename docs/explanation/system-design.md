@@ -994,9 +994,10 @@ per-ID entries (latest pointer, metadata pointer) hang off the ID, not the name.
 
 The decoupling matters. A branch ID never changes for the lifetime of the branch; it is what
 identifies the branch's history. A branch name is a label that can be archived (the
-name-to-ID mapping is removed, but the branch metadata and latest pointer remain), restored
-(the mapping is put back), or reused (a new branch can take the name of an archived one
-without clobbering the archived branch's history). Tools that need to refer to a branch
+name-to-ID mapping is removed and the metadata records the archive; the metadata and latest
+pointer stay), restored (the mapping is put back and the metadata records the
+restore), or reused (a new branch can take the name of an archived one without clobbering the
+archived branch's history). Tools that need to refer to a branch
 unambiguously refer to it by ID; tools that need to present the branch to a human user
 use the name and let the mutable store resolve it.
 
@@ -1014,7 +1015,11 @@ the immutable store (where it gets a new hash), and issues a `cas` on the branch
 metadata pointer to refer to the new blob's hash. Renaming a branch, advancing repository
 metadata, restoring an archived name, registering a repository in the catalog - all reduce to
 "write the new immutable blob (if any), then `cas` the relevant key in the mutable
-store." The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
+store." No `cas` spans two keys. A restore writes the branch's metadata and its name's mapping,
+so it first records in the metadata the name it claims. A restore that stops between the two
+writes leaves that record, and the next restore or archive of the branch settles it: it releases
+the name, and keeps a record of it until a later restore removes it.
+The protocol exposes the `load`, `store`, and `cas` operations directly; clients and
 servers coordinate every mutable-state change through the same contract.
 
 This is the only true serialization point in the architecture. Two clients reading do not
@@ -1215,9 +1220,11 @@ cheap to load, and fully resident in memory while in use.
 For each entity type, Lore reserves a set of *built-in* keys that the system itself reads or
 writes. Examples include `message`, `timestamp`, `created-by`, `committed-by`,
 `change-request`, and `cherry-picked-from` on a revision; `category`, `creator`, `created`,
-and `protect` on a branch; `name`, `description`, `default-branch`, `creator`, and `created`
-on a repository. Some built-in keys are read-only (assigned by the system at creation and
-never modified); others can be set or updated by users, but the key itself is reserved.
+`protect`, and the `archived`, `restored`, `restoring` and `released` keys that archives and
+restores write on a branch; `name`, `description`, `default-branch`, `creator`, and `created` on a
+repository. Some built-in keys are read-only: the system assigns them, at creation or, for the
+keys archives and restores write, when it archives or restores the branch, and no metadata set
+or clear changes them. Others can be set or updated by users, but the key itself is reserved.
 
 The remaining key space is free for application use. Tools and integrations attach their own
 keys for purposes the system itself does not know about - code review IDs, build provenance,
@@ -1289,6 +1296,9 @@ Views shape what the local cache is asked to hold, what the remote is asked to s
 filesystem-level tools (search, indexing, build systems) see. They are useful well beyond the
 obvious "I only work on this directory" case.
 
+For the rule syntax and worked examples, see
+[Write view filters and ignore files](../how-to/write-view-filters-and-ignore-files.md).
+
 #### 12.3 Ignore files: outbound filtering
 
 An *ignore file* (`.loreignore`) is an outbound filter declaring which paths the user does not
@@ -1297,10 +1307,13 @@ not staged, not committed, and not reported in status. A forced stage or a merge
 such a path; status lists it and the commit takes it. Build artifacts, editor temporary files,
 machine-local configuration: all typical inhabitants.
 
-Ignore is purely about *new* content. A file that is already part of the committed revision
-will keep flowing through inbound operations even if a later ignore rule would exclude it; the
-ignore rule does not retroactively eject committed files. Removing such a file from the
-revision is a separate explicit act.
+An instance can add rules of its own in `ignore`, in its Lore directory (`.lore/ignore` for a
+regular instance). They use the syntax of `.loreignore`, apply after its rules and wherever it
+applies, and are never committed, so they suit what only one working tree produces. They can only
+exclude: Lore skips a `!` re-inclusion there with a warning.
+
+An ignore file uses the same rule syntax as a view file; see
+[Write view filters and ignore files](../how-to/write-view-filters-and-ignore-files.md).
 
 #### 12.4 FilterMode: which filter applies when
 
@@ -1321,9 +1334,12 @@ The rule is simple: operations on *committed state* consult the view only; opera
   through both. The view limits what the operation sees on disk; the ignore file then further
   excludes things the user has declared shouldn't be staged. The ignore file is asked only about
   paths the tree does not hold yet: a path already staged or committed, for example one staged
-  past the ignore file with `--force`, keeps flowing through staging and status like any other,
-  its deletion included. A working-tree entry of another kind at its path is new content
-  ([ADR-00027](../developing/decisions/00027-ignore-filter-applies-to-untracked-paths-only.md)).
+  past the ignore file with `--force`, keeps flowing through staging, status and locking like any
+  other, its deletion included. A working-tree entry of another kind at its path is new content.
+  A change staged past the view, by a forced stage or a merge, is listed by status and committed
+  like any other. A forced stage of a file a merge staged there resolves the merge with the
+  working tree's file. Unstaging follows the view, below links too but not yet below a layer
+  mount, and a forced unstage takes back what a forced stage staged there outside a merge.
 
 This split is what keeps `.loreignore` from breaking earlier history: a newly-added ignore
 rule does not retroactively excise committed files, because committed-state operations consult
@@ -1655,11 +1671,13 @@ on the machine that recorded it.
 Deciding whether a given file has changed is made cheap. A file is compared against
 its tracked node by size first, then modification time, and only by content hash
 when the size matches but the recorded modification time differs. The per-file
-modification time is held in the local mutable store, keyed by instance and path,
-rather than on the tree node - so the common case (size and mtime unchanged) is
-confirmed unmodified without ever reading the file's bytes. This is what keeps a full
-scan linear in file count rather than in total bytes: most files are dismissed on
-metadata alone.
+modification time is held in the instance's own Lore directory, in `.lore/records/`,
+keyed by path, rather than on the tree node - so the common case (size and mtime
+unchanged) is confirmed unmodified without ever reading the file's bytes. An SWFS or
+in-memory instance keeps its times in the local mutable store, keyed by instance and
+path, and an instance an older client created still reads a time from there when its
+own records hold none. This is what keeps a full scan linear in file count rather than
+in total bytes: most files are dismissed on metadata alone.
 
 #### 15.3 Paths into the dirty set
 
@@ -1864,9 +1882,12 @@ Failures have well-defined user-visible shapes:
 - *Validation failure on push.* The server rejects the push. Fragments uploaded in phase 1
   may be in the immutable store, but no branch latest pointer references them; the failed
   revision is unreachable, and the unreferenced fragments can be obliterated if desired.
+- *Client crash while a flush writes with `--fast-flush`.* The index file being written is
+  left partly written, and the next open drops every entry it held, including those of
+  revisions and branches not yet pushed.
 
-In each case, the user-visible failure is "the operation did not happen, and nothing else
-changed." There is no in-between state to clean up.
+In each case but the last, the user-visible failure is "the operation did not happen, and
+nothing else changed." There is no in-between state to clean up.
 
 ### 17. Access Model, Data Isolation, and Multi-Tenancy
 
@@ -2277,15 +2298,18 @@ production layout.
 
 The `MutableStore` trait exposes a narrow API: `load`, `store`, `cas`, `list`, each
 taking a typed key. The `cas` (compare-and-swap) operation is what gives Lore atomic
-state transitions (§9.4); every backend must implement it correctly.
+state transitions (§9.4); every backend must implement it correctly. A key holds zero
+when it's absent: a `cas` from zero creates the key, and a `cas` or `store` to zero
+removes it and leaves no entry behind.
 
 Lore ships with:
 
 - *Local file store.* File-backed key-value store with a bucketed layout, using
   filesystem locking for the `cas` primitive. The default for clients and
   small servers.
-- *AWS DynamoDB store.* DynamoDB's conditional-write support maps directly onto the
-  `cas` primitive. Suitable for multi-region server deployments where the
+- *AWS DynamoDB store.* DynamoDB's conditional writes map onto the `cas` primitive: a
+  conditional put or delete, or a strongly consistent read for a swap whose new value is the one
+  it expects. Suitable for multi-region server deployments where the
   mutable store is the only true serialization point and DynamoDB's consistency
   guarantees are the right fit.
 
@@ -2524,6 +2548,11 @@ Either way, the parent revision pins a specific revision of the linked content.
 Updating the link to a different revision is an explicit `link update` operation that
 produces a new parent revision; the previous parent revision still pins the previous
 linked revision.
+
+A merge of the parent carries its link changes as the parent's diff records them. A link
+the merged branch removes is removed, and its repository is not merged. A link the merged
+branch adds keeps the pin it was given. A link the merged branch moves is merged where it
+moves to.
 
 #### 22.4 Link-scoped commit and single-link merge
 

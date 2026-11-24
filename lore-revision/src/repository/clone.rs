@@ -33,9 +33,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
-use super::load_repository_config_from_dot_dir;
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::dependency;
 use crate::errors::*;
 use crate::event;
@@ -73,7 +71,9 @@ use crate::repository;
 use crate::repository::FileConfig;
 use crate::repository::RepositoryConfig;
 use crate::repository::StoreConfig;
+use crate::repository::VfsType;
 use crate::repository::prefetch;
+use crate::repository::prefetch::TreePrefetch;
 use crate::revision;
 use crate::state;
 use crate::state::FileModification;
@@ -358,8 +358,12 @@ pub struct CloneOptions {
     pub allow_non_empty: bool,
     /// Use direct file write
     pub direct_file_write: bool,
-    /// File containing list of files to prefetch
+    /// Access recording whose paths a virtual clone warms in the background: one
+    /// repository-relative path per line, directories ending with `/`
     pub prefetch: Option<String>,
+    /// How much of the tree a virtual clone warms in the background; `None` takes the
+    /// environment's setting ([`prefetch::plan`])
+    pub tree_prefetch: Option<TreePrefetch>,
     /// Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
     /// Whether to use VFS
@@ -1045,17 +1049,27 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
-    // An SWFS clone mounts the repository, and a mount cannot be removed again.
-    if call.dry_run()
-        && options
-            .vfs_options
-            .as_ref()
-            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
-    {
+    let vfs = options
+        .vfs_options
+        .as_ref()
+        .map_or(VfsType::None, |vfs| vfs.vfs_type);
+    let swfs = vfs == VfsType::Swfs;
+    // A VFS clone mounts the repository, and a mount cannot be removed again.
+    if call.dry_run() && vfs.is_virtual() {
+        let kind = if swfs { "an SWFS" } else { "a FUSE" };
         return Err(CloneError::from(InvalidArguments {
-            reason: "--dry-run is not supported for an SWFS clone".to_string(),
+            reason: format!("--dry-run is not supported for {kind} clone"),
         }));
     }
+    if swfs {
+        repository::refuse_instance_nested_at(path)?;
+        repository::refuse_swfs_past_mount_limit()?;
+    } else {
+        repository::refuse_nesting_in_swfs_mount(path)?;
+    }
+
+    // Read before anything below can create the path, so cleanup only removes what this call created.
+    let mount_point_preexisted = path.exists();
 
     // FORK-LOCAL (Tideshift): an existing working copy is only replaced under `--force`, and only
     // once the remote has answered. Removing it before the remote resolves left an unreachable
@@ -1063,12 +1077,9 @@ pub async fn clone(
     let existing_dot_dir = get_dot_lore_path(path)?;
     let replace_existing = existing_dot_dir.exists();
     if replace_existing {
-        // A working copy over a provider-held (SWFS) repository is never replaced, `--force` or
-        // not.
-        let existing_repository_is_swfs =
-            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
-                .is_ok_and(|config| config.is_swfs());
-        if !call.force() || existing_repository_is_swfs {
+        // Only an ordinary working copy is replaced: never one over a mounted virtual clone or a
+        // provider-held repository ([`repository::force_may_replace`]), `--force` or not.
+        if !call.force() || !repository::force_may_replace(path, &existing_dot_dir) {
             return Err(CloneError::from(RepositoryAlreadyExists {
                 path: path.display().to_string(),
             }));
@@ -1133,6 +1144,7 @@ pub async fn clone(
     repository_config
         .validate()
         .forward::<CloneError>("Error validating repository config")?;
+    let is_fuse = repository_config.vfs_type() == VfsType::Fuse;
 
     let repository_metadata = {
         // Dummy repository context just to be able to load the repository
@@ -1231,6 +1243,8 @@ pub async fn clone(
             view,
             layer,
             options,
+            is_fuse,
+            mount_point_preexisted,
         },
         &mut repository_path_guard,
         &mut dot_directory_guard,
@@ -1263,6 +1277,10 @@ struct CloneBound<'a> {
     view: Option<&'a Path>,
     layer: Option<CloneLayer>,
     options: CloneOptions,
+    /// Whether the clone is a FUSE mount, whose mount a failure undoes.
+    is_fuse: bool,
+    /// Whether the clone target existed before this call, read before anything could create it.
+    mount_point_preexisted: bool,
 }
 
 async fn clone_bound(
@@ -1286,6 +1304,8 @@ async fn clone_bound(
         view,
         layer,
         options,
+        is_fuse,
+        mount_point_preexisted,
     } = bound;
 
     let prefetch_branch_fut = {
@@ -1306,7 +1326,7 @@ async fn clone_bound(
     };
 
     let local_init_fut = async move {
-        let created = repository::create_local(
+        let created = match repository::create_local(
             path,
             &write_token,
             repository_id,
@@ -1316,7 +1336,12 @@ async fn clone_bound(
             no_tracking,
         )
         .await
-        .forward::<CloneError>("Failed to initialize repository on disk")?;
+        .forward::<CloneError>("Failed to initialize repository on disk")
+        {
+            Ok(repository) => repository,
+            Err(error) => return (None, Err(error)),
+        };
+        let instance_id = created.instance_id;
         lore_debug!("Initialized repository on disk in {}", path.display());
 
         // Share the outer write token to whichever context we load. The Client
@@ -1324,7 +1349,7 @@ async fn clone_bound(
         // concurrent same-path clones; the mutex is meaningful even in NoStore
         // mode because both clones still race on the destination directory's
         // file materialization. Sharing here means downstream helpers
-        // (`branch::create` → `store_name_to_id` / `metadata_store` /
+        // (`branch::create` → `create_record`'s metadata swap / `claim_name` /
         // `store_latest`) see a context with write capability and can populate
         // the (in-memory or on-disk) mutable store.
         let load_token = Some(write_token.share());
@@ -1334,12 +1359,24 @@ async fn clone_bound(
         // Kept until the loaded context has claimed the stores, so it joins the created
         // context's claims and finds the stores current rather than reading them again.
         drop(created);
-        loaded
+        (Some(instance_id), loaded)
     };
 
-    let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
+    // Not `try_join!`: a prefetch failure must not drop the instance id of a mount to undo.
+    let ((created_instance_id, local_result), prefetch_result) =
+        tokio::join!(local_init_fut, prefetch_branch_fut);
 
-    clone_into(
+    if let Some(instance_id) = created_instance_id
+        && (local_result.is_err() || prefetch_result.is_err())
+    {
+        abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
+    }
+
+    let repository = local_result?;
+    let instance_id = repository.instance_id;
+    let prefetched_branch = prefetch_result?;
+
+    let result = clone_into(
         repository,
         remote,
         repository_metadata,
@@ -1352,7 +1389,45 @@ async fn clone_bound(
         repository_path_guard,
         dot_directory_guard,
     )
-    .await
+    .await;
+
+    if result.is_err() {
+        abandon_failed_fuse_clone(path, is_fuse, mount_point_preexisted, instance_id).await;
+    }
+
+    result
+}
+
+/// Undoes a FUSE clone's mount after a failure past a successful `create_local`. A no-op off
+/// Linux and when `is_fuse` is false; best-effort otherwise, logged and never allowed to shadow
+/// the original failure it is cleaning up after.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+async fn abandon_failed_fuse_clone(
+    path: &Path,
+    is_fuse: bool,
+    mount_point_preexisted: bool,
+    instance_id: InstanceId,
+) {
+    #[cfg(target_os = "linux")]
+    {
+        if is_fuse
+            && let Some(mount_manager) =
+                crate::fs::mount_manager_state::MountManagerState::mount_manager()
+            && let Err(error) = mount_manager
+                .fuse()
+                .abandon_clone(path, instance_id, !mount_point_preexisted)
+                .await
+        {
+            lore_warn!(
+                "Failed to undo FUSE clone mount at {}: {error}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, is_fuse, mount_point_preexisted, instance_id);
+    }
 }
 
 /// FORK-LOCAL (Tideshift): an existing control directory moved aside while `--force` clones over
@@ -1655,37 +1730,14 @@ async fn clone_into(
 
     let branch_name = branch::name(&metadata).unwrap_or_default().to_string();
 
-    let store_task: tokio::task::JoinHandle<Result<(), CloneError>> = lore_spawn!({
-        let repository = repository.clone();
-        let branch_name = branch_name.clone();
-        let branch_metadata = branch.metadata;
-        async move {
-            if !branch::exist_local(repository.clone(), branch_id).await {
-                branch::mutable_store_metadata(repository.clone(), branch_id, branch_metadata)
-                    .await
-                    .forward::<CloneError>("Failed to create local branch")?;
-                branch::store_name_to_id(repository.clone(), branch_id, branch_name)
-                    .await
-                    .forward::<CloneError>("Failed to create local branch")?;
-            }
-            if !revision.is_zero() {
-                let local_latest = branch::load_latest(repository.clone(), branch_id)
-                    .await
-                    .unwrap_or_default();
-                branch::store_latest(
-                    repository.clone(),
-                    branch_id,
-                    local_latest,
-                    revision,
-                    BranchLatestStatus::Convergent,
-                )
-                .await
-                .forward::<CloneError>("Failed to create local branch")?;
-                branch::store_last_sync(repository.clone(), branch_id, revision).await;
-            }
-            Ok::<(), CloneError>(())
-        }
-    });
+    let store_task: tokio::task::JoinHandle<Result<(), CloneError>> =
+        lore_spawn!(store_cloned_branch(
+            repository.clone(),
+            branch_id,
+            branch_name.clone(),
+            branch.metadata,
+            revision,
+        ));
 
     event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
         repository: repository.id,
@@ -1724,7 +1776,7 @@ async fn clone_into(
         Err(e) => Err(CloneError::internal(format!("Store task failed: {e}"))),
     };
 
-    let _ = repository.flush(call.sync_data()).await;
+    let _ = repository.flush(call.flush_options()).await;
 
     let operation_result = operation
         .finalize()
@@ -1750,6 +1802,59 @@ async fn clone_into(
     .send();
 
     Ok(())
+}
+
+/// Stores the cloned branch `branch_id` in the local store. Where the store lacks the branch, it
+/// swaps `branch_metadata` in as its metadata from none and claims `branch_name` for it unless
+/// another branch holds the name or the mapping changes during the clone
+/// ([`branch::claim_name_unless_held`]), failing where its read of the mapping fails. Metadata
+/// another writer stored first is left as it is, with its name, and logged. A non-zero `revision`
+/// is stored as the branch's latest, converged with the remote, and as its last sync.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn store_cloned_branch(
+    repository: Arc<RepositoryContext>,
+    branch_id: crate::lore::BranchId,
+    branch_name: String,
+    branch_metadata: Hash,
+    revision: Hash,
+) -> impl Future<Output = Result<(), CloneError>> {
+    async move {
+        if !branch::exist_local(repository.clone(), branch_id).await {
+            let held = branch::mutable_try_store(
+                repository.clone(),
+                branch::METADATA,
+                branch_id,
+                Hash::default(),
+                branch_metadata,
+            )
+            .await
+            .forward::<CloneError>("Failed to create local branch")?;
+            if !held.is_zero() {
+                lore_warn!(
+                    "Another writer stored the metadata of the cloned branch {branch_id} first, so the clone leaves it"
+                );
+            } else if !branch::claim_name_unless_held(repository.clone(), &branch_name, branch_id)
+                .await
+                .forward::<CloneError>("Failed to create local branch")?
+            {
+                lore_warn!(
+                    "The name {branch_name} names another branch or changed during the clone, so it doesn't name the cloned branch {branch_id}"
+                );
+            }
+        }
+        if !revision.is_zero() {
+            let local_latest = branch::load_latest(repository.clone(), branch_id)
+                .await
+                .unwrap_or_default();
+            branch::store_synced_latest(&repository, branch_id, local_latest, revision)
+                .await
+                .forward::<CloneError>("Failed to create local branch")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1783,18 +1888,21 @@ fn refuse_on_held_state(
     Err(hold::refused("restrict a clone to a dependency set").into())
 }
 
-/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
-/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+/// Hands a provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`])
+/// `ctx.state` to hold ([`InstanceOperationImpl::hold_state`]) instead of walking a tree that does
+/// not exist, then starts the background prefetch that `ctx.options` asks for and returns without
+/// waiting for it, answering whether it held. The provider loads whatever the prefetch has not
+/// yet warmed on demand.
 ///
 /// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
 /// so does a dry run.
 #[lore_macro::test_pub]
-async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<bool, CloneError> {
     if ctx.options.bare || ctx.state.revision().is_zero() {
-        return Ok(());
+        return Ok(false);
     }
     if execution_context().globals().dry_run() {
-        return Ok(());
+        return Ok(false);
     }
     ctx.operation
         .hold_state(
@@ -1803,7 +1911,41 @@ async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
             HoldOptions::default(),
         )
         .await
-        .forward::<CloneError>("Holding the cloned revision")
+        .forward::<CloneError>("Holding the cloned revision")?;
+    let plan = prefetch::plan(ctx.options.tree_prefetch, ctx.options.prefetch.as_deref()).await;
+    if !plan.is_empty() {
+        ctx.operation.start_prefetch(plan);
+    }
+    Ok(true)
+}
+
+/// Caches `state`'s own records, and with `file_metadata` its file metadata blocks, in a task of
+/// its own ([`State::cache_fragments`]).
+fn spawn_fragment_cache(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    file_metadata: bool,
+) -> tokio::task::JoinHandle<Result<(), crate::state::StateError>> {
+    let repository = repository.clone();
+    let state = state.clone();
+    lore_spawn!(async move { state.cache_fragments(repository, file_metadata).await })
+}
+
+/// Clones onto a provider that holds its state in a `State`: [`clone_materialize_hold`], then,
+/// where it held, caches the state's records ([`spawn_fragment_cache`]), so the state reads and
+/// commits offline, and reads the held ignore file into the store meanwhile
+/// ([`InstanceOperationImpl::warm_held_ignore_file`]). Answers the caching task.
+#[lore_macro::test_pub]
+async fn clone_onto_held_state(
+    ctx: &CloneContext,
+) -> Result<Option<tokio::task::JoinHandle<Result<(), crate::state::StateError>>>, CloneError> {
+    if !clone_materialize_hold(ctx).await? {
+        return Ok(None);
+    }
+    let cache_task =
+        spawn_fragment_cache(&ctx.repository, &ctx.state, ctx.options.cache_file_metadata);
+    ctx.operation.warm_held_ignore_file().await;
+    Ok(Some(cache_task))
 }
 
 /// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
@@ -1826,7 +1968,7 @@ async fn clone_materialize(
     let mut cache_task = None;
 
     if ctx.operation.holds_state() {
-        clone_materialize_hold(&ctx).await?;
+        cache_task = clone_onto_held_state(&ctx).await?;
     } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
@@ -1851,14 +1993,11 @@ async fn clone_materialize(
             }
         }));
 
-        let cache_repository = repository.clone();
-        let cache_state = state.clone();
-        let cache_file_metadata = options.cache_file_metadata;
-        cache_task = Some(lore_spawn!(async move {
-            cache_state
-                .cache_fragments(cache_repository, cache_file_metadata)
-                .await
-        }));
+        cache_task = Some(spawn_fragment_cache(
+            &repository,
+            &state,
+            options.cache_file_metadata,
+        ));
 
         clone_result = clone_in_path(ctx).await;
     }
@@ -1949,25 +2088,12 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             visited: DashSet::new(),
         });
 
-        event::LoreEvent::DependencyResolveBegin(dependency::LoreDependencyResolveBeginEventData {
-            root_count: options.root_files.len() as u64,
-        })
-        .send();
-
-        for root_path in &options.root_files {
-            let relative = RelativePath::new_from_initial_path(root_path)
-                .forward_with::<CloneError, _>(|| format!("Invalid path: {root_path}"))?;
-            let repository_path = relative;
-            let node_link = state
-                .find_node_link(repository.clone(), repository_path.as_str())
+        let roots =
+            dependency::resolve::resolve_root_nodes(&repository, &state, &options.root_files)
                 .await
-                .forward_with::<CloneError, _>(|| format!("Root file not found: {root_path}"))?;
-            if !node_link.is_valid() {
-                return Err(CloneError::internal(format!(
-                    "Root file not found: {root_path}"
-                )));
-            }
-            let node_id = node_link.node;
+                .forward::<CloneError>("Resolving the root files")?;
+
+        for (_, repository_path) in &roots {
             let parent = repository_path.parent_path();
             if !parent.is_empty() {
                 ctx.operation
@@ -1975,6 +2101,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                     .await
                     .forward::<CloneError>("Failed to root path parent directory")?;
             }
+        }
+        for (node_id, repository_path) in roots {
             dep_ctx.visited.insert(node_id);
             dispatcher.dispatch(BlockDiscoverItem {
                 node_id,
@@ -2162,13 +2290,13 @@ pub async fn clone_execute(
     // A missing fragment must not prevent later files from being attempted. Keep the
     // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
-    let mut tasks: JoinSet<Result<Option<(Hash, u64)>, CloneError>> = JoinSet::new();
+    let mut tasks: JoinSet<Result<Option<state::ModifiedTimeEntry>, CloneError>> = JoinSet::new();
     let repository = ctx.repository.clone();
     let stats = ctx.stats.clone();
     // Permit cap grows monotonically with queue depth; unused permits cost nothing. Starts from whatever caller configured (default CLONE_FILE_DISCOVERY).
     let mut current_permits = stats.file_inflight.available_permits();
-    // Each `clone_file` returns its (key, mtime) pair, or None for the retain, dry run and
-    // zero byte cases, and they are collected as the JoinSet drains.
+    // Each `clone_file` returns its modified-time entry, where it has one, and they are collected
+    // as the JoinSet drains.
     let modified_times = ctx.modified_times.clone();
 
     while let Some(item) = rx.recv().await {
@@ -2403,7 +2531,7 @@ fn clone_file(
     node: Node,
     repository_path: RelativePath,
     permit: OwnedSemaphorePermit,
-) -> impl Future<Output = Result<Option<(Hash, u64)>, CloneError>> {
+) -> impl Future<Output = Result<Option<state::ModifiedTimeEntry>, CloneError>> {
     let CloneContext {
         repository,
         operation,
@@ -2516,10 +2644,9 @@ fn clone_file(
                 .bytes_transferred
                 .fetch_add(fragment.size_content, Ordering::Relaxed);
 
-            // Compute the (mtime_key, mtime) pair and return it; the caller
-            // (`clone_execute`) collects pairs in a stack-local buffer and
-            // fire-and-forgets a batched mutable-store write when the buffer fills,
-            // so each `clone_file` task avoids awaiting its own bucket write.
+            // Returned rather than recorded here: the caller collects each entry in
+            // `ctx.modified_times`, which is stored once after the clone, so no
+            // `clone_file` task waits on a write of its own.
             stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(state::file_modified_time_entry(
                 &repository,

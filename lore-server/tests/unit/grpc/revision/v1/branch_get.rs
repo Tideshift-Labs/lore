@@ -1012,7 +1012,7 @@ mod refresh_generation {
         let hook: ReadHook = Arc::new(move || {
             let context = hook_context.clone();
             Box::pin(async move {
-                branch::store_name_to_id(context, moved_to, "test-name")
+                branch::claim_name(context, "test-name", branch_id, moved_to)
                     .await
                     .expect("re-point the name between the two resolves");
             })
@@ -1145,7 +1145,10 @@ mod store_read_failures {
             self.inner.clone().list(partition, key_type).await
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             self.inner.clone().flush(sync_data).await
         }
     }

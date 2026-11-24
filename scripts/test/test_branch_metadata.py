@@ -90,6 +90,32 @@ def test_branch_metadata_clear_defaults_to_current_branch(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_branch_metadata_keeps_the_archive_keys(new_lore_repo):
+    """Archive keys are read-only: a set or clear fails, and clearing all keeps them."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Initial commit", {"file.txt": ["Line one\n"]})
+    repo.branch_create("kept-keys")
+    repo.write_commit_push("Branch commit", {"file.txt": ["Line one\nBranch\n"]})
+    branch_id = parse_jsonl(repo.branch_info(json=True), "branchInfo")[0]["id"]
+    repo.branch_switch("main")
+    repo.branch_archive("kept-keys")
+    repo.branch_create("kept-keys", id=branch_id)
+
+    before = get_metadata_dict(repo.branch_metadata_get(branch="kept-keys", json=True))
+    assert "archived" in before, before.keys()
+
+    for key in ["archived", "restored", "restoring", "released"]:
+        with pytest.raises(ImproperArgumentsError):
+            repo.branch_metadata_set([key, "1"], branch="kept-keys")
+        with pytest.raises(ImproperArgumentsError):
+            repo.branch_metadata_clear([key], branch="kept-keys")
+    repo.branch_metadata_clear(branch="kept-keys")
+
+    after = get_metadata_dict(repo.branch_metadata_get(branch="kept-keys", json=True))
+    assert after["archived"] == before["archived"]
+
+
+@pytest.mark.smoke
 def test_branch_metadata_set_single_arg_rejected(new_lore_repo):
     """A lone argument has no value; the set must be rejected, not panic."""
     repo: Lore = new_lore_repo()
@@ -161,4 +187,30 @@ def test_branch_metadata_set_binary_outside_repository(new_lore_repo, scratch_di
     repo.file_write(address=events[0]["value"]["data"], output=str(restored))
     assert restored.read_bytes() == payload, (
         "The payload read back from the store must match the file outside the repository"
+    )
+
+
+ZERO_ADDRESS = "0" * 64 + "-" + "0" * 32
+
+
+@pytest.mark.smoke
+def test_branch_metadata_set_binary_empty(new_lore_repo):
+    """An empty file is a binary value too: its content is stored under the zero hash, which
+    names no blob for the server to hold."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("empty.bin", "wb"):
+        pass
+
+    repo.branch_metadata_set(["empty-key", "empty.bin"], branch="main", binary=True)
+
+    events = get_metadata_events(
+        repo.branch_metadata_get("empty-key", branch="main", json=True)
+    )
+    assert len(events) == 1, f"Expected 1 metadata event, got {len(events)}"
+    assert events[0]["value"]["tagName"] == "address", (
+        f"Binary metadata must record an address.\nGot: {events[0]['value']}"
+    )
+    assert events[0]["value"]["data"] == ZERO_ADDRESS, (
+        f"An empty file must record the zero address.\nGot: {events[0]['value']}"
     )

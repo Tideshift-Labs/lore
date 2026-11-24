@@ -28,7 +28,7 @@ use lore_base::runtime::LoreTaskLifecycleEvent;
 use lore_base::runtime::LoreTaskSpawn;
 use lore_base::runtime::TaskLifecycleObserver;
 use lore_base::runtime::runtime;
-use lore_base::runtime::runtime_with_settings;
+use lore_base::runtime::serving_runtime;
 use lore_base::runtime::set_task_lifecycle_observer;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_postgres::domain::fragments::FragmentCellRetentionHandle;
@@ -42,6 +42,7 @@ use lore_revision::runtime::execution_context;
 use lore_revision::store::composite::CompositeStoreBuilder;
 use lore_revision::store::remote::RemoteImmutableStore;
 use lore_revision::store::remote::RemoteMutableStore;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::assume_server_policies;
@@ -75,7 +76,6 @@ use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
 
-use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt::TokenVerification;
 use crate::auth::oidc::advertised_oidc;
@@ -319,6 +319,14 @@ async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
 /// // Base server with no plugins
 /// lore_server::server::server_main(ServerConfig::default()).unwrap();
 /// ```
+/// The runtime the server runs on, sized for serving as `settings.tokio` configures it (see
+/// [`serving_runtime`]). Runs before anything else in the server builds a runtime, since each is
+/// sized once.
+#[lore_macro::test_pub]
+fn server_runtime(settings: &Settings) -> tokio::runtime::Handle {
+    serving_runtime(settings.tokio.clone())
+}
+
 pub fn server_main(config: ServerConfig) -> Result<()> {
     set_fallback_user_agent_product("lore-server".to_string());
     assume_server_policies();
@@ -334,17 +342,7 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    // Server default: one net-runtime thread per processor — serving
-    // thousands of concurrent client connections is its normal case. An
-    // explicit `tokio.net_threads` config (seeded first inside
-    // runtime_with_settings) wins over this default.
-    let runtime_handle = match settings.tokio.as_ref() {
-        Some(tokio) => runtime_with_settings(Some(tokio.clone())),
-        None => runtime(),
-    };
-    let _ = lore_base::runtime::set_net_threads_default(
-        std::thread::available_parallelism().map_or(2, |count| count.get()),
-    );
+    let runtime_handle = server_runtime(&settings);
     let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
@@ -1209,6 +1207,7 @@ impl QuicPublicStreamHandler {
                         mutable_store.clone(),
                         enforce_write_permission,
                         user_agent_filter.clone(),
+                        crate::protocol::storage::session::SessionMap::default(),
                     )
                     .with_caller_capability_policy(caller_capability_policy);
                     Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
@@ -1341,7 +1340,7 @@ async fn configure_immutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote immutable store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(remote_settings, settings.server.upstream_connections)
         }
         _ => {
             // All other modes use the plugin system
@@ -1591,7 +1590,7 @@ async fn configure_mutable_store_via_plugin(
                 .as_ref()
                 .ok_or(anyhow!("Missing remote mutable store settings"))?;
 
-            configure_remote_mutable_store(remote_settings)
+            configure_remote_mutable_store(remote_settings, settings.server.upstream_connections)
         }
         store_mode::REPLICATED => Err(anyhow!("replicated mutable store is not implemented")),
         store_mode::COMPOSITE => Err(anyhow!(
@@ -1947,6 +1946,11 @@ fn generate_ephemeral_certificate(endpoint: &str) -> Result<crate::tls::Certific
     })
 }
 
+/// Whether the server runs in maintenance mode, serving no store.
+fn maintenance_mode() -> bool {
+    std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1")
+}
+
 async fn create_local_store(
     settings: &LocalImmutableStoreSettings,
     flush_background: bool,
@@ -1975,6 +1979,7 @@ async fn create_local_store(
             isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
+            defer_eviction_flush: !maintenance_mode(), /* Server mode, no other process uses the server's stores, so unwritten buckets holding a store's flock block nobody; in maintenance mode the stores are left free for the maintenance */
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),
@@ -2036,24 +2041,27 @@ async fn configure_local_mutable_store(
 
 fn configure_remote_immutable_store(
     settings: &RemoteStoreSettings,
+    upstream_connections: u32,
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!(
         "Wiring up remote immutable store to {}",
         settings.remote_url
     );
 
-    Ok(Arc::new(RemoteImmutableStore::new(
-        settings.remote_url.as_str(),
-        settings.auth_url.as_deref(),
-    )))
+    Ok(Arc::new(
+        RemoteImmutableStore::new(settings.remote_url.as_str(), settings.auth_url.as_deref())
+            .verifying(settings.verify)
+            .connecting_over(upstream_connections as usize),
+    ))
 }
 
 async fn configure_replicated_immutable_store(
     settings: &ReplicatedStoreSettings,
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!(
-        "Wiring up replicated immutable store to {}",
-        settings.remote_url
+        remote_url = %settings.remote_url,
+        num_clients = settings.num_clients,
+        "Wiring up replicated immutable store"
     );
 
     let certs = if let Some(setting_certs) = &settings.certs {
@@ -2101,23 +2109,27 @@ async fn configure_replicated_immutable_store(
     let store = ReplicatedStore::new(
         Arc::new(factory),
         container_config,
-        Duration::from_secs(settings.periodic_client_refresh_secs),
+        settings.num_clients,
+        Duration::from_secs(settings.periodic_client_refresh_secs.get()),
         Duration::from_secs(settings.client_metrics_interval_seconds),
     )
     .await?;
     Ok(store)
 }
 
-fn configure_remote_mutable_store(settings: &RemoteStoreSettings) -> Result<Arc<dyn MutableStore>> {
+fn configure_remote_mutable_store(
+    settings: &RemoteStoreSettings,
+    upstream_connections: u32,
+) -> Result<Arc<dyn MutableStore>> {
     info!("Wiring up remote mutable store to {}", settings.remote_url);
 
     // TODO(mjansson): Identity handling
     let identity = None::<&str>;
 
-    Ok(Arc::new(RemoteMutableStore::new(
-        settings.remote_url.as_str(),
-        identity,
-    )))
+    Ok(Arc::new(
+        RemoteMutableStore::new(settings.remote_url.as_str(), identity)
+            .connecting_over(upstream_connections as usize),
+    ))
 }
 
 async fn configure_composite_store(
@@ -2133,7 +2145,14 @@ async fn configure_composite_store(
             settings.cache_metadata.unwrap_or_default(),
             settings.cache_metadata_semaphore_size,
         )
-        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band)
+        .with_read_replica_selection(settings.read_replica_selection.unwrap_or_default())
+        .with_round_robin_tries(
+            settings.round_robin_max_tries,
+            settings
+                .round_robin_try_limit_ms
+                .map(|limit| Duration::from_millis(limit.get())),
+        );
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -2226,6 +2245,12 @@ async fn configure_composite_store(
     }
 
     let store = Arc::new(composite_store_builder.build()?);
+    info!(
+        read_replica_selection = ?store.read_replica_selection(),
+        round_robin_max_tries = store.round_robin_max_tries(),
+        round_robin_try_limit = ?store.round_robin_try_limit(),
+        "Composite store read replicas"
+    );
 
     if let Some(topology) = &topology {
         store
@@ -2258,7 +2283,10 @@ async fn configure_composite_substore(
                 .as_ref()
                 .ok_or(anyhow!("Missing composite remote store settings"))?;
 
-            configure_remote_immutable_store(remote_settings)
+            configure_remote_immutable_store(
+                remote_settings,
+                global_settings.server.upstream_connections,
+            )
         }
         store_mode::COMPOSITE => Err(anyhow!(
             "Composite store not supported as a composite substore"
@@ -2503,7 +2531,10 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
             info!("Done seeding local store, flushing store to disk.");
             // Since we effectively disabled background flushing, we force a flush once seeding is
             // complete
-            store.flush(true).await.map_err(anyhow::Error::from)?;
+            store
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .map_err(anyhow::Error::from)?;
             info!("Done flushing store to disk.");
 
             result
@@ -2601,6 +2632,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // of scope
     let (mut settings, settings_hash) = settings;
     crate::grpc::caller_capabilities::validate_settings(&settings)?;
+    crate::uds::refuse_socket_route(lore_transport::uds::route())?;
     let runtime = runtime();
     let telemetry = settings.telemetry.clone().unwrap_or_default();
     let metrics_config = telemetry.metrics.clone().unwrap_or_default();
@@ -2914,7 +2946,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
     let drain_state = DrainState::new();
 
-    let is_maintenance = if std::env::var("LORE_SERVER_MAINTENANCE").is_ok_and(|v| v == "1") {
+    let is_maintenance = if maintenance_mode() {
         info!(
             "Server is running in maintenance mode - only environment and health endpoints will be served"
         );
@@ -2958,19 +2990,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => {
-            let jwk = auth.jwk.clone().unwrap_or_default();
-            let jwk_service = JwkServiceImpl::with_issuers(jwk, Some(&auth.jwt_issuer))?;
-            jwk_service
-                .fetch_new_keys(None /* fetch all keys */)
-                .await?;
-            Some(JwtVerifier {
-                jwk_service: Arc::new(jwk_service),
-                jwt_issuer: Some(auth.jwt_issuer.clone()),
-                jwt_audience: Some(auth.jwt_audience.clone()),
-                jwt_typ: auth.jwt_typ.clone(),
-            })
-        }
+        Some(auth) => Some(JwtVerifier::from_settings(auth).await?),
         None => None,
     };
     let token_verification = TokenVerification::new(
@@ -3037,6 +3057,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         } else {
             None
         };
+
+    // The machine server's container sockets, claimed and bound before any endpoint serves. A
+    // socket serves cached content to whoever holds a token for it, so it verifies every token
+    // and runs only under an authorizer that tells partitions apart.
+    let uds_sockets = match settings.server.uds.clone() {
+        Some(uds_settings) if uds_settings.enabled && !is_maintenance => {
+            let Some(jwt_verifier) = jwt_verifier.clone() else {
+                anyhow::bail!(
+                    "[server.uds] requires [server.auth]: the sockets verify every token"
+                );
+            };
+            crate::uds::check_settings(
+                &uds_settings,
+                settings.server.auth.as_ref(),
+                auth_url.as_deref(),
+            )?;
+            let bound = crate::uds::bind_sockets(&uds_settings).await?;
+            Some((uds_settings, bound, jwt_verifier))
+        }
+        _ => None,
+    };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let (termination_tx, termination_rx) = tokio::sync::watch::channel(0u32);
@@ -3393,6 +3434,39 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
+    if let Some((uds_settings, bound, jwt_verifier)) = uds_sockets {
+        let immutable_store = immutable_store.clone();
+        let local_immutable_store = local_store().unwrap_or_else(|| immutable_store.clone());
+        let mutable_store = mutable_store.clone();
+        let repository_authorizer = repository_authorizer.clone();
+        let user_agent_filter = user_agent_filter.clone();
+        let shutdown_rx = _shutdown_rx.clone();
+        // FORK-LOCAL (Tideshift): the socket serves the same storage commands as public QUIC, so it
+        // takes the same write gate and caller-capability policy (ADR-00011).
+        let enforce_write_permission = settings
+            .server
+            .auth
+            .as_ref()
+            .is_none_or(|auth| auth.enforce_write_permission);
+        let caller_capability_policy = quic_caller_capability_policy(&settings);
+        lore_spawn!(
+            endpoints,
+            crate::uds::launch_uds_server(
+                uds_settings,
+                bound,
+                immutable_store,
+                local_immutable_store,
+                mutable_store,
+                jwt_verifier,
+                repository_authorizer,
+                enforce_write_permission,
+                caller_capability_policy,
+                user_agent_filter,
+                shutdown_rx,
+            )
+        );
+    }
+
     // the internal-only QUIC server. Hosts the ReplicationStoreService —
     // blanket storage access with no JWT layer — so the startup-time
     // validator demands mTLS unless verify_client_certs is explicitly
@@ -3576,8 +3650,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     up_gauge.record(0, &up_attributes);
 
     info!("Flushing stores");
-    let _ = immutable_store.flush(true).await;
-    let _ = mutable_store.flush(true).await;
+    let _ = immutable_store.flush(FlushOptions::SYNC_DATA).await;
+    let _ = mutable_store.flush(FlushOptions::SYNC_DATA).await;
 
     Ok(hold)
 }

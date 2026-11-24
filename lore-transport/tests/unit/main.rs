@@ -13,12 +13,14 @@ mod caller_operation;
 mod connection;
 mod error;
 mod grpc;
+mod local_socket;
 mod outcome;
 mod quic;
 mod session;
 mod session_pool;
 mod session_rebind_expiry;
 mod types;
+mod uds;
 mod unmanaged_write;
 
 /// Points the token store at a directory of this process's own, in its fallback form, so that no

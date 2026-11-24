@@ -771,7 +771,7 @@ async fn branch_list_carries_no_authn_bearer_header() {
         .expect("revision client");
 
     revision
-        .branch_list()
+        .branch_list(None, false)
         .await
         .expect("branch_list must succeed");
 

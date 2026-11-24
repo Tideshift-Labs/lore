@@ -13,6 +13,7 @@ use lore::remote::message::encode_message;
 use lore::remote::message::write_message;
 use lore::remote::message::write_payload;
 use lore::repository::LoreRepositoryDeleteArgs;
+use lore::repository::LoreRepositoryInstanceCloneArgs;
 use lore::repository::LoreRepositoryStatusArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddArgs;
 use lore::revision_tree::add::LoreRevisionTreeAddEntry;
@@ -80,7 +81,7 @@ async fn message_to_server_to_and_from_bytes() {
         LoreString::from_str("def"),
     ]);
     let environment = CallEnvironment {
-        values: [Some("/tmp/global".to_string()), None],
+        values: [Some("/tmp/global".to_string()), None, None],
     };
     let message = MessageToServer {
         globals: LoreGlobalArgs {
@@ -321,6 +322,26 @@ async fn repository_delete_survives_the_wire() {
     match relayed(LoreCommand::RepositoryDelete(args.clone())) {
         LoreCommand::RepositoryDelete(read_back) => {
             assert_eq!(read_back, args, "must carry the URL unchanged");
+        }
+        other => panic!("Unexpected command: {other:?}"),
+    }
+}
+
+/// An instance clone names its destination by text alone, so the service clones to the path the
+/// caller named only if that text crosses the wire unchanged.
+#[tokio::test]
+async fn repository_instance_clone_survives_the_wire() {
+    let args = LoreRepositoryInstanceCloneArgs {
+        target_path: LoreString::from_str("/work/clones/second"),
+        allow_copy: 1,
+    };
+
+    match relayed(LoreCommand::RepositoryInstanceClone(args.clone())) {
+        LoreCommand::RepositoryInstanceClone(read_back) => {
+            assert_eq!(
+                read_back, args,
+                "must carry the target path and the allow-copy flag unchanged"
+            );
         }
         other => panic!("Unexpected command: {other:?}"),
     }

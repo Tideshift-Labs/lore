@@ -9,8 +9,14 @@ use crate::fragment_flags::FragmentFlags;
 pub struct WriteOptions {
     /// This fragment stores a revision state
     pub revision_state: bool,
-    /// This fragment should be cached locally with payload if possible
+    /// This fragment should be cached locally with payload if possible. Recorded in the fragment's
+    /// flags, so it travels with the fragment and every store that fetches it caches it too, unless
+    /// the read stores nothing locally ([`ReadOptions::no_local_write`]).
     pub local_cache_priority: bool,
+    /// Keep the payload in this store even where the write makes it durable on the remote,
+    /// without asking anyone else to cache it: unlike `local_cache_priority`, it is not recorded in
+    /// the fragment.
+    pub keep_local: bool,
     /// Allow attempting to write the fragment to a remote
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
@@ -46,6 +52,18 @@ impl WriteOptions {
     pub fn with_local_cache_priority(mut self) -> Self {
         self.local_cache_priority = true;
         self
+    }
+
+    /// See [`WriteOptions::keep_local`].
+    pub fn with_keep_local(mut self) -> Self {
+        self.keep_local = true;
+        self
+    }
+
+    /// Whether the write keeps the payload in this store once it is durable on the remote: asked
+    /// for by [`WriteOptions::local_cache_priority`] or [`WriteOptions::keep_local`].
+    pub fn cache_local(&self) -> bool {
+        self.local_cache_priority || self.keep_local
     }
 
     pub fn with_remote_write(mut self) -> Self {
@@ -92,6 +110,27 @@ impl From<WriteOptions> for u32 {
     }
 }
 
+/// Options controlling how a store flushes its pending writes. The default syncs nothing and
+/// replaces each index file through a temporary file.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct FlushOptions {
+    /// Sync what the flush writes to the storage media.
+    pub sync_data: bool,
+    /// Write the files of a local store's index in place rather than replacing each through a
+    /// temporary file, which is faster where creating files is slow. A process that stops, or a
+    /// write that fails, while a file is being written leaves it partly written, and the next load
+    /// drops every entry it held. Stores without local index files ignore it.
+    pub fast_flush: bool,
+}
+
+impl FlushOptions {
+    /// Sync what is written, replacing each index file through a temporary file.
+    pub const SYNC_DATA: Self = Self {
+        sync_data: true,
+        fast_flush: false,
+    };
+}
+
 /// Options controlling how a fragment is read from storage.
 ///
 /// A payload the local store holds is read as stored. One fetched from a remote is checked against
@@ -112,6 +151,14 @@ pub struct ReadOptions {
     pub remote: bool,
     /// Cache locally
     pub cache: bool,
+    /// Store nothing the read fetches in the local store, whatever `cache`, a local copy that does
+    /// not load, or the fragment's local cache priority asks.
+    pub no_local_write: bool,
+    /// Where no remote is in reach, answer a local read that fails with its error, and a local
+    /// payload that fails its size check or does not decompress with an internal error, rather
+    /// than with `AddressNotFound`, which stays the answer for an address the local store does not
+    /// hold.
+    pub strict_local: bool,
     /// Write to file directly
     pub direct_write: bool,
     /// Force sync data to storage media after write
@@ -141,6 +188,8 @@ impl Default for ReadOptions {
             local: true,
             remote: true,
             cache: false,
+            no_local_write: false,
+            strict_local: false,
             direct_write: false,
             sync_data: false,
             create_parent: false,
@@ -185,6 +234,18 @@ impl ReadOptions {
 
     pub fn optional_cache(mut self, cache: bool) -> Self {
         self.cache = cache;
+        self
+    }
+
+    /// See [`ReadOptions::no_local_write`].
+    pub fn with_no_local_write(mut self) -> Self {
+        self.no_local_write = true;
+        self
+    }
+
+    /// See [`ReadOptions::strict_local`].
+    pub fn with_strict_local(mut self) -> Self {
+        self.strict_local = true;
         self
     }
 

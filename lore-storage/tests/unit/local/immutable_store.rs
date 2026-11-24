@@ -36,6 +36,7 @@ mod oodle_migration;
 mod payload_gate;
 mod representation;
 
+use lore_storage::FlushOptions;
 use lore_storage::local::immutable_store::*;
 
 use crate::store_fixture::assert_payloads_read_back;
@@ -160,6 +161,72 @@ fn stored_fragment(payload: &Bytes, flags: FragmentFlags) -> Fragment {
         flags: flags.as_u32(),
         size_payload: payload.len() as u32,
         size_content: payload.len() as u64,
+    }
+}
+
+/// A put of the payload over an entry that lost it restores the payload of every entry of its hash,
+/// which compaction left without one, whichever of them the put lands on.
+#[tokio::test]
+async fn a_put_over_an_entry_without_its_payload_restores_every_entry_of_its_hash() {
+    let payload = Bytes::from_static(b"content two files hold, its payload compacted away");
+    let fragment = stored_fragment(&payload, FragmentFlags::PayloadStoredDurable);
+    let partition = Partition::from([0x5A; 16]);
+    let at = |byte: u8| Address {
+        hash: hash::hash_slice(&payload),
+        context: Context::from([byte; 16]),
+    };
+    for (first, second) in [(0x29, 0xD6), (0xD6, 0x29)] {
+        let dir = lore_base::test_util::TempDir::new("is_restore_siblings_");
+        let store: Arc<dyn lore_storage::immutable_store::ImmutableStore> =
+            LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+        for byte in [first, second] {
+            store
+                .clone()
+                .put(partition, at(byte), fragment, Some(payload.clone()), false)
+                .await
+                .expect("put the payload");
+        }
+        let mut resume = None;
+        loop {
+            resume = store
+                .clone()
+                .compact(0, resume, false, None)
+                .await
+                .expect("compact");
+            if resume.is_none() {
+                break;
+            }
+        }
+        for byte in [first, second] {
+            assert!(store.clone().get(partition, at(byte)).await.is_err());
+        }
+
+        store
+            .clone()
+            .put(
+                partition,
+                at(second),
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put the payload again");
+
+        for byte in [first, second] {
+            let got = store
+                .clone()
+                .get(partition, at(byte))
+                .await
+                .unwrap_or_else(|err| panic!("{byte:#x} after {second:#x}: {err}"));
+            assert_eq!(
+                got.payload,
+                Some(payload.clone()),
+                "{byte:#x} after {second:#x}"
+            );
+        }
     }
 }
 
@@ -347,7 +414,11 @@ async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
     let partition = Partition::from([9u8; 16]);
     let (first, _) = payload_off_bucket_zero(1);
     put_payload(&store, partition, first.context, b"written before", false).await;
-    dyn_store.clone().flush(false).await.expect("flush");
+    dyn_store
+        .clone()
+        .flush(FlushOptions::default())
+        .await
+        .expect("flush");
     let address = put_payload(
         &store,
         partition,
@@ -362,11 +433,12 @@ async fn a_flush_waits_for_a_bucket_write_another_flush_claimed() {
     let delayed = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
         Arc::downgrade(&store),
         group_index,
-        0
+        Duration::ZERO
     ));
     pause.reached.notified().await;
     let flushing = dyn_store.clone();
-    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let mut flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut flush)
             .await
@@ -403,7 +475,8 @@ async fn a_flush_writes_a_bucket_whose_claimed_write_did_not_land() {
     let writing = group.flush_lock.clone().lock_owned().await;
     assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
     let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
-    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let mut flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut flush)
             .await
@@ -451,7 +524,8 @@ async fn a_flush_skips_no_group_whose_claimed_write_did_not_land() {
         .map(|_| pause_at(PausePoint::Scanning))
         .collect();
     let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     for pause in &scanning[..claimed_group] {
         pause.reached.notified().await;
         pause.resume.notify_one();
@@ -510,7 +584,7 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
     }
     dyn_store
         .clone()
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .expect("flush at level 1");
 
@@ -536,7 +610,7 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
     }
     dyn_store
         .clone()
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .expect("flush fanning out");
     assert_eq!(
@@ -579,7 +653,8 @@ async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_it
 
         let first = pause_at(PausePoint::Serializing);
         let flushing = dyn_store.clone();
-        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        let flush =
+            lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
         first.reached.notified().await;
         let second = pause_at(PausePoint::Serializing);
         first.resume.notify_one();
@@ -598,7 +673,7 @@ async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_it
         );
         dyn_store
             .clone()
-            .flush(false)
+            .flush(FlushOptions::default())
             .await
             .expect("the next flush");
     }
@@ -638,7 +713,8 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
 
         let committing = pause_at(PausePoint::Committing);
         let flushing = dyn_store.clone();
-        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        let flush =
+            lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
         committing.reached.notified().await;
         flush.abort();
         assert!(flush.await.is_err(), "the flush was dropped");
@@ -702,7 +778,8 @@ async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
 
     let mut serializing = pause_at(PausePoint::Serializing);
     let flushing = dyn_store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     for _ in 1..written.len() {
         serializing.reached.notified().await;
         let next = pause_at(PausePoint::Serializing);
@@ -770,7 +847,8 @@ async fn a_group_flush_left_by_a_dropped_flush_releases_the_flock_once_it_ends()
 
     let serializing = pause_at(PausePoint::Serializing);
     let flushing: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     serializing.reached.notified().await;
     flush.abort();
     assert!(flush.await.unwrap_err().is_cancelled());
@@ -829,7 +907,7 @@ async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_i
         }
         dyn_store
             .clone()
-            .flush(false)
+            .flush(FlushOptions::default())
             .await
             .expect("flush at level 1");
         for payload in &payloads[2..5] {
@@ -845,7 +923,10 @@ async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_i
             .find(|&bucket| bucket != 0)
             .expect("an entry outside bucket 0 at the fanned out level");
         let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
-        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+        super::fail_commit_at_rename(&blocked, || {
+            dyn_store.clone().flush(FlushOptions::default())
+        })
+        .await;
 
         for payload in &payloads[5..] {
             let address = put_payload(&store, partition, Context::default(), payload, false).await;
@@ -853,7 +934,8 @@ async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_i
         }
         let serializing = pause_at(PausePoint::Serializing);
         let flushing = dyn_store.clone();
-        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        let flush =
+            lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
         serializing.reached.notified().await;
         copy_tree(dir.path(), killed.path());
         serializing.resume.notify_one();
@@ -918,9 +1000,13 @@ async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucke
         let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 4);
         let bucket = lore_storage::local::fan_out::bucket_index_for(&stored[0].0.hash, level);
         let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
-        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+        super::fail_commit_at_rename(&blocked, || {
+            dyn_store.clone().flush(FlushOptions::default())
+        })
+        .await;
 
-        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
 
         let group = &store.group[group_index];
         assert_eq!(group.pending_level.load(atomic::Ordering::Relaxed), 0);
@@ -966,7 +1052,10 @@ async fn an_eviction_writes_no_level_marker_while_a_commit_is_pending() {
     let level = lore_storage::local::fan_out::level_for(1, payloads.len(), 4);
     let bucket = lore_storage::local::fan_out::bucket_index_for(&addresses[0].hash, level);
     let blocked = format_bucket_path(&dir.path().join("immutable"), group_index, bucket);
-    super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+    super::fail_commit_at_rename(&blocked, || {
+        dyn_store.clone().flush(FlushOptions::default())
+    })
+    .await;
 
     let (evicted, _) = store
         .clone()
@@ -1009,7 +1098,10 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
             stored.push((address, payload.clone()));
         }
         let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
-        dyn_store.flush(false).await.expect("flush");
+        dyn_store
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         store.group[group_index]
             .bucket_count
             .load(atomic::Ordering::Relaxed)
@@ -1040,7 +1132,7 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
 async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
     let weak = Arc::downgrade(store);
     for group_index in 0..GROUP_COUNT {
-        ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, Duration::ZERO).await;
     }
 }
 
@@ -1164,6 +1256,77 @@ async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
     }
 }
 
+/// A flush asked for `fast_flush` writes each bucket file in place, keeping the file, and one not
+/// asked for it through a renamed temporary file, with and without `sync_data`. Either way it leaves
+/// no temporary file, and the store reopens with every entry. The second flush is the one observed:
+/// the first commits the groups' level, which renames `.new` files whatever the options.
+#[tokio::test]
+async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
+    use lore_storage::immutable_store::ImmutableStore;
+    for fast_flush in [false, true] {
+        for sync_data in [false, true] {
+            let dir = lore_base::test_util::TempDir::new("is_fast_flush_");
+            let partition = Partition::from([7u8; 16]);
+            let root = dir.path().join("immutable").join("index");
+            let mut addresses = Vec::new();
+            {
+                let store =
+                    LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                        .await
+                        .expect("store opens");
+                let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+                let mut before = None;
+                // Enough fragments per batch that the second lands in groups the first wrote.
+                for seeds in [0..256u16, 256..512] {
+                    for seed in seeds {
+                        let (address, payload) = payload_off_bucket_zero(seed);
+                        let fragment = Fragment {
+                            flags: 0,
+                            size_payload: payload.len() as u32,
+                            size_content: payload.len() as u64,
+                        };
+                        dyn_store
+                            .clone()
+                            .put(partition, address, fragment, Some(payload), false)
+                            .await
+                            .expect("put succeeds");
+                        addresses.push(address);
+                    }
+                    dyn_store
+                        .clone()
+                        .flush(FlushOptions {
+                            sync_data,
+                            fast_flush,
+                        })
+                        .await
+                        .expect("flush succeeds");
+                    match &before {
+                        None => before = Some(super::bucket_files(&root)),
+                        Some(before) => super::assert_rewritten(&root, before, fast_flush),
+                    }
+                }
+            }
+
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            let dyn_store: Arc<dyn ImmutableStore> = store.clone();
+            for address in &addresses {
+                dyn_store
+                    .clone()
+                    .get(partition, *address)
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "fast flush {fast_flush} sync data {sync_data}: {address} reads back \
+                             as {err:?}"
+                        )
+                    });
+            }
+        }
+    }
+}
+
 mod oodle_migration_seed {
     use super::*;
 
@@ -1176,7 +1339,10 @@ mod oodle_migration_seed {
                 .expect("store opens");
             let addresses = put_fragments(&store, Partition::from([7u8; 16]), 32).await;
             let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
-            dyn_store.flush(true).await.expect("store flushes");
+            dyn_store
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("store flushes");
             addresses
                 .iter()
                 .map(|address| address.hash.data()[0] as i32)
@@ -1414,7 +1580,10 @@ async fn a_marked_group_keeps_the_level_it_recorded() {
         let dyn_store: Arc<dyn lore_storage::immutable_store::ImmutableStore> = store.clone();
         let _ = put_fragments(&store, partition, 8).await;
         // A real flush commits the level through the two-phase path.
-        dyn_store.flush(false).await.expect("flush succeeds");
+        dyn_store
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush succeeds");
     }
 
     let before: Vec<(PathBuf, Vec<u8>)> = level_markers(&index_root)
@@ -1652,7 +1821,7 @@ async fn store_recovers_from_corrupt_bucket_and_remains_usable() {
         .await
         .unwrap();
 
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
         address
     };
 
@@ -1804,7 +1973,7 @@ async fn group_compaction_reports_a_finished_group_complete() {
         )
         .await;
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     assert!(
         compact_group(&store, group_index).await,
@@ -2119,7 +2288,7 @@ async fn compaction_leaves_a_fully_referenced_group_in_place() {
     for payload in &payloads {
         put_payload(&store, partition, Context::default(), payload, false).await;
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let group = &store.group[group_index];
     assert_eq!(group.packstore.sizes().await.unwrap(), vec![4 * 4096]);
@@ -2158,7 +2327,7 @@ async fn compaction_rewrites_a_packfile_with_orphaned_payloads() {
             local.push((address, payload.clone()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     assert!(compact_group(&store, group_index).await);
     assert_eq!(
@@ -2209,7 +2378,7 @@ async fn compaction_writes_only_the_buckets_it_changed() {
             local.push((address, payload.clone()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     // Compaction passes over a group with a bucket not loaded.
     store.deserialize_all_buckets().await.unwrap();
 
@@ -2273,7 +2442,7 @@ async fn compact_with_one_orphan(dir_prefix: &str, local: usize) -> (usize, bool
     for (index, payload) in payloads.iter().enumerate() {
         put_payload(&store, partition, Context::default(), payload, index == 0).await;
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let durable = FragmentFlags::PayloadStoredDurable.bits();
     let local_locations = |entries: Vec<ImmutableStoreEntry>| {
@@ -2353,7 +2522,7 @@ async fn store_in_packfiles(
                 );
             }
         }
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
         .await
@@ -2577,7 +2746,7 @@ async fn compaction_skips_a_group_with_a_bucket_that_failed_to_load() {
             addresses
                 .push(put_payload(&store, partition, Context::default(), payload, index < 2).await);
         }
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let bucket_path = format_bucket_path(&dir.path().join("immutable"), group_index, 0);
@@ -2625,7 +2794,7 @@ async fn loading_the_index_lets_eviction_see_every_entry() {
         for payload in &payloads {
             put_payload(&store, partition, Context::default(), payload, true).await;
         }
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
@@ -2735,7 +2904,7 @@ async fn loading_the_index_reports_a_failed_load_each_time() {
             false,
         )
         .await;
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
     write_bucket_file(
         &format_bucket_path(&dir.path().join("immutable"), group_index, 0),
@@ -2769,7 +2938,7 @@ async fn compaction_keeps_a_packfile_it_cannot_empty() {
             local.push((address, payload.clone()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let mut unreadable_hash = [0xffu8; 32];
     unreadable_hash[0] = group_index as u8;
@@ -2835,7 +3004,7 @@ async fn compaction_counts_a_shared_payload_once() {
     let address = put_payload(&store, partition, Context::default(), &payloads[1], false).await;
     local.push((address, payloads[1].clone()));
     put_payload(&store, partition, Context::default(), &payloads[2], true).await;
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     assert_eq!(
         store.group[group_index].packstore.sizes().await.unwrap()[0],
@@ -2907,7 +3076,7 @@ async fn compaction_reports_one_end_for_every_begin() {
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let sink = Arc::new(CountingSink::default());
 
@@ -3351,7 +3520,7 @@ async fn a_reload_clears_the_record_of_having_loaded_every_bucket() {
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     store.deserialize_all_buckets().await.unwrap();
     assert!(
@@ -3467,11 +3636,11 @@ async fn a_delayed_flush_with_nothing_to_write_claims_nothing() {
         .unwrap();
     let ((group_index, _), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[0].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO).await;
 
     assert_eq!(
         std::fs::read(&epoch).ok(),
@@ -3503,7 +3672,7 @@ async fn a_delayed_flush_writes_no_level_marker_for_a_group_with_nothing_flagged
         .join(lore_storage::local::fan_out::MARKER_FILENAME);
     let before = std::fs::read(&epoch).ok();
 
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), 0, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), 0, Duration::ZERO).await;
 
     assert_eq!(
         std::fs::read(&epoch).ok(),
@@ -3549,7 +3718,7 @@ async fn a_delayed_flush_releases_the_flock_a_span_left_to_it() {
     let flush = lore_base::lore_spawn!(ImmutableStoreGroup::flush_delayed(
         Arc::downgrade(&store),
         group_index,
-        0
+        Duration::ZERO
     ));
     pause.reached.notified().await;
     drop(span);
@@ -3689,7 +3858,7 @@ async fn a_store_drops_what_another_one_changed_underneath_it() {
             )
             .await
             .unwrap();
-        writer.clone().flush(true).await.unwrap();
+        writer.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let mut results = [StoreMatchResult::default(); 1];
@@ -3760,7 +3929,7 @@ async fn a_read_into_a_callers_buffer_serves_what_another_store_wrote() {
             )
             .await
             .unwrap();
-        writer.clone().flush(true).await.unwrap();
+        writer.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let (_fragment, read) = reader
@@ -3863,7 +4032,7 @@ async fn a_stamp_reaches_the_bucket_file() {
     // nothing. A read marks the bucket for the next flush without marking the store
     // as changed, so the flush writes it under a read claim.
     store.find(partition, address, Lookup::Read).await.unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let root = store.path.clone().expect("a disk-backed store has a path");
     let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
@@ -3896,15 +4065,15 @@ async fn a_flush_with_nothing_to_write_announces_nothing() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
     {
         let _span = store.clone().hold_for_command().await.unwrap();
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     assert_eq!(std::fs::read(&epoch).ok(), before, "nothing was written");
     assert!(!lock.is_held(), "and nothing is left claimed");
@@ -3924,7 +4093,7 @@ async fn a_read_stamp_reaches_disk_without_announcing_a_change() {
     // Written once as a change, so the group's level is committed and the stamp below
     // goes through the regular path.
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), true)
+    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), FlushOptions::SYNC_DATA)
         .await
         .unwrap();
     assert!(!lock.is_held());
@@ -3932,7 +4101,7 @@ async fn a_read_stamp_reaches_disk_without_announcing_a_change() {
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
     store.find(partition, address, Lookup::Read).await.unwrap();
-    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), true)
+    lore_storage::immutable_store::ImmutableStore::flush(store.clone(), FlushOptions::SYNC_DATA)
         .await
         .unwrap();
 
@@ -3971,7 +4140,7 @@ async fn a_write_keeps_the_store_claimed_until_it_is_flushed() {
     backdated_fragment(&store, STALE_ACCESS).await;
     assert!(lock.is_held(), "an unflushed write holds the store");
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held(), "and the flush that settles it releases it");
 }
 
@@ -4032,7 +4201,7 @@ async fn an_eviction_writes_what_it_evicted_and_releases_the_store() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
 
@@ -4079,7 +4248,7 @@ async fn an_eviction_writes_on_its_own_claim_past_another_span() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let span = ImmutableStore::hold_for_command(store.clone())
         .await
@@ -4141,7 +4310,7 @@ async fn a_compaction_claims_to_write_on_its_own_past_another_span() {
     drop(span);
     selected.resume.notify_one();
     compacting.await.expect("the pass ends").expect("compacts");
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     assert!(
         !lock.is_held(),
         "the pass let the store go once it had ended"
@@ -4206,7 +4375,7 @@ async fn a_healing_verify_releases_the_store() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     store.clone().verify(true).await.unwrap();
     assert!(
@@ -4239,7 +4408,7 @@ async fn a_verify_heals_a_corrupt_payload_a_fan_out_would_move_out_of_its_walk()
     for payload in &payloads[..4] {
         addresses.push(put_payload(&store, partition, Context::default(), payload, false).await);
     }
-    ImmutableStore::flush(store.clone(), false)
+    ImmutableStore::flush(store.clone(), FlushOptions::default())
         .await
         .expect("flush at level 1");
     let corrupt = *addresses
@@ -4278,7 +4447,9 @@ async fn a_verify_heals_a_corrupt_payload_a_fan_out_would_move_out_of_its_walk()
     checking[group_index].reached.notified().await;
     let mut flushing = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { ImmutableStore::flush(store, false).await })
+        lore_base::lore_spawn!(async move {
+            ImmutableStore::flush(store, FlushOptions::default()).await
+        })
     };
     let flushed_meanwhile = tokio::time::timeout(Duration::from_millis(100), &mut flushing)
         .await
@@ -4322,7 +4493,7 @@ async fn a_verify_fails_when_a_bucket_cannot_be_loaded() {
             .await
             .expect("store opens");
         put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-        ImmutableStore::flush(store.clone(), false)
+        ImmutableStore::flush(store.clone(), FlushOptions::default())
             .await
             .expect("flush");
     }
@@ -4359,7 +4530,7 @@ async fn a_flush_settles_an_emptied_bucket_it_has_nothing_to_write_for() {
     group.dirty[0].store(true, atomic::Ordering::Relaxed);
     group.soft_dirty[0].store(true, atomic::Ordering::Relaxed);
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!group.needs_flush(0), "the flags were settled");
     assert!(!lock.is_held(), "so nothing keeps the store claimed");
 }
@@ -4422,7 +4593,7 @@ async fn a_background_pass_leaves_a_store_in_use_for_later() {
     .unwrap();
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let elsewhere = lore_base::fs::lock::FSLock::acquire_exact_path(
         &dir.to_path_buf().join("immutable").join("lock"),
@@ -4465,7 +4636,7 @@ async fn a_compaction_pass_decides_again_from_a_store_its_claim_reloaded() {
         .unwrap();
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     let held_in_memory = store.packstore_total_size().await;
     assert!(
         held_in_memory > 0,
@@ -4523,7 +4694,7 @@ async fn a_compaction_whose_write_claim_reloaded_the_store_rewrites_nothing() {
     let ((group_index, bucket_index), partition, address) =
         backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     // Held, so the pass stops between the buckets it loads and the write claim it takes.
     let permit = store
@@ -4628,7 +4799,7 @@ async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
         // Written once, so the group's level is committed and the write below takes the
         // regular path to the bucket's own file.
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
         assert!(!lock.is_held());
 
         block_bucket_file(&store, group_index, bucket_index);
@@ -4637,7 +4808,14 @@ async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
 
         assert!(
-            store.clone().flush(sync_data).await.is_err(),
+            store
+                .clone()
+                .flush(FlushOptions {
+                    sync_data,
+                    ..FlushOptions::default()
+                })
+                .await
+                .is_err(),
             "sync_data {sync_data}: the bucket cannot be written"
         );
         assert!(
@@ -4667,7 +4845,7 @@ async fn a_stamp_that_fails_to_reach_disk_stays_a_stamp() {
             backdated_fragment(&store, STALE_ACCESS).await;
         let group = store.group[group_index].clone();
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
         block_bucket_file(&store, group_index, bucket_index);
         store.find(partition, address, Lookup::Read).await.unwrap();
@@ -4677,7 +4855,14 @@ async fn a_stamp_that_fails_to_reach_disk_stays_a_stamp() {
         );
 
         assert!(
-            store.clone().flush(sync_data).await.is_err(),
+            store
+                .clone()
+                .flush(FlushOptions {
+                    sync_data,
+                    ..FlushOptions::default()
+                })
+                .await
+                .is_err(),
             "sync_data {sync_data}: the bucket cannot be written"
         );
         assert!(
@@ -4725,7 +4910,7 @@ async fn a_flush_that_fails_to_commit_its_level_keeps_the_store_claimed_until_on
     .expect("a directory where the commit point goes");
 
     assert!(
-        store.clone().flush(true).await.is_err(),
+        store.clone().flush(FlushOptions::SYNC_DATA).await.is_err(),
         "the level cannot be committed"
     );
     assert!(
@@ -4738,7 +4923,7 @@ async fn a_flush_that_fails_to_commit_its_level_keeps_the_store_claimed_until_on
         .expect("the commit point is freed");
     store
         .clone()
-        .flush(true)
+        .flush(FlushOptions::SYNC_DATA)
         .await
         .expect("the level is committed");
     assert!(!store.group[group_index].needs_flush(bucket_index));
@@ -4763,7 +4948,7 @@ async fn a_flush_reloads_a_changed_store_before_it_writes() {
         .unwrap();
     let ((group_index, bucket_index), _, address) = backdated_fragment(&mine, STALE_ACCESS).await;
     mine.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    mine.clone().flush(true).await.unwrap();
+    mine.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     // Another store on the directory adds the same content under a second partition.
     let theirs = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
@@ -4785,11 +4970,11 @@ async fn a_flush_reloads_a_changed_store_before_it_writes() {
         )
         .await
         .unwrap();
-    theirs.clone().flush(true).await.unwrap();
+    theirs.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     // A flag on this store's copy of the bucket, which no longer describes it.
     mine.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    mine.clone().flush(true).await.unwrap();
+    mine.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let root = mine.path.clone().expect("a disk-backed store has a path");
     let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
@@ -4822,13 +5007,13 @@ async fn a_flush_of_a_change_announces_it_without_a_write_claim_behind_it() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     let ((group_index, bucket_index), _, _) = backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held());
 
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     assert_ne!(
         std::fs::read(&epoch).ok(),
@@ -4855,12 +5040,12 @@ async fn a_delayed_flush_writes_stamps_without_announcing_them() {
     let ((group_index, bucket_index), partition, address) =
         backdated_fragment(&store, STALE_ACCESS).await;
     store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
 
     let epoch = dir.to_path_buf().join("immutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
     store.find(partition, address, Lookup::Read).await.unwrap();
-    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+    ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO).await;
 
     let root = store.path.clone().expect("a disk-backed store has a path");
     let entry = ImmutableStoreBucket::deserialize_files(format_bucket_path(
@@ -4997,7 +5182,7 @@ async fn a_write_inside_a_span_keeps_the_flock_past_the_span_until_flushed() {
         "the bucket the write flagged keeps the flock past the span"
     );
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(
         !lock.is_held(),
         "and the flush that writes it releases the flock"
@@ -5037,7 +5222,7 @@ async fn a_store_kept_over_its_deleted_directory_reloads_it_recreated_and_empty(
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     drop(span);
 
     std::fs::remove_dir_all(dir.join("immutable")).expect("deletes the store directory");
@@ -5101,7 +5286,7 @@ async fn a_store_holds_no_packfile_open_between_uses() {
         )
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(
         open_packfiles(&store).await > 0,
         "the write opened the group's packfiles"
@@ -5358,7 +5543,7 @@ async fn a_group_flush_left_by_a_dropped_flush_holds_its_group_until_it_ends() {
     let in_flight = lore_storage::test_util::hold_store_write();
     let flush = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { store.flush(false).await })
+        lore_base::lore_spawn!(async move { store.flush(FlushOptions::default()).await })
     };
     in_flight.issued.notified().await;
     flush.abort();
@@ -5924,13 +6109,13 @@ async fn an_unsynced_flush_replaces_the_bucket_file() {
     let (group_index, payloads) = payloads_in_one_group(2);
     let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
     put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     let written = std::fs::read(&bucket_path).unwrap();
     let link = dir.join("last_written");
     std::fs::hard_link(&bucket_path, &link).unwrap();
 
     put_payload(&store, partition, Context::default(), &payloads[1], false).await;
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
 
     assert_eq!(
         std::fs::read(&link).unwrap(),
@@ -5992,7 +6177,11 @@ async fn healing_the_last_entry_in_a_bucket_survives_reopening_the_store() {
             .expect("put the payload");
 
         // On disk before anything goes wrong, so the file healing has to account for exists.
-        store.clone().flush(true).await.expect("flush the bucket");
+        store
+            .clone()
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flush the bucket");
 
         let group_index = hash.data()[0] as usize;
         let found = store
@@ -6017,7 +6206,11 @@ async fn healing_the_last_entry_in_a_bucket_survives_reopening_the_store() {
             .expect("verify answers");
         assert!(healed.healed, "the corrupt payload was not healed");
 
-        store.clone().flush(true).await.expect("flush the removal");
+        store
+            .clone()
+            .flush(FlushOptions::SYNC_DATA)
+            .await
+            .expect("flush the removal");
     }
 
     let reopened = LocalImmutableStore::new(
@@ -7057,7 +7250,11 @@ mod obliteration {
         let payload = b"content to be obliterated".repeat(16);
         let partition = Partition::from([0x75u8; 16]);
         let address = put(&dyn_store, partition, &payload).await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
 
         let pause = pause_at(PausePoint::Serializing);
         let obliterating = dyn_store.clone();
@@ -7108,7 +7305,11 @@ mod obliteration {
             &b"content to be obliterated".repeat(16),
         )
         .await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
 
         let pause = pause_at(PausePoint::Serializing);
         let obliterating = dyn_store.clone();
@@ -7145,7 +7346,11 @@ mod obliteration {
             &b"content to be obliterated".repeat(16),
         )
         .await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         let group = &store.group[address.hash.data()[0] as usize];
         let lock = store.lock.clone().expect("a disk-backed store has a lock");
 
@@ -7321,7 +7526,11 @@ mod obliteration {
         for payload in &payloads[..2] {
             addresses.push(put(&dyn_store, partition, payload).await);
         }
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         for payload in &payloads[2..] {
             addresses.push(put(&dyn_store, partition, payload).await);
         }
@@ -7329,7 +7538,13 @@ mod obliteration {
             .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
         std::fs::create_dir_all(&pending).expect("block level.pending");
         std::fs::write(pending.join("blocker"), b"x").expect("block level.pending");
-        assert!(dyn_store.clone().flush(false).await.is_err());
+        assert!(
+            dyn_store
+                .clone()
+                .flush(FlushOptions::default())
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(&pending).expect("unblock level.pending");
         let group = &store.group[group_index];
         assert_ne!(
@@ -7382,7 +7597,11 @@ mod obliteration {
         for payload in &payloads[..2] {
             addresses.push(put(&dyn_store, partition, payload).await);
         }
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         for payload in &payloads[2..] {
             addresses.push(put(&dyn_store, partition, payload).await);
         }
@@ -7390,7 +7609,13 @@ mod obliteration {
             .with_file_name(lore_storage::local::fan_out::LEVEL_PENDING_FILENAME);
         std::fs::create_dir_all(&pending).expect("block level.pending");
         std::fs::write(pending.join("blocker"), b"x").expect("block level.pending");
-        assert!(dyn_store.clone().flush(false).await.is_err());
+        assert!(
+            dyn_store
+                .clone()
+                .flush(FlushOptions::default())
+                .await
+                .is_err()
+        );
         std::fs::remove_dir_all(&pending).expect("unblock level.pending");
 
         let committing =
@@ -7439,7 +7664,11 @@ mod obliteration {
         let (group_index, payloads) = payloads_in_one_group(2);
         let obliterated = put(&dyn_store, partition, &payloads[0]).await;
         let kept = put(&dyn_store, partition, &payloads[1]).await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
 
         let serializing =
             lore_storage::test_util::pause_at(lore_storage::test_util::PausePoint::Serializing);
@@ -7501,7 +7730,11 @@ mod obliteration {
         std::fs::create_dir_all(&blocked).expect("block the bucket's rename");
         std::fs::write(blocked.join("blocker"), b"x").expect("block the bucket's rename");
         assert!(
-            dyn_store.clone().flush(false).await.is_err(),
+            dyn_store
+                .clone()
+                .flush(FlushOptions::default())
+                .await
+                .is_err(),
             "the commit's rename fails"
         );
         assert!(
@@ -7954,7 +8187,10 @@ mod put_validation {
             }
             group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             drop(bucket);
-            dyn_store.flush(true).await.expect("flush");
+            dyn_store
+                .flush(FlushOptions::SYNC_DATA)
+                .await
+                .expect("flush");
         }
 
         let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
@@ -8322,7 +8558,7 @@ async fn compaction_rewrites_a_packfile_spread_over_many_buckets() {
             local.push((address, payload.clone()));
         }
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     store.deserialize_all_buckets().await.unwrap();
     assert_eq!(
         store.group[group_index]
@@ -8362,14 +8598,14 @@ async fn a_failed_bucket_write_leaves_the_bucket_dirty() {
     let partition = Partition::from([0x45u8; 16]);
     let (group_index, payloads) = payloads_in_one_group(2);
     put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     let bucket_path = format_bucket_path(&dir.join("immutable"), group_index, 0);
     std::fs::remove_file(&bucket_path).unwrap();
     std::fs::create_dir(&bucket_path).unwrap();
     std::fs::write(bucket_path.join("blocker"), b"x").unwrap();
 
     put_payload(&store, partition, Context::default(), &payloads[1], false).await;
-    let _ = store.clone().flush(false).await;
+    let _ = store.clone().flush(FlushOptions::default()).await;
 
     assert!(store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
     let mut temporary = bucket_path.into_os_string();
@@ -8396,11 +8632,11 @@ async fn a_failed_fan_out_commit_leaves_its_buckets_dirty() {
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::write(pending.join("blocker"), b"x").unwrap();
 
-        assert!(store.clone().flush(false).await.is_err());
+        assert!(store.clone().flush(FlushOptions::default()).await.is_err());
         assert!(store.group[group_index].dirty[0].load(atomic::Ordering::Relaxed));
 
         std::fs::remove_dir_all(&pending).unwrap();
-        store.clone().flush(false).await.unwrap();
+        store.clone().flush(FlushOptions::default()).await.unwrap();
         address
     };
 
@@ -8425,7 +8661,7 @@ async fn compaction_skips_a_group_whose_fan_out_is_not_committed() {
     for (index, payload) in payloads.iter().enumerate() {
         put_payload(&store, partition, Context::default(), payload, index < 2).await;
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     store.deserialize_all_buckets().await.unwrap();
     let group = &store.group[group_index];
     group.committed_level.store(32, atomic::Ordering::Relaxed);
@@ -8465,7 +8701,7 @@ async fn compaction_keeps_a_packfile_when_a_bucket_write_fails() {
                 local.push((address, payload.clone()));
             }
         }
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
         std::fs::remove_file(&bucket_path).unwrap();
         std::fs::create_dir(&bucket_path).unwrap();
         std::fs::write(bucket_path.join("blocker"), b"x").unwrap();
@@ -8479,7 +8715,7 @@ async fn compaction_keeps_a_packfile_when_a_bucket_write_fails() {
             "the packfile is not truncated"
         );
         std::fs::remove_dir_all(&bucket_path).unwrap();
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
@@ -8533,7 +8769,7 @@ async fn compaction_keeps_a_packfile_when_its_group_level_marker_cannot_be_writt
             "a bucket file was written without its group's level marker"
         );
         std::fs::remove_dir_all(&marker).unwrap();
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
@@ -8594,7 +8830,7 @@ async fn no_bucket_file_is_written_while_a_fan_out_is_uncommitted() {
             addresses
                 .push(put_payload(&store, partition, Context::default(), payload, false).await);
         }
-        store.clone().flush(false).await.unwrap();
+        store.clone().flush(FlushOptions::default()).await.unwrap();
         let committed = std::fs::read(&bucket_path).unwrap();
         for payload in &payloads[2..] {
             addresses
@@ -8602,7 +8838,7 @@ async fn no_bucket_file_is_written_while_a_fan_out_is_uncommitted() {
         }
         std::fs::create_dir_all(&pending).unwrap();
         std::fs::write(pending.join("blocker"), b"x").unwrap();
-        assert!(store.clone().flush(false).await.is_err());
+        assert!(store.clone().flush(FlushOptions::default()).await.is_err());
         let group = &store.group[group_index];
         assert_ne!(
             group.bucket_count.load(atomic::Ordering::Relaxed),
@@ -8610,13 +8846,14 @@ async fn no_bucket_file_is_written_while_a_fan_out_is_uncommitted() {
             "the group fanned out without committing"
         );
 
-        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, 0).await;
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
 
         assert_eq!(std::fs::read(&bucket_path).unwrap(), committed);
         assert!(!format_bucket_path(&dir.join("immutable"), group_index, 1).exists());
         assert!(group.dirty[0].load(atomic::Ordering::Relaxed));
         std::fs::remove_dir_all(&pending).unwrap();
-        store.clone().flush(false).await.unwrap();
+        store.clone().flush(FlushOptions::default()).await.unwrap();
     }
 
     let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
@@ -8660,7 +8897,7 @@ async fn compaction_goes_on_past_a_group_whose_packfiles_fail_to_load() {
                 }
             }
         }
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
     let pack = dir
         .join("immutable")
@@ -8721,7 +8958,7 @@ async fn store_for_rewrite(
         )
         .await;
     }
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     store
 }
 
@@ -8929,7 +9166,7 @@ async fn a_bucket_write_in_flight_holds_up_no_lookup_or_insert() {
     let serializing = pause_at(PausePoint::Serializing);
     let flush = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { store.flush(false).await })
+        lore_base::lore_spawn!(async move { store.flush(FlushOptions::default()).await })
     };
     serializing.reached.notified().await;
 
@@ -8943,7 +9180,7 @@ async fn a_bucket_write_in_flight_holds_up_no_lookup_or_insert() {
     let second = during.expect("the insert and the lookup do not wait for the bucket write");
     flush.await.unwrap().unwrap();
 
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     drop(store);
     let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), settings())
         .await
@@ -9217,7 +9454,7 @@ async fn a_compaction_sync_holds_up_no_lookup_or_insert() {
     let late = during.expect("the insert and the lookup do not wait for the sync");
     assert!(compaction.await.unwrap());
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     drop(store);
     let reopened = LocalImmutableStore::new(Some(dir.to_path_buf()), client_settings())
         .await
@@ -9379,13 +9616,13 @@ async fn a_durable_flush_syncs_the_payloads_its_bucket_files_point_at() {
     });
     let late = payloads.pop().unwrap();
     put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     put_payload(&store, partition, Context::default(), &payloads[0], true).await;
 
     let serializing = pause_at(PausePoint::Serializing);
     let flush = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { store.flush(true).await })
+        lore_base::lore_spawn!(async move { store.flush(FlushOptions::SYNC_DATA).await })
     };
     serializing.reached.notified().await;
     put_payload(&store, partition, Context::default(), &late, false).await;
@@ -9458,7 +9695,7 @@ async fn a_bucket_file_records_the_size_of_the_packfile_taking_writes() {
     for payload in &payloads[..2] {
         put_payload(&store, partition, Context::default(), payload, false).await;
     }
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
 
     let (header, bytes) = read_bucket_file(&dir, group_index, 0);
     assert_eq!(
@@ -9468,7 +9705,7 @@ async fn a_bucket_file_records_the_size_of_the_packfile_taking_writes() {
     assert_eq!(bytes.len(), bucket_file_len(2));
 
     put_payload(&store, partition, Context::default(), &payloads[2], false).await;
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     let (header, bytes) = read_bucket_file(&dir, group_index, 0);
     assert_eq!(header.packfile_sizes, SIZES_RECORDED);
     assert_eq!(bytes.len(), bucket_file_len(3));
@@ -9494,7 +9731,7 @@ async fn a_bucket_file_holds_the_sizes_its_header_has_no_room_for_after_its_entr
             .await
             .unwrap();
         let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-        store.clone().flush(false).await.unwrap();
+        store.clone().flush(FlushOptions::default()).await.unwrap();
         let bucket_count = store.group[group_index]
             .bucket_count
             .load(atomic::Ordering::Relaxed);
@@ -9548,7 +9785,7 @@ async fn more_packfiles_to_record_than_a_bucket_file_holds_are_synced_instead() 
         .await
         .unwrap();
     let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     let bucket_count = store.group[group_index]
         .bucket_count
         .load(atomic::Ordering::Relaxed);
@@ -9577,7 +9814,7 @@ async fn two_payloads_written(
     for payload in &payloads[..2] {
         addresses.push(put_payload(&store, partition, Context::default(), payload, false).await);
     }
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     (group_index, addresses, payloads)
 }
 
@@ -9660,7 +9897,7 @@ async fn payloads_in_a_missing_packfile_are_cleared_when_their_bucket_loads() {
             .await
             .unwrap();
         let address = put_payload(&store, partition, Context::default(), &payloads[0], false).await;
-        store.clone().flush(false).await.unwrap();
+        store.clone().flush(FlushOptions::default()).await.unwrap();
         address
     };
     std::fs::remove_file(group_pack_dir(&dir, group_index).join("2")).unwrap();
@@ -9817,7 +10054,7 @@ async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
         2,
         "a capacity of one evicts the entry and the tombstone"
     );
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
 
     assert!(
         ImmutableStoreBucket::deserialize_files(bucket_path)
@@ -9836,4 +10073,569 @@ async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
         .await
         .expect_err("an evicted entry is not loaded back");
     assert!(matches!(err, StoreError::AddressNotFound(_)));
+}
+
+mod evict {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::*;
+    use crate::store_fixture::payload_in_groups;
+
+    /// Settings for a store that uses the full bucket layout, flushes in the background, and has no
+    /// eviction protection.
+    pub(super) fn background_settings(defer_eviction_flush: bool) -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            flush_background: true,
+            defer_eviction_flush,
+            initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
+            ..quiet_settings()
+        }
+    }
+
+    /// Stores `payload` with durability set by `durable` and returns its group and bucket.
+    async fn put_one(
+        store: &Arc<LocalImmutableStore>,
+        payload: &[u8],
+        durable: bool,
+    ) -> (usize, usize) {
+        let address = put_payload(
+            store,
+            Partition::from([0x44u8; 16]),
+            Context::default(),
+            payload,
+            durable,
+        )
+        .await;
+        let group_index = address.hash.data()[0] as usize;
+        let bucket_count = store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed);
+        (
+            group_index,
+            lore_storage::local::fan_out::bucket_index_for(&address.hash, bucket_count),
+        )
+    }
+
+    /// Opens a store with `settings` and writes all `payloads` to disk, using each payload's
+    /// durability flag. No group has a pending delayed flush. Returns each payload's group and
+    /// bucket.
+    pub(super) async fn store_with_written(
+        dir: &lore_base::test_util::TempDir,
+        settings: ImmutableStoreSettings,
+        payloads: &[(Vec<u8>, bool)],
+    ) -> (Arc<LocalImmutableStore>, Vec<(usize, usize)>) {
+        let store = LocalImmutableStore::new(Some(dir.to_path_buf()), settings)
+            .await
+            .unwrap();
+        let mut written = vec![];
+        for (payload, durable) in payloads {
+            written.push(put_one(&store, payload, *durable).await);
+        }
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
+        for group in store.group.iter() {
+            group.flush.lock().await.abort_all();
+            group.scheduled.store(false, atomic::Ordering::Relaxed);
+        }
+        (store, written)
+    }
+
+    /// One payload in each of two groups, neither durable.
+    pub(super) fn two_groups() -> Vec<(Vec<u8>, bool)> {
+        let [(_, first), (_, second)] = payloads_in_two_groups(1);
+        vec![(first[0].clone(), false), (second[0].clone(), false)]
+    }
+
+    pub(super) async fn entries_on_disk(
+        store: &LocalImmutableStore,
+        group_index: usize,
+        bucket_index: usize,
+    ) -> usize {
+        let root = store.path.clone().expect("a disk-backed store has a path");
+        ImmutableStoreBucket::deserialize_files(format_bucket_path(
+            &root,
+            group_index,
+            bucket_index,
+        ))
+        .await
+        .unwrap()
+        .entry
+        .len()
+    }
+
+    /// Polls until the bucket's file holds no entry, failing after `within`.
+    async fn wait_until_written(
+        store: &LocalImmutableStore,
+        (group_index, bucket_index): (usize, usize),
+        within: Duration,
+    ) {
+        tokio::time::timeout(within, async {
+            while entries_on_disk(store, group_index, bucket_index).await != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("group {group_index}'s eviction is written within {within:?}"));
+    }
+
+    /// **A store that defers its eviction flush relies on each affected group's delayed flush
+    /// to write the evicted buckets**, keeping the flock until the flush has written every
+    /// bucket.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_each_evicted_group_and_keeps_the_flock_until_written() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has a delayed flush due"
+            );
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                1,
+                "the pass left group {group_index} unwritten"
+            );
+        }
+        assert!(lock.is_held(), "the unwritten buckets keep the flock");
+
+        for &(group_index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+                .await;
+        }
+
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the delayed flush wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(
+            !lock.is_held(),
+            "the delayed flushes let the store go once nothing was flagged"
+        );
+    }
+
+    /// **Every eviction pass schedules each group with unwritten changes, including a pass that
+    /// evicts nothing**, so a group whose delayed flush ended without writing it is tried again.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_a_group_left_flagged_at_a_pass_that_evicts_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_again_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let (left, _) = written[0];
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        // A failed delayed flush leaves this state: woken, with the bucket still flagged for
+        // writing.
+        store.group[left]
+            .scheduled
+            .store(false, atomic::Ordering::Relaxed);
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 0, "the second pass finds nothing left to evict");
+        assert!(
+            store.group[left].scheduled.load(atomic::Ordering::Relaxed),
+            "the group the first pass left flagged has a delayed flush due again"
+        );
+    }
+
+    /// **An evicting pass schedules a group holding only access stamps, and a pass that evicts
+    /// nothing leaves it alone**, since stamps never hold the flock.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_a_group_holding_only_stamps_after_an_evicting_pass() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_stamps_");
+        let settings = ImmutableStoreSettings {
+            protect_local_fragment: true,
+            ..background_settings(true)
+        };
+        let [(_, kept), (_, evictable)] = payloads_in_two_groups(1);
+        let payloads = [(kept[0].clone(), false), (evictable[0].clone(), true)];
+        let (store, written) = store_with_written(&dir, settings, &payloads).await;
+        let (stamped, stamped_bucket) = written[0];
+        store.group[stamped].soft_dirty[stamped_bucket].store(true, atomic::Ordering::Relaxed);
+
+        assert_eq!(
+            store.clone().evict(1, false, None).await.unwrap(),
+            1,
+            "the pass evicts only the durable fragment"
+        );
+        assert!(
+            store.group[stamped]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "the stamped group has a delayed flush due after an evicting pass"
+        );
+
+        store.group[stamped]
+            .scheduled
+            .store(false, atomic::Ordering::Relaxed);
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+        assert!(
+            !store.group[stamped]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "a pass that evicts nothing schedules no flush for stamps alone"
+        );
+    }
+
+    /// **When a fan-out awaits its commit and no bucket is flagged, a pass that evicts nothing
+    /// takes no claim**: claiming to write would tell every other process the store changed, and
+    /// nothing holds the flock for the commit.
+    #[tokio::test]
+    async fn a_deferring_store_leaves_a_pending_commit_alone_at_a_pass_that_evicts_nothing() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_no_claim_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let group = &store.group[written[0].0];
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        for &(index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), index, Duration::ZERO).await;
+        }
+        assert!(!lock.is_held(), "the delayed flushes let the store go");
+        let epoch = dir.to_path_buf().join("immutable").join("epoch");
+        let before = std::fs::read(&epoch).ok();
+        let full = group.bucket_count.load(atomic::Ordering::Relaxed);
+        group
+            .committed_level
+            .store(full / 2, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+
+        assert_eq!(
+            std::fs::read(&epoch).ok(),
+            before,
+            "the pass told no other process the store changed"
+        );
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            full / 2,
+            "the commit waits for a pass that evicts"
+        );
+        assert!(!lock.is_held(), "the store stays free");
+    }
+
+    /// **A pass that ends after garbage collection was asked to stop schedules no delayed
+    /// flush**, which would claim the store after background work was to end.
+    #[tokio::test]
+    async fn a_deferring_store_schedules_nothing_once_asked_to_stop() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_stop_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let (group_index, bucket_index) = written[0];
+        store.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
+        store.stop_requests.fetch_add(1, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 0);
+
+        assert!(
+            !store.group[group_index]
+                .scheduled
+                .load(atomic::Ordering::Relaxed),
+            "no delayed flush is due"
+        );
+        store.stop_requests.fetch_sub(1, atomic::Ordering::Relaxed);
+    }
+
+    /// **When asked to sync, a store with deferred eviction flushes writes the evicted buckets at
+    /// the end of the pass**, since the delayed flush writes without syncing.
+    #[tokio::test]
+    async fn a_deferring_store_writes_as_the_pass_ends_when_asked_to_sync() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_sync_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, true, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+
+    /// **A store with deferral enabled but background flushing disabled writes each pass's
+    /// evictions when the pass ends**, because its changes to durable entries wait for an explicit
+    /// flush rather than a delayed one.
+    #[tokio::test]
+    async fn a_store_deferring_without_background_flushing_writes_as_the_pass_ends() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_no_bg_");
+        let settings = ImmutableStoreSettings {
+            flush_background: false,
+            ..background_settings(true)
+        };
+        let (store, written) = store_with_written(&dir, settings, &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+
+    /// **An in-memory store does not defer**, having no disk to write to and so no delayed flush
+    /// that would clear a group's due flag.
+    #[tokio::test]
+    async fn an_in_memory_store_schedules_no_delayed_flush() {
+        let store = LocalImmutableStore::new(None, background_settings(true))
+            .await
+            .unwrap();
+        let mut groups = vec![];
+        for (payload, durable) in two_groups() {
+            groups.push(put_one(&store, &payload, durable).await.0);
+        }
+        for &group_index in &groups {
+            store.group[group_index]
+                .scheduled
+                .store(false, atomic::Ordering::Relaxed);
+        }
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for group_index in groups {
+            assert!(
+                !store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has no delayed flush due"
+            );
+        }
+    }
+
+    /// **A store with deferred eviction flushes writes evicted buckets in a lower-numbered group
+    /// well before those in a higher-numbered group.** The groups' delayed flushes are spread
+    /// across one flush delay. With a delay of 16 seconds, a group below 32 is due within two
+    /// seconds of the pass, and a group numbered 224 or higher is due after more than fourteen.
+    #[tokio::test]
+    async fn a_deferring_store_spreads_the_groups_writes_across_the_flush_delay() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_spread_");
+        let settings = ImmutableStoreSettings {
+            flush_delay_seconds: 16,
+            ..background_settings(true)
+        };
+        let payloads = [
+            (payload_in_groups(0..32), false),
+            (payload_in_groups(224..GROUP_COUNT), false),
+        ];
+        let (store, written) = store_with_written(&dir, settings, &payloads).await;
+        let (low, high) = (written[0], written[1]);
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for (group_index, _) in [low, high] {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "the pass scheduled group {group_index}'s delayed flush"
+            );
+        }
+        wait_until_written(&store, low, Duration::from_secs(10)).await;
+        assert_eq!(
+            entries_on_disk(&store, high.0, high.1).await,
+            1,
+            "the high group's delayed flush is not yet due"
+        );
+    }
+
+    /// **A store with background flushing enabled and eviction flushing not deferred writes
+    /// each bucket from which it evicted entries at the end of the eviction pass**, then
+    /// releases the store.
+    #[tokio::test]
+    async fn a_background_flushing_store_that_does_not_defer_writes_as_the_pass_ends() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_no_defer_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(false), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        let evicted = store.clone().evict(1, false, None).await.unwrap();
+
+        assert_eq!(evicted, 2, "a cap of one evicts both fragments");
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the pass wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the pass wrote what it evicted and let go");
+    }
+}
+
+mod flush_delayed {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    use super::evict::background_settings;
+    use super::evict::entries_on_disk;
+    use super::evict::store_with_written;
+    use super::evict::two_groups;
+    use super::*;
+
+    /// **When a store defers eviction writes, the delayed flush completes a fan-out waiting for its
+    /// commit** by writing the whole group, then releases the store.
+    #[tokio::test]
+    async fn a_deferring_stores_delayed_flush_commits_a_pending_fan_out() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_commit_");
+        let (store, written) =
+            store_with_written(&dir, background_settings(true), &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+        let (group_index, bucket_index) = written[0];
+        let group = &store.group[group_index];
+        let full = group.bucket_count.load(atomic::Ordering::Relaxed);
+        group
+            .committed_level
+            .store(full / 2, atomic::Ordering::Relaxed);
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+        assert!(
+            group.scheduled.load(atomic::Ordering::Relaxed),
+            "the group has a delayed flush due"
+        );
+        for &(index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), index, Duration::ZERO).await;
+        }
+
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            full,
+            "the delayed flush committed the group's layout"
+        );
+        assert_eq!(
+            entries_on_disk(&store, group_index, bucket_index).await,
+            0,
+            "and wrote the eviction"
+        );
+        assert!(!lock.is_held(), "and let the store go");
+    }
+
+    /// **A store with deferred eviction writes leaves a group below the full layout to its delayed
+    /// flush**, like any other group, and that flush writes the eviction.
+    #[tokio::test]
+    async fn a_deferring_store_writes_a_group_below_the_full_layout_in_its_delayed_flush() {
+        let dir = lore_base::test_util::TempDir::new("is_evict_defer_level_");
+        let settings = ImmutableStoreSettings {
+            initial_fan_out_level: 1,
+            ..background_settings(true)
+        };
+        let (store, written) = store_with_written(&dir, settings, &two_groups()).await;
+        let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+        assert_eq!(store.clone().evict(1, false, None).await.unwrap(), 2);
+
+        for &(group_index, bucket_index) in &written {
+            assert!(
+                store.group[group_index]
+                    .scheduled
+                    .load(atomic::Ordering::Relaxed),
+                "group {group_index} has a delayed flush due"
+            );
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                1,
+                "the pass left group {group_index} unwritten"
+            );
+        }
+        for &(group_index, _) in &written {
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+                .await;
+        }
+        for &(group_index, bucket_index) in &written {
+            assert_eq!(
+                entries_on_disk(&store, group_index, bucket_index).await,
+                0,
+                "the delayed flush wrote group {group_index}'s eviction"
+            );
+        }
+        assert!(!lock.is_held(), "the delayed flushes let the store go");
+    }
+
+    /// **A deferring store's delayed flush fans out a group whose bucket holds more entries than
+    /// the fan-out threshold**, as only a flush of the whole group does.
+    #[tokio::test]
+    async fn a_deferring_stores_delayed_flush_fans_out_a_group_past_its_threshold() {
+        let dir = lore_base::test_util::TempDir::new("is_delayed_fan_out_");
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                initial_fan_out_level: 1,
+                fan_out_threshold: 2,
+                ..background_settings(true)
+            },
+        )
+        .await
+        .unwrap();
+        let (group_index, payloads) = payloads_in_one_group(3);
+        for payload in &payloads {
+            put_payload(
+                &store,
+                Partition::from([0x44u8; 16]),
+                Context::default(),
+                payload,
+                false,
+            )
+            .await;
+        }
+        let group = &store.group[group_index];
+        group.flush.lock().await.abort_all();
+        group.scheduled.store(false, atomic::Ordering::Relaxed);
+        assert_eq!(group.bucket_count.load(atomic::Ordering::Relaxed), 1);
+
+        ImmutableStoreGroup::flush_delayed(Arc::downgrade(&store), group_index, Duration::ZERO)
+            .await;
+
+        let bucket_count = group.bucket_count.load(atomic::Ordering::Relaxed);
+        assert!(bucket_count > 1, "the delayed flush fanned the group out");
+        assert_eq!(
+            group.committed_level.load(atomic::Ordering::Relaxed),
+            bucket_count,
+            "and committed its new layout"
+        );
+    }
+}
+
+mod eviction_flush_delay {
+    use super::*;
+
+    /// Group wait times increase in equal steps. The first group waits for a fraction of the
+    /// flush delay, and the last waits for the full delay.
+    #[test]
+    fn spreads_groups_in_equal_steps_up_to_the_flush_delay() {
+        let flush_delay = Duration::from_secs(10);
+        let step = flush_delay / GROUP_COUNT as u32;
+
+        for group_index in 0..GROUP_COUNT {
+            assert_eq!(
+                LocalImmutableStore::eviction_flush_delay(flush_delay, group_index),
+                step * (group_index as u32 + 1),
+                "group {group_index} waits its own number of steps"
+            );
+        }
+        assert_eq!(
+            LocalImmutableStore::eviction_flush_delay(flush_delay, GROUP_COUNT - 1),
+            flush_delay,
+            "the last group waits the whole delay"
+        );
+    }
 }

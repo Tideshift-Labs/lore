@@ -33,10 +33,12 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
+use crate::infer::ConflictMarkers;
 use crate::interface::LoreArray;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
+use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
@@ -49,6 +51,7 @@ use crate::lore_trace;
 use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeExtFlags;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
@@ -65,7 +68,14 @@ use crate::repository::is_reserved_node_name;
 use crate::revision::sync;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
+use crate::state::AddedSince;
+use crate::state::ChainMark;
+use crate::state::Ext;
+use crate::state::LinkPin;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::NodeMapping;
+use crate::state::OwnFlags;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
@@ -312,7 +322,8 @@ pub struct StageOptions {
     /// When `false` (default), directory paths stage only the files and child
     /// directories currently marked dirty in the repository state. When
     /// `true`, directory paths are walked recursively on the filesystem and
-    /// every file is reconciled, ignoring the dirty flags.
+    /// every file is reconciled, ignoring the dirty flags. A forced stage walks
+    /// them whatever this holds.
     pub scan: bool,
 }
 
@@ -423,16 +434,12 @@ pub(crate) async fn drops_cleanly(
         return Ok(true);
     }
 
-    let mut directories = vec![(id, *node)];
-    while let Some((directory, directory_node)) = directories.pop() {
-        let mut children = StateNodeChildrenIterator::from_parent(
-            state.clone(),
-            repository.clone(),
-            directory,
-            &directory_node,
-        )
-        .await
-        .forward::<StageError>("Failed to list the staged directory")?;
+    let mut directories = vec![id];
+    while let Some(directory) = directories.pop() {
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), repository.clone(), directory)
+                .await
+                .forward::<StageError>("Failed to list the staged directory")?;
         while let Some((child, child_node)) = children
             .next()
             .await
@@ -442,7 +449,7 @@ pub(crate) async fn drops_cleanly(
                 return Ok(false);
             }
             if child_node.is_directory() {
-                directories.push((child, child_node));
+                directories.push(child);
             }
         }
     }
@@ -607,11 +614,13 @@ pub(crate) async fn stage_filesystem_path(
     let staged_info = if let Some(info) = resolved_info {
         Some(info)
     } else {
-        operation
+        // A path the operation cannot describe is an error and not a missing path: reading it as
+        // missing would stage the deletion of a file that is there.
+        let info = operation
             .file_info(&full_relative_path)
             .await
-            .ok()
-            .filter(|info| info.exists())
+            .forward_any::<StageError>("Failed to describe a path to stage")?;
+        info.exists().then_some(info)
     };
 
     let force = execution_context().globals().force();
@@ -761,7 +770,7 @@ pub(crate) async fn stage_filesystem_path(
     // The tree is searched before the filter is asked, since a path the tree tracks is past the
     // ignore slot.
     let filter = &repository.filter;
-    let mode = absence_mode(force, FilterMode::Full);
+    let mode = FilterMode::Full.absence(force);
     let parent_states = filter.parent_exclusion_states(&full_relative_path);
 
     let Ok((node_link, linked)) = state
@@ -776,6 +785,15 @@ pub(crate) async fn stage_filesystem_path(
             return Ok(NodeLink::invalid());
         }
         lore_debug!("Path {} does not exist in repository", full_relative_path);
+        if operation
+            .unversioned_symlink_at(&full_relative_path)
+            .await
+            .forward::<StageError>("Failed to read the path")?
+        {
+            lore_trace!("Path is a symbolic link, which is not versioned: {full_relative_path}");
+            crate::path::emit_path_ignore(full_relative_path.as_str()).await;
+            return Ok(NodeLink::default());
+        }
         if !force {
             return Err(StageError::internal(format!(
                 "Invalid path {full_relative_path}"
@@ -899,7 +917,7 @@ async fn absent_named_node(
             parent,
             path,
             is_directory,
-            absence_mode(force, FilterMode::TRACKED),
+            FilterMode::TRACKED.absence(force),
             async || state.tracks(repository, id, flags).await,
         )
         .await
@@ -1033,6 +1051,7 @@ impl StageDescent {
                 link: node_link,
                 states,
                 added,
+                prepended: _,
             } = stage_node_from_metadata(
                 operation,
                 NodeMapping {
@@ -1204,35 +1223,55 @@ pub(crate) async fn stage_single_node(
                 .await
                 .forward::<StageError>("Failed deserializing state node block")?;
 
-            let existing_node = block.node(node_index);
+            // What the update needs of the existing node, read where no await holds it.
+            let (same_type, place, resized, link) = {
+                let existing_node = block.node(node_index);
+                lore_debug!(
+                    "Found previous node {} flags 0x{:x}",
+                    found_node,
+                    existing_node.flags
+                );
+                (
+                    node_flags.node_type() == existing_node.node_type(),
+                    (base_node.node, existing_node.name_hash),
+                    (existing_node.size, existing_node.mode) != (node.size, node.mode),
+                    existing_node.is_link(),
+                )
+            };
 
-            lore_debug!(
-                "Found previous node {} flags 0x{:x}",
-                found_node,
-                existing_node.flags
-            );
-
-            if node_flags.node_type() == existing_node.node_type() {
-                let block_dirtied = {
-                    let mut block_writer = block.write();
-                    let existing_node = block_writer.node(node_index);
-                    existing_node.address = node.address;
-                    existing_node.mode = node.mode;
-                    existing_node.size = node.size;
-                    existing_node.take_mount_source(&node);
-                    block_writer.mark_dirty()
-                };
-                if block_dirtied {
-                    state.block_modified(block.clone(), block_index);
-                    state.mark_dirty();
+            if same_type {
+                // Update the existing node: a link takes the whole pin, its node in the linked
+                // State included (H17); any other node its content.
+                if link {
+                    state
+                        .node_set_link_target_in(
+                            &block,
+                            found_node,
+                            LinkPin::Whole {
+                                address: node.address,
+                                child: node.child,
+                            },
+                        )
+                        .forward::<StageError>("Failed to repin the link")?;
+                    if resized {
+                        state.node_change_in_place(&block, found_node, place, |held| {
+                            held.set_size(node.size);
+                            held.set_mode(node.mode);
+                            true
+                        });
+                    }
+                } else {
+                    state.node_change_in_place(&block, found_node, place, |held| {
+                        held.overwrite_content(node.address, node.size, node.mode);
+                        true
+                    });
                 }
 
                 state
                     .node_mark(
-                        repository.clone(),
+                        &repository,
                         found_node,
-                        node_flags.bitand(NodeFlags::StagedBits),
-                        true,
+                        Mark::staged(node_flags.bitand(NodeFlags::StagedBits), true),
                     )
                     .await
                     .forward::<StageError>("Failed to mark node as staged")?;
@@ -1276,6 +1315,9 @@ pub(crate) async fn stage_single_node(
         Err(e) if e.is_node_not_found() => {
             // Fall through to create a new node
         }
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward::<StageError>("finding the subnode");
+        }
         Err(err) => {
             return Err(StageError::internal_with_context(
                 err,
@@ -1296,12 +1338,7 @@ pub(crate) async fn stage_single_node(
         node_flags | NodeFlags::StagedAdd
     };
     state
-        .node_mark(
-            repository.clone(),
-            node_id,
-            mark_flags,
-            true, /* mark dirty */
-        )
+        .node_mark(&repository, node_id, Mark::staged(mark_flags, true))
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
 
@@ -1381,7 +1418,8 @@ pub(crate) async fn stage_merge_path(
                     .await
                     .forward_with::<StageError, _>(|| {
                         format!("checking {} for conflict markers", change.path())
-                    })?)
+                    })?
+                    == ConflictMarkers::Present)
         {
             lore_debug!(
                 "Merge change filesystem state is conflicted: {}",
@@ -1392,10 +1430,9 @@ pub(crate) async fn stage_merge_path(
 
         state_stage
             .node_mark(
-                repository.clone(),
+                &repository,
                 change.to.mapping.node,
-                merge_flags,
-                true,
+                Mark::staged(merge_flags, true),
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
@@ -1418,10 +1455,9 @@ pub(crate) async fn stage_merge_path(
 
         state_stage
             .node_mark(
-                repository.clone(),
+                &repository,
                 change.to.mapping.node,
-                merge_flags,
-                true,
+                Mark::staged(merge_flags, true),
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
@@ -1435,32 +1471,38 @@ pub(crate) async fn stage_merge_path(
     Ok(())
 }
 
-/// After staging a filesystem-detected change, also mark the node dirty so that
-/// `flagDirty` reflects the working-tree difference: any uncommitted change is
-/// dirty, whether it was recorded by `dirty`, `status --scan` or `stage`/
-/// `stage --scan`. `node_mark` only sets staged bits (it preserves an existing
-/// Dirty but never sets one), so the dirty bit must be applied here.
+/// The mark a stage records on a node it found changed: the staged action `staged` with the
+/// stage's own `node_flags`, and the dirty action `dirty` beside it, so that `flagDirty`
+/// reflects the working-tree difference: any uncommitted change is dirty, whether it was
+/// recorded by `dirty`, `status --scan` or `stage`/`stage --scan`.
 ///
-/// Skipped for merge staging — a merge resolution is not a fresh filesystem
-/// detection and keeps its own staged/merge flags.
-async fn mark_staged_node_dirty(
-    repository: Arc<RepositoryContext>,
-    state: &Arc<State>,
-    node_id: NodeID,
-    dirty_flags: NodeFlags,
-    node_flags: NodeFlags,
-) -> Result<(), StageError> {
-    if node_flags.contains(NodeFlags::StagedMerge) {
-        return Ok(());
+/// No dirty action for merge staging: a merge resolution is not a fresh filesystem detection
+/// and keeps its own staged and merge flags.
+#[lore_macro::test_pub]
+pub(crate) fn staged_change(staged: NodeFlags, dirty: NodeFlags, node_flags: NodeFlags) -> Mark {
+    Mark {
+        staged: Some((staged | node_flags, true)),
+        dirty: (!node_flags.contains(NodeFlags::StagedMerge)).then_some((
+            dirty,
+            Ext::Set(NodeExtFlags::NoFlags),
+            true,
+        )),
     }
-    state
-        .node_mark_dirty(repository, node_id, dirty_flags, true)
-        .await
-        .forward::<StageError>("Failed to mark staged node as dirty")
+}
+
+/// Whether staging the deletion of a node held as `held`, with the stage's own `node_flags`, leaves
+/// the node as it is: it holds the staged deletion and every staged flag the stage sets, as a node
+/// holding them is left by [`State::node_mark`]'s unforced mark. A merge's flags the node lacks
+/// mark it again.
+pub(crate) fn deletion_staged_already(held: NodeFlags, node_flags: NodeFlags) -> bool {
+    held.contains(NodeFlags::StagedDelete | (node_flags & NodeFlags::StagedBits))
 }
 
 /// Mark `node_id` staged for deletion, reporting the node when this call is the one that
-/// marked it so a caller walking the subtree knows whether it still has work below.
+/// marked it so a caller walking the subtree knows whether it still has work below. The staged
+/// half keeps an add the node holds beside the deletion, an add taken back, as the revision it
+/// was staged on lacks the node; a mark that sets a dirty action too records the deletion alone,
+/// the two halves sharing their action bits.
 async fn stage_delete_node(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -1478,7 +1520,7 @@ async fn stage_delete_node(
         .forward::<StageError>("Failed deserializing state node block")?;
 
     let node = block.node(node_index);
-    if node.is_staged_delete() {
+    if deletion_staged_already(NodeFlags::from_bits_retain(node.flags), node_flags) {
         return Ok(None);
     }
 
@@ -1504,26 +1546,16 @@ async fn stage_delete_node(
         stats.file_checked_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    let flags = NodeFlags::StagedDelete | node_flags;
-
-    state
-        .node_mark(
-            repository.clone(),
-            node_id,
-            flags,
-            true, /* Mark dirty */
-        )
-        .await
-        .forward::<StageError>("Failed to mark node as staged")?;
-
-    mark_staged_node_dirty(
-        repository.clone(),
-        state,
-        node_id,
+    let held_add = NodeFlags::from_bits_retain(node.flags) & NodeFlags::StagedAdd;
+    let mark = staged_change(
+        NodeFlags::StagedDelete | held_add,
         NodeFlags::DirtyDelete,
         node_flags,
-    )
-    .await?;
+    );
+    state
+        .node_mark(repository, node_id, mark)
+        .await
+        .forward::<StageError>("Failed to mark node as staged")?;
 
     if let Some(tracker) = link_tracker {
         tracker.on_node_changed(repository);
@@ -1564,6 +1596,9 @@ async fn stage_delete_replaced(
     .await
 }
 
+/// Stages the deletion of the node `node_id` at `relative_path`, and of everything below a
+/// directory this call marks, with the stage's own `node_flags`.
+#[lore_macro::test_pub]
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -1640,33 +1675,6 @@ fn stage_delete_recurse(
     ))
 }
 
-/// The filter slots asked about a deletion that a path missing from the working tree drives: the
-/// view alone where the stage is forced, since a forced stage passes the ignore file and the
-/// working tree lacks what the view excludes without its having been deleted, and `unforced`
-/// otherwise.
-fn absence_mode(force: bool, unforced: FilterMode) -> FilterMode {
-    if force { FilterMode::View } else { unforced }
-}
-
-/// The filter verdict a staging walk carries from `parent` to `path`, and whether it leaves `path`
-/// out, asking the slots in `unforced`. A forced stage leaves out nothing, and still steps the view
-/// for the deletions below that ask it.
-fn stage_step(
-    filter: &Filter,
-    force: bool,
-    parent: FilterStates,
-    path: &RelativePath,
-    is_directory: bool,
-    unforced: FilterMode,
-) -> (FilterStates, bool) {
-    if force {
-        let (states, _) = filter.child_excludes_tree(parent, path, is_directory, FilterMode::View);
-        (states, false)
-    } else {
-        filter.child_emit_excludes(parent, path, is_directory, unforced)
-    }
-}
-
 /// Stages the deletion of the node the tree holds at `path` where it is of the kind the working
 /// tree does not hold there, `replaced_directory` saying whether that kind is a directory. The
 /// filter leaves out what the working tree holds and keeps a node of the other kind, whose
@@ -1737,7 +1745,8 @@ async fn stage_replaced_node(
 /// path, as a view leaves the files it excludes out of the working tree. So does a directory the
 /// view excludes that holds no children, which nothing materializes. The ignore file has no say
 /// over a node the tree tracks, so a deletion of one is staged as any other; it leaves out only an
-/// add marked dirty, which was never staged. A node already staged for deletion keeps nothing.
+/// add marked dirty, which was never staged. A node already staged for deletion keeps nothing,
+/// and is marked again only as [`deletion_staged_already`] says.
 ///
 /// `held` is what the tree holds `node_id` as: its type and what is staged on it. `states` is the
 /// filter verdict at `relative_path`, which each child steps from, and `force` whether the stage
@@ -1755,7 +1764,7 @@ async fn stage_absent_delete(
     states: FilterStates,
     force: bool,
 ) -> Result<bool, StageError> {
-    if held.contains(NodeFlags::StagedDelete) {
+    if deletion_staged_already(held, node_flags) {
         return Ok(false);
     }
 
@@ -1800,7 +1809,7 @@ async fn stage_absent_delete(
                 states,
                 &child_path,
                 is_directory,
-                absence_mode(force, FilterMode::TRACKED),
+                FilterMode::TRACKED.absence(force),
                 async || state.tracks(&repository, child_node_id, child_held).await,
             )
             .await
@@ -2023,17 +2032,16 @@ struct DirectoryChildren {
     /// by the first two, so a tie on the hash is claimed in sibling order. The
     /// id is held here as well, where a claim has taken it out of `node`.
     by_name_hash: Vec<(u64, u32, NodeID)>,
-    /// The child the chain was headed by when the listing was taken, which
-    /// everything linked into it since sits ahead of.
-    listing_head: Option<NodeID>,
+    /// The chain as the listing began it, which everything linked into it since
+    /// sits ahead of while no reattach moves it; `None` for a link's or a file's.
+    since: Option<ChainMark>,
 }
 
 impl DirectoryChildren {
     /// The children of a directory node in sibling order, with the name hash
-    /// each of them carries.
+    /// each of them carries, and the mark of the chain the listing began from.
     #[lore_macro::test_pub]
-    fn new(child: Vec<(NodeID, u64)>) -> Self {
-        let listing_head = child.first().map(|&(node, _)| node);
+    fn new(child: Vec<(NodeID, u64)>, since: Option<ChainMark>) -> Self {
         let mut by_name_hash: Vec<(u64, u32, NodeID)> = child
             .iter()
             .enumerate()
@@ -2044,7 +2052,7 @@ impl DirectoryChildren {
         Self {
             node,
             by_name_hash,
-            listing_head,
+            since,
         }
     }
 
@@ -2071,6 +2079,25 @@ impl DirectoryChildren {
         Some(node)
     }
 
+    /// Marks `node` claimed where the listing holds it: a child a search of the chain
+    /// answered, which the listing may hold under the name it had before a rename,
+    /// so the pass over what nothing claimed leaves it.
+    #[lore_macro::test_pub]
+    fn claim_node(&mut self, node: NodeID) {
+        if let Some(slot) = self.node.iter_mut().find(|slot| **slot == node) {
+            *slot = INVALID_NODE;
+        }
+    }
+
+    /// Counts a node the stage itself added to the directory, prepending it, in the mark, so
+    /// the stage's own adds never make its searches stale nor show as a reattach. Only an add
+    /// that landed counts: counting one that did not could hide a reattach.
+    fn count_own_add(&mut self) {
+        if let Some(since) = self.since.as_mut() {
+            since.count_own_prepend();
+        }
+    }
+
     /// The first child the listing holds carrying `name_hash`, claimed or not,
     /// which is the one a search of the chain reaches once past what was linked
     /// into it since.
@@ -2092,6 +2119,7 @@ impl DirectoryChildren {
 
 /// Whether the caller has established which child of a directory a name belongs
 /// to.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 pub(crate) enum KnownChild {
     /// The child, or that the directory holds none. Taken as given.
@@ -2105,8 +2133,17 @@ pub(crate) enum KnownChild {
 ///
 /// A child is prepended, so whatever was linked into the chain since the listing
 /// was taken lies ahead of it. Only that much is walked; the listing answers from
-/// the index behind it, claimed children included. The answer is the one a search
-/// of the whole chain reaches.
+/// the index behind it, claimed children included. Where a reattach may have put a
+/// node in front of what was linked in since, the whole chain is searched. The
+/// answer is the one a search of the whole chain reaches; a child a search answered
+/// after a reattach is claimed in the listing too, which may hold it under the name
+/// it had. A link's or a file's listing, which carries no mark, answers from the
+/// listing alone.
+///
+/// The listing's own answers are taken as given: no writer but the stage's own tasks, each in its
+/// own directory, runs beside a stage (the node module's Limitations, "The stage's listing"), so no
+/// child the listing holds is renamed, moved or removed meanwhile.
+#[lore_macro::test_pub]
 async fn claim_child(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
@@ -2117,19 +2154,33 @@ async fn claim_child(
     if let Some(node) = children.claim(name_hash) {
         return Ok(Some(node));
     }
-    if let Some(node) = state
-        .find_subnode_added_since(
-            repository.clone(),
-            directory_node,
-            children.listing_head,
-            name_hash,
-        )
+    let Some(since) = children.since.as_ref() else {
+        return Ok(children.holds(name_hash));
+    };
+    let searched = match state
+        .find_subnode_added_since(repository.clone(), since, name_hash)
         .await
         .forward::<StageError>("Failed to search the directory node children")?
     {
-        return Ok(Some(node));
+        AddedSince::Found(node) => node,
+        AddedSince::Absent => return Ok(children.holds(name_hash)),
+        AddedSince::Stale => match state
+            .find_subnode(repository.clone(), directory_node, name_hash)
+            .await
+        {
+            Ok(node) => node,
+            Err(error) if error.is_node_not_found() => return Ok(children.holds(name_hash)),
+            Err(error) => {
+                return Err(error)
+                    .forward::<StageError>("Failed to search the directory node children");
+            }
+        },
+    };
+    // A listed child stands ahead of the mark's head only where a reattach moved it.
+    if since.reattached() {
+        children.claim_node(searched);
     }
-    Ok(children.holds(name_hash))
+    Ok(Some(searched))
 }
 
 static DIRECTORY_TASK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
@@ -2176,7 +2227,7 @@ async fn unclaimed_child(
             states,
             &filter_path,
             !node.is_file(),
-            absence_mode(force, FilterMode::TRACKED),
+            FilterMode::TRACKED.absence(force),
             async || state.tracks(repository, child, held).await,
         )
         .await
@@ -2226,12 +2277,11 @@ pub(crate) async fn stage_directory(
     discards: PendingDiscards,
     states: FilterStates,
 ) -> Result<bool, StageError> {
-    let mut children = DirectoryChildren::new(
-        state
-            .node_children_with_name_hash(repository.clone(), directory_node)
-            .await
-            .forward::<StageError>("Failed to list directory node children")?,
-    );
+    let (listing, since) = state
+        .node_children_with_name_hash_marked(repository.clone(), directory_node)
+        .await
+        .forward::<StageError>("Failed to list directory node children")?;
+    let mut children = DirectoryChildren::new(listing, since);
 
     let directory_path = relative_path.clone().freeze();
     let mut file_list = operation
@@ -2381,6 +2431,9 @@ pub(crate) async fn stage_directory(
                     break;
                 }
             };
+            if staged.prepended {
+                children.count_own_add();
+            }
             let node_link = staged.link;
             let child_states = staged.states;
             let added = staged.added;
@@ -2492,7 +2545,15 @@ pub(crate) async fn stage_directory(
                 states,
             )
             .await;
-            fold_child(result.map(|staged| staged.link.is_valid()), &mut outcome);
+            match result {
+                Ok(staged) => {
+                    if staged.prepended {
+                        children.count_own_add();
+                    }
+                    fold_child(Ok(staged.link.is_valid()), &mut outcome);
+                }
+                Err(error) => fold_child(Err(error), &mut outcome),
+            }
         }
 
         while let Some(result) = directory_tasks.try_join_next() {
@@ -2549,6 +2610,9 @@ pub(crate) async fn stage_directory(
         .await;
         fold_child(result.map(|_| true), &mut outcome);
     }
+    // Nothing reads the listing past here: its vectors and the mark's block go before the
+    // subtree's tasks are awaited.
+    drop(children);
 
     while let Some(result) = directory_tasks.join_next().await {
         fold_child(
@@ -2773,9 +2837,12 @@ fn stage_directory_recurse(
 ///
 /// The verdict is handed back rather than recomputed below, because staging the
 /// child had to reach it to decide whether the child was excluded at all.
+#[lore_macro::test_pub]
 pub(crate) struct StagedChild {
     pub link: NodeLink,
     pub states: FilterStates,
+    /// Whether the stage added the child's node to the directory, prepending it there.
+    pub prepended: bool,
     /// A directory no commit holds whose add this call staged, which the caller records once it
     /// keeps it.
     pub added: bool,
@@ -2787,21 +2854,25 @@ impl StagedChild {
         Self {
             link: NodeLink::invalid(),
             states: FilterStates::ROOT,
+            prepended: false,
             added: false,
         }
     }
 }
 
-/// Record on `node` what a staged file carries: it is a file, it holds no children, and it is
-/// the size the walk measured.
-///
-/// The mode is not recorded. A commit reads the file's mode and compares it with the node's to
-/// see whether the revision has to carry a change to it, so a mode recorded here would be
-/// compared against itself and a change to the executable bit alone would be lost.
-fn record_staged_file(node: &mut Node, info: &FileInfo) {
-    node.flags |= NodeFlags::File;
-    node.child = 0;
-    node.size = info.size();
+/// Renames `from` to `to` on the filesystem, which differ only in case. A refusal the stage error
+/// declares, such as a read-only instance, stays that error.
+async fn unify_case(
+    operation: &InstanceOperationImpl,
+    from: &RelativePath,
+    to: &RelativePath,
+) -> Result<(), StageError> {
+    operation
+        .rename(from, to)
+        .await
+        .forward_any_with::<StageError, _>(|| {
+            format!("Unable to rename file system path {from} to {to}")
+        })
 }
 
 /// Whether `directory` holds both the spelling the tree carries and the one the file system
@@ -2829,7 +2900,17 @@ async fn holds_both_spellings(
 ///
 /// `parent_states` is the filter verdict for `base`'s path, which the child named here steps from
 /// rather than folding its whole path.
+///
+/// A changed file a merge in progress staged past the view ([`crate::commit::merged_past_the_view`]),
+/// which only a forced stage reaches, is taken from the working tree as the merge's resolution,
+/// again where a forced stage resolved it before: its content hash is dropped, and its size is the
+/// working tree's. A zero hash with a nonzero size is content not yet stored, the state
+/// a newly staged add has, so the commit reads the file, as it reads a merged file in view. An
+/// empty file leaves a zero hash with size 0, which the commit takes from the node as it stands,
+/// and the file's mode with it. The file ID and the merge bits stay, and a staged add or move, a
+/// merge's included, keeps its action.
 #[allow(clippy::too_many_arguments, unused_assignments)]
+#[lore_macro::test_pub]
 pub(crate) async fn stage_node_from_metadata(
     operation: &Arc<InstanceOperationImpl>,
     base: NodeMapping,
@@ -2855,6 +2936,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states: parent_states,
+            prepended: false,
             added: false,
         });
     }
@@ -2935,9 +3017,9 @@ pub(crate) async fn stage_node_from_metadata(
         Ok(Some(_)) => true,
         _ => false,
     };
-    let (states, excluded) = stage_step(
-        &repository.filter,
+    let (states, excluded) = repository.filter.child_emit_unless_forced(
         force,
+        FilterMode::View,
         parent_states,
         &filter_path,
         info.is_dir(),
@@ -3023,6 +3105,9 @@ pub(crate) async fn stage_node_from_metadata(
             }
         }
         Ok(None) => NodeLink::invalid(),
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward::<StageError>("finding the subnode");
+        }
         Err(err) => {
             return Err(StageError::internal_with_context(
                 err,
@@ -3073,24 +3158,15 @@ pub(crate) async fn stage_node_from_metadata(
             .await
             .forward::<StageError>("Failed to add a node to revision tree")?;
 
-        state
-            .node_mark(
-                repository.clone(),
-                node_id,
-                NodeFlags::StagedAdd | options.node_flags,
-                true, /* mark dirty */
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-
-        mark_staged_node_dirty(
-            repository.clone(),
-            &state,
-            node_id,
+        let mark = staged_change(
+            NodeFlags::StagedAdd,
             NodeFlags::DirtyAdd,
             options.node_flags,
-        )
-        .await?;
+        );
+        state
+            .node_mark(&repository, node_id, mark)
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
 
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(&repository);
@@ -3120,6 +3196,7 @@ pub(crate) async fn stage_node_from_metadata(
                 revision: state.revision(),
             },
             states,
+            prepended: true,
             added: info.is_dir(),
         });
     }
@@ -3133,41 +3210,28 @@ pub(crate) async fn stage_node_from_metadata(
         .await
         .forward::<StageError>("Failed deserializing state node block")?;
 
-    let mut node = block.node(node_index);
+    let node = block.node(node_index);
     let mut event_action = None;
     let mut from_path = None;
+    #[cfg(feature = "state-hooks")]
+    crate::state::node::hooks::reached(crate::state::node::hooks::Point::StageWindow).await;
 
-    // Undelete if deleted
+    // Undelete if deleted: the forced mark replaces the staged deletion. The merge flags stand
+    // until an unstage drops them, as the mark keeps them; under merge options it sets the
+    // options' merge state instead, as the stage's own mark below does again. The decisions
+    // below read the node as found.
     if node.is_staged_delete() {
         lore_trace!("Undelete node {} before staging", node_link.node);
 
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_staged_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state.block_modified(block.clone(), block_index);
-            state.mark_dirty();
-        }
-        state
-            .node_mark(
-                repository.clone(),
-                node_link.node,
-                NodeFlags::StagedModify | options.node_flags,
-                true, /* Mark dirty */
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-
-        mark_staged_node_dirty(
-            repository.clone(),
-            &state,
-            node_link.node,
+        let mark = staged_change(
+            NodeFlags::StagedModify,
             NodeFlags::DirtyModify,
             options.node_flags,
-        )
-        .await?;
+        );
+        state
+            .node_mark(&repository, node_link.node, mark)
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
 
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(&repository);
@@ -3206,11 +3270,7 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = relative_path.join(&name);
 
-                operation.rename(&from_path, &to_path).await.map_err(|e| {
-                    StageError::internal(format!(
-                        "Unable to rename file system path {from_path} to {to_path}: {e}"
-                    ))
-                })?;
+                unify_case(operation, &from_path, &to_path).await?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -3225,41 +3285,26 @@ pub(crate) async fn stage_node_from_metadata(
                     lore_debug!(
                         "Case rename: old path {old_path} still exists alongside {new_path}, unifying file system"
                     );
-                    operation.rename(&old_path, &new_path).await.map_err(|e| {
-                        StageError::internal(format!(
-                            "Unable to rename file system path {old_path} to {new_path}: {e}"
-                        ))
-                    })?;
+                    unify_case(operation, &old_path, &new_path).await?;
                 }
 
                 from_path = Some(relative_path.join(&node_name).to_string());
                 event_action = Some(LoreFileAction::Move);
 
-                let dirtied = {
-                    let mut block_writer = block.write();
-                    let (current_name_offset, current_name_length) = {
-                        let current_node = block_writer.node(node_index);
-                        (current_node.name_offset, current_node.name_length)
-                    };
-                    let (name_offset, name_length) = block_writer
-                        .node_name_store(name.as_str(), current_name_offset, current_name_length)
-                        .forward::<StageError>("storing node name on stage move")?;
-                    let write_node = block_writer.node(node_index);
-                    write_node.name_hash = name_hash;
-                    write_node.name_offset = name_offset;
-                    write_node.name_length = name_length;
-                    block_writer.mark_dirty()
-                };
-                if dirtied {
-                    state.block_modified(block.clone(), block_index);
-                    state.mark_dirty();
-                }
+                // The case alone changes, so the node keeps its name hash and its place.
                 state
-                    .node_mark(
+                    .node_rename(
                         repository.clone(),
                         node_link.node,
-                        NodeFlags::StagedMove | options.node_flags,
-                        true, /* Mark dirty */
+                        NameChange::Rename(name.as_str()),
+                    )
+                    .await
+                    .forward::<StageError>("storing node name on stage move")?;
+                state
+                    .node_mark(
+                        &repository,
+                        node_link.node,
+                        Mark::staged(NodeFlags::StagedMove | options.node_flags, true),
                     )
                     .await
                     .forward::<StageError>("Failed to mark node as staged")?;
@@ -3284,47 +3329,49 @@ pub(crate) async fn stage_node_from_metadata(
         || node.is_staged_merge_unresolved()
     {
         let mut maybe_content_modified = false;
-        let mut content_or_type_fields_modified = false;
         // An unstaged-add node is a previously-staged add that the user
         // unstaged; re-staging must promote it back to a staged add even when
         // the filesystem content compares equal to the node's stored hash.
         let was_dirty_add = node.is_dirty_add();
+        // Whether the node's own fields are written in place: a node of another kind than the
+        // filesystem entry was staged for deletion above, and a new one added.
+        let mut write_content = false;
+        let mut resolves_merge = false;
 
         if !info.is_dir() {
-            let stage_file_node = if !node.is_file() {
-                lore_debug!("Stage node type change to file for node {}", node_link.node);
-                true
-            } else {
-                let node_path = relative_path.join(name.as_str());
-
-                info.mode_differs_from(node.mode)
-                    || file_modified_against_node(
-                        repository.clone(),
-                        &node,
-                        info.mtime(),
-                        info.size(),
-                        &node_path,
-                        !node.is_staged(),
-                        operation,
-                        &lore_storage::ContentHashes::default(),
-                    )
-                    .await
-                    .forward::<StageError>("Failed to determine if file is modified")?
-                    .is_modified()
-            };
+            debug_assert!(node.is_file(), "a file entry over a node of another kind");
+            let node_path = relative_path.join(name.as_str());
+            let stage_file_node = info.mode_differs_from(node.mode)
+                || file_modified_against_node(
+                    repository.clone(),
+                    &node,
+                    info.mtime(),
+                    info.size(),
+                    &node_path,
+                    !node.is_staged(),
+                    operation,
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .forward::<StageError>("Failed to determine if file is modified")?
+                .is_modified();
 
             if stage_file_node {
-                record_staged_file(&mut node, &info);
+                // The size the walk measured. Not the mode: a commit compares the file's mode with
+                // the node's to see whether the revision carries a change to it, so a mode
+                // recorded here would be compared with itself and a change to the executable bit
+                // alone would be lost.
+                write_content = true;
                 maybe_content_modified = true;
-                content_or_type_fields_modified = true;
+                resolves_merge =
+                    crate::commit::merged_past_the_view(&repository, &node_path, &node);
             } else if was_dirty_add {
                 maybe_content_modified = true;
             }
-        } else if node.is_file() || node.mode != 0 {
-            node.flags &= !NodeFlags::File;
-            node.mode = 0;
+        } else if node.mode != 0 {
+            debug_assert!(!node.is_file(), "a directory entry over a file node");
+            write_content = true;
             maybe_content_modified = true;
-            content_or_type_fields_modified = true;
         } else if node.is_dirty_add() {
             // A new directory has no content change to detect but must still be
             // staged.
@@ -3336,52 +3383,55 @@ pub(crate) async fn stage_node_from_metadata(
             || options.node_flags.contains(NodeFlags::StagedMerge)
             || node.is_staged_merge_unresolved()
         {
-            if content_or_type_fields_modified {
-                let dirtied = {
-                    let mut block_writer = block.write();
-                    let write_node = block_writer.node(node_index);
-                    if info.is_dir() {
-                        write_node.flags &= !NodeFlags::File;
-                        write_node.mode = 0;
-                    } else {
-                        write_node.flags |= NodeFlags::File;
-                        write_node.child = 0;
-                        write_node.mode = node.mode;
-                        write_node.size = node.size;
-                    }
-                    block_writer.mark_dirty()
-                };
-
-                if dirtied {
-                    state.block_modified(block, block_index);
-                    state.mark_dirty();
-                }
+            if write_content {
+                let changed = state.node_change_in_place(
+                    &block,
+                    node_link.node,
+                    (node.parent, node.name_hash),
+                    |held| {
+                        if info.is_dir() {
+                            held.set_mode(0);
+                        } else if resolves_merge {
+                            let mode = if info.size() == 0 {
+                                info.mode(held.mode)
+                            } else {
+                                held.mode
+                            };
+                            held.set_content(Address::default(), info.size(), mode);
+                        } else {
+                            held.set_size(info.size());
+                        }
+                        true
+                    },
+                );
+                debug_assert!(changed, "the staged node left its place");
             }
 
-            let (staged_flag, dirty_flag) = if was_dirty_add {
-                (NodeFlags::StagedAdd, NodeFlags::DirtyAdd)
+            let (staged_flag, dirty_flag, action) = if was_dirty_add || node.is_staged_add() {
+                (
+                    NodeFlags::StagedAdd,
+                    NodeFlags::DirtyAdd,
+                    LoreFileAction::Add,
+                )
+            } else if node.is_staged_move() {
+                (
+                    NodeFlags::StagedMove,
+                    NodeFlags::DirtyMove,
+                    LoreFileAction::Move,
+                )
             } else {
-                (NodeFlags::StagedModify, NodeFlags::DirtyModify)
+                (
+                    NodeFlags::StagedModify,
+                    NodeFlags::DirtyModify,
+                    LoreFileAction::Keep,
+                )
             };
 
+            let mark = staged_change(staged_flag, dirty_flag, options.node_flags);
             state
-                .node_mark(
-                    repository.clone(),
-                    node_link.node,
-                    staged_flag | options.node_flags,
-                    true, /* Mark dirty */
-                )
+                .node_mark(&repository, node_link.node, mark)
                 .await
                 .forward::<StageError>("Failed to mark node as staged")?;
-
-            mark_staged_node_dirty(
-                repository.clone(),
-                &state,
-                node_link.node,
-                dirty_flag,
-                options.node_flags,
-            )
-            .await?;
 
             lore_trace!(
                 "Staged existing node {} as modified for {}",
@@ -3394,11 +3444,7 @@ pub(crate) async fn stage_node_from_metadata(
             }
 
             if event_action.is_none() {
-                event_action = Some(if was_dirty_add {
-                    LoreFileAction::Add
-                } else {
-                    LoreFileAction::Keep
-                });
+                event_action = Some(action);
             }
         }
     }
@@ -3428,6 +3474,7 @@ pub(crate) async fn stage_node_from_metadata(
     Ok(StagedChild {
         link: node_link,
         states,
+        prepended: false,
         added,
     })
 }
@@ -3438,6 +3485,39 @@ pub(crate) enum MergeParent {
     Theirs,
     CherryPick,
     Revert,
+}
+
+/// The revision a resolve to `merge_parent` restores the paths of the merge in progress in `state`
+/// from.
+pub(crate) async fn merge_parent_revision(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    merge_parent: MergeParent,
+) -> Result<Hash, StageError> {
+    Ok(match merge_parent {
+        MergeParent::Mine => state.parents()[0],
+        MergeParent::Theirs => state.parents()[1],
+        MergeParent::CherryPick => {
+            state
+                .revision_metadata(repository.clone())
+                .await
+                .forward::<StageError>("Failed to deserialize revision state")?
+                .cherry_picked_from
+        }
+        MergeParent::Revert => {
+            // For revert "theirs", we want the content that the revert would produce,
+            // which is the PARENT of the reverted revision (i.e., the state before the change)
+            let reverted_from = state
+                .revision_metadata(repository.clone())
+                .await
+                .forward::<StageError>("Failed to deserialize revision state")?
+                .reverted_from;
+            let reverted_state = State::deserialize(repository.clone(), reverted_from)
+                .await
+                .forward::<StageError>("Failed to deserialize revision state")?;
+            reverted_state.parent_self()
+        }
+    })
 }
 
 // Determine the merge NodeFlags based on the target vs the current repository state
@@ -3472,40 +3552,287 @@ pub(crate) fn determine_merge_action(
     }
 }
 
-/// Recursively collect all file paths with the staged merge flag under a node.
-/// If the node is a file with a staged merge, returns it directly.
-/// If the node is a directory, walks all descendants and collects matching files.
-pub(crate) fn collect_staged_merge_files(
+/// One side of a merge, cherry-pick or revert in progress, and the link mounts it holds.
+struct MergeSide {
+    state: Arc<State>,
+    mounts: Vec<state::LinkMountInfo>,
+}
+
+struct MergeSides {
+    mine: MergeSide,
+    other: MergeSide,
+}
+
+impl MergeSides {
+    /// The side a resolve to `merge_parent` restores from, and the side it replaces.
+    fn restored_and_replaced(&self, merge_parent: MergeParent) -> (&MergeSide, &MergeSide) {
+        if merge_parent == MergeParent::Mine {
+            (&self.mine, &self.other)
+        } else {
+            (&self.other, &self.mine)
+        }
+    }
+}
+
+/// The state a resolve walks: the parent repository's, or a linked repository's, whose resolver
+/// restores files only.
+#[derive(Clone, Copy, PartialEq)]
+enum ResolveScope {
+    Parent,
+    InsideLink,
+}
+
+struct MergeInProgress {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    sides: tokio::sync::OnceCell<MergeSides>,
+    abort: &'static str,
+}
+
+/// What a resolve of the merge in progress refuses because resolving it would corrupt a link: a
+/// type change at a link mount either side of the merge holds, and a folder or link conflict
+/// inside a linked repository.
+#[derive(Clone)]
+pub(crate) struct ResolveRefusal {
+    merge: Arc<MergeInProgress>,
+    scope: ResolveScope,
+}
+
+impl ResolveRefusal {
+    /// The refusal for the merge in progress in `state`.
+    pub(crate) fn new(repository: &Arc<RepositoryContext>, state: &Arc<State>) -> Self {
+        Self {
+            merge: Arc::new(MergeInProgress {
+                repository: repository.clone(),
+                state: state.clone(),
+                sides: tokio::sync::OnceCell::new(),
+                abort: branch::merge::get_merge_type(state).abort_command(),
+            }),
+            scope: ResolveScope::Parent,
+        }
+    }
+
+    /// This refusal for a walk over a linked repository's state.
+    pub(crate) fn inside_link(&self) -> Self {
+        Self {
+            merge: self.merge.clone(),
+            scope: ResolveScope::InsideLink,
+        }
+    }
+
+    /// Both sides of the merge, read once on first use.
+    async fn sides(&self) -> Result<&MergeSides, StageError> {
+        let merge = &self.merge;
+        merge
+            .sides
+            .get_or_try_init(async || {
+                let (repository, state) = (&merge.repository, &merge.state);
+                let other = if state.is_cherry_pick() {
+                    MergeParent::CherryPick
+                } else if state.is_revert() {
+                    MergeParent::Revert
+                } else {
+                    MergeParent::Theirs
+                };
+                let side = async |merge_parent| {
+                    let revision = merge_parent_revision(repository, state, merge_parent).await?;
+                    let state = State::deserialize(repository.clone(), revision)
+                        .await
+                        .forward::<StageError>("Failed to deserialize revision state")?;
+                    let mounts = state::collect_link_mounts_below(
+                        &state,
+                        repository,
+                        ROOT_NODE,
+                        &RelativePath::new(),
+                    )
+                    .await
+                    .forward_any::<StageError>("Failed to collect the link mounts of the merge")?;
+                    Ok::<_, StageError>(MergeSide { state, mounts })
+                };
+                let (mine, other) = tokio::try_join!(side(MergeParent::Mine), side(other))?;
+                Ok(MergeSides { mine, other })
+            })
+            .await
+    }
+
+    /// Whether either side holds a link mounted at `path`.
+    async fn mounted_at(&self, path: &RelativePath) -> Result<bool, StageError> {
+        let sides = self.sides().await?;
+        Ok(sides
+            .mine
+            .mounts
+            .iter()
+            .chain(&sides.other.mounts)
+            .any(|mount| mount.mount_path.as_lowercase_str() == path.as_lowercase_str()))
+    }
+
+    /// The refusal for `node` at `path`, which carries an unresolved conflict and is not a file,
+    /// or `None` where a resolve walks into it.
+    async fn at_node(
+        &self,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<Option<NotSupported>, StageError> {
+        if self.scope == ResolveScope::InsideLink && !node.is_link() {
+            return Ok(Some(self.inside_link_conflict(path)));
+        }
+        if node.is_link() || self.mounted_at(path).await? {
+            return Ok(Some(self.mount_type_change(path)));
+        }
+        Ok(None)
+    }
+
+    /// The refusal for resolving a path inside the link whose node in the parent's state is
+    /// `local_node`, mounted at `mount`, where that node carries an unresolved conflict.
+    pub(crate) async fn entering_link(
+        &self,
+        local_node: NodeID,
+        mount: &RelativePath,
+    ) -> Result<Option<NotSupported>, StageError> {
+        let node = self
+            .merge
+            .state
+            .node(self.merge.repository.clone(), local_node)
+            .await
+            .forward::<StageError>("Failed to read the link node")?;
+        Ok(node
+            .is_staged_merge_unresolved()
+            .then(|| self.mount_type_change(mount)))
+    }
+
+    /// The refusal for restoring `paths` in the parent repository from the side `merge_parent`
+    /// names, where that side holds a link mount at, above or below one of them, or the side it
+    /// replaces holds one below, which restoring removes.
+    async fn restoring(
+        &self,
+        merge_parent: MergeParent,
+        paths: &[RelativePath],
+    ) -> Result<Option<NotSupported>, StageError> {
+        let (restored, replaced) = self.sides().await?.restored_and_replaced(merge_parent);
+        let mount = restored
+            .mounts
+            .iter()
+            .find(|mount| {
+                paths
+                    .iter()
+                    .any(|path| mount.mount_path.overlaps_ignore_case(path))
+            })
+            .or_else(|| {
+                replaced.mounts.iter().find(|mount| {
+                    paths.iter().any(|path| {
+                        path.covers_ignore_case(&mount.mount_path)
+                            && path.as_lowercase_str() != mount.mount_path.as_lowercase_str()
+                    })
+                })
+            });
+        Ok(mount.map(|mount| self.mount_type_change(&mount.mount_path)))
+    }
+
+    /// The refusal for restoring the file at `path` inside a linked repository from a side that
+    /// holds `target` there.
+    fn restoring_file_inside_link(
+        &self,
+        target: &Node,
+        path: &RelativePath,
+    ) -> Option<NotSupported> {
+        (!target.is_file()).then(|| self.inside_link_conflict(path))
+    }
+
+    fn mount_type_change(&self, mount: &RelativePath) -> NotSupported {
+        NotSupported {
+            operation: format!(
+                "resolving a link mount type change at {mount} - abort with `{}`",
+                self.merge.abort
+            ),
+        }
+    }
+
+    fn inside_link_conflict(&self, path: &RelativePath) -> NotSupported {
+        NotSupported {
+            operation: format!(
+                "resolving the folder or link conflict at {path} inside a linked repository - \
+                 abort with `{}`",
+                self.merge.abort
+            ),
+        }
+    }
+}
+
+/// What [`collect_merge_paths`] collected below a node.
+#[derive(Default)]
+pub(crate) struct StagedMergePaths {
+    pub(crate) files: Vec<RelativePath>,
+    /// Whether a node collected carries a merge conflict.
+    pub(crate) holds_conflict: bool,
+    /// The mount and the mounted node of each link met, whose paths are resolved in the linked
+    /// repository's own state.
+    pub(crate) links: Vec<(RelativePath, NodeLink)>,
+}
+
+/// Which nodes [`collect_merge_paths`] collects.
+#[derive(Clone, Copy)]
+pub(crate) struct MergeWalk {
+    /// Collect conflicts not yet resolved rather than every staged merge.
+    pub(crate) unresolved_only: bool,
+    /// Collect a directory carrying a conflict no node below it carries: the conflict is with a
+    /// file the other side put in its place.
+    pub(crate) whole_directories: bool,
+}
+
+/// Collects the paths of the merged nodes at and below `node_id`, and the links met, with what
+/// `refusal` refuses on the way.
+pub(crate) fn collect_merge_paths(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
     base_path: RelativePath,
-) -> Pin<Box<dyn Future<Output = Result<Vec<RelativePath>, StageError>> + Send>> {
+    walk: MergeWalk,
+    refusal: Option<ResolveRefusal>,
+) -> Pin<Box<dyn Future<Output = Result<StagedMergePaths, StageError>> + Send>> {
     Box::pin(async move {
-        let block_index = NodeBlock::index(node_id);
-        let node_index = Node::index(node_id);
         let block = state
-            .block(repository.clone(), block_index)
+            .block(repository.clone(), NodeBlock::index(node_id))
             .await
             .forward::<StageError>("Failed deserializing state node block")?;
-        let node = block.node(node_index);
+        let node = block.node(Node::index(node_id));
 
-        if node.is_link() {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
+        let collects = |node: &Node| {
+            if walk.unresolved_only {
+                node.is_staged_merge_conflict() && node.is_staged_merge_unresolved()
+            } else {
+                node.is_staged_merge()
+            }
+        };
 
         if node.is_file() {
-            if node.is_staged_merge() {
-                return Ok(vec![base_path]);
+            if !collects(&node) {
+                return Ok(StagedMergePaths::default());
             }
-            return Ok(vec![]);
+            return Ok(StagedMergePaths {
+                files: vec![base_path],
+                holds_conflict: node.is_staged_merge_conflict(),
+                links: Vec::new(),
+            });
+        }
+        if let Some(refusal) = &refusal
+            && node.is_staged_merge_unresolved()
+            && let Some(refused) = refusal.at_node(&node, &base_path).await?
+        {
+            return Err(refused.into());
+        }
+        if node.is_link() {
+            let mut collected = StagedMergePaths::default();
+            // A link nested in a linked repository is not merged with it, so it holds no merge.
+            if refusal
+                .as_ref()
+                .is_none_or(|refusal| refusal.scope == ResolveScope::Parent)
+            {
+                collected.links.push((base_path, node.linked_node()));
+            }
+            return Ok(collected);
         }
 
-        // Directory: recurse into children
-        let mut collected = Vec::new();
+        let mut collected = StagedMergePaths::default();
         let mut children =
             StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
                 .await
@@ -3519,14 +3846,95 @@ pub(crate) fn collect_staged_merge_files(
             let child_path = base_path.push_into_buf(&child_name).freeze();
             // Release the block read lock before recursing (see NodeNameLock docs).
             drop(child_name);
-            let mut child_files =
-                collect_staged_merge_files(repository.clone(), state.clone(), child_id, child_path)
-                    .await?;
-            collected.append(&mut child_files);
+            let mut child = collect_merge_paths(
+                repository.clone(),
+                state.clone(),
+                child_id,
+                child_path,
+                walk,
+                refusal.clone(),
+            )
+            .await?;
+            collected.files.append(&mut child.files);
+            collected.holds_conflict |= child.holds_conflict;
+            collected.links.append(&mut child.links);
         }
 
+        if walk.whole_directories
+            && node.is_staged_merge_conflict()
+            && collects(&node)
+            && !collected.holds_conflict
+        {
+            return Ok(StagedMergePaths {
+                files: vec![base_path],
+                holds_conflict: true,
+                links: collected.links,
+            });
+        }
         Ok(collected)
     })
+}
+
+/// Refuses to remove `path` from the working tree, which holds what `replaced` holds there, where
+/// that loses what no resolve restores: an entry `replaced` does not track, a file changed since,
+/// or a linked repository mounted below.
+async fn refuse_losing_local_work(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    replaced: &Arc<State>,
+    path: &RelativePath,
+) -> Result<(), StageError> {
+    let node_link = replaced
+        .find_node_link(repository.clone(), path.as_str())
+        .await
+        .unwrap_or_default();
+    if !node_link.is_valid() || node_link.crosses_link(repository, replaced) {
+        return Err(LocalModifications.into());
+    }
+    if !state::collect_link_mounts_below(replaced, repository, node_link.node, path)
+        .await
+        .forward::<StageError>("Failed to read the links below the replaced path")?
+        .is_empty()
+    {
+        return Err(StageError::internal(
+            "Links not yet implemented, cannot perform actions in other repositories",
+        ));
+    }
+
+    let side = NodeMapping {
+        repository: repository.clone(),
+        state: replaced.clone(),
+        path: path.clone(),
+        node: node_link.node,
+    };
+    let mut changes = state::diff_filesystem_subtree(
+        operation,
+        side.clone(),
+        side,
+        path.clone(),
+        FilterMode::View,
+        FilesystemDiffIntent::Report,
+        Arc::new(Vec::new()),
+    )
+    .await
+    .forward::<StageError>("Failed to compare the replaced path against the file system")?;
+    // A tracked entry already gone from the working tree loses nothing.
+    let mut local_work = None;
+    while let Some(change) = changes.next().await {
+        if change.action != change::FileAction::Delete {
+            local_work = Some(change.path().clone());
+            break;
+        }
+    }
+    changes
+        .finish()
+        .await
+        .forward::<StageError>("Failed to compare the replaced path against the file system")?;
+    if let Some(changed) = local_work {
+        lore_error!("Resolving {path} would remove the local changes at {changed}");
+        return Err(LocalModifications.into());
+    }
+    Ok(())
 }
 
 pub(crate) async fn stage_from_parent_revision(
@@ -3546,6 +3954,177 @@ pub(crate) async fn stage_from_parent_revision(
         .await
     })
     .await
+}
+
+/// Removes `relative_path` from the working tree with what it holds, stages it from there with
+/// `options`, a deletion where nothing is left, and removes the copies a merge wrote beside it
+/// unless `preserve_conflict_files` keeps them for an unresolve.
+async fn unlink_and_stage(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    relative_path: RelativePath,
+    state: Arc<State>,
+    stats: Arc<StageStats>,
+    options: StageOptions,
+    preserve_conflict_files: bool,
+) -> Result<(), StageError> {
+    let _ = operation.remove_recursive(&relative_path).await;
+
+    Box::pin(stage_filesystem_path(
+        operation.clone(),
+        NodeMapping::root(repository.clone(), state.clone()),
+        relative_path.clone(),
+        stats.clone(),
+        options,
+        None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+        None, // No layer mask
+        None, // No prefix map for a path resolved on its own
+        None, // No discard queue
+    ))
+    .await?;
+
+    if !preserve_conflict_files {
+        sync::unlink_merge_artifacts(&operation, &relative_path).await;
+    }
+    Ok(())
+}
+
+/// Stages the deletion of each directory above `relative_path`, a file whose deletion `state`
+/// stages and the working tree lacks, nearest first, that `side` lacks and that holds no child in
+/// `state` but nodes staged for deletion: a merge resolution keeping the deletion leaves no
+/// directory only the merge's change of the file kept. Each is removed from the working tree as an
+/// empty directory before its deletion is staged, the copies a merge wrote beside the file removed
+/// before the first; the walk stops at one that still holds entries, such as an untracked or
+/// ignored file, which stays with its node, as it does at one `side` holds or a live child keeps.
+/// Where the walk removes nothing, the copies stay until the commit.
+pub(crate) async fn stage_emptied_ancestors(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    side: &State,
+    relative_path: &RelativePath,
+    stats: &Arc<StageStats>,
+    options: StageOptions,
+) -> Result<(), StageError> {
+    let mut search_path = relative_path.clone();
+    search_path.pop();
+    let mut unlinked = false;
+    while !search_path.is_empty() {
+        match side
+            .find_node_link(repository.clone(), search_path.as_str())
+            .await
+        {
+            Ok(in_side) if in_side.is_valid() => break,
+            Ok(_) => {}
+            Err(err) if err.is_node_not_found() => {}
+            Err(err) => {
+                return Err(err).forward::<StageError>("Failed to find the directory in the side");
+            }
+        }
+        let staged = state
+            .find_node_link(repository.clone(), search_path.as_str())
+            .await
+            .forward::<StageError>("Failed to find subnode")?;
+        let children = state
+            .node_children(repository.clone(), staged.node)
+            .await
+            .forward::<StageError>("Failed to find subnode")?;
+        let mut live = false;
+        for child in children.iter() {
+            if !state
+                .node(repository.clone(), *child)
+                .await
+                .forward::<StageError>("Failed to read a child of a directory left by a merge")?
+                .is_staged_delete()
+            {
+                live = true;
+                break;
+            }
+        }
+        if live {
+            break;
+        }
+        if !unlinked {
+            sync::unlink_merge_artifacts(operation, relative_path).await;
+            unlinked = true;
+        }
+        if !removed_empty_directory(operation, &search_path).await? {
+            break;
+        }
+        lore_debug!("Stage {search_path} deleted, as nothing in it stays");
+        Box::pin(stage_filesystem_path(
+            operation.clone(),
+            NodeMapping::root(repository.clone(), state.clone()),
+            search_path.clone(),
+            stats.clone(),
+            options,
+            None,
+            None,
+            None,
+            None,
+        ))
+        .await?;
+        search_path.pop();
+    }
+    Ok(())
+}
+
+/// Removes the directory at `path` where it holds no entries, and answers whether the working tree
+/// then lacks it, as it lacks one it never held. A dry run removes nothing, and answers whether
+/// the working tree lacks it already.
+async fn removed_empty_directory(
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RelativePath,
+) -> Result<bool, StageError> {
+    let removal = if execution_context().globals().dry_run() {
+        None
+    } else {
+        match operation.remove_empty_directory(path).await {
+            Ok(()) => return Ok(true),
+            Err(err) => Some(err),
+        }
+    };
+    let held = operation
+        .file_info(path)
+        .await
+        .forward_any::<StageError>("Failed to describe a directory left by a merge")?
+        .exists();
+    if held && let Some(err) = removal {
+        lore_debug!("Directory {path} left by a merge stays: {err}");
+    }
+    Ok(!held)
+}
+
+/// Gives the staged file `node` the executable bit `mode`, which a resolve realized it with:
+/// staging it from the working tree records no bit, and a commit records the staged bit where it
+/// reads none from the working tree. Does nothing for an invalid `node`.
+async fn stage_resolved_mode(
+    repository: &Arc<RepositoryContext>,
+    state: &State,
+    node: NodeID,
+    mode: u16,
+) -> Result<(), StageError> {
+    if !node.is_valid_node_id() {
+        return Ok(());
+    }
+    crate::fs::realize::carry_staged_mode(state, repository, node, mode)
+        .await
+        .forward::<StageError>("Failed to stage the resolved file's mode")
+}
+
+/// The file `chosen`, the side a resolve takes, with the executable bit of `merged`, the file the
+/// merge staged at its path, where the two are one file: a resolve chooses the content where the
+/// sides conflict and never undoes a change of the bit, on every file it touches, conflicted or
+/// merged cleanly. A file of another identity, added again on that side, keeps its own bit.
+fn with_merged_mode(chosen: Node, merged: &Node) -> Node {
+    if merged.is_file() && merged.address.context == chosen.address.context {
+        Node {
+            mode: merged.mode,
+            ..chosen
+        }
+    } else {
+        chosen
+    }
 }
 
 /// Stages `paths` from the revision `merge_parent` names: a file is restored and staged here,
@@ -3589,7 +4168,7 @@ async fn stage_from_parent_revision_in_operation(
     // Link-paths need a separate helper that operates against each link's
     // own state (and updates the parent's pin afterwards).
     let mut parent_paths: Vec<LoreString> = Vec::new();
-    let mut link_paths: Vec<LoreString> = Vec::new();
+    let mut link_paths: Vec<LinkPath> = Vec::new();
     for path in paths.as_slice().iter() {
         let Ok(relative_path) =
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
@@ -3604,57 +4183,35 @@ async fn stage_from_parent_revision_in_operation(
             .await
             .unwrap_or_default();
         if node_link.is_valid_or_root() && node_link.repository != repository.id {
-            link_paths.push(path.clone());
+            link_paths.push(LinkPath {
+                path: relative_path,
+                named: Some(path.clone()),
+            });
         } else {
             parent_paths.push(path.clone());
         }
     }
 
-    if !link_paths.is_empty() {
-        Box::pin(stage_link_paths_from_parent_revision(
-            operation.clone(),
-            repository.clone(),
-            token,
-            state.clone(),
-            LoreArray::from_vec(link_paths),
-            merge_parent,
-        ))
-        .await?;
-    }
+    // Every path passes the refusals before any is staged, so a refused resolve stages nothing.
+    let refusal = ResolveRefusal::new(&repository, &state);
 
     if parent_paths.is_empty() {
-        return Ok(());
+        let link_groups =
+            collect_link_groups(&repository, &state, link_paths, merge_parent, &refusal).await?;
+        return Box::pin(stage_link_groups(
+            operation,
+            repository,
+            token,
+            state,
+            link_groups,
+            merge_parent,
+        ))
+        .await;
     }
     let paths = LoreArray::from_vec(parent_paths);
 
-    let state_target_hash = match merge_parent {
-        MergeParent::Mine => state.parents()[0],
-        MergeParent::Theirs => state.parents()[1],
-        MergeParent::CherryPick => {
-            state
-                .revision_metadata(repository.clone())
-                .await
-                .forward::<StageError>("Failed to deserialize revision state")?
-                .cherry_picked_from
-        }
-        MergeParent::Revert => {
-            // For revert "theirs", we want the content that the revert would produce,
-            // which is the PARENT of the reverted revision (i.e., the state before the change)
-            let reverted_from = state
-                .revision_metadata(repository.clone())
-                .await
-                .forward::<StageError>("Failed to deserialize revision state")?
-                .reverted_from;
-            let reverted_state = State::deserialize(repository.clone(), reverted_from)
-                .await
-                .forward::<StageError>("Failed to deserialize revision state")?;
-            reverted_state.parent_self()
-        }
-    };
-
-    let state_target = State::deserialize(repository.clone(), state_target_hash)
-        .await
-        .forward::<StageError>("Failed to deserialize revision state")?;
+    let sides = refusal.sides().await?;
+    let state_target = sides.restored_and_replaced(merge_parent).0.state.clone();
 
     // Get current repository state for merge action comparison
     let state_current = State::deserialize(repository.clone(), current_revision)
@@ -3697,9 +4254,8 @@ async fn stage_from_parent_revision_in_operation(
         }
 
         if node_link.repository != repository.id {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
             return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
+                "A path left to the parent repository resolves into a linked repository",
             ));
         }
 
@@ -3718,22 +4274,42 @@ async fn stage_from_parent_revision_in_operation(
                 emit_path_ignore(path.as_str()).await;
                 lore_debug!("Ignoring invalid path, node is not a staged merge: {path}");
             }
-        } else if node.is_directory() {
-            let expanded = collect_staged_merge_files(
+        } else {
+            let expanded = collect_merge_paths(
                 repository.clone(),
                 state.clone(),
                 node_link.node,
                 relative_path,
+                MergeWalk {
+                    unresolved_only: false,
+                    whole_directories: true,
+                },
+                Some(refusal.clone()),
             )
             .await?;
-            resolved_paths.extend(expanded);
-        } else {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
+            resolved_paths.extend(expanded.files);
+            link_paths.extend(expanded.links.into_iter().map(|(mount, _)| LinkPath {
+                path: mount,
+                named: None,
+            }));
         }
     }
+
+    let link_groups =
+        collect_link_groups(&repository, &state, link_paths, merge_parent, &refusal).await?;
+    if let Some(refused) = refusal.restoring(merge_parent, &resolved_paths).await? {
+        return Err(refused.into());
+    }
+
+    Box::pin(stage_link_groups(
+        operation.clone(),
+        repository.clone(),
+        token,
+        state.clone(),
+        link_groups,
+        merge_parent,
+    ))
+    .await?;
 
     let stats = Arc::new(StageStats::default());
     #[cfg(not(feature = "test-util"))]
@@ -3830,36 +4406,6 @@ async fn stage_from_parent_revision_in_operation(
             // preserve them for potential unresolve. Commit and abort clean them up.
             let had_conflict_files = sync::exist_merge_artifacts(&operation, &relative_path).await;
 
-            async fn unlink_and_stage(
-                operation: Arc<InstanceOperationImpl>,
-                repository: Arc<RepositoryContext>,
-                relative_path: RelativePath,
-                state: Arc<State>,
-                stats: Arc<StageStats>,
-                options: StageOptions,
-                preserve_conflict_files: bool,
-            ) -> Result<(), StageError> {
-                let _ = operation.remove_recursive(&relative_path).await;
-
-                Box::pin(stage_filesystem_path(
-                    operation.clone(),
-                    NodeMapping::root(repository.clone(), state.clone()),
-                    relative_path.clone(),
-                    stats.clone(),
-                    options,
-                    None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-                    None, // No layer mask
-                    None, // No prefix map for a path resolved on its own
-                    None, // No discard queue
-                ))
-                .await?;
-
-                if !preserve_conflict_files {
-                    sync::unlink_merge_artifacts(&operation, &relative_path).await;
-                }
-                Ok(())
-            }
-
             if !target_node_link.is_valid() {
                 // At this point it's known that the node exist in the merged revision and it's known
                 // that it's a staged merge. If the path does not exist in the target state, the merge
@@ -3884,88 +4430,22 @@ async fn stage_from_parent_revision_in_operation(
                     false,
                 ))
                 .await?;
-
-                // If we stage a delete, check parents. If they are also empty in the current state,
-                // and missing in the parent we are staging from, unlink them too.
-                let mut search_path = relative_path.clone();
-                search_path.pop();
-
-                while !search_path.is_empty() {
-                    lore_debug!(
-                        "Searching parent directory {} after staging a delete",
-                        search_path.as_str()
-                    );
-
-                    let parent_node_link = state_target
-                        .find_node_link(repository.clone(), search_path.as_str())
-                        .await
-                        .unwrap_or_default();
-
-                    if parent_node_link.is_valid() {
-                        // If parent is present in the target state, nothing more to do
-                        break;
-                    }
-
-                    // Find the count of the still valid child nodes in the currently staged state
-                    let current_node_link = state
-                        .find_node_link(repository.clone(), search_path.as_str())
-                        .await
-                        .forward::<StageError>("Failed to find subnode")?;
-                    let children = state
-                        .node_children(repository.clone(), current_node_link.node)
-                        .await
-                        .forward::<StageError>("Failed to find subnode")?;
-
-                    let mut valid_children = 0;
-
-                    for child in children.iter() {
-                        let valid = match state.node(repository.clone(), *child).await {
-                            Ok(node) => !node.is_staged_delete(),
-                            Err(_) => false,
-                        };
-
-                        if valid {
-                            valid_children += 1;
-                        }
-                    }
-
-                    lore_debug!("Found {} valid children in parent", valid_children);
-                    if valid_children != 0 {
-                        break;
-                    }
-
-                    // No valid children in the currently staged state so remove unlink the parent directory
-                    // and stage delete since we also know at this point the parent is missing in the target state
-                    lore_debug!(
-                        "Stage {} from {} deleted node",
-                        search_path.as_str(),
-                        if matches!(merge_parent, MergeParent::Mine) {
-                            "self"
-                        } else {
-                            "other"
-                        },
-                    );
-                    Box::pin(unlink_and_stage(
-                        operation.clone(),
-                        repository.clone(),
-                        search_path.clone(),
-                        state.clone(),
-                        stats.clone(),
-                        options,
-                        false,
-                    ))
-                    .await?;
-
-                    // Check parent
-                    search_path.pop();
-                }
+                stage_emptied_ancestors(
+                    &operation,
+                    &repository,
+                    &state,
+                    &state_target,
+                    &relative_path,
+                    &stats,
+                    options,
+                )
+                .await?;
                 continue;
             }
 
             if target_node_link.repository != repository.id {
-                // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                 return Err(StageError::internal(
-                    "Links not yet implemented, cannot perform actions in other repositories",
+                    "A path resolved in the parent repository is restored from a linked repository",
                 ));
             }
 
@@ -3988,10 +4468,36 @@ async fn stage_from_parent_revision_in_operation(
                 node
             );
 
+            // Where the two sides of the conflict hold a file and a directory, the working tree
+            // holds the other one.
+            if node_staged.node_type() != node.node_type()
+                && operation
+                    .file_info(&relative_path)
+                    .await
+                    .is_ok_and(|info| info.exists() && info.is_dir() != node.is_directory())
+            {
+                // The working tree holds the side not chosen.
+                let replaced = if merge_parent == MergeParent::Mine {
+                    sides.other.state.clone()
+                } else {
+                    state_current.clone()
+                };
+                refuse_losing_local_work(&operation, &repository, &replaced, &relative_path)
+                    .await?;
+                operation
+                    .remove_recursive(&relative_path)
+                    .await
+                    .forward_with::<StageError, _>(|| {
+                        format!("Unable to remove {relative_path}")
+                    })?;
+            }
+
             if node.is_file() {
                 // Restoring to a merge parent leaves content the current revision does not
                 // hold, so the times it lands with state nothing and are left to drop with
                 // the operation.
+                let node = with_merged_mode(node, &node_staged);
+                let mode = node.mode;
                 crate::fs::realize::realize_file(
                     repository.clone(),
                     operation.clone(),
@@ -4002,7 +4508,7 @@ async fn stage_from_parent_revision_in_operation(
                 .await
                 .forward::<StageError>("Unable to restore path to selected state")?;
 
-                Box::pin(stage_filesystem_path(
+                let staged = Box::pin(stage_filesystem_path(
                     operation.clone(),
                     NodeMapping::root(repository.clone(), state.clone()),
                     relative_path.clone(),
@@ -4014,6 +4520,7 @@ async fn stage_from_parent_revision_in_operation(
                     None, // No discard queue
                 ))
                 .await?;
+                stage_resolved_mode(&repository, &state, staged.node, mode).await?;
 
                 if !had_conflict_files {
                     sync::unlink_merge_artifacts(&operation, &relative_path).await;
@@ -4104,87 +4611,110 @@ async fn stage_from_parent_revision_in_operation(
     Ok(())
 }
 
-/// Stage paths inside linked repositories from one of the link's merge
-/// parents (Mine = `parent_self`, Theirs = `parent_other`).
-///
-/// Mirrors `stage_from_parent_revision`'s per-file logic but operates on
-/// each affected link's staged state. After all paths for a link are
-/// processed the link state is re-serialized and the parent's pin updated
-/// via `link::update_link_pin_by_path`.
-pub(crate) async fn stage_link_paths_from_parent_revision(
-    operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
-    token: &RepositoryWriteToken,
-    state: Arc<State>,
-    paths: LoreArray<LoreString>,
-    merge_parent: MergeParent,
-) -> Result<(), StageError> {
-    // Group by link repository id so each link's state is loaded once.
-    struct LinkGroup {
-        link_context: Arc<RepositoryContext>,
-        link_path: String,
-        link_path_rel: RelativePath,
-        link_state_staged: Arc<State>,
-        link_state_target: Arc<State>,
-        link_state_current: Arc<State>,
-        // (mount-prefixed user-path, link-relative path)
-        files: Vec<(RelativePath, RelativePath)>,
-        link_branch: BranchId,
+/// A path inside a linked repository for [`collect_link_groups`] to resolve.
+struct LinkPath {
+    path: RelativePath,
+    /// The path as the caller named it, where a walk did not meet it, to report it ignored.
+    named: Option<LoreString>,
+}
+
+/// Reports `named` as ignored, where the caller named the path rather than a walk meeting it.
+async fn emit_named_path_ignore(named: Option<&LoreString>) {
+    if let Some(named) = named {
+        emit_path_ignore(named.as_str()).await;
     }
+}
+
+/// A file a resolve restores inside a linked repository.
+struct LinkFile {
+    /// The path from the parent's root.
+    user: RelativePath,
+    below_mount: RelativePath,
+    /// The path in the link's own states, which each number their nodes as they please.
+    in_link: RelativePath,
+    /// The node the target holds at `in_link`.
+    target: NodeLink,
+}
+
+/// The files a resolve restores inside one linked repository, from one of the link's merge
+/// parents (Mine = `parent_self`, Theirs = `parent_other`).
+struct LinkGroup {
+    local_node: NodeID,
+    link_context: Arc<RepositoryContext>,
+    link_path_rel: RelativePath,
+    /// The node of `link_state_staged` mounted at `link_path_rel`.
+    mounted: NodeID,
+    source_path: RelativePath,
+    link_state_staged: Arc<State>,
+    link_state_target: Arc<State>,
+    link_state_current: Arc<State>,
+    files: Vec<LinkFile>,
+    link_branch: BranchId,
+}
+
+/// Groups `paths`, which lie inside linked repositories, by link, and checks each against
+/// `refusal` without staging anything. A link the merge did not merge holds nothing to resolve.
+async fn collect_link_groups(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    paths: Vec<LinkPath>,
+    merge_parent: MergeParent,
+    refusal: &ResolveRefusal,
+) -> Result<Vec<LinkGroup>, StageError> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let refusal = refusal.inside_link();
     let mut groups: Vec<LinkGroup> = Vec::new();
 
-    for path in paths.as_slice().iter() {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path: {path}");
-            continue;
-        };
-
-        let link_list = state
-            .link_list(repository.clone())
+    let links = crate::link::links_and_merged(state, repository.clone())
+        .await
+        .forward::<StageError>("Failed to read the links of the merge")?;
+    let mut mounts = Vec::with_capacity(links.len());
+    for (link_ref, merged) in links {
+        let mount = state
+            .node_path(repository.clone(), link_ref.local_node)
             .await
-            .forward::<StageError>("Failed to read parent link list")?;
+            .forward::<StageError>("Failed to resolve a link mount path")?;
+        mounts.push((
+            link_ref,
+            merged,
+            RelativePath::from_str(&mount).unwrap_or_default(),
+        ));
+    }
 
-        let mut chosen_link: Option<state::LinkReference> = None;
-        let mut chosen_mount: Option<String> = None;
-        for link_ref in &link_list {
-            let mount = state
-                .node_path(repository.clone(), link_ref.local_node)
-                .await
-                .unwrap_or_default();
-            if relative_path.as_str() == mount
-                || relative_path.as_str().starts_with(&format!("{mount}/"))
-            {
-                chosen_link = Some(*link_ref);
-                chosen_mount = Some(mount);
-                break;
-            }
-        }
-        let (Some(link_ref), Some(mount)) = (chosen_link, chosen_mount) else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path, does not resolve to any link: {path}");
+    for LinkPath {
+        path: relative_path,
+        named,
+    } in paths
+    {
+        let Some(&(link_ref, merged, ref mount)) = mounts
+            .iter()
+            .filter(|(_, _, mount)| relative_path.below(mount).is_some())
+            .max_by_key(|(_, _, mount)| mount.as_str().len())
+        else {
+            emit_named_path_ignore(named.as_ref()).await;
+            lore_debug!("Ignoring path, does not resolve to any link: {relative_path}");
             continue;
         };
-
-        // For a `source_path == "/"` link, the mount-relative path IS the
-        // link-relative path. Non-trivial source paths would need the
-        // source_path prepended; not yet supported.
-        let after_mount = relative_path
-            .as_str()
-            .strip_prefix(&mount)
-            .unwrap_or(relative_path.as_str());
-        let link_relative_str = after_mount.strip_prefix('/').unwrap_or(after_mount);
-        let link_relative =
-            RelativePath::from_str(link_relative_str).unwrap_or_else(|_| RelativePath::new());
 
         let group_index = groups
             .iter()
-            .position(|g| g.link_context.id == link_ref.repository);
+            .position(|g| g.local_node == link_ref.local_node);
         let group = if let Some(idx) = group_index {
             &mut groups[idx]
         } else {
+            if let Some(refused) = refusal
+                .entering_link(link_ref.local_node as NodeID, mount)
+                .await?
+            {
+                return Err(refused.into());
+            }
+            if !merged {
+                emit_named_path_ignore(named.as_ref()).await;
+                lore_debug!("Ignoring path, the link holding it is not merged: {relative_path}");
+                continue;
+            }
             let link_context = repository.to_link_context(link_ref.repository).await;
             let link_state_staged =
                 state::State::deserialize(link_context.clone(), link_ref.signature)
@@ -4201,24 +4731,38 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     link_state_staged.parent_other()
                 }
             };
-            let link_state_target = state::State::deserialize(link_context.clone(), target_hash)
+            let mounted = state
+                .node(repository.clone(), link_ref.local_node)
                 .await
-                .forward::<StageError>("Failed to deserialize link target state")?;
+                .forward::<StageError>("Failed to load the link node")?
+                .child;
             // `link_state_current` is approximated by `parent_self` — only
             // used for `determine_merge_action` so a precise distinction
             // (an actual pre-merge HEAD) isn't needed.
-            let link_state_current =
-                state::State::deserialize(link_context.clone(), link_state_staged.parent_self())
-                    .await
-                    .forward::<StageError>("Failed to deserialize link current state")?;
-
-            let link_path_rel =
-                RelativePath::from_str(&mount).unwrap_or_else(|_| RelativePath::new());
+            let (link_state_target, link_state_current, source_path) = tokio::try_join!(
+                async {
+                    state::State::deserialize(link_context.clone(), target_hash)
+                        .await
+                        .forward::<StageError>("Failed to deserialize link target state")
+                },
+                async {
+                    state::State::deserialize(link_context.clone(), link_state_staged.parent_self())
+                        .await
+                        .forward::<StageError>("Failed to deserialize link current state")
+                },
+                async {
+                    crate::link::link_source_path(link_context.clone(), &link_state_staged, mounted)
+                        .await
+                        .forward::<StageError>("Failed to resolve the link source path")
+                },
+            )?;
 
             groups.push(LinkGroup {
+                local_node: link_ref.local_node,
                 link_context,
-                link_path: mount.clone(),
-                link_path_rel,
+                link_path_rel: mount.clone(),
+                mounted,
+                source_path,
                 link_state_staged,
                 link_state_target,
                 link_state_current,
@@ -4228,14 +4772,22 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
             groups.last_mut().expect("just pushed")
         };
 
+        let in_group = |user: RelativePath| {
+            let below_mount = RelativePath::from_str(user.below(&group.link_path_rel)?).ok()?;
+            let in_link = group.source_path.join(below_mount.as_str());
+            Some((user, below_mount, in_link))
+        };
+        let Some((user, below_mount, in_link)) = in_group(relative_path) else {
+            continue;
+        };
         let node_link = group
             .link_state_staged
-            .find_node_link(group.link_context.clone(), link_relative.as_str())
+            .find_node_link(group.link_context.clone(), in_link.as_str())
             .await
             .unwrap_or_default();
         if !node_link.is_valid_or_root() {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid link path, does not exist in link staged state: {path}");
+            emit_named_path_ignore(named.as_ref()).await;
+            lore_debug!("Ignoring invalid link path, does not exist in link staged state: {user}");
             continue;
         }
         let block = group
@@ -4244,40 +4796,88 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
             .await
             .forward::<StageError>("Failed deserializing link state node block")?;
         let node = block.node(Node::index(node_link.node));
-        if node.is_file() {
-            if node.is_staged_merge() {
-                group.files.push((relative_path, link_relative));
-            } else {
-                emit_path_ignore(path.as_str()).await;
-                lore_debug!("Ignoring invalid path, link node is not a staged merge: {path}");
+        let files = if node.is_file() {
+            if !node.is_staged_merge() {
+                emit_named_path_ignore(named.as_ref()).await;
+                lore_debug!("Ignoring invalid path, link node is not a staged merge: {user}");
+                continue;
             }
-        } else if node.is_directory() {
-            let expanded = collect_staged_merge_files(
+            vec![(user, below_mount, in_link)]
+        } else {
+            collect_merge_paths(
                 group.link_context.clone(),
                 group.link_state_staged.clone(),
                 node_link.node,
-                link_relative.clone(),
+                user,
+                MergeWalk {
+                    unresolved_only: false,
+                    whole_directories: false,
+                },
+                Some(refusal.clone()),
             )
-            .await?;
-            for f in expanded {
-                let user = group.link_path_rel.join(f.as_str());
-                group.files.push((user, f));
+            .await?
+            .files
+            .into_iter()
+            .filter_map(in_group)
+            .collect()
+        };
+        for (user, below_mount, in_link) in files {
+            let target = match group
+                .link_state_target
+                .find_node_link(group.link_context.clone(), in_link.as_str())
+                .await
+            {
+                Ok(target) => target,
+                Err(err) if err.is_node_not_found() => NodeLink::invalid(),
+                Err(err) => {
+                    Err(err).forward::<StageError>("Failed to find the link target node")?
+                }
+            };
+            if target.is_valid() {
+                let target_node = group
+                    .link_state_target
+                    .node(group.link_context.clone(), target.node)
+                    .await
+                    .forward::<StageError>("Failed to read the link target node")?;
+                if let Some(refused) = refusal.restoring_file_inside_link(&target_node, &user) {
+                    return Err(refused.into());
+                }
             }
-        } else {
-            return Err(StageError::internal(
-                "Link nodes inside a link are not supported",
-            ));
+            group.files.push(LinkFile {
+                user,
+                below_mount,
+                in_link,
+                target,
+            });
         }
     }
+    Ok(groups)
+}
 
+/// Stages the files of `groups` from the merge parent `merge_parent` names, then re-serializes
+/// each link's state and updates the parent's pin via `link::update_link_pin_by_path`.
+async fn stage_link_groups(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    groups: Vec<LinkGroup>,
+    merge_parent: MergeParent,
+) -> Result<(), StageError> {
     if groups.is_empty() {
         return Ok(());
     }
 
     let stats = Arc::new(StageStats::default());
 
-    for group in &groups {
-        for (mount_path, link_relative) in &group.files {
+    for group in groups.iter().filter(|group| !group.files.is_empty()) {
+        for LinkFile {
+            user: mount_path,
+            below_mount,
+            in_link: link_relative,
+            target: target_node_link,
+        } in &group.files
+        {
             let staged_node_link = group
                 .link_state_staged
                 .find_node_link(group.link_context.clone(), link_relative.as_str())
@@ -4314,11 +4914,6 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
 
             // Look up the file in the link's target/current states for the
             // merge-action flags (Add / Modify / Delete / NoFlags).
-            let target_node_link = group
-                .link_state_target
-                .find_node_link(group.link_context.clone(), link_relative.as_str())
-                .await
-                .unwrap_or_default();
             let current_node_link = group
                 .link_state_current
                 .find_node_link(group.link_context.clone(), link_relative.as_str())
@@ -4353,8 +4948,8 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
 
             // Mirror `stage_from_parent_revision`: realize the chosen
             // target's content on disk, then read it back into state via
-            // `stage_filesystem_path`, anchored at the mount, whose node is
-            // the root of the link's own state.
+            // `stage_filesystem_path`, anchored at the mount and the node of
+            // the link's own state mounted there.
             if !target_node_link.is_valid() {
                 // No file at the path → `stage_filesystem_path` stages a
                 // delete; we just clear the on-disk file first.
@@ -4365,9 +4960,9 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
                         path: group.link_path_rel.clone(),
-                        node: ROOT_NODE,
+                        node: group.mounted,
                     },
-                    link_relative.clone(),
+                    below_mount.clone(),
                     stats.clone(),
                     options,
                     None,
@@ -4394,6 +4989,8 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 // `link_context.path` shares the parent's path and
                 // `mount_path` is parent-relative, so realizing through the
                 // link context writes to `<parent>/<mount>/<file>`.
+                let node_t = with_merged_mode(node_t, &node_staged);
+                let mode = node_t.mode;
                 crate::fs::realize::realize_file(
                     group.link_context.clone(),
                     operation.clone(),
@@ -4410,9 +5007,9 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                         repository: group.link_context.clone(),
                         state: group.link_state_staged.clone(),
                         path: group.link_path_rel.clone(),
-                        node: ROOT_NODE,
+                        node: group.mounted,
                     },
-                    link_relative.clone(),
+                    below_mount.clone(),
                     stats.clone(),
                     options,
                     None,
@@ -4420,6 +5017,13 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     None, // No prefix map for a path resolved on its own
                     None, // No discard queue
                 ))
+                .await?;
+                stage_resolved_mode(
+                    &group.link_context,
+                    &group.link_state_staged,
+                    staged_node_link.node,
+                    mode,
+                )
                 .await?;
 
                 sync::unlink_merge_artifacts(&operation, mount_path).await;
@@ -4434,7 +5038,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
         crate::link::update_link_pin_by_path(
             &state,
             repository.clone(),
-            &group.link_path,
+            group.link_path_rel.as_str(),
             group.link_branch,
             new_link_sig,
         )
@@ -4495,6 +5099,7 @@ async fn stage_realized_delete(
 /// with the directory tasks of [`stage_from_parent_revision_in_operation`]. A change runs inline
 /// when no permit is free, never waiting for one: this task holds a permit itself, and directory
 /// tasks each waiting for a permit a change needs would wait on each other.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_from_parent_state(
     operation: Arc<InstanceOperationImpl>,
@@ -4508,14 +5113,6 @@ pub(crate) async fn stage_from_parent_state(
     stats: Arc<StageStats>,
     budget: Arc<Semaphore>,
 ) -> Result<(), StageError> {
-    let block_index = NodeBlock::index(node_id_target);
-    let node_index = Node::index(node_id_target);
-    let block = state_target
-        .block(repository_target.clone(), block_index)
-        .await
-        .forward::<StageError>("Failed deserializing state node block")?;
-    let node = block.node(node_index);
-
     let node_link_current = state_current
         .find_node_link(repository_current.clone(), relative_path.as_str())
         .await
@@ -4524,14 +5121,6 @@ pub(crate) async fn stage_from_parent_state(
         .resolve(repository_current.clone(), state_current.clone())
         .await
         .forward::<StageError>("Failed to resolve node path in state")?;
-    let node_current = if node_link_current.is_valid() {
-        state_current
-            .node(repository_current.clone(), node_link_current.node)
-            .await
-            .forward::<StageError>("Failed to resolve node path in state")?
-    } else {
-        Node::default()
-    };
 
     let mut changes = state::diff_filesystem_subtree(
         &operation,
@@ -4539,13 +5128,13 @@ pub(crate) async fn stage_from_parent_state(
             repository: repository_target.clone(),
             state: state_target.clone(),
             path: relative_path.clone(),
-            node: node.parent,
+            node: node_id_target,
         },
         NodeMapping {
             repository: repository_current.clone(),
             state: state_current.clone(),
             path: relative_path.clone(),
-            node: node_current.parent,
+            node: node_link_current.node,
         },
         relative_path.clone(),
         FilterMode::Full,
@@ -4571,27 +5160,21 @@ pub(crate) async fn stage_from_parent_state(
 
     // Unstage nodes that were already staged but whose disk state had to change to have them included in output
     for change in changes.iter().rev() {
-        if !change.to.mapping.node.is_valid_node_id() {
-            // The reverse above puts the state's side on `to`, so one holding no node stands
-            // where the state held nothing and has no staged flags to clear.
+        // The reverse above puts the target's side on `to`, whose node is the target's own, so
+        // the staged node is found by path.
+        let staged = state_current
+            .find_node_link(repository_current.clone(), change.path().as_str())
+            .await
+            .unwrap_or_default();
+        if !staged.is_valid() || staged.repository != repository_current.id {
             continue;
         }
 
-        let block_index = NodeBlock::index(change.to.mapping.node);
-        let node_index = Node::index(change.to.mapping.node);
         let block = state_current
-            .block(change.to.mapping.repository.clone(), block_index)
+            .block(repository_current.clone(), NodeBlock::index(staged.node))
             .await
             .forward::<StageError>("Failed deserializing state node block")?;
-        let dirtied = {
-            let mut block_writer = block.write();
-            block_writer.node(node_index).clear_staged_flags();
-            block_writer.mark_dirty()
-        };
-        if dirtied {
-            state_current.block_modified(block, block_index);
-            state_current.mark_dirty();
-        }
+        state_current.node_clear_own(&block, staged.node, OwnFlags::Staged);
     }
 
     // Perform the changes
@@ -4607,10 +5190,15 @@ pub(crate) async fn stage_from_parent_state(
     .await
     .forward::<StageError>("Unable to restore path to selected state")?;
 
-    // Stage the files that were reverted to the given target state
+    // Stage the files that were reverted to the given target state. A directory is staged before
+    // what it holds, and before anything below it looks up its node.
+    let mut in_path_order: Vec<&change::NodeChange> = changes.iter().collect();
+    in_path_order.sort_by(|lhs, rhs| lhs.path().as_str().cmp(rhs.path().as_str()));
     let mut tasks = JoinSet::new();
     let dispatch_result: Result<(), StageError> = async {
-        for change in changes.iter() {
+        for change in in_path_order {
+            let stages_directory =
+                change.to.mapping.node.is_valid_node_id() && change.to.flags.is_directory();
             let mut parent_path = change.path().clone();
             parent_path.pop();
             let parent_node_link = state_current
@@ -4627,6 +5215,27 @@ pub(crate) async fn stage_from_parent_state(
                 .resolve(repository_current.clone(), state_current.clone())
                 .await
                 .forward::<StageError>("Failed to resolve node path in state")?;
+            // The conflict, the side and the action are the resolved path's own, and a restored
+            // file keeps the identity the target gives it. What a directory holds is staged by its
+            // own changes.
+            let options = if change.path() == &relative_path {
+                StageOptions {
+                    no_children: stages_directory,
+                    ..options
+                }
+            } else {
+                StageOptions {
+                    node_flags: options.node_flags & NodeFlags::StagedMerge,
+                    file_id: change
+                        .to
+                        .mapping
+                        .node
+                        .is_valid_node_id()
+                        .then_some(change.to.address.context),
+                    no_children: stages_directory,
+                    ..options
+                }
+            };
             let stats = stats.clone();
             let file_path = change.path().clone();
             let operation = operation.clone();
@@ -4667,7 +5276,7 @@ pub(crate) async fn stage_from_parent_state(
                     }
                 })
             };
-            if let Ok(permit) = budget.clone().try_acquire_owned() {
+            if !stages_directory && let Ok(permit) = budget.clone().try_acquire_owned() {
                 #[cfg(feature = "test-util")]
                 let live = RESOLVE_TASKS.enter();
                 lore_spawn!(tasks, async move {
@@ -4701,7 +5310,28 @@ pub(crate) async fn stage_from_parent_state(
             ))),
         };
     }
-    final_result
+    final_result?;
+
+    // The directory carries the resolution even where the working tree already held the
+    // target's content, which leaves nothing above to stage there.
+    if node_link_current.is_valid()
+        && !changes.iter().any(|change| change.path() == &relative_path)
+        && state_current
+            .node(repository_current.clone(), node_link_current.node)
+            .await
+            .is_ok_and(|node| node.is_directory())
+    {
+        state_current
+            .node_mark(
+                &repository_current,
+                node_link_current.node,
+                Mark::staged(options.node_flags, true),
+            )
+            .await
+            .forward::<StageError>("Failed to mark node as staged")?;
+        stats.directory_modify_count.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
 }
 
 /// Counts and holds the tasks one-side resolutions spawn, and sizes their budget, for a test.

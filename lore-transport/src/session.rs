@@ -499,7 +499,8 @@ impl StorageSession {
     /// the parent `Connection`'s session pool cache, so no resolution hands out
     /// a pool holding session ids the server may not know. Call this after the
     /// transport surfaces a `NotConnected`/`Failed` server response indicating
-    /// the session-id is no longer known server-side.
+    /// the session-id is no longer known server-side, or after a refusal, so the
+    /// next resolution presents the current token.
     pub async fn invalidate(&self) {
         match &self.inner {
             SessionInner::Pending {
@@ -678,6 +679,14 @@ impl StorageSession {
             // discards it too; a caller that wants it calls the `_outcome` method.
             MutableOutcome::Unknown(_) => Err(ProtocolError::from(Disconnected)),
         }
+    }
+
+    /// Whether this session was started on `connection`, which it then holds.
+    fn started_on(&self, connection: &Arc<Connection>) -> bool {
+        matches!(
+            &self.inner,
+            SessionInner::Resolved(resolved) if Arc::ptr_eq(&resolved.connection, connection)
+        )
     }
 
     /// Read from the resolved session, driving the pending resolver on first call. Every method
@@ -1273,6 +1282,17 @@ impl SessionPool {
     fn next_index(&self) -> usize {
         self.next.fetch_add(1, Ordering::Relaxed) % self.sessions.len()
     }
+
+    /// How many of this pool's sessions were started on `connection` and are held by this pool
+    /// alone: the references to `connection` the pool keeps that nothing else reaches. A session
+    /// started on another connection holds no reference to this one and is left out, so a pool
+    /// whose sessions are on other connections makes `connection` look held rather than unused.
+    fn sessions_on_held_only_here(&self, connection: &Arc<Connection>) -> usize {
+        self.sessions
+            .iter()
+            .filter(|session| Arc::strong_count(session) == 1 && session.started_on(connection))
+            .count()
+    }
 }
 
 /// The session pool an owner holds for each partition it uses: the one started for the latest
@@ -1307,6 +1327,14 @@ impl PartitionSessions {
             .remove_if(&partition, |_, pool| pool.serves(correlation_id));
     }
 
+    /// The pool held for `partition`, if it [`serves`](SessionPool::serves) `correlation_id` over a
+    /// connection that is not stale. An owner that finds none holds the unpinned pool it starts in
+    /// its place, which serves it whether or not the connection pins pools.
+    pub fn get_live(&self, partition: Partition, correlation_id: &str) -> Option<Arc<SessionPool>> {
+        self.get(partition, correlation_id)
+            .filter(|pool| !pool.connection_is_stale())
+    }
+
     /// Drops every pool held.
     pub fn clear(&self) {
         self.pools.clear();
@@ -1319,6 +1347,16 @@ impl PartitionSessions {
             pool.mark_stale();
         }
         self.pools.clear();
+    }
+
+    /// How many references to `connection` the pools held here keep that nothing else reaches:
+    /// one for each session started on it that its pool alone holds, in a pool held here alone.
+    pub(crate) fn references_held_only_here(&self, connection: &Arc<Connection>) -> usize {
+        self.pools
+            .iter()
+            .filter(|pool| Arc::strong_count(pool.value()) == 1)
+            .map(|pool| pool.sessions_on_held_only_here(connection))
+            .sum()
     }
 }
 
@@ -1348,6 +1386,8 @@ pub struct StorageConnector {
     /// answer will not change until the identity does, and asking again is a round trip that can
     /// only fail. Cleared by a `session_start` that later succeeds, which is proof it has.
     refused_partitions: dashmap::DashSet<Partition>,
+    /// The `session_start` fan-outs begun: one per miss of [`session_pool`](Self::session_pool).
+    session_starts: AtomicUsize,
 }
 
 impl StorageConnector {
@@ -1358,7 +1398,14 @@ impl StorageConnector {
             pools: dashmap::DashMap::new(),
             authorized_partitions: dashmap::DashSet::new(),
             refused_partitions: dashmap::DashSet::new(),
+            session_starts: AtomicUsize::new(0),
         }
+    }
+
+    /// The `session_start` fan-outs this connector has begun, whether or not the starts succeed.
+    #[cfg(feature = "test-util")]
+    pub fn session_starts(&self) -> usize {
+        self.session_starts.load(Ordering::Relaxed)
     }
 
     /// Whether the given partition has previously had `session_start` succeed on every
@@ -1418,6 +1465,7 @@ impl StorageConnector {
         }
 
         // Slow path: start one session per connection in parallel. No lock held.
+        self.session_starts.fetch_add(1, Ordering::Relaxed);
         let correlation: Arc<str> = Arc::from(correlation_id);
         let mut tasks = DetachingJoinSet::default();
         for storage in self.connections.iter().cloned() {

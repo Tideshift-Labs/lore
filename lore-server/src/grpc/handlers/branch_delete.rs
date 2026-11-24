@@ -6,7 +6,6 @@ use std::sync::Arc;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_proto::BranchDeleteRequest;
 use lore_proto::BranchDeleteResponse;
-use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository::RepositoryContext;
@@ -27,7 +26,9 @@ use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::BranchWriteFollowUp;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::delete_branch_detached;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_repository;
@@ -47,8 +48,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
-    hook_dispatcher: &HookDispatcher,
-    instrument_provider: &impl InstrumentProvider,
+    hook_dispatcher: &Arc<HookDispatcher>,
+    instrument_provider: &(impl InstrumentProvider + Clone + Send + 'static),
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
@@ -106,32 +107,49 @@ pub async fn handler(
                 .await
                 .map_err(hook_error_to_status)?;
 
+            // FORK (CR-029): a governed delete commits through the domain
+            // coordinator in one Postgres transaction, in the request; a lost
+            // answer is reconciled through its receipt. Only the ungoverned
+            // path runs its write detached (upstream 8e39850e). The governed
+            // commit's follow-ups run in a spawned task, started in the same
+            // poll the commit returns, so a request dropped after the commit
+            // cannot cancel them (as upstream's `run_detached` does).
             if let Some(governed) = governed {
                 governed.commit_branch(repository, branch).await?;
-                instrument_provider
-                    .counter("num_branches_deleted")
-                    .add(1, &[]);
-                notification_sender
-                    .branch_deleted(repository_id, branch)
-                    .await;
-                hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
+                let follow_up = lore_base::lore_spawn!(tracing::Instrument::in_current_span({
+                    let hook_dispatcher = hook_dispatcher.clone();
+                    let instrument_provider = instrument_provider.clone();
+                    async move {
+                        instrument_provider
+                            .counter("num_branches_deleted")
+                            .add(1, &[]);
+                        notification_sender
+                            .branch_deleted(repository_id, branch)
+                            .await;
+                        hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
+                    }
+                }));
+                // The delete is committed: a failed follow-up task must not fail it.
+                if let Err(err) = follow_up.await {
+                    warn!({BRANCH_ID} = %branch, error = ?err, "Branch delete follow-up task failed");
+                }
                 return Ok(Response::new(BranchDeleteResponse {}));
             }
-            match branch::delete(repository, branch)
-                .await
-                .filter_slow_down()?
+            match delete_branch_detached(
+                repository,
+                branch,
+                BranchWriteFollowUp {
+                    notification_sender,
+                    hook_dispatcher: hook_dispatcher.clone(),
+                    hook_context: hook_ctx,
+                    instrument_provider: instrument_provider.clone(),
+                },
+            )
+            .await?
+            .filter_slow_down()?
             {
-                Ok(_) => {
+                Ok(()) => {
                     debug!({BRANCH_ID} = %branch, "Branch deleted");
-                    let num_branches_deleted = instrument_provider.counter("num_branches_deleted");
-                    num_branches_deleted.add(1, &[]);
-
-                    notification_sender
-                        .branch_deleted(repository_id, branch)
-                        .await;
-
-                    hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
-
                     Ok(Response::new(BranchDeleteResponse {}))
                 }
                 Err(err) if err.is_branch_not_found() => {

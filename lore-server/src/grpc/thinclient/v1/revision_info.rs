@@ -23,6 +23,7 @@ use tracing::debug;
 use tracing::warn;
 
 use super::helpers::resolve_signature;
+use super::helpers::revision_record;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -132,53 +133,25 @@ async fn load_revision(
         );
         warn_error_to_status(&err, |e| Status::internal(e.to_string()))
     })?;
-    let identifier = model_v1::RevisionIdentifier {
-        branch_id: branch_id.into(),
-        number: state.revision_number(),
-    };
-
-    let mut commit_message = String::default();
-    let mut timestamp: u64 = 0;
-    let mut created_by = String::default();
-    let mut committed_by = String::default();
-    let mut metadata_entries: Vec<thin_client_v1::Metadata> = Vec::new();
-
-    metadata.walk(|key, value, value_type| {
-        let key = match std::str::from_utf8(key) {
-            Ok(k) => k,
-            Err(_) => return,
-        };
-        match key {
-            metadata::MESSAGE => {
-                commit_message = std::str::from_utf8(value).unwrap_or_default().to_string();
-            }
-            metadata::TIMESTAMP => {
-                if value.len() == std::mem::size_of::<u64>() {
-                    timestamp = u64::from_le_bytes(value.try_into().unwrap());
-                }
-            }
+    let mut created_by = String::new();
+    let mut entries = Vec::new();
+    let mut revision = revision_record(
+        signature,
+        state.revision_number(),
+        branch_id,
+        &metadata,
+        |key, value, value_type| match key {
             metadata::CREATED_BY => {
-                if let Ok(value) = std::str::from_utf8(value) {
-                    created_by = value.to_string();
-                }
-            }
-            metadata::COMMITTED_BY => {
-                if let Ok(value) = std::str::from_utf8(value) {
-                    committed_by = value.to_string();
-                }
+                created_by = std::str::from_utf8(value).unwrap_or_default().to_owned();
             }
             // Branch is surfaced via `identifier.branch_id`; not echoed
             // again as a generic metadata entry.
             metadata::BRANCH => {}
-            _ => {
-                if let Some(entry) = encode_metadata_entry(key, value, value_type) {
-                    metadata_entries.push(entry);
-                }
-            }
-        }
-    });
+            _ => entries.extend(encode_metadata_entry(key, value, value_type)),
+        },
+    );
 
-    // Total content size is an enrichment (the recursive byte sum carried
+    // FORK: total content size is an enrichment (the recursive byte sum carried
     // on the tree root). A failure to read the tree header must not fail
     // the whole RevisionInfo call — fall back to unset (unknown).
     let total_size_bytes = match state.tree(repository.clone()).await {
@@ -192,19 +165,12 @@ async fn load_revision(
         }
     };
 
-    Ok(thin_client_v1::Revision {
-        signature: signature.into(),
-        identifier: Some(identifier),
-        commit_message,
-        timestamp,
-        created_by,
-        committed_by,
-        metadata: metadata_entries,
-        parent_self,
-        parent_other,
-        number: state.revision_number(),
-        total_size_bytes,
-    })
+    revision.created_by = created_by;
+    revision.metadata = entries;
+    revision.parent_self = parent_self;
+    revision.parent_other = parent_other;
+    revision.total_size_bytes = total_size_bytes;
+    Ok(revision)
 }
 
 /// Encode an internal metadata entry as the v1 thin-client `Metadata`

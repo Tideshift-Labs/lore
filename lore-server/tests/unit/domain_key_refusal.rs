@@ -133,7 +133,10 @@ impl lore_storage::MutableStore for RecordingStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), lore_storage::StoreError> {
         self.inner.clone().flush(sync_data).await
     }
 }
@@ -731,6 +734,7 @@ impl QuicV04 {
             f.recording.clone(),
             false,
             Arc::new(UserAgentFilter::default()),
+            lore_server::protocol::storage::session::SessionMap::default(),
         );
         let (session_id, _) = service
             .session_map
@@ -742,6 +746,7 @@ impl QuicV04 {
                 None,
                 None,
                 false,
+                Vec::new(),
             )
             .expect("seed session");
         service

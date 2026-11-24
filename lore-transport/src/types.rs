@@ -135,7 +135,7 @@ pub struct Oidc {
     pub issuer: String,
     /// The public client ID presented to the provider.
     pub client_id: String,
-    /// Default scopes to request at login. Empty leaves the choice to the client.
+    /// Default scopes to request at an interactive (device) login. Empty leaves the choice to the client.
     pub scopes: Vec<String>,
     /// Whether a client takes the OIDC path by default rather than `auth_url`.
     pub preferred: bool,
@@ -145,6 +145,8 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
+    /// Scopes to request with the client credentials grant. Empty requests none.
+    pub client_credentials_scopes: Vec<String>,
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec
@@ -185,24 +187,40 @@ pub struct BranchPushResponse {
     pub message: Option<String>,
 }
 
-pub struct BranchQueryResponse {
-    /// Branch ID
+/// A branch as Lore Server records it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchRecord {
+    /// Branch identifier.
     pub id: BranchId,
-    /// Latest revision
+    /// Branch name.
+    pub name: String,
+    /// Category the branch belongs to.
+    pub category: String,
+    /// Identity that created the branch.
+    pub creator: String,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created: u64,
+    /// Latest revision on the branch.
     pub latest: Hash,
-    /// Metadata hash
+    /// Hash of the branch's metadata blob.
     pub metadata: Hash,
-    /// Whether the branch has been deleted (name->id mapping removed)
+    /// Whether the branch is archived: the record remains, and its name no longer maps to it.
     pub deleted: bool,
+    /// Branch points the branch is built on, from its parent's to the root's.
+    pub stack: Vec<BranchPoint>,
     /// FORK-LOCAL (WP-120). The branch's authoritative domain generation, set
     /// only by a cell with an armed domain coordinator. `None` means "no
-    /// authority", never "generation zero".
+    /// authority", never "generation zero". Only a branch query sets it; a
+    /// branch list or create leaves it `None`.
     pub generation: Option<u64>,
 }
 
+/// The answer to a branch query: the branch's record.
+pub type BranchQueryResponse = BranchRecord;
+
 pub struct BranchListResponse {
     /// Branch list
-    pub list: Vec<BranchMetadata>,
+    pub list: Vec<BranchRecord>,
 }
 
 pub struct RevisionListResponse {

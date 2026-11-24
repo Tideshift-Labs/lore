@@ -228,7 +228,7 @@ pub struct RevisionSyncArgs {
     #[clap(long, action, conflicts_with = "forward_changes")]
     reset: bool,
 
-    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+    /// Root files for dependency-based selective sync (only sync changes for these files and their dependencies). A root file inside a link is skipped
     #[clap(long = "root-file", value_name = "path")]
     root_files: Vec<String>,
 
@@ -2023,7 +2023,7 @@ fn handle_revision_cherry_pick_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");
@@ -2305,7 +2305,7 @@ fn handle_revision_revert_resolve_impl(
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 => {
                 let count = count_atomic.load(Ordering::Relaxed);
                 if count == 0 {
                     println!("No conflicts resolved");

@@ -76,10 +76,6 @@ pub mod put_file;
 pub mod put_file_resolved;
 pub mod put_resolved;
 #[cfg(not(feature = "test-util"))]
-pub(crate) mod remote;
-#[cfg(feature = "test-util")]
-pub mod remote;
-#[cfg(not(feature = "test-util"))]
 pub(crate) mod store;
 #[cfg(feature = "test-util")]
 pub mod store;
@@ -155,7 +151,7 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
                 store.immutable.clone(),
                 store.mutable.clone(),
                 claims,
-                false,
+                lore_storage::FlushOptions::default(),
             );
         });
     }

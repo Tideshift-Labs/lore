@@ -71,7 +71,7 @@ A command-line interface (CLI) is the text-based way to drive Lore, through the 
 
 ### Clone
 
-The act of creating a local repository instance from a remote URL (`lore clone`), and the resulting repository instance. Lore-native — not a Git-ism.
+The act of creating a local repository instance from a remote URL (`lore clone`), and the resulting repository instance. An instance clone (`lore repository instance clone`) creates one from an instance already on the machine instead, sharing its data blocks, or copying them where the user allows it. Lore-native — not a Git-ism.
 
 Compare to: repository instance.
 
@@ -170,7 +170,7 @@ Also see: address, BLAKE3, partition.
 
 ### Ignore file
 
-An outbound filter (`.loreignore`) declaring which paths are excluded from staging and committing. It applies only to new content; a file already in the committed revision keeps flowing through until explicitly removed.
+An outbound filter (`.loreignore`, and `ignore` in an instance's Lore directory) declaring which untracked paths stay out of staging and committing. A committed or staged file keeps flowing through until explicitly removed. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: view filter.
 
@@ -233,6 +233,12 @@ The product, the system, the project, and the open-source project. Capital `L` w
 
 ## M
 
+### Machine server
+
+A Lore server on a build machine that serves the containers on that machine, each through a socket of its own: it caches their content on the machine's disk, writes content through to the upstream, and forwards their other requests, unchanged, to the hosts they name. A container names it in a `lore-unix://<upstream host>/<repository>` remote URL.
+
+Also see: upstream, remote.
+
 ### Merge revision
 
 A revision with two parents instead of one, recording both parent state hashes; its tree combines the two parent trees. Lore produces a merge revision when reconciling divergent branch history, including by sync.
@@ -251,6 +257,12 @@ Merkle tree <https://en.wikipedia.org/wiki/Merkle_tree>
 A typed key-value blob attached to a file, revision, branch, or repository — the primary extension point for built-in system data (commit message, timestamps) and arbitrary application data. Revision and file metadata are part of immutable history; branch and repository metadata are mutable annotations.
 
 Also see: immutable store, mutable store.
+
+### Modified-time record
+
+The time at which a file of an instance last held its revision's content, kept so a scan can skip hashing a file whose time has not moved: in the instance's Lore directory, or in the mutable store for an SWFS or in-memory instance. An instance clone carries its source's records.
+
+Also see: repository instance.
 
 ### Multi-tenancy
 
@@ -296,7 +308,7 @@ Also see: sync.
 
 ### Repository instance
 
-A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
+A local working directory of a repository, with its own working tree, view, and staged state, identified by a UUIDv7 in `.lore/instance`. Multiple instances can share one shared store on a machine while keeping independent state. Created by `lore clone`, or copied from another instance on the machine by `lore repository instance clone`. Closest Git analog: worktree, but every instance is a peer and none is a main repository; see [Run parallel instances over a shared store](how-to/run-parallel-instances-over-a-shared-store.md).
 
 Also see: shared store, working tree.
 
@@ -369,6 +381,16 @@ A merge that uses a common ancestor revision plus the two revisions being merged
 For more information, see:
 Three-way merge <https://en.wikipedia.org/wiki/Merge_(version_control)>
 
+## U
+
+### Upstream
+
+The remote that another Lore server, such as a machine server, reaches through a `remote` store: it reads the content it lacks from there and writes content through to it.
+
+Compare to: remote.
+
+Also see: machine server.
+
 ## V
 
 ### VCS
@@ -377,7 +399,7 @@ A version control system (VCS) is software that records and manages changes to f
 
 ### View filter
 
-A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, restore — not only at clone time, and local to an instance so it never travels with a clone. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout.
+A client-side, glob-based inbound filter (`.lore/view`) declaring which paths are materialized to disk. It's applied on every materialization — clone, sync, branch switch, reset — not only at clone time, and local to an instance so it never travels with a clone from a remote; an instance clone copies it with the rest of the Lore directory. Mechanically close to a Perforce stream view but per-instance; closest Git analog: sparse-checkout. For the rule syntax, see [Write view filters and ignore files](how-to/write-view-filters-and-ignore-files.md).
 
 Compare to: ignore file.
 

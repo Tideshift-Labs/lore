@@ -212,9 +212,11 @@ pub(crate) async fn write_file(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            WriteError::from(RevisionNotFound {
-                revision: revision.clone(),
+        .map_err(|err| {
+            forward_refusal_or(err, "resolving the revision", |_err| {
+                WriteError::from(RevisionNotFound {
+                    revision: revision.clone(),
+                })
             })
         })?
     } else {
@@ -237,9 +239,11 @@ pub(crate) async fn write_file(
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
-        .map_err(|_err| {
-            WriteError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "finding the node", |_err| {
+                WriteError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
     if !node_link.is_valid() {
@@ -252,9 +256,11 @@ pub(crate) async fn write_file(
     let node = state
         .node(repository.clone(), node_link.node)
         .await
-        .map_err(|_err| {
-            WriteError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "reading the node", |_err| {
+                WriteError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
 

@@ -75,7 +75,7 @@ lore = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
-lore-revision = { workspace = true, features = ["test-util"] }
+lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 uuid = { workspace = true }
@@ -91,7 +91,10 @@ jsonwebtoken = { workspace = true, features = ["use_pem"] }
 ctor = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }
-# test-util exposes branch::push::push_fragments to storage_copy_on_write_test.rs.
+# Here rather than under [dependencies]: a normal dependency's features apply to every build that
+# includes this package, so a release build of the workspace would compile lore-revision's test
+# access into every binary. test-util also exposes branch::push::push_fragments to
+# storage_copy_on_write_test.rs.
 lore-revision = { workspace = true, features = ["test-util"] }
 # test-util makes `StorageServiceV4`'s fields public, so quic_declared_session_test.rs can read the
 # server's own `SessionMap` rather than infer live sessions from the wire.
@@ -116,6 +119,10 @@ tonic = { workspace = true, features = ["channel"] }
 # client of both — so the server halves are hand-rolled in the shape
 # `tonic-prost-build` emits, and that shape needs the codec directly.
 tonic-prost = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = { workspace = true }
+lore-fuse = { path = "../lore-fuse", features = ["test-util"] }
 
 [features]
 integration_tests = ["lore-server/integration_tests"]

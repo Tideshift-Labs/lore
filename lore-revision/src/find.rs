@@ -6,12 +6,14 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
 use serde::Serialize;
+use zerocopy::FromBytes;
 
 use crate::branch;
 use crate::errors::SlowDown;
 use crate::errors::absent_unless;
 use crate::event;
 use crate::immutable;
+use crate::immutable::ImmutableError;
 use crate::immutable::ReadFromImmutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -104,7 +106,7 @@ where
             // Batch load a chunk of history
             // TODO(mjansson): Hide batch cache latency by issuing requests while iterating
             //                 previous batch of history, trying to stay ahead of the load curve
-            batch_load_history(repository.clone(), revision).await;
+            let _ = batch_load_history(repository.clone(), revision).await;
         }
 
         let state = State::deserialize(repository.clone(), revision)
@@ -153,6 +155,53 @@ where
 
     // No emit, let caller decide if it is an error or not
     Err(FindError::internal("no revision found"))
+}
+
+/// Whether `ancestor`, numbered `ancestor_number`, is on the history of `revision`: `revision`
+/// itself, a revision its first parents lead back to, or the other parent of a merge on that line.
+/// A zero `ancestor` precedes every revision.
+///
+/// The walk stops at the first revision numbered at or below `ancestor_number`, so it reads at most
+/// one revision for each revision number between the two, and after `search_limit` revisions where
+/// one is given. A revision that cannot be read, or a spent limit, ends it, answering `false`.
+///
+/// The branch module's history-line search walks a line too, but over batches of revision numbers
+/// and hashes, which carry no other parent. This walk reads each revision's state for it.
+pub async fn is_on_history(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    ancestor: Hash,
+    ancestor_number: u64,
+    search_limit: Option<usize>,
+) -> bool {
+    if ancestor.is_zero() {
+        return true;
+    }
+    if revision.is_zero() {
+        return false;
+    }
+    // The branch names where a zero revision starts, so a walk from `revision` never reads it.
+    find_revision(
+        repository,
+        BranchId::default(),
+        revision,
+        false,
+        search_limit,
+        |state, _metadata| {
+            if state.revision() == ancestor || state.parent_other() == ancestor {
+                FindMatchResult::Match
+            } else if state.revision_number() <= ancestor_number {
+                FindMatchResult::Abort
+            } else {
+                FindMatchResult::Continue
+            }
+        },
+    )
+    .await
+    .inspect_err(|err| {
+        lore_debug!("Revision {ancestor} not found on the history of {revision}: {err}");
+    })
+    .is_ok()
 }
 
 /// Find revision in the current branch history which has a matching key-value pair in metadata
@@ -253,59 +302,170 @@ pub async fn revision_by_number(
     .await
 }
 
+/// What a walk of a revision's line in the local store finds for a revision number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumberWalk {
+    /// The revision with the number.
+    Found(Hash),
+    /// No revision on the line has the number: the walk reached a revision numbered below it, or
+    /// the end of the line.
+    Absent,
+    /// The read of this revision's state answered `AddressNotFound` before the walk could tell
+    /// whether the line holds the number: the local store lacks the state or, on a context without
+    /// strict-local reads, the read failed or found its payload corrupt. With the remote off, a
+    /// context that reads from the remote alone ([`RepositoryContext::reading_remote_only`]) reads
+    /// nothing, so the walk answers this for any non-zero start.
+    Missing(Hash),
+}
+
+/// Find the revision numbered `number` on the line from `revision` back through self parents, in
+/// the local store alone. The walk stops at the first revision numbered at or below `number`, as
+/// [`revision_by_number`] does, and where the line ends or leaves the store. Each step is one
+/// [`local_line_step`], with the options `repository` gives its reads. A state the store lacks is
+/// [`NumberWalk::Missing`]; any other read error fails the walk, a failed or corrupt read among
+/// them on a strict-local context, and so does a blob that is not a revision state.
+///
+/// [`revision_by_number`] costs more per step: it probes the store, builds a [`State`], and fetches
+/// and caches from the remote what the store lacks.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn revision_by_number_local(
+    repository: &Arc<RepositoryContext>,
+    mut revision: Hash,
+    number: u64,
+) -> impl Future<Output = Result<NumberWalk, FindError>> + '_ {
+    async move {
+        let options = immutable::read_options_from_repository(repository);
+        while !revision.is_zero() {
+            let (revision_number, parent) =
+                match local_line_step(repository, revision, options).await {
+                    Ok(Some(step)) => step,
+                    Ok(None) => return Ok(NumberWalk::Missing(revision)),
+                    Err(err) => {
+                        return Err(err).forward_any_with::<FindError, _>(|| {
+                            format!("reading the state of revision {revision}")
+                        });
+                    }
+                };
+            match revision_number.cmp(&number) {
+                Ordering::Equal => return Ok(NumberWalk::Found(revision)),
+                Ordering::Less => break,
+                Ordering::Greater => revision = parent,
+            }
+        }
+        Ok(NumberWalk::Absent)
+    }
+}
+
+/// One step of a walk along a line in the local store: the number and first parent of `revision`,
+/// read from its state with `options` and the remote off, as [`line_step`] describes. Its error
+/// does not name `revision`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[inline]
+pub(crate) fn local_line_step(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    options: ReadOptions,
+) -> impl Future<Output = Result<Option<(u64, Hash)>, ImmutableError>> + Send {
+    let read = StateData::read_from_immutable(
+        repository.clone(),
+        Address::zero_context_hash(revision),
+        options.no_remote(),
+    );
+    futures::FutureExt::map(read, line_step)
+}
+
+/// The number and first parent of the state `read` gives, or `None` where the store answered
+/// `AddressNotFound`. A blob whose header lacks the state magic fails with an internal error,
+/// rather than giving its bytes as a number and a parent. The format version is not checked, so a
+/// state a newer client wrote is still walked.
+fn line_step(
+    read: Result<StateData, ImmutableError>,
+) -> Result<Option<(u64, Hash)>, ImmutableError> {
+    match read {
+        Ok(state) if state.has_state_magic() => Ok(Some((state.revision_number, state.parent[0]))),
+        Ok(_) => Err(ImmutableError::internal("the blob is not a revision state")),
+        Err(ImmutableError::AddressNotFound(_)) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 pub const BATCH_COUNT: usize = 100;
 
+/// The revisions of `batch`, a batch [`batch_load_history`] loaded from `start`, below `start`:
+/// without `start`, which the batch lists first. Empty where nothing below `start` was loaded, as
+/// at the end of the line.
+pub(crate) fn below(batch: &[(u64, Hash)], start: Hash) -> &[(u64, Hash)] {
+    match batch.split_first() {
+        Some((first, rest)) if first.1 == start => rest,
+        _ => batch,
+    }
+}
+
+/// The line from `revision` back through self parents, newest first, each revision with its
+/// number: the revisions the local store holds, up to [`BATCH_COUNT`], each read by a
+/// [`local_line_step`], then the remote's page from the revision the local walk stops at, whole.
+/// The local walk stops at a revision whose step gives no number and parent: one the store lacks,
+/// a failed read, or a blob that is not a revision state. Where the remote cannot list that page,
+/// only the revisions the local walk read. The number of a listed revision is read from its state,
+/// as [`verified_number`] describes, and the page's states are cached as [`cache_page_states`]
+/// describes. Fails where the page lists a revision on the line without its own state.
 pub async fn batch_load_history(
     repository: Arc<RepositoryContext>,
     mut revision: Hash,
-) -> Vec<Hash> {
+) -> Result<Vec<(u64, Hash)>, FindError> {
     let mut history = Vec::with_capacity(BATCH_COUNT);
 
     while !revision.is_zero()
         && history.len() < BATCH_COUNT
-        && let Ok(state) = StateData::read_from_immutable(
-            repository.clone(),
-            Address::zero_context_hash(revision),
-            ReadOptions::default().no_remote(),
-        )
-        .await
+        && let Ok(Some((number, parent))) =
+            local_line_step(&repository, revision, ReadOptions::default()).await
     {
-        history.push(revision);
-        revision = state.parent[0];
+        history.push((number, revision));
+        revision = parent;
     }
 
     if revision.is_zero() || history.len() >= BATCH_COUNT {
-        return history;
+        return Ok(history);
     }
 
     let Ok(remote) = repository.remote().await else {
-        return vec![];
+        return Ok(history);
     };
     let Ok(revision_protocol) = remote.revision(repository.id).await else {
-        return vec![];
+        return Ok(history);
     };
 
     lore_debug!("Query remote for revision state history");
 
     let Ok(response) = revision_protocol.revision_list(revision.into()).await else {
-        return vec![];
+        return Ok(history);
     };
 
     lore_debug!("Got {} revisions", response.items.len(),);
 
-    cache_revision_list_states(repository.clone(), &response.items).await;
-
     let line = response.items_from(revision);
-
+    for item in line {
+        let Some(number) = verified_number(item) else {
+            return Err(FindError::internal(format!(
+                "the remote listed revision {} without its own state",
+                item.signature
+            )));
+        };
+        history.push((number, item.signature));
+    }
     let metadata_addresses: Vec<Address> = line
         .iter()
         .map(|item| Address::zero_context_hash(item.metadata))
         .collect();
-    history.extend(line.iter().map(|item| item.signature));
+    let unverified = response.items.len() - line.len();
 
-    let _ = immutable::cache(repository, metadata_addresses, true).await;
+    let _ = immutable::cache(repository.clone(), metadata_addresses, true).await;
+    cache_page_states(repository, &response.items, unverified).await;
 
-    history
+    Ok(history)
 }
 
 /// Cache the per-item state blobs from a remote `revision_list` response into
@@ -314,29 +474,64 @@ pub async fn batch_load_history(
 /// `signature` lets the local cache absorb the response without a follow-up
 /// fetch and protects against a server returning bytes that do not match the
 /// signature it advertises.
-pub async fn cache_revision_list_states(
+pub fn cache_revision_list_states(
     repository: Arc<RepositoryContext>,
     items: &[lore_transport::RevisionItem],
-) {
-    let expected_len = std::mem::size_of::<StateData>();
-    for item in items {
-        if item.state.len() != expected_len {
-            continue;
+) -> impl Future<Output = ()> + '_ {
+    cache_page_states(repository, items, items.len())
+}
+
+/// Write the states a remote page's `items` carry to the local immutable store, so the revisions
+/// they describe are read without a remote fetch. Each of the first `unverified` items is written
+/// where its state is its revision's own, as [`holds_its_state`] checks, so bytes that don't hash
+/// to the item's signature are not stored. Each item after them is one the caller has checked the
+/// same way, as [`verified_number`] does, so it is written without hashing it again.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn cache_page_states(
+    repository: Arc<RepositoryContext>,
+    items: &[lore_transport::RevisionItem],
+    mut unverified: usize,
+) -> impl Future<Output = ()> + '_ {
+    async move {
+        for item in items {
+            if unverified > 0 {
+                unverified -= 1;
+                if !holds_its_state(item) {
+                    continue;
+                }
+            }
+            let _ = immutable::write(
+                repository.clone(),
+                Context::default(),
+                item.state.clone(),
+                immutable::write_options_from_repository(repository.clone())
+                    .with_revision_state()
+                    .with_local_cache_priority()
+                    .no_remote_write(),
+            )
+            .await;
         }
-        if Hash::hash_buffer(&item.state) != item.signature {
-            continue;
-        }
-        let _ = immutable::write(
-            repository.clone(),
-            Context::default(),
-            item.state.clone(),
-            immutable::write_options_from_repository(repository.clone())
-                .with_revision_state()
-                .with_local_cache_priority()
-                .no_remote_write(),
-        )
-        .await;
     }
+}
+
+/// Whether `item` carries its revision's state: the bytes its signature is the hash of.
+fn holds_its_state(item: &lore_transport::RevisionItem) -> bool {
+    item.state.len() == std::mem::size_of::<StateData>()
+        && Hash::hash_buffer(&item.state) == item.signature
+}
+
+/// The revision number in the state `item` carries, where that state is the revision's own, as
+/// [`holds_its_state`] checks. The number beside it in the item is the server's claim; the state's
+/// is the one its signature fixes.
+pub(crate) fn verified_number(item: &lore_transport::RevisionItem) -> Option<u64> {
+    if !holds_its_state(item) {
+        return None;
+    }
+    StateData::read_from_bytes(&item.state)
+        .ok()
+        .map(|state| state.revision_number)
 }
 
 /// Data for the event reporting a revision found by a search.

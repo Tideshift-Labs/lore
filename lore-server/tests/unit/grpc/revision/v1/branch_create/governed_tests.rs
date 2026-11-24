@@ -152,6 +152,7 @@ async fn authenticated_handler_persists_creator_from_exact_repository_permission
     use lore_server::auth::jwt::AuthorizationToken;
     use lore_server::auth::jwt::ResourcePermission;
 
+    #[derive(Clone)]
     struct Instruments;
     impl lore_telemetry::InstrumentProvider for Instruments {
         fn namespace(&self) -> &'static str {
@@ -225,7 +226,7 @@ async fn authenticated_handler_persists_creator_from_exact_repository_permission
                     mutable,
                     Arc::new(notifications),
                     &None,
-                    &lore_server::hooks::HookDispatcher::empty(),
+                    &Arc::new(lore_server::hooks::HookDispatcher::empty()),
                     &Instruments,
                 )
                 .await

@@ -598,7 +598,7 @@ mod check_advertised_endpoints {
     }
 
     /// Both schemes end in `s`, so both remotes authenticate the server.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_refuses_a_remote_advertising_an_endpoint_that_skips_server_authentication() {
         add(
             "refuses",
@@ -659,7 +659,7 @@ fn a_refusal_lasts_until_a_session_start_succeeds() {
 
 /// A command's session takes turns over every storage connection, so bulk reads through it,
 /// such as a cache fill, are not held to the rate of the connection a single pick lands on.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_spreads_requests_over_every_storage_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -682,7 +682,7 @@ async fn a_session_spreads_requests_over_every_storage_connection() {
 /// Calls under one correlation id share the pool the connection pins for a partition, so its
 /// sessions start once however many calls take it. A call under another correlation id pins a
 /// pool of its own in its place, and the sessions of the one it replaces stop.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -713,7 +713,7 @@ async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
 
 /// A call under another correlation id replaces the pool pinned for its own partition alone: the
 /// pool pinned for another partition keeps serving its correlation id, and its sessions stay open.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -837,7 +837,7 @@ async fn releasing_one_partition_leaves_another_partitions_pool_pinned() {
 }
 
 /// An unpinned pool's server-side sessions stop once its last holder drops it.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_partition;
@@ -862,7 +862,7 @@ async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
 
 /// The pool that replaces an invalidated one serves on every connection while the invalidated pool
 /// is still held.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalidated_pools_replacement_serves_on_every_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -898,7 +898,7 @@ async fn an_invalidated_pools_replacement_serves_on_every_connection() {
 
 /// Invalidating a lazy session marks the pool it resolved to stale, so the next resolution starts
 /// a new pool even while another holder keeps the old one and its session ids.
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invalidated_pool_is_not_handed_out_again() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
@@ -1066,4 +1066,595 @@ fn resolved_user_fields() {
     };
     assert_eq!(user.user_id, "uid-42");
     assert_eq!(user.user_name, "Bob");
+}
+
+/// The connection cache: the connections it hands to calls, the connections it takes out, and the
+/// checks that close those no call has used for a while.
+mod cache {
+    use std::collections::HashMap;
+    use std::sync::Weak;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::lore_spawn_net;
+    use lore_transport::auth::AuthEndpoint;
+    use lore_transport::traits::Admin;
+    use lore_transport::traits::Environment;
+    use lore_transport::traits::Lock;
+    use lore_transport::traits::Protocol;
+    use lore_transport::traits::Repository;
+    use lore_transport::traits::Revision;
+    use lore_transport::traits::Storage;
+    use tokio::time::Instant;
+
+    use super::*;
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    const IDLE: Duration = Duration::from_secs(300);
+
+    /// A cache holding only `connection`, as the connection cache holds it.
+    fn cache_of(connection: Arc<Connection>) -> HashMap<ConnectionKey, Arc<Connection>> {
+        HashMap::from([(
+            (
+                "lore://idle.test.invalid".to_string(),
+                String::new(),
+                false,
+                String::new(),
+                AuthMode::Auto,
+            ),
+            connection,
+        )])
+    }
+
+    /// Runs `test` in an execution context, as a call runs.
+    async fn in_a_call(test: impl Future<Output = ()>) {
+        lore_base::runtime::LORE_CONTEXT
+            .scope(Arc::new(()), test)
+            .await;
+    }
+
+    /// A connection to `server`'s storage with a pool pinned for its partition, and nothing else
+    /// holding the pool.
+    async fn with_a_pinned_pool(server: &TestStorageServer) -> Arc<Connection> {
+        let connection = Connection::detached(server.connect(2).await);
+        connection
+            .session_pool(test_partition(), "first")
+            .await
+            .expect("a pinned pool");
+        connection
+    }
+
+    /// A call served a connection cached under its key, as an identity, adopts the credentials it
+    /// supplied, so the services the connection built present them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_call_served_a_cached_connection_adopts_its_credentials() {
+        in_a_call(async {
+            let remote = url::Url::parse("lore://cache-adopting.test.invalid")
+                .expect("a valid URL")
+                .to_string();
+            let cached = Connection::detached(Vec::new());
+            add_connection(&remote, "alice", true, AuthMode::Auto, cached.clone());
+
+            let served = connect(
+                &remote,
+                "alice",
+                RepositoryId::default(),
+                1,
+                "rotated identity token",
+                "rotated access token",
+                AuthMode::Auto,
+            )
+            .await
+            .expect("the cached connection");
+
+            assert!(Arc::ptr_eq(&served, &cached));
+            assert_eq!(
+                cached.credentials().tokens(),
+                (
+                    "rotated identity token".to_string(),
+                    "rotated access token".to_string()
+                )
+            );
+            remove_connection(cached);
+        })
+        .await;
+    }
+
+    /// A connection cached under a key a live connection is cached under leaves the live one in
+    /// place and is handed it, so the cache never takes out a connection calls are using.
+    #[test]
+    fn a_connection_cached_while_a_live_one_is_cached_under_its_key_is_not() {
+        let remote = "lore://cache-cached-twice.test.invalid";
+        let first = Connection::detached(Vec::new());
+        let cached = add_connection(remote, "", false, AuthMode::Auto, first.clone());
+        assert!(Arc::ptr_eq(&cached, &first));
+
+        let cached = add_connection(
+            remote,
+            "",
+            false,
+            AuthMode::Auto,
+            Connection::detached(Vec::new()),
+        );
+
+        assert!(
+            Arc::ptr_eq(&cached, &first),
+            "the second connection replaced the first"
+        );
+        let found = find_connection(remote, "", false, AuthMode::Auto);
+        assert!(found.is_some_and(|found| Arc::ptr_eq(&found, &first)));
+        remove_connection(first);
+    }
+
+    /// A stale connection taken out of the cache drops the pools it pins, so it is freed once no
+    /// call holds it, by each way one leaves the cache: replaced by a connection cached under its
+    /// key, dropped by a lookup that finds it stale, and marked failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_connection_taken_out_of_the_cache_drops_the_pools_it_pins() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let remote = "lore://cache-retired.test.invalid";
+            for way in ["replaced", "looked up", "marked failed"] {
+                let stale = with_a_pinned_pool(&server).await;
+                add_connection(remote, "", false, AuthMode::Auto, stale.clone());
+                match way {
+                    "replaced" => {
+                        stale.stale.store(true, Ordering::Relaxed);
+                        let replacement = Connection::detached(Vec::new());
+                        add_connection(remote, "", false, AuthMode::Auto, replacement.clone());
+                        remove_connection(replacement);
+                    }
+                    "looked up" => {
+                        stale.stale.store(true, Ordering::Relaxed);
+                        assert!(find_connection(remote, "", false, AuthMode::Auto).is_none());
+                    }
+                    _ => stale.mark_failed(),
+                }
+
+                assert!(find_connection(remote, "", false, AuthMode::Auto).is_none());
+                assert_eq!(
+                    Arc::strong_count(&stale),
+                    1,
+                    "a connection {way} is still held by the pool it pins"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A connection out of the cache pins no pool, so a call still holding it doesn't hold it back
+    /// again. One the transport marked stale while it is still cached pins its pools, so the calls
+    /// using it share a pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_out_of_the_cache_pins_no_pool() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let stale = Connection::detached(server.connect(2).await);
+            stale.stale.store(true, Ordering::Relaxed);
+            stale
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pool");
+            assert!(
+                Arc::strong_count(&stale) > 1,
+                "a stale connection still cached pinned no pool"
+            );
+
+            let retired = Connection::detached(server.connect(2).await);
+            remove_connection(retired.clone());
+            retired
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pool");
+            assert_eq!(
+                Arc::strong_count(&retired),
+                1,
+                "the pool it pinned holds the connection"
+            );
+            remove_connection(stale);
+        })
+        .await;
+    }
+
+    /// Retiring a connection drops its pins and leaves its pools valid, so a call holding one goes
+    /// on using its sessions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pool_a_call_holds_serves_on_once_its_connection_is_retired() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = Connection::detached(server.connect(2).await);
+            let pool = connection
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pinned pool");
+
+            remove_connection(connection.clone());
+
+            assert!(
+                pool.serves("first"),
+                "retiring the connection made the pool a call holds stale"
+            );
+        })
+        .await;
+    }
+
+    /// A subtask a connect spawns after the connect was cancelled is aborted as it is held, and so
+    /// releases the connection it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_subtask_held_after_its_connect_is_cancelled_is_aborted() {
+        in_a_call(async {
+            let cancelled: SubtaskAborts = Arc::new(parking_lot::Mutex::new(None));
+            let subtask = lore_spawn_net!(std::future::pending::<()>());
+
+            hold_subtask(&cancelled, subtask.abort_handle());
+
+            let ended = tokio::time::timeout(Duration::from_secs(10), subtask)
+                .await
+                .expect("the subtask ran on");
+            assert!(ended.is_err_and(|ended| ended.is_cancelled()));
+        })
+        .await;
+    }
+
+    /// A protocol whose environment lookups wait until `arrived` holds as many calls as it was made
+    /// for, so those calls all miss the cache and connect at once, and whose storage connects never
+    /// finish. It records each connection a storage connect was started for.
+    struct RacingProtocol {
+        arrived: Arc<tokio::sync::Barrier>,
+        connections: Arc<parking_lot::Mutex<Vec<Weak<Connection>>>>,
+    }
+
+    struct RacingEnvironment(Arc<tokio::sync::Barrier>);
+
+    #[async_trait::async_trait]
+    impl Environment for RacingEnvironment {
+        async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
+            self.0.wait().await;
+            Ok(EnvironmentConfig::default())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Protocol for RacingProtocol {
+        async fn storage(
+            &self,
+            connection: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: Partition,
+            _: usize,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Storage>, ProtocolError> {
+            self.connections.lock().push(connection);
+            std::future::pending().await
+        }
+
+        async fn revision(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Revision>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn repository(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Repository>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn admin(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Admin>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn lock(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+            _: &AuthEndpoint,
+            _: &str,
+            _: RepositoryId,
+            _: &Arc<SuppliedCredentials>,
+        ) -> Result<Arc<dyn Lock>, ProtocolError> {
+            Err(ProtocolError::from(Disconnected))
+        }
+
+        async fn environment(
+            &self,
+            _: Weak<Connection>,
+            _: &str,
+        ) -> Result<Arc<dyn Environment>, ProtocolError> {
+            Ok(Arc::new(RacingEnvironment(self.arrived.clone())))
+        }
+    }
+
+    /// Calls that connect under one key at once share one connection, the first cached. The others
+    /// stop connecting and are freed. Whether two calls overlap after the lookup that would have
+    /// found the other's is up to the scheduler, so this runs rounds of many.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn calls_that_connect_at_once_share_one_connection() {
+        in_a_call(async {
+            const CALLS: usize = 16;
+            let connections: Arc<parking_lot::Mutex<Vec<Weak<Connection>>>> = Arc::default();
+            add(
+                "racing",
+                Arc::new(RacingProtocol {
+                    arrived: Arc::new(tokio::sync::Barrier::new(CALLS)),
+                    connections: connections.clone(),
+                }),
+            )
+            .expect("registering the racing scheme");
+
+            for round in 0..10 {
+                let remote = format!("racing://round-{round}.invalid:41337");
+                let mut calls = tokio::task::JoinSet::new();
+                for _ in 0..CALLS {
+                    let remote = remote.clone();
+                    lore_spawn_net!(calls, async move {
+                        connect(
+                            &remote,
+                            "",
+                            RepositoryId::default(),
+                            1,
+                            "",
+                            "",
+                            AuthMode::Auto,
+                        )
+                        .await
+                    });
+                }
+                let mut shared: Option<Arc<Connection>> = None;
+                while let Some(connected) = calls.join_next().await {
+                    let connection = connected.expect("the connect task").expect("connected");
+                    let first = shared.get_or_insert_with(|| connection.clone());
+                    assert!(
+                        Arc::ptr_eq(first, &connection),
+                        "calls connecting to {remote} at once were given different connections"
+                    );
+                }
+                let shared = shared.expect("a connection");
+                remove_connection(shared.clone());
+                shared
+                    .cancel_connect()
+                    .await
+                    .expect("cancelling the connect");
+                drop(shared);
+
+                wait_until(
+                    || {
+                        connections
+                            .lock()
+                            .iter()
+                            .all(|connection| connection.upgrade().is_none())
+                    },
+                    "a connection that lost the race was left connecting",
+                )
+                .await;
+            }
+        })
+        .await;
+    }
+
+    #[test]
+    fn idle_checks_run_ten_times_per_timeout_from_once_a_second_to_twice_a_minute() {
+        for (idle, interval) in [(300, 30), (60, 6), (2, 1), (0, 1), (3600, 30)] {
+            assert_eq!(
+                idle_check_interval(Duration::from_secs(idle)),
+                Duration::from_secs(interval),
+                "for a timeout of {idle} s"
+            );
+        }
+    }
+
+    /// A connection is in use by the call that opened it until a check finds no call holding it,
+    /// and is taken once no call has used it for the timeout from that check.
+    #[test]
+    fn an_unused_connection_is_taken_once_idle_for_the_timeout() {
+        let mut cache = cache_of(Connection::detached(Vec::new()));
+        let released = Instant::now();
+
+        assert!(take_unused(&mut cache, IDLE, released).is_empty());
+        assert!(take_unused(&mut cache, IDLE, released + IDLE - Duration::from_secs(1)).is_empty());
+        assert_eq!(take_unused(&mut cache, IDLE, released + IDLE).len(), 1);
+        assert!(cache.is_empty(), "a taken connection was left in the cache");
+    }
+
+    /// A call holding a connection keeps it however long it holds it, and the timeout runs from
+    /// the first check after the call stops holding it.
+    #[test]
+    fn a_held_connection_is_taken_only_once_idle_for_the_timeout_after_its_release() {
+        let connection = Connection::detached(Vec::new());
+        let mut cache = cache_of(connection.clone());
+        let start = Instant::now();
+
+        assert!(take_unused(&mut cache, IDLE, start).is_empty());
+        assert!(
+            take_unused(&mut cache, IDLE, start + 10 * IDLE).is_empty(),
+            "a connection a call holds was taken"
+        );
+
+        drop(connection);
+        let released = start + 10 * IDLE + Duration::from_secs(1);
+        assert!(take_unused(&mut cache, IDLE, released).is_empty());
+        assert!(
+            take_unused(&mut cache, IDLE, released + IDLE - Duration::from_secs(1)).is_empty(),
+            "the timeout ran from the last check that found the connection held"
+        );
+        assert_eq!(take_unused(&mut cache, IDLE, released + IDLE).len(), 1);
+    }
+
+    /// A call that takes a connection from the cache between two checks has used it, though no
+    /// check found it held: the timeout runs from the check after the take. Both the lookup by the
+    /// full key and the one by URL alone, for a call that has no identity yet, take it.
+    #[test]
+    fn a_connection_taken_from_the_cache_between_checks_was_in_use() {
+        for (cached_as, looked_up_as) in [("", ""), ("alice", "")] {
+            let remote = format!("lore://idle-taken-as-{cached_as}.test.invalid");
+            let mut cache = cache_of(Connection::detached(Vec::new()));
+            let start = Instant::now();
+            assert!(take_unused(&mut cache, IDLE, start).is_empty());
+
+            let connection = cache
+                .values()
+                .next()
+                .expect("the cached connection")
+                .clone();
+            add_connection(
+                &remote,
+                cached_as,
+                false,
+                AuthMode::Auto,
+                connection.clone(),
+            );
+            let taken = find_connection(&remote, looked_up_as, false, AuthMode::Auto);
+            assert!(
+                taken.is_some_and(|taken| Arc::ptr_eq(&taken, &connection)),
+                "looked up as {looked_up_as:?}"
+            );
+            remove_connection(connection);
+
+            assert!(
+                take_unused(&mut cache, IDLE, start + IDLE).is_empty(),
+                "a connection taken as {looked_up_as:?} since the last check was taken as unused"
+            );
+            assert_eq!(take_unused(&mut cache, IDLE, start + 2 * IDLE).len(), 1);
+        }
+    }
+
+    /// A connection cached under a key a live connection is cached under takes the live one, and so
+    /// restarts its timeout as a lookup does.
+    #[test]
+    fn a_connection_cached_under_a_live_ones_key_takes_it() {
+        let remote = "lore://idle-taken-by-adding.test.invalid";
+        let mut cache = cache_of(Connection::detached(Vec::new()));
+        let start = Instant::now();
+        assert!(take_unused(&mut cache, IDLE, start).is_empty());
+
+        let connection = cache
+            .values()
+            .next()
+            .expect("the cached connection")
+            .clone();
+        add_connection(remote, "", false, AuthMode::Auto, connection.clone());
+        add_connection(
+            remote,
+            "",
+            false,
+            AuthMode::Auto,
+            Connection::detached(Vec::new()),
+        );
+        remove_connection(connection);
+
+        assert!(
+            take_unused(&mut cache, IDLE, start + IDLE).is_empty(),
+            "a connection taken by a second add since the last check was taken as unused"
+        );
+        assert_eq!(take_unused(&mut cache, IDLE, start + 2 * IDLE).len(), 1);
+    }
+
+    /// The sessions of a pool the connection pins hold the connection back, and a call holds the
+    /// connection through them only by holding the pool or one of its sessions. Each hold spans two
+    /// checks, the timeout apart: the first check after a change only records it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_pools_a_connection_pins_hold_it_only_for_a_call_holding_them() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = Connection::detached(server.connect(2).await);
+            let pool = connection
+                .session_pool(test_partition(), "first")
+                .await
+                .expect("a pinned pool");
+            let mut cache = cache_of(connection);
+            let start = Instant::now();
+
+            for look in 0..2u32 {
+                assert!(
+                    take_unused(&mut cache, IDLE, start + look * IDLE).is_empty(),
+                    "taken while a call held a pool it pins"
+                );
+            }
+
+            let session = pool.pick();
+            drop(pool);
+            for look in 2..4u32 {
+                assert!(
+                    take_unused(&mut cache, IDLE, start + look * IDLE).is_empty(),
+                    "taken while a call held a session of a pool it pins"
+                );
+            }
+
+            drop(session);
+            assert!(take_unused(&mut cache, IDLE, start + 4 * IDLE).is_empty());
+            assert_eq!(
+                take_unused(&mut cache, IDLE, start + 5 * IDLE).len(),
+                1,
+                "the pool it pins held the connection with no call holding the pool"
+            );
+        })
+        .await;
+    }
+
+    /// Closing an unused connection frees it, though the pool it pins holds it, and closes its
+    /// storage connections, so the server releases them. It is stale, so nothing reuses it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_an_unused_connection_frees_it_and_closes_its_storage_at_the_server() {
+        in_a_call(async {
+            let server = TestStorageServer::start();
+            let connection = with_a_pinned_pool(&server).await;
+
+            connection.close_unused().await;
+
+            assert!(connection.stale.load(Ordering::Relaxed));
+            assert_eq!(
+                Arc::strong_count(&connection),
+                1,
+                "the sessions of the pool it pins still hold the connection"
+            );
+            wait_until(
+                || server.closed_connections() == 2,
+                "the server's storage connections were left open",
+            )
+            .await;
+        })
+        .await;
+    }
+
+    /// With a timeout of zero, a connection is taken at the check after the first one that finds no
+    /// call holding it, so no single check's counts close it.
+    #[test]
+    fn with_no_timeout_a_connection_is_taken_at_the_second_check_that_finds_no_call_holding_it() {
+        let connection = Connection::detached(Vec::new());
+        let mut cache = cache_of(connection.clone());
+        let start = Instant::now();
+
+        assert!(
+            take_unused(&mut cache, Duration::ZERO, start).is_empty(),
+            "taken while a call held it"
+        );
+        drop(connection);
+        assert!(
+            take_unused(&mut cache, Duration::ZERO, start).is_empty(),
+            "taken at the first check that found no call holding it"
+        );
+        assert_eq!(take_unused(&mut cache, Duration::ZERO, start).len(), 1);
+    }
 }

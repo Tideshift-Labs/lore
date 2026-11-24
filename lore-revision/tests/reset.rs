@@ -619,6 +619,46 @@ mod tests {
         .await;
     }
 
+    /// A purge leaves an entry spelled in another case than a child the revision holds only where
+    /// it is that child's entry, as on a file system that folds case. Elsewhere it is untracked: a
+    /// file variant, edited, goes beside the file the reset restores, a directory variant goes with
+    /// what it holds, and so does the temporary file of a write in progress spelled after a variant.
+    #[tokio::test]
+    async fn a_purge_leaves_a_case_variant_only_where_it_names_the_child() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            std::fs::create_dir_all(path("Dir")).expect("Failed to create the directory");
+            for committed in ["Foo.txt", "Bar.txt", "Dir/a.txt"] {
+                test_file_write(&path(committed), b"committed");
+            }
+            test_commit_tree(&fixture, "Initial").await;
+            let folds_case = case_insensitive(&fixture.path);
+            std::fs::rename(path("Foo.txt"), path("foo.txt")).expect("Failed to rename the file");
+            test_file_write(&path("foo.txt"), b"edited");
+            test_file_write(&path("bar.txt.~loretemp"), b"partial");
+            std::fs::create_dir_all(path("dir")).expect("Failed to create the variant");
+            test_file_write(&path("dir/b.txt"), b"untracked");
+
+            reset_purging_through(&fixture, fixture.repository.clone(), &[""], "").await;
+
+            assert_working_files(
+                &fixture,
+                &[
+                    ("Foo.txt", Some(b"committed")),
+                    ("foo.txt", folds_case.then_some(b"committed".as_slice())),
+                    ("Bar.txt", Some(b"committed")),
+                    (
+                        "bar.txt.~loretemp",
+                        folds_case.then_some(b"partial".as_slice()),
+                    ),
+                    ("Dir/a.txt", Some(b"committed")),
+                    ("dir/b.txt", None),
+                ],
+            );
+        })
+        .await;
+    }
+
     /// A purge leaves a nested repository in place, one an ignore rule matches, whether it reaches
     /// the repository from the root or names it.
     #[tokio::test]
@@ -940,6 +980,87 @@ mod tests {
                 std::fs::read(path("game/cache.tmp")).ok().as_deref(),
                 Some(&b"committed"[..])
             );
+        })
+        .await;
+    }
+
+    /// A reset that fails at a later path still discards the dirty add an earlier path's reset
+    /// replaced, so the staged state it stores holds the committed node under the name.
+    #[tokio::test]
+    async fn a_failing_reset_discards_the_dirty_add_an_earlier_path_replaced() {
+        with_fixture(async |fixture| {
+            let path = |relative: &str| fixture.path.join(relative);
+            let paths = |relative: &[&str]| {
+                LoreArray::from_vec(
+                    relative
+                        .iter()
+                        .map(|relative| LoreString::from(path(relative).to_string_lossy().as_ref()))
+                        .collect(),
+                )
+            };
+            test_file_write(&path("entry"), b"committed");
+            test_file_write(&path("staged.txt"), b"committed");
+            test_commit_tree(&fixture, "Initial").await;
+
+            std::fs::remove_file(path("entry")).expect("Failed to delete file");
+            test_directory_create(&path("entry"));
+            test_file_write(&path("entry/inner.txt"), b"inner");
+            let scan = StageOptions {
+                scan: true,
+                ..Default::default()
+            };
+            file::stage::stage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["entry"]),
+                scan,
+            )
+            .await
+            .expect("Stage failed");
+            file::unstage::unstage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["."]),
+                Default::default(),
+            )
+            .await
+            .expect("Unstage failed");
+            test_file_write(&path("staged.txt"), b"modified");
+            file::stage::stage(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["staged.txt"]),
+                scan,
+            )
+            .await
+            .expect("Stage failed");
+
+            reset::reset(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                paths(&["entry", "staged.txt"]),
+                LoreString::default(),
+                ResetOptions::default(),
+            )
+            .await
+            .expect_err("A reset of a staged file must fail");
+
+            let (current, staged, _) =
+                state::State::deserialize_current_and_staged(fixture.repository.clone())
+                    .await
+                    .expect("Failed to deserialize the states");
+            let staged = staged.expect("The staged file keeps a staged state");
+            let node = |state: Arc<state::State>| {
+                let repository = fixture.repository.clone();
+                async move {
+                    state
+                        .find_node_link(repository, "entry")
+                        .await
+                        .expect("The states hold entry")
+                        .node
+                }
+            };
+            assert_eq!(node(staged).await, node(current).await);
         })
         .await;
     }

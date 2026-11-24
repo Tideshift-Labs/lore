@@ -170,7 +170,10 @@ mod auth_guard {
             panic!("admission must short-circuit before any mutable-store access")
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), lore_storage::StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), lore_storage::StoreError> {
             panic!("admission must short-circuit before any mutable-store access")
         }
     }

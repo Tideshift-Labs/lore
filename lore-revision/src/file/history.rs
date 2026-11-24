@@ -395,14 +395,17 @@ async fn find_start_revision(
         }
     } else {
         let branch_name = options.branch.clone().unwrap_or_default();
-        let resolved = branch::resolve(repository.clone(), branch_name.as_str())
-            .await
-            .map_err(|_err| {
-                FileHistoryError::from(BranchNotFound {
+        match branch::resolve(repository.clone(), branch_name.as_str()).await {
+            Ok(resolved) => resolved.id,
+            Err(err) if is_refusal(&err) => {
+                return Err(err).forward_any("resolving branch");
+            }
+            Err(_err) => {
+                return Err(FileHistoryError::from(BranchNotFound {
                     branch: branch_name,
-                })
-            })?;
-        resolved.id
+                }));
+            }
+        }
     };
 
     if execution_context().globals().offline_or_local() {
@@ -485,12 +488,14 @@ pub(crate) async fn resolve_revision(
     )
     .await
     .map_err(|err| {
-        FileHistoryError::RevisionNotFound(
-            RevisionNotFound {
-                revision: revision.to_string(),
-            }
-            .chain_err_from(err, "resolving the revision to query at"),
-        )
+        forward_refusal_or(err, "resolving the revision to query at", |err| {
+            FileHistoryError::RevisionNotFound(
+                RevisionNotFound {
+                    revision: revision.to_string(),
+                }
+                .chain_err_from(err, "resolving the revision to query at"),
+            )
+        })
     })
 }
 
@@ -628,11 +633,7 @@ pub async fn history(
                 node_id,
                 metadata_node
             );
-            let slot = if metadata_node.revision[0].is_zero() {
-                1
-            } else {
-                0
-            };
+            let slot = metadata_node.history_slot();
             (
                 metadata_node.action[slot],
                 metadata_node.revision[slot],

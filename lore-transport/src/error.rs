@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
+
 use lore_base::error::*;
 use lore_error_set::prelude::*;
 use thiserror::Error;
@@ -600,13 +602,6 @@ pub(crate) fn is_read_resend_allowed(error: &ProtocolError) -> bool {
     false
 }
 
-impl ProtocolError {
-    /// Whether the remote refused the credentials presented, as unauthenticated or unauthorized.
-    pub fn is_refusal(&self) -> bool {
-        self.is_not_authorized() || self.is_not_authenticated()
-    }
-}
-
 impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         if is_unsupported_client_status(&value) {
@@ -675,9 +670,11 @@ impl From<tonic::Status> for ProtocolError {
                 } else {
                     message
                 };
-                ProtocolError::from(NotAuthenticated::new(reason))
+                // Upstream (v0.14, 7d8653d3) also puts the remote's words on the trace;
+                // both are kept, so trace readers and reason readers see the same cause.
+                refusal(ProtocolError::from(NotAuthenticated::new(reason)), &value)
             }
-            tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
+            tonic::Code::PermissionDenied => refusal(ProtocolError::from(NotAuthorized), &value),
             tonic::Code::NotFound => ProtocolError::from(NotFound),
             tonic::Code::FailedPrecondition => match address_not_found_details(&value) {
                 Some(error) => ProtocolError::from(error),
@@ -816,6 +813,20 @@ fn outcome_unknown_marker(status: &tonic::Status) -> Option<OutcomeUnknown> {
         attempt_id: text(crate::outcome::OUTCOME_UNKNOWN_ATTEMPT_KEY)
             .unwrap_or_else(|| UNNAMED_ATTEMPT.to_string()),
     })
+}
+
+/// `error` with the message of `status`, the remote's reason for the refusal, on its trace when
+/// the remote gave one.
+fn refusal(mut error: ProtocolError, status: &tonic::Status) -> ProtocolError {
+    if !status.message().is_empty() {
+        error.push_trace(lore_error_set::Location::with_context(
+            file!(),
+            line!(),
+            column!(),
+            Arc::from(status.message()),
+        ));
+    }
+    error
 }
 
 impl From<ProtocolError> for tonic::Status {

@@ -82,6 +82,7 @@ fn v4_with_token(
         stores.mutable.clone(),
         auth,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     )
     .with_caller_capability_policy(policy);
     let permissions = if write {
@@ -99,6 +100,7 @@ fn v4_with_token(
             None,
             exp.map(token_with_exp),
             declared,
+            Vec::new(),
         )
         .expect("seed session");
     Service::V4(service, session_id)
@@ -418,6 +420,7 @@ async fn auth_off_sessions_never_expire() {
         stores.mutable.clone(),
         false,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     );
     let response = service
         .run_request_handler(
@@ -476,6 +479,7 @@ fn entry_expiring_at(expires_at: Option<u64>) -> SessionEntry {
         authorized_sources: Arc::new(dashmap::DashSet::new()),
         declared: false,
         expires_at,
+        held: Vec::new(),
     }
 }
 
@@ -512,6 +516,7 @@ fn start_derives_expires_at_from_the_token_exp_plus_the_leeway() {
             None,
             token,
             false,
+            Vec::new(),
         )
         .expect("start")
         .0
@@ -590,6 +595,7 @@ fn session_expired_maps_to_201_not_logged_and_unauthenticated_on_grpc() {
         Arc::new(NullMutable),
         false,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     );
     let info = stores_service.transform_protocol_error(&error);
     assert_eq!(info.response_error_code, 201);
@@ -679,7 +685,10 @@ impl ImmutableStore for NullImmutable {
     fn max_query_batch(&self) -> Option<usize> {
         None
     }
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        _sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         unreachable!("never called")
     }
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
@@ -743,7 +752,10 @@ impl MutableStore for NullMutable {
     ) -> Result<KeyValueStream, StoreError> {
         unreachable!("never called")
     }
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        _sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         unreachable!("never called")
     }
 }
@@ -768,6 +780,7 @@ mod sweep {
             None,
             expires_at.map(|at| token_with_exp(at - TOKEN_EXP_LEEWAY_SECS)),
             false,
+            Vec::new(),
         )
         .expect("start")
         .0
@@ -857,6 +870,7 @@ mod sweep {
                     EXPIRED_SESSION_SWEEP_GRACE_SECS + 600,
                 ))),
                 true,
+                Vec::new(),
             )
             .expect("start")
             .0;
@@ -873,6 +887,7 @@ mod sweep {
                 None,
                 Some(token_with_exp(exp_valid_for(3600))),
                 true,
+                Vec::new(),
             )
             .expect("start")
             .0;
@@ -919,6 +934,7 @@ mod sweep {
                 None,
                 Some(token_with_exp(past_the_grace)),
                 false,
+                Vec::new(),
             )
             .expect("start");
             assert_eq!(
@@ -944,6 +960,7 @@ mod sweep {
                 None,
                 Some(token_with_exp(inside_grace)),
                 false,
+                Vec::new(),
             )
             .expect("start");
         }
@@ -966,6 +983,7 @@ mod sweep {
                 None,
                 Some(token_with_exp(long_expired)),
                 false,
+                Vec::new(),
             )
             .expect("fill");
         }
@@ -979,6 +997,7 @@ mod sweep {
                 None,
                 None,
                 false,
+                Vec::new(),
             )
             .expect("fill");
         }
@@ -997,6 +1016,7 @@ mod sweep {
                 None,
                 None,
                 false,
+                Vec::new(),
             ),
             Err(SessionError::LimitReached)
         );
@@ -1009,6 +1029,7 @@ mod sweep {
             None,
             Some(token_with_exp(exp_valid_for(3600))),
             false,
+            Vec::new(),
         );
         assert!(
             admitted.is_ok(),
@@ -1035,6 +1056,7 @@ mod sweep {
                 None,
                 Some(token_with_exp(inside_grace)),
                 false,
+                Vec::new(),
             )
             .expect("fill");
         }
@@ -1047,6 +1069,7 @@ mod sweep {
                 None,
                 None,
                 false,
+                Vec::new(),
             ),
             Err(SessionError::LimitReached),
             "sessions inside the grace are not swept, so the limit still holds"
@@ -1090,6 +1113,7 @@ mod sweep {
                 None,
                 None,
                 false,
+                Vec::new(),
             )
             .expect("a later start runs the sweep");
 
@@ -1389,6 +1413,7 @@ mod urc_0_2 {
                 jwt_issuer: None,
                 jwt_audience: Some(vec![AUDIENCE.to_string()]),
                 jwt_typ: None,
+                exchange_issuer: None,
             })),
             Arc::new(AllowAllRepositoryAuthorizer),
             stores.immutable.clone(),

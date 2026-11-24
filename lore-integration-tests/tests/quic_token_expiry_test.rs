@@ -158,6 +158,7 @@ mod quic_token_expiry_tests {
             jwt_issuer: None,
             jwt_audience: Some(vec![AUDIENCE.to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -322,7 +323,10 @@ mod quic_token_expiry_tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             self.inner.clone().flush(sync_data).await
         }
 
@@ -380,6 +384,7 @@ mod quic_token_expiry_tests {
                         mutable.clone(),
                         true,
                         Arc::new(UserAgentFilter::default()),
+                        lore_server::protocol::storage::session::SessionMap::default(),
                     )
                     .with_caller_capability_policy(policy);
                     maps.lock()

@@ -1660,6 +1660,7 @@ pub async fn commit_exact_selection(
             token.share(),
             state_current.clone(),
             state_staged.clone(),
+            state_staged.committed_revision(),
             RelativePath::new(),
             crate::node::ROOT_NODE,
             metadata.clone(),

@@ -1,14 +1,25 @@
 import os
 import re
+import sys
 import typing
 
 import pytest
-from error_types import RepositoryAlreadyExistsError, SwfsOutsideServiceError
+from error_types import (
+    ImproperArgumentsError,
+    NotSupportedError,
+    RepositoryAlreadyExistsError,
+    SwfsOutsideServiceError,
+)
 from service_util import LORE_SERVICE_ENVIRONMENT
 from test_repository_info import get_instance_id
 from test_shared_store import per_url_store_path
 
 from lore import Lore
+
+pytestmark = pytest.mark.own_vfs("makes its SWFS clones from ordinary repositories")
+
+# The most SWFS instances a service mounts, `MountManager::MOUNT_LIMIT`.
+SWFS_MOUNT_LIMIT = 8
 
 
 @pytest.mark.smoke
@@ -29,10 +40,9 @@ def test_no_swfs_clone_outside_service(new_lore_repo):
         lore.clone(vfs="swfs", use_shared_store=True)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_creates_external_dot_lore(
     new_lore_repo, background_lore_service, global_dir_name
 ):
@@ -60,10 +70,9 @@ def test_swfs_creates_external_dot_lore(
     assert os.path.exists(external_dot_lore)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_repo_prevents_creating_non_swfs_repo(
     new_lore_repo, background_lore_service
 ):
@@ -115,10 +124,9 @@ def _get_stores_size(stores_path: str) -> int:
     return total_data_size
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_caches_file_contents(new_lore_repo, background_lore_service, scratch_dir):
     # Create a repo to clone
     original_repo: Lore = new_lore_repo(
@@ -154,10 +162,9 @@ def _repositories_match_files(
         ), f"File mismatch {file_name}"
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     # Create a repo and clone it into a SWFS-backed instance.
     lore_service_runner.start()
@@ -188,10 +195,9 @@ def test_swfs_actually_mounted(new_lore_repo, lore_service_runner):
     _repositories_match_files(original_repo, swfs_repo, file_contents)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_mount_is_closed_when_its_service_stops(
     new_lore_repo, lore_service_runner, scratch_dir
 ):
@@ -244,10 +250,9 @@ def _swfs_handles(output: str, event: str, mount_name: str) -> list[str]:
     return handles
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_sync(new_lore_repo, background_lore_service):
     # Create the original repo with 2 revisions
     original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
@@ -319,10 +324,9 @@ def _remove_commit_push(repo: Lore, message: str, removed: typing.Sequence[str])
     repo.push()
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_sync_removes_file_with_no_other_changes(
     new_lore_repo, background_lore_service
 ):
@@ -358,10 +362,9 @@ def test_swfs_sync_removes_file_with_no_other_changes(
     _repositories_match_files(original_repo, swfs_repo, kept_contents)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_service):
     original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
     unchanged_contents = {
@@ -411,10 +414,9 @@ def test_swfs_sync_force_clears_local_writes(new_lore_repo, background_lore_serv
             assert unchanged_file.read() == local_contents[file_name]
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
 @pytest.mark.smoke
-@pytest.mark.skipif(
-    "not config.getoption('--swfs')", reason="Test requires --swfs flag"
-)
 def test_swfs_sync_force_removes_locally_written_file(
     new_lore_repo, background_lore_service
 ):
@@ -449,3 +451,86 @@ def test_swfs_sync_force_removes_locally_written_file(
     assert not swfs_repo.file_exists(removed_file)
     assert not swfs_repo.file_exists(nested_removed_file)
     _repositories_match_files(original_repo, swfs_repo, kept_contents)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_refuses_a_repository_nested_in_its_mount(
+    new_lore_repo, background_lore_service
+):
+    original_repo = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    original_repo.write_commit_push("first", {"a.txt": "a"})
+    swfs_repo = _swfs_clone(original_repo)
+    swfs_repo.make_dirs("nested")
+
+    # A repository with its own state inside the mount, unlike a link or a layer, which is the
+    # parent's own content.
+    with pytest.raises(ImproperArgumentsError):
+        swfs_repo.run(
+            ["repository", "create", "nested"],
+            path=os.path.join(swfs_repo.path, "nested"),
+            offline=True,
+        )
+    assert not swfs_repo.path_exists(os.path.join("nested", ".lore"))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_instance_is_refused_inside_another_repository(
+    new_lore_repo, background_lore_service
+):
+    # A plain repository, named so even under --all-swfs: the parent's own SWFS mount would be
+    # refused for the other reason.
+    parent = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    parent.repository_create(vfs="none")
+    parent.write_commit_push("first", {"a.txt": "a"})
+    parent.shared_store_create(parent.remote)
+
+    with pytest.raises(ImproperArgumentsError):
+        parent.clone(
+            os.path.join(parent.path, "inner"), vfs="swfs", use_shared_store=True
+        )
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="swfs is only available on Windows")
+@pytest.mark.swfs
+@pytest.mark.smoke
+def test_swfs_refuses_an_instance_past_the_mount_limit(
+    new_lore_repo, background_lore_service, global_dir_name
+):
+    """SWFS attaches about eight mounts and parks the process that asks for one more, so the
+    service refuses another SWFS instance, cloned or created, once it mounts that many, before
+    any of the instance is made."""
+    # A plain repository, named so even under --all-swfs, so that only the clones count.
+    source = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    source.repository_create(vfs="none")
+    source.write_commit_push("first", {"a.txt": "a"})
+    source.shared_store_create(source.remote)
+
+    instances = [
+        source.clone(vfs="swfs", use_shared_store=True) for _ in range(SWFS_MOUNT_LIMIT)
+    ]
+    external = os.path.join(global_dir_name, "data", "external")
+    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT
+
+    with pytest.raises(NotSupportedError):
+        source.clone(vfs="swfs", use_shared_store=True)
+    creator = new_lore_repo(
+        create_repo=False, environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+    with pytest.raises(NotSupportedError):
+        creator.repository_create(vfs="swfs", use_shared_store=True)
+    assert len(os.listdir(external)) == SWFS_MOUNT_LIMIT, (
+        "a refused instance must leave nothing behind"
+    )
+
+    # The mounted instances still work, and a plain clone is not limited.
+    for repo in (instances[-1], source.clone(vfs="none")):
+        with repo.open_file("a.txt") as f:
+            assert f.read() == "a"

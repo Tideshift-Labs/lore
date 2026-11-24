@@ -6,15 +6,18 @@ import random
 import shutil
 import stat
 import string
+import sys
 
 import pytest
-from error_types import CommitFailed
+from error_types import CommitFailed, LocalChanges
+from lore_parsers import parse_status_json
 
 from lore import Lore
 
 logger = logging.getLogger(__name__)
 
 
+@pytest.mark.own_vfs("reads a plain status that sees no unmarked local edit, where a status on a virtual clone always scans, its provider's diff being exact")
 @pytest.mark.smoke
 def test_merge(new_lore_repo):
     repo: Lore = new_lore_repo()
@@ -1431,3 +1434,218 @@ def test_merge_deleted_files(new_lore_repo):
     assert "M directory/file.two (M)" in output, (
         f"Expected file not staged as modified merge: {output}"
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("replaced", ["file", "folder"])
+@pytest.mark.parametrize("current", ["file", "folder"])
+@pytest.mark.parametrize("outcome", ["mine", "theirs", "abort", "clean"])
+def test_merge_file_against_folder(new_lore_repo, replaced, current, outcome):
+    """The branch `file` holds the file `thing` and the branch `folder` the folder `thing/a.txt`.
+    One of them replaced what the base held there and the other edited it, which conflicts at
+    `thing` and resolves to either side or aborts, or edited another file, which merges cleanly."""
+    repo: Lore = new_lore_repo()
+    file, folder = {"thing": "file\n"}, {"thing/a.txt": "folder\n"}
+    base, replacement = (file, folder) if replaced == "file" else (folder, file)
+    replacer, editor = ("folder", "file") if replaced == "file" else ("file", "folder")
+    repo.write_commit_push("Base", {"root.txt": "root\n", **base})
+
+    repo.branch_create(replacer)
+    if replaced == "file":
+        repo.remove_file("thing")
+    else:
+        repo.rmtree("thing")
+    repo.write_files(replacement)
+    repo.stage("thing", scan=True)
+    repo.commit(f"Replace the {replaced}")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_create(editor)
+    edited = {
+        path: content.replace("\n", " edited\n") for path, content in base.items()
+    }
+    if outcome == "clean":
+        repo.write_commit_push("Edit another file", {"root.txt": "root edited\n"})
+    else:
+        repo.write_commit_push(f"Edit the {replaced}", edited)
+    holds = {replacer: replacement, editor: edited}
+
+    incoming = editor if current == replacer else replacer
+    repo.branch_switch(current)
+    repo.branch_merge_start(incoming, no_commit=True)
+
+    conflicted = repo.unresolved_paths()
+    if outcome == "clean":
+        assert not conflicted
+        expected = {"root.txt": "root edited\n", **replacement}
+    else:
+        assert conflicted == {"thing"}
+        kept = current if outcome in ("mine", "abort") else incoming
+        expected = {"root.txt": "root\n", **holds[kept]}
+
+    if outcome == "abort":
+        repo.branch_merge_abort()
+    else:
+        if outcome == "mine":
+            repo.branch_merge_resolve_mine("thing")
+        elif outcome == "theirs":
+            repo.branch_merge_resolve_theirs("thing")
+        repo.commit(f"Merge {incoming}")
+        repo.push()
+
+    assert repo.read_files() == expected
+    assert not parse_status_json(repo.status(scan=True, json=True))
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("current", ["file", "folder"])
+@pytest.mark.parametrize("outcome", ["mine", "theirs", "abort", "local_edit"])
+def test_merge_file_and_folder_both_added(new_lore_repo, current, outcome):
+    """The branch `file` adds the file `thing` and the branch `folder` the folder `thing/a.txt`,
+    which conflicts at `thing` and resolves to either side, after first choosing the other, or
+    aborts. Resolving to the other side is refused where the working tree holds a local edit at
+    `thing`."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"root.txt": "root\n"})
+    holds = {"file": {"thing": "file\n"}, "folder": {"thing/a.txt": "folder\n"}}
+    for branch, files in holds.items():
+        repo.branch_switch("main")
+        repo.branch_create(branch)
+        repo.write_commit_push(f"Add the {branch}", files)
+
+    incoming = "folder" if current == "file" else "file"
+    repo.branch_switch(current)
+    repo.branch_merge_start(incoming, no_commit=True)
+    assert repo.unresolved_paths() == {"thing"}
+
+    if outcome == "local_edit":
+        edit = (
+            {"thing": "local edit\n"} if current == "file" else {"thing/b.txt": "new\n"}
+        )
+        repo.write_files(edit)
+        with pytest.raises(LocalChanges):
+            repo.branch_merge_resolve_theirs("thing")
+        assert repo.unresolved_paths() == {"thing"}
+        kept = {**holds[current], **edit}
+        files = repo.read_files()
+        assert {path: files.get(path) for path in kept} == kept
+        return
+
+    if outcome == "abort":
+        repo.branch_merge_abort()
+    else:
+        resolve = {
+            "mine": repo.branch_merge_resolve_mine,
+            "theirs": repo.branch_merge_resolve_theirs,
+        }
+        resolve["theirs" if outcome == "mine" else "mine"]("thing")
+        resolve[outcome]("thing")
+        repo.commit(f"Merge {incoming}")
+        repo.push()
+
+    kept = current if outcome in ("mine", "abort") else incoming
+    assert repo.read_files() == {"root.txt": "root\n", **holds[kept]}
+    assert not parse_status_json(repo.status(scan=True, json=True))
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+@pytest.mark.parametrize("edited", ["Top.txt", "Dir/a.txt"], ids=["other-file", "same-file"])
+@pytest.mark.parametrize(
+    "operation",
+    ["merge", "sync", "cherry-pick", "revert", "fast-forward-merge"],
+)
+def test_a_mode_change_merges_with_an_edit(new_lore_repo, operation, edited):
+    """Each operation that joins two lines of history keeps a change of a file's
+    executable bit on one line where the other edits that file or another one: the
+    file holds the edit and the bit, nothing conflicts, and the revision holds what
+    the working tree does. A revert of the change takes the bit away and keeps the
+    edit."""
+    repo: Lore = new_lore_repo()
+    repo.make_dirs("Dir")
+    for path in ["Dir/a.txt", "Top.txt"]:
+        with repo.open_file(path, "w") as f:
+            f.write(f"{path}\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Base", offline=True)
+    repo.push()
+
+    def chmod(instance: Lore):
+        os.chmod(os.path.join(instance.path, "Dir/a.txt"), 0o755)
+        instance.file_stage("Dir/a.txt", offline=True)
+        instance.commit("Chmod", offline=True)
+
+    def edit(instance: Lore):
+        with instance.open_file(edited, "w") as f:
+            f.write("edited\n")
+        instance.file_stage(edited, offline=True)
+        instance.commit("Edit", offline=True)
+
+    joined = repo
+    executable = True
+    if operation == "merge":
+        repo.branch_create("feature", offline=True)
+        chmod(repo)
+        repo.branch_switch("main", offline=True)
+        edit(repo)
+        repo.branch_merge("feature", offline=True)
+    elif operation == "sync":
+        clone = repo.clone()
+        edit(repo)
+        repo.push()
+        chmod(clone)
+        clone.sync()
+        joined = clone
+    elif operation == "cherry-pick":
+        repo.branch_create("feature", offline=True)
+        chmod(repo)
+        picked = repo.history(branch="feature", offline=True)[-1].signature
+        repo.branch_switch("main", offline=True)
+        edit(repo)
+        repo.revision_cherry_pick(revision=picked, message="Pick", offline=True)
+    elif operation == "revert":
+        chmod(repo)
+        reverted = repo.history(offline=True)[-1].signature
+        edit(repo)
+        repo.revision_revert(revision=reverted, message="Revert", offline=True)
+        executable = False
+    else:
+        clone = repo.clone()
+        edit(clone)
+        clone.push()
+        chmod(repo)
+        repo.push(fast_forward_merge=True)
+        joined = repo.clone()
+
+    mode = os.stat(os.path.join(joined.path, "Dir/a.txt")).st_mode
+    assert bool(mode & stat.S_IXUSR) == executable, f"{mode:o}"
+    with joined.open_file(edited, "r") as f:
+        assert f.read() == "edited\n"
+    status = parse_status_json(joined.status(scan=True, offline=True, json=True))
+    assert status == [], status
+
+
+@pytest.mark.smoke
+def test_merge_of_a_move_of_a_locally_edited_file_refuses(new_lore_repo):
+    """A merge bringing a move of a file the working tree edited, which also changes its content,
+    refuses and keeps the edit at the path the file moves from."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Base", {"moved/from.txt": "base\n", "other.txt": "o\n"})
+    repo.branch_create("move-file")
+    repo.move("moved/from.txt", "moved/to.txt")
+    repo.stage_move("moved/from.txt", "moved/to.txt")
+    repo.write_files({"moved/to.txt": "incoming\n"})
+    repo.stage("moved/to.txt")
+    repo.commit("Move and modify")
+    repo.push()
+    repo.branch_switch("main")
+    repo.write_commit_push("Main", {"other.txt": "main\n"})
+    repo.write_files({"moved/from.txt": "locally edited\n"})
+
+    with pytest.raises(LocalChanges):
+        repo.branch_merge("move-file", message="Merge move-file")
+
+    with repo.open_file("moved/from.txt") as f:
+        assert f.read() == "locally edited\n", "the refused merge should keep the edit"
+    assert not repo.file_exists("moved/to.txt")

@@ -298,6 +298,7 @@ mod grpc_mutation_dispatch_loss_tests {
             1,
             "",
             "",
+            lore_transport::auth::AuthMode::Auto,
         )
         .await?;
         let storage = connection.storage().await?;
@@ -453,6 +454,7 @@ mod grpc_mutation_dispatch_loss_tests {
             1,
             "",
             "",
+            lore_transport::auth::AuthMode::Auto,
         )
         .await?;
         let repository = connection.repository().await?;

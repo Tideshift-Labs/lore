@@ -343,6 +343,7 @@ mod quic_declared_session_tests {
                         mutable.clone(),
                         false,
                         Arc::new(UserAgentFilter::default()),
+                        lore_server::protocol::storage::session::SessionMap::default(),
                     )
                     .with_caller_capability_policy(CallerCapabilityPolicy::RequireOutcomeUnknownV1);
                     probe

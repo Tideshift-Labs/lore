@@ -31,6 +31,7 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
+use lore_storage::FlushOptions;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::Oversized;
 use lore_storage::StoreError;
@@ -68,7 +69,7 @@ use crate::aws_error::is_retryable_sdk_error;
 use crate::default_aws_timeout_millis;
 use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
-use crate::dynamodb::DynamoDbPutCondition;
+use crate::dynamodb::DynamoDbCondition;
 use crate::dynamodb::DynamoDbQuery;
 use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 use crate::s3::S3;
@@ -417,7 +418,7 @@ impl DynamoDbQuery for PartitionAssociationQuery {
 #[derive(Debug, PartialEq)]
 pub(crate) struct RowAbsent;
 
-impl DynamoDbPutCondition for RowAbsent {
+impl DynamoDbCondition for RowAbsent {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
             condition_expression: "attribute_not_exists(#hash)".to_string(),
@@ -434,7 +435,7 @@ impl DynamoDbPutCondition for RowAbsent {
 #[derive(Debug, PartialEq)]
 pub(crate) struct StateUnchanged(pub(crate) FragmentState);
 
-impl DynamoDbPutCondition for StateUnchanged {
+impl DynamoDbCondition for StateUnchanged {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
             condition_expression: "#state = :state".to_string(),
@@ -2327,7 +2328,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 

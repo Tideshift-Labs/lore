@@ -711,9 +711,9 @@ pub struct LoreGlobalArgs {
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
-    /// Cache fragment payloads fetched from remote in the local store. Without
-    /// this only state fragments and fragments flagged for local cache priority
-    /// are retained
+    /// Cache fragment payloads fetched from remote, and those written, in the local store, as
+    /// a repository's `[store] cache_payloads` does for every command. Without either only state
+    /// fragments and fragments flagged for local cache priority are retained
     pub cache: u8,
     /// Authentication token to use instead of the one held in the secure token
     /// store. Authorization tokens are exchanged from it as they are needed.
@@ -752,6 +752,13 @@ pub struct LoreGlobalArgs {
     /// takes it from the globals it is opened with. Any non-zero value trusts
     /// the remote, so a caller zeroes the whole struct, padding included
     pub trust_remote: u8,
+    /// Have the call's flushes write the local stores' index in place, rather than replacing each
+    /// of its files through a temporary file, which is faster where creating files is slow. If the
+    /// process stops or a write fails while a file is being written, the store drops every entry
+    /// that file held, including those of revisions and branches not yet pushed. Eviction and
+    /// compaction replace the files they write whatever it says, and it is independent of
+    /// `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+    pub fast_flush: u8,
     /// The attempt identity this call's mutations are dispatched under, as a
     /// hyphenated lowercase `UUIDv7`. Empty for every caller that does not track
     /// attempts, which is the CLI and every embedder that has not opted in.
@@ -911,6 +918,14 @@ impl LoreGlobalArgs {
         self.sync_data != 0
     }
 
+    /// The options of the flushes this call makes: its `sync_data` and `fast_flush`.
+    pub fn flush_options(&self) -> lore_storage::FlushOptions {
+        lore_storage::FlushOptions {
+            sync_data: self.sync_data(),
+            fast_flush: self.fast_flush != 0,
+        }
+    }
+
     pub fn cache(&self) -> bool {
         self.cache != 0
     }
@@ -1038,7 +1053,7 @@ fn execution_initialize() {
     });
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ExecutionMode {
     Client,
     Server,
@@ -1065,10 +1080,7 @@ pub struct ExecutionContext {
     /// no counters, and only a push reads them whatever the level.
     fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
     /// What this call's push registered with the peer, accumulated across every
-    /// revision, link and layer it covers.
-    ///
-    /// Kept whatever the statistics level: the per-revision progress event reads
-    /// its share out of these, so they are load-bearing rather than diagnostic.
+    /// revision, link and layer it covers, for the statistics event.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
     /// FORK-LOCAL (Tideshift, WP-124 K10): set when a repository this call opened could not
     /// pre-warm its storage session pool within the managed bound (a dead QUIC path). A
@@ -1078,6 +1090,8 @@ pub struct ExecutionContext {
     /// FORK-LOCAL (Tideshift, WP-124 K10): this call's declared, best-effort upload scope, when
     /// the command installed one. See `crate::managed_commit_uploads`.
     managed_uploads: parking_lot::Mutex<Option<Arc<lore_storage::managed_uploads::ManagedUploads>>>,
+    /// The query and upload slots every push this call makes shares.
+    push_budget: OnceLock<crate::branch::push::PushBudget>,
     /// The environment of the process that relayed this call, read in place of this process's
     /// through [`lore_base::env::var`]. `None` for a call made in this process.
     environment: Option<CallEnvironment>,
@@ -1143,6 +1157,40 @@ impl ExecutionContext {
         }
     }
 
+    /// This context for a holder that serves past the call that made it, a mounted filesystem,
+    /// for a caller with `environment`: these globals and this mode, and a dispatcher that sends
+    /// nowhere, as no call awaits what the holder logs.
+    #[cfg(target_os = "linux")]
+    #[lore_macro::test_pub]
+    pub(crate) fn serving(&self, environment: CallEnvironment) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        let user_id = self
+            .user_id
+            .try_lock()
+            .map(|id| id.clone())
+            .unwrap_or_default();
+        Self {
+            globals: self.globals.clone(),
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(user_id),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            environment: Some(environment),
+            ..Default::default()
+        }
+    }
+
+    /// The environment of the process that relayed this call, `None` for a call made in this
+    /// process.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn environment(&self) -> Option<&CallEnvironment> {
+        self.environment.as_ref()
+    }
+
     pub fn globals(&self) -> &LoreGlobalArgs {
         &self.globals
     }
@@ -1202,6 +1250,12 @@ impl ExecutionContext {
     ) -> Option<Arc<lore_storage::managed_uploads::ManagedUploads>> {
         std::mem::replace(&mut *self.managed_uploads.lock(), uploads)
     }
+
+    /// The slots this call's pushes share. See the field.
+    pub(crate) fn push_budget(&self) -> &crate::branch::push::PushBudget {
+        self.push_budget
+            .get_or_init(crate::branch::push::PushBudget::default)
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1219,6 +1273,7 @@ impl Default for ExecutionContext {
             push_stats: OnceLock::new(),
             prewarm_expired: Arc::default(),
             managed_uploads: parking_lot::Mutex::new(None),
+            push_budget: OnceLock::new(),
             environment: None,
         }
     }

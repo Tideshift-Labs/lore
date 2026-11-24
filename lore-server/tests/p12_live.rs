@@ -464,8 +464,10 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                 mutable_rows(&raw_client, &repository_partition, &global_partition).await;
             assert_eq!(
                 legacy_rows.len(),
-                5,
-                "the legacy writers must leave exactly five lore_mutable rows, got {legacy_rows:?}"
+                // v0.14 mutable-store contract: an all-zero value is an absent key, so the
+                // fresh default branch's zero tip row is no longer stored (four rows, was five).
+                4,
+                "the legacy writers must leave exactly four lore_mutable rows, got {legacy_rows:?}"
             );
 
             // Delete the legacy rows before the governed write, so the
@@ -491,7 +493,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
                 mutable_rows(&raw_client, &repository_partition, &global_partition).await;
             assert!(
                 cleared_rows.is_empty(),
-                "the five legacy rows must be gone before the governed write runs, got \
+                "the four legacy rows must be gone before the governed write runs, got \
                  {cleared_rows:?}"
             );
 
@@ -989,12 +991,38 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                     governed_latest_key.as_slice(),
                 ),
             ] {
+                // SYNC4 follow-up B: governed delete does not stamp v0.14 archive keys
+                // (8e39850e). The v0.14 legacy `branch::delete` archives the branch: it
+                // swaps in new metadata carrying `archived` (name released by CAS). The
+                // governed delete still removes only the name row, so its metadata keeps the
+                // old hash. This is the one KNOWN difference; everything else still agrees.
+                if label == "oracle metadata" {
+                    assert_ne!(
+                        value_of(&before_rows, key_type, key),
+                        value_of(&after_rows, key_type, key),
+                        "the v0.14 legacy delete must swap in archived branch metadata"
+                    );
+                    let archived_hash = value_of(&after_rows, key_type, key)
+                        .expect("oracle metadata must still be present after the archive");
+                    let archived_metadata = branch::load_metadata(
+                        repo.clone(),
+                        lore_storage::Hash::from(archived_hash.as_slice()),
+                    )
+                    .await
+                    .expect("load the archived oracle metadata");
+                    assert!(
+                        archived_metadata.get_u64(branch::ARCHIVED).is_ok(),
+                        "the v0.14 legacy delete's new metadata must carry `archived`"
+                    );
+                    continue;
+                }
                 assert_eq!(
                     value_of(&before_rows, key_type, key),
                     value_of(&after_rows, key_type, key),
-                    "{label} must survive its branch's delete unchanged on both sides -- \
-                     BranchDeletePublication::projection() returns one row, not three, \
-                     exactly because a branch delete leaves metadata/latest in place"
+                    "{label} must survive its branch's delete unchanged on both sides, \
+                     except the legacy oracle's metadata, which v0.14 archives (handled \
+                     above) -- BranchDeletePublication::projection() returns one row, not \
+                     three"
                 );
                 assert!(
                     value_of(&after_rows, key_type, key).is_some(),
@@ -1011,10 +1039,19 @@ async fn branch_delete_governed_and_real_legacy_delete_agree_on_the_lore_mutable
                 !(row.key_type == name_key_type
                     && (row.key == oracle_name_key || row.key == governed_name_key))
             });
+            // The legacy oracle's metadata row is the one other row that moves (archived).
+            for row in &mut expected_after {
+                if row.key_type == KeyType::BranchMetadata as i16
+                    && row.key == oracle_metadata_key
+                {
+                    row.value = value_of(&after_rows, row.key_type, &row.key)
+                        .expect("archived oracle metadata present");
+                }
+            }
             assert_eq!(
                 after_rows, expected_after,
                 "the only rows to change between the two full snapshots must be the two \
-                 removed name rows -- both sides must leave every other lore_mutable row \
+                 removed name rows and the oracle's archived metadata -- both sides must leave every other lore_mutable row \
                  (both branches' metadata/latest, and main's own rows) untouched"
             );
         })

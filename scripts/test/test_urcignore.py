@@ -220,6 +220,7 @@ def test_urcignore_merge_new_file_from_incoming_branch(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
 @pytest.mark.smoke
 def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     """
@@ -289,6 +290,7 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
 @pytest.mark.smoke
 @pytest.mark.parametrize("command", ["sync", "branch switch"])
 def test_urcignore_reset_restores_committed_file(new_lore_repo, command):
@@ -418,4 +420,86 @@ def test_urcignore_legacy_fallback(new_lore_repo):
     )
     assert "legacy.tmp" in output, (
         ".urcignore must no longer be consulted once .loreignore exists"
+    )
+
+
+def _without_warnings(output: str) -> str:
+    """`output` without the warnings Lore logs, which name paths of their own."""
+    return "\n".join(
+        line for line in output.splitlines() if not line.startswith("[Warn]")
+    )
+
+
+@pytest.mark.smoke
+def test_instance_ignore_rules(new_lore_repo):
+    """
+    The `ignore` file in the instance's Lore directory excludes untracked
+    entries from the working-directory operations as `.loreignore` does,
+    without being committed: an untracked file under a rule drops out of
+    `status --scan` and a scanning stage, an edit to a tracked file under it
+    still flows through, and `--force stage` stages the untracked file. A `!`
+    line is skipped with a warning naming it.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_files(
+        {
+            "Binaries/Win64/tool.exe": "tracked\n",
+            "notes.txt": "tracked\n",
+        }
+    )
+    repo.stage(scan=True)
+    repo.commit("Commit files before the instance ignore rules")
+
+    with open(os.path.join(repo.dot_path(), "ignore"), "w") as f:
+        f.write("# build outputs\n\nBinaries/\n!Binaries/Win64/\n")
+    repo.write_files(
+        {
+            "Binaries/Mac/editor": "untracked\n",
+            "Binaries/Win64/tool.exe": "edited\n",
+            "notes.txt": "edited\n",
+        }
+    )
+
+    output = repo.status(scan=True)
+    # Windows paths print with either separator, so compare them with forward slashes
+    ignore_path = os.path.join(repo.dot_path(), "ignore").replace("\\", "/")
+    warning = f"Skipping line 4 of {ignore_path}, !Binaries/Win64/"
+    assert warning in output.replace("\\", "/"), (
+        f"no warning names the skipped re-inclusion:\n{output}"
+    )
+    entries = _without_warnings(output)
+    assert "editor" not in entries, (
+        f"status --scan reports an untracked file the instance ignore file excludes:\n{output}"
+    )
+    assert "notes.txt" in entries, "status --scan should report notes.txt"
+    assert "tool.exe" in entries, (
+        f"status --scan should report an edit to a tracked file under a rule:\n{output}"
+    )
+
+    diff = _without_warnings(repo.diff())
+    assert "notes.txt" in diff, "diff should report notes.txt"
+    assert "tool.exe" in diff, f"diff should report an edit to a tracked file:\n{diff}"
+
+    repo.stage(scan=True)
+    output = _without_warnings(repo.status())
+    verify_operations_in_status(
+        output,
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
+    )
+    assert "editor" not in output, (
+        f"a scanning stage staged an untracked file the instance ignore file excludes:\n{output}"
+    )
+    assert ".lore" not in output, "the instance ignore file must never be staged"
+
+    repo.stage("Binaries/Mac/editor", force=True)
+    verify_operations_in_status(
+        repo.status(),
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.ADD, "Binaries/Mac/editor"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
     )

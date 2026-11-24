@@ -5,6 +5,7 @@ mod operation_tests;
 mod rehash_bench;
 mod rehash_tests;
 mod statistics_level_tests;
+mod sweep_tests;
 mod walk_tests;
 mod weave_tests;
 
@@ -266,9 +267,13 @@ async fn commit_files_and_rehash_wrapper_forwards_callers_modified_times() {
             .await
             .expect("build commit metadata fixture");
 
-            prune_dirty_for_commit(state_staged.clone(), repository.clone())
-                .await
-                .expect("prune dirty state before rehash");
+            prune_dirty_for_commit(
+                state_staged.clone(),
+                repository.clone(),
+                state_staged.committed_revision(),
+            )
+            .await
+            .expect("prune dirty state before rehash");
 
             let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
             let modified_times = Arc::new(RecordedModifiedTimes::default());
@@ -283,6 +288,7 @@ async fn commit_files_and_rehash_wrapper_forwards_callers_modified_times() {
                     repository.clone(),
                     write_token.share(),
                     state_staged.clone(),
+                    BasedOn::FirstParent,
                     RelativePath::new(),
                     ROOT_NODE,
                     metadata,

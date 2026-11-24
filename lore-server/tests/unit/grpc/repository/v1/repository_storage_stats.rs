@@ -228,7 +228,10 @@ impl ImmutableStore for StatsStubStore {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), lore_storage::StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        _sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), lore_storage::StoreError> {
         unimplemented!("not exercised by repository_storage_stats tests")
     }
 

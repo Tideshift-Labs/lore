@@ -84,6 +84,10 @@ impl ImmutableStore for CreationMetadataStore {
         self.store.try_join_claim()
     }
 
+    fn hold_correlation(&self, correlation_id: &str) -> Option<lore_storage::CorrelationHold> {
+        self.store.hold_correlation(correlation_id)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }
@@ -201,7 +205,7 @@ impl ImmutableStore for CreationMetadataStore {
     fn max_query_batch(&self) -> Option<usize> {
         Some(2)
     }
-    async fn flush(self: Arc<Self>, _: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _: lore_storage::FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
     async fn verify(self: Arc<Self>, _: bool) -> Result<(), StoreError> {

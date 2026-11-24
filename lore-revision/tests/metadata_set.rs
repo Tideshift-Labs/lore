@@ -225,7 +225,10 @@ mod tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), lore_storage::StoreError> {
             self.inner.clone().flush(sync_data).await
         }
 

@@ -75,6 +75,7 @@ async fn an_identity_token_reads_but_cannot_put() {
                 mutable_store,
                 true,
                 Arc::new(UserAgentFilter::default()),
+                lore_server::protocol::storage::session::SessionMap::default(),
             );
             let session_id = start_session(&service, repository, &token(None)).await;
             assert!(

@@ -174,12 +174,14 @@ pub async fn diff(
         )
         .await
         .map_err(|err| {
-            DiffError::RevisionNotFound(
-                RevisionNotFound {
-                    revision: signature.clone(),
-                }
-                .chain_err_from(err, "source revision not found"),
-            )
+            forward_refusal_or(err, "resolving the source revision", |err| {
+                DiffError::RevisionNotFound(
+                    RevisionNotFound {
+                        revision: signature.clone(),
+                    }
+                    .chain_err_from(err, "source revision not found"),
+                )
+            })
         })?
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
@@ -198,12 +200,14 @@ pub async fn diff(
             )
             .await
             .map_err(|err| {
-                DiffError::RevisionNotFound(
-                    RevisionNotFound {
-                        revision: signature.clone(),
-                    }
-                    .chain_err_from(err, "target revision not found"),
-                )
+                forward_refusal_or(err, "resolving the target revision", |err| {
+                    DiffError::RevisionNotFound(
+                        RevisionNotFound {
+                            revision: signature.clone(),
+                        }
+                        .chain_err_from(err, "target revision not found"),
+                    )
+                })
             })?,
         )
     } else {
@@ -1239,11 +1243,11 @@ async fn diff_read_file(
     let state = match side {
         DiffSide::Revision(state) => state,
         DiffSide::Working(operation) => {
-            let content = operation
+            let source = operation
                 .content_source(relative_path)
                 .await
-                .forward::<DiffError>("naming the content of the file to diff")?
-                .read_all()
+                .forward::<DiffError>("naming the content of the file to diff")?;
+            let content = immutable::read_source(&repository, &source)
                 .await
                 .forward_any::<DiffError>("Failed reading file for diff")?;
             return Ok(make_diff_content(&content));
@@ -1253,9 +1257,11 @@ async fn diff_read_file(
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
-        .map_err(|_err| {
-            DiffError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "finding the file to diff", |_err| {
+                DiffError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
 
@@ -1324,11 +1330,11 @@ pub(crate) async fn read_working_content(
             return Ok(None);
         }
 
-        let content = operation
+        let source = operation
             .content_source(relative_path)
             .await
-            .forward::<DiffError>("naming the content of the working tree file")?
-            .read_all()
+            .forward::<DiffError>("naming the content of the working tree file")?;
+        let content = immutable::read_source(&repository, &source)
             .await
             .forward_any::<DiffError>("Failed reading file from the working tree")?;
 

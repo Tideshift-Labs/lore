@@ -25,6 +25,8 @@ enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true, features = ["server", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
@@ -102,6 +104,7 @@ aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-to
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 lore-credential = { workspace = true }
+lore-storage = { workspace = true, features = ["test-util"] }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 tempfile = "3.21"
@@ -119,6 +122,8 @@ lore-server = { workspace = true, features = ["test-util", "mock-replication-cli
 # FORK: the test JWKS fixtures sign with PEM keys, and the workspace drops `use_pem`
 # (upstream 5bca99d6), so the tests turn it back on.
 jsonwebtoken = { workspace = true, features = ["use_pem"] }
+# The points where a test stops a branch write, to leave a restore stopped part way.
+lore-revision = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
@@ -150,11 +155,18 @@ seeding = ["lore-revision/seeding"]
 # express that the two features move together, so this is pinned by
 # `plugins::postgres::the_failpoint_feature_chain_reaches_lore_postgres`.
 failure_generator = ["lore-storage/failure_generator", "lore-postgres/failure_generator"]
+# Builds the `uds-bench` example, which the container tests drive.
+uds-bench = []
 
 [[bin]]
 name = "loreserver"
 # The binary holds no unit tests; the library it drives does.
 test = false
+
+[[example]]
+name = "uds-bench"
+path = "examples/uds_bench.rs"
+required-features = ["uds-bench"]
 
 [lib]
 name = "lore_server"

@@ -6,6 +6,8 @@ use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
 use lore_base::types::LockResource;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -13,6 +15,7 @@ use serde::Serialize;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use crate::errors::is_refusal;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::lore::Address;
@@ -23,7 +26,10 @@ use crate::lore_debug;
 use crate::repository::RepositoryContext;
 
 #[error_set]
-pub enum NotificationError {}
+pub enum NotificationError {
+    NotAuthenticated,
+    NotAuthorized,
+}
 
 impl crate::event::EventError for NotificationError {}
 
@@ -316,10 +322,16 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         stale.shutdown().await;
     }
 
-    let Ok(remote) = repository.remote().await else {
-        return Err(NotificationError::internal(
-            "notifications not available when offline",
-        ));
+    let remote = match repository.remote().await {
+        Ok(remote) => remote,
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward_any("connecting to remote for notifications");
+        }
+        Err(_) => {
+            return Err(NotificationError::internal(
+                "notifications not available when offline",
+            ));
+        }
     };
 
     let remote_url = remote.remote_url.to_string();
@@ -396,6 +408,8 @@ pub fn register_notification_service(id: &str, service: Arc<dyn NotificationServ
     notification_service_registry().insert(id.to_string(), service);
 }
 
+/// Sends a repository's notifications to their subscribers. A caller can await a call where no
+/// deadline stops it, so each call must return promptly.
 #[async_trait]
 pub trait NotificationSender
 where

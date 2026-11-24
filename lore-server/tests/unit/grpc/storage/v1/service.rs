@@ -234,7 +234,10 @@ async fn verify_with_a_local_store_still_reaches_it() {
             .put(repository, address, fragment, Some(payload), false)
             .await
             .expect("put a fragment");
-        immutable_store.flush(true).await.expect("flush");
+        immutable_store
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
+            .await
+            .expect("flush");
         StorageServiceV1::verify(&service, verify_request(repository, address)).await
     }))
     .await

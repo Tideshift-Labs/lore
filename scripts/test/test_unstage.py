@@ -1,32 +1,15 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
-import json
 import logging
 import os
 
 import pytest
-from test_utils import to_posix
+from test_utils import get_unstage_counts, has_staged_anchor, to_posix
 from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
 
 logger = logging.getLogger(__name__)
-
-
-def has_staged_anchor(repo: Lore) -> bool:
-    """Check whether the repository has a staged revision by querying status."""
-    output = repo.status(json=True, offline=True)
-    zero_hash = "0" * 64
-    for line in output.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        data = event.get("data", {})
-        revision_staged = data.get("revisionStaged", "")
-        if revision_staged and revision_staged != zero_hash:
-            return True
-    return False
 
 
 @pytest.mark.smoke
@@ -159,13 +142,6 @@ def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
     )
 
     repo.branch_switch("main")
-
-
-def get_unstage_counts(output: str) -> dict:
-    """Extract the count object from the fileUnstageEnd event in JSON output."""
-    events = parse_jsonl(output, "fileUnstageEnd")
-    assert len(events) == 1, f"Expected 1 fileUnstageEnd event, got {len(events)}"
-    return events[0]["count"]
 
 
 def get_unstage_file_events(output: str) -> list[dict]:
@@ -493,3 +469,70 @@ def test_restage_after_unstage_promotes_dirty_add_back_to_staged_add(new_lore_re
         "after re-stage, file.txt should be a staged dirty add again "
         f"(equivalent to its post-original-stage state), got {entry}"
     )
+
+
+REPLACEMENTS = {
+    "file_to_directory": (
+        {"entry": "committed\n"},
+        {"entry/inner.txt": "inner\n"},
+        {
+            ("entry", "add", False),
+            ("entry/inner.txt", "add", True),
+            ("entry", "delete", True),
+        },
+    ),
+    "directory_to_file": (
+        {"entry/inner.txt": "committed\n"},
+        {"entry": "replaced\n"},
+        {
+            ("entry", "add", True),
+            ("entry", "delete", False),
+            ("entry/inner.txt", "delete", True),
+        },
+    ),
+}
+
+
+def replace_committed_entry(repo: Lore, committed: dict, replacement: dict) -> None:
+    repo.write_files(committed)
+    repo.stage(scan=True, offline=True)
+    repo.commit("base", offline=True)
+    if repo.file_exists("entry"):
+        repo.remove_file("entry")
+    else:
+        repo.rmtree("entry")
+    repo.write_files(replacement)
+
+
+def scanned_changes(repo: Lore) -> list[tuple]:
+    entries = parse_status_json(repo.status(scan=True, json=True, offline=True))
+    return sorted((to_posix(e["path"]), e["action"], e["type"]) for e in entries)
+
+
+def committed_delta(repo: Lore) -> set[tuple]:
+    deltas = parse_jsonl(
+        repo.revision_info(delta=True, json=True, offline=True), "revisionInfoDelta"
+    )
+    return {(to_posix(d["path"]), d["action"], d["flagFile"]) for d in deltas}
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("target", [".", "entry"])
+@pytest.mark.parametrize("replacement", REPLACEMENTS.keys())
+def test_unstage_of_a_staged_replacement_leaves_it_untracked(
+    new_lore_repo, replacement, target
+):
+    """Unstaging a path replaced by one of the other kind returns it to the
+    never-staged state, so staging the path again commits the replacement."""
+    committed, replaced, delta = REPLACEMENTS[replacement]
+    repo: Lore = new_lore_repo()
+    replace_committed_entry(repo, committed, replaced)
+    never_staged = scanned_changes(repo)
+
+    repo.stage("entry", scan=True, offline=True)
+    repo.unstage(target, offline=True)
+    assert scanned_changes(repo) == never_staged
+
+    repo.stage("entry", scan=True, offline=True)
+    repo.commit("replace", offline=True)
+    assert committed_delta(repo) == delta

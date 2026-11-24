@@ -8,7 +8,10 @@ from subprocess import CalledProcessError
 class ServerException(Exception): ...
 
 
-class LoreException(Exception): ...
+class LoreException(Exception):
+    """A failed Lore command. `returncode` is its exit status where the command ran."""
+
+    returncode: int | None = None
 
 
 class ServerConnectionError(LoreException): ...
@@ -63,6 +66,10 @@ class LocalModificationsError(LocalChanges):
     """Tracked files have been locally modified and the operation refuses to
     proceed without `--force`. Subclass of `LocalChanges` so existing call
     sites that catch `LocalChanges` keep working."""
+
+
+#: The exit status of a command refused by local modifications.
+LOCAL_MODIFICATIONS = 44
 
 
 class FileAlreadyExist(LoreException): ...
@@ -204,7 +211,18 @@ class NotSupportedError(LoreException):
     configured."""
 
 
-class SwfsOutsideServiceError(LoreException): ...
+class VfsOutsideServiceError(LoreException):
+    """A virtual-filesystem instance created or loaded by a process that is not
+    the service, which is the only process allowed to serve its mount."""
+
+
+# The refusal carries one message for SWFS and FUSE alike, so both names catch it.
+SwfsOutsideServiceError = VfsOutsideServiceError
+FuseOutsideServiceError = VfsOutsideServiceError
+
+
+class MountsBusyError(LoreException):
+    """A service stop refused because something holds one of its mounts."""
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
@@ -315,6 +333,12 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         "Attempting to create an SWFS instance outside the service",
         SwfsOutsideServiceError,
     ),
+    (
+        "Attempting to create a virtual-filesystem instance outside the service",
+        VfsOutsideServiceError,
+    ),
+    ("without using the service", VfsOutsideServiceError),
+    ("Mounts are busy:", MountsBusyError),
     ("invalid arguments:", ImproperArgumentsError),
     ("Address not found", AddressNotFound),
 ]

@@ -11,6 +11,7 @@ mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
     use std::collections::BTreeSet;
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use std::sync::RwLock;
     use std::sync::atomic::AtomicBool;
@@ -18,6 +19,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
+    use futures::FutureExt;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
@@ -31,8 +33,11 @@ mod tests {
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::Content;
+    use lore_revision::state::Rewrite;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
+    use lore_revision::state::StateError;
     use lore_revision::state::collect_new_fragments;
     use lore_revision::util::request_tracker::StoreRequestTracker;
     use lore_storage::Fragment;
@@ -677,7 +682,10 @@ mod tests {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            sync_data: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             self.inner.clone().flush(sync_data).await
         }
 
@@ -1382,7 +1390,16 @@ mod tests {
                         .await
                         .expect("Failed to deserialize state");
                     state_to
-                        .node_modify(repository.clone(), file_ids[10], 0o644, 10, file_content(2000))
+                        .node_rewrite(
+                            &repository,
+                            file_ids[10],
+                            &Content {
+                                mode: 0o644,
+                                size: 10,
+                                address: file_content(2000),
+                            },
+                            Rewrite::Plain,
+                        )
                         .await
                         .expect("Failed to modify a file");
                     state_to
@@ -1611,6 +1628,7 @@ mod tests {
     }
 
     use lore_revision::change;
+    use lore_revision::state::Mark;
     use lore_revision::state::compute_change_flags;
 
     #[test]
@@ -1822,134 +1840,6 @@ mod tests {
         .await;
     }
 
-    /// A child is prepended, so the search for what was linked in since a head
-    /// was seen covers everything ahead of that head and stops there: it finds
-    /// the new children and never the ones the caller already holds.
-    #[tokio::test]
-    async fn a_search_since_a_head_covers_what_was_linked_in_ahead_of_it() {
-        with_state(|repository, state| async move {
-            let held = add_node(&repository, &state, ROOT_NODE, "held", NodeFlags::File).await;
-            let added = add_node(&repository, &state, ROOT_NODE, "added", NodeFlags::File).await;
-
-            let since_held = |name: &str| {
-                let repository = repository.clone();
-                let state = state.clone();
-                let name_hash = hash_string(name);
-                async move {
-                    state
-                        .find_subnode_added_since(repository, ROOT_NODE, Some(held), name_hash)
-                        .await
-                        .expect("Failed to search the children added since")
-                }
-            };
-
-            assert_eq!(
-                since_held("added").await,
-                Some(added),
-                "a child linked in after the head was seen is ahead of it"
-            );
-            assert_eq!(
-                since_held("held").await,
-                None,
-                "the head itself is where the search stops, so what it holds is not reported"
-            );
-            assert_eq!(
-                since_held("never").await,
-                None,
-                "a name no child carries is not reported"
-            );
-            assert_eq!(
-                state
-                    .find_subnode_added_since(
-                        repository.clone(),
-                        ROOT_NODE,
-                        None,
-                        hash_string("held")
-                    )
-                    .await
-                    .expect("Failed to search the children added since"),
-                Some(held),
-                "a caller holding no children has the whole chain searched"
-            );
-        })
-        .await;
-    }
-
-    /// Children linked in since a head was seen that do not all fit in the block
-    /// that head sits in: the search crosses into the block it started from and
-    /// only then reaches the head it stops at.
-    #[tokio::test]
-    async fn a_search_since_a_head_crosses_blocks_before_it_reaches_the_head() {
-        with_state(|repository, state| async move {
-            let mut head = ROOT_NODE;
-            for index in 0..BLOCK_NODE_COUNT - 64 {
-                head = add_node(
-                    &repository,
-                    &state,
-                    ROOT_NODE,
-                    &format!("held-{index:05}"),
-                    NodeFlags::File,
-                )
-                .await;
-            }
-            let mut added = Vec::new();
-            for index in 0..128 {
-                added.push(
-                    add_node(
-                        &repository,
-                        &state,
-                        ROOT_NODE,
-                        &format!("added-{index:05}"),
-                        NodeFlags::File,
-                    )
-                    .await,
-                );
-            }
-            assert!(
-                state.block_count() > 1,
-                "the children added since must reach past the block the head sits in"
-            );
-
-            let since_head = |name: String| {
-                let repository = repository.clone();
-                let state = state.clone();
-                async move {
-                    state
-                        .find_subnode_added_since(
-                            repository,
-                            ROOT_NODE,
-                            Some(head),
-                            hash_string(&name),
-                        )
-                        .await
-                        .expect("Failed to search the children added since")
-                }
-            };
-
-            assert_eq!(
-                since_head("added-00127".to_string()).await,
-                added.last().copied(),
-                "the child linked in last heads the chain"
-            );
-            assert_eq!(
-                since_head("added-00000".to_string()).await,
-                added.first().copied(),
-                "a child linked in before the block boundary is still reached"
-            );
-            assert_eq!(
-                since_head(format!("held-{:05}", BLOCK_NODE_COUNT - 65)).await,
-                None,
-                "the head is where the search stops"
-            );
-            assert_eq!(
-                since_head("held-00000".to_string()).await,
-                None,
-                "nothing behind the head is reached"
-            );
-        })
-        .await;
-    }
-
     /// A directory holding more children than one node block takes: the walk
     /// reads a run of siblings under one lock on the block they share and takes
     /// the next block where the run ends, which a directory inside a single
@@ -2005,7 +1895,14 @@ mod tests {
             let last = add_node(&repository, &state, source, "last", NodeFlags::File).await;
 
             state
-                .move_node(repository.clone(), middle, destination, "middle")
+                .node_move_staged(
+                    repository.clone(),
+                    middle,
+                    destination,
+                    ("middle", hash_string("middle")),
+                    &state.moves_permit().await.expect("the moves permit"),
+                    false,
+                )
                 .await
                 .expect("Failed to move the middle child");
 
@@ -2053,26 +1950,31 @@ mod tests {
                 .await
                 .expect("Failed to read the directory");
             state
-                .node_mark_staged(
-                    repository.clone(),
+                .node_mark(
+                    &repository,
                     directory,
-                    NodeFlags::NoFlags,
-                    NodeFlags::NoFlags,
+                    Mark::staged_and_dirty(NodeFlags::NoFlags, NodeFlags::NoFlags),
                 )
                 .await
                 .expect("Failed to settle the directory");
             state
-                .node_mark_staged(
-                    repository.clone(),
+                .node_mark(
+                    &repository,
                     child,
-                    NodeFlags::NoFlags,
-                    NodeFlags::NoFlags,
+                    Mark::staged_and_dirty(NodeFlags::NoFlags, NodeFlags::NoFlags),
                 )
                 .await
                 .expect("Failed to settle the child");
 
             state
-                .move_node(repository.clone(), directory, ROOT_NODE, "after")
+                .node_move_staged(
+                    repository.clone(),
+                    directory,
+                    ROOT_NODE,
+                    ("after", hash_string("after")),
+                    &state.moves_permit().await.expect("the moves permit"),
+                    false,
+                )
                 .await
                 .expect("Failed to rename the directory");
 
@@ -2122,11 +2024,13 @@ mod tests {
     }
 
     /// A node whose parent pointer names a directory it is not a child of cannot be
-    /// unlinked, and the move fails there — after every check has passed. Nothing may be
-    /// half-written at that point: the node must be where it was, under the name it had,
-    /// and the chain it really sits in must still be whole.
+    /// unlinked, and the move fails there — after every check has passed and the directory it
+    /// names was marked. The move itself writes nothing: the node must be where it was, under
+    /// the name it had, and the chain it really sits in must still be whole. The mark stays,
+    /// as nothing is undone, and the move is noted unfinished, so a commit counts no change of
+    /// its own in it.
     #[tokio::test]
-    async fn move_node_that_cannot_unlink_writes_nothing() {
+    async fn a_staged_move_that_cannot_unlink_moves_nothing() {
         with_state(|repository, state| async move {
             let source = add_node(&repository, &state, ROOT_NODE, "src", NodeFlags::NoFlags).await;
             let destination =
@@ -2140,15 +2044,26 @@ mod tests {
                 .block(repository.clone(), NodeBlock::index(second))
                 .await
                 .expect("Failed to read the block");
-            block.write().node(Node::index(second)).parent = destination;
+            block.write_for_tests().node(Node::index(second)).parent = destination;
 
             let failure = state
-                .move_node(repository.clone(), second, ROOT_NODE, "second.bin")
+                .node_move_staged(
+                    repository.clone(),
+                    second,
+                    ROOT_NODE,
+                    ("second.bin", hash_string("second.bin")),
+                    &state.moves_permit().await.expect("the moves permit"),
+                    false,
+                )
                 .await
                 .expect_err("a node missing from its parent's chain cannot be moved");
             assert!(
-                failure.to_string().contains("not in the child chain"),
-                "the failure must name what it could not do, got {failure}"
+                failure.is_internal(),
+                "a node its parent's chain does not hold is a broken hierarchy, got {failure}"
+            );
+            assert!(
+                state.has_unfinished_change(),
+                "a move failing after its marks is noted unfinished"
             );
 
             // Read the links rather than walking them: the fixture's own corruption is
@@ -2174,6 +2089,10 @@ mod tests {
                 destination_node.child().is_none(),
                 "and the node must not have been linked in anywhere else"
             );
+            assert!(
+                destination_node.is_staged() && destination_node.is_dirty(),
+                "the directory the node names was marked first, and stays marked"
+            );
             assert_eq!(
                 state
                     .node_name_clone(repository.clone(), second)
@@ -2186,21 +2105,25 @@ mod tests {
         .await;
     }
 
-    /// The reason a refused move gave. Several distinct rules all report invalid
-    /// arguments, so a test that only asserts "some error" cannot tell which one fired —
-    /// or notice when a later change makes a different one fire first.
+    /// The error a refused move gave.
     async fn move_failure(
         repository: &Arc<RepositoryContext>,
         state: &Arc<State>,
         node_id: NodeID,
         destination_parent_id: NodeID,
         dst_name: &str,
-    ) -> String {
+    ) -> StateError {
         state
-            .move_node(repository.clone(), node_id, destination_parent_id, dst_name)
+            .node_move_staged(
+                repository.clone(),
+                node_id,
+                destination_parent_id,
+                (dst_name, hash_string(dst_name)),
+                &state.moves_permit().await.expect("the moves permit"),
+                false,
+            )
             .await
             .expect_err("the move must be refused")
-            .to_string()
     }
 
     /// The checks that are about a node's *staging state* rather than the tree's shape. The
@@ -2241,31 +2164,26 @@ mod tests {
                 .node_delete(repository.clone(), doomed_parent)
                 .await
                 .expect("Failed to stage the destination's deletion");
-            lore_revision::state::node_discard_patch(
-                state.clone(),
-                repository.clone(),
-                discarded,
-                |_node_id, _flags| {},
-            )
-            .await
-            .expect("Failed to discard the node");
+            lore_revision::state::node_discard_fused(state.clone(), repository.clone(), discarded)
+                .await
+                .expect("Failed to discard the node");
 
-            let reason =
+            let error =
                 move_failure(&repository, &state, deleted, destination, "deleted.bin").await;
             assert!(
-                reason.contains("staged for deletion"),
-                "a node staged for deletion is leaving the revision, not moving in it: {reason}"
+                error.is_invalid_arguments(),
+                "a node staged for deletion is leaving the revision, not moving in it: {error}"
             );
-            let reason =
+            let error =
                 move_failure(&repository, &state, discarded, destination, "discarded.bin").await;
             assert!(
-                reason.contains("discarded"),
-                "a discarded node is gone; its slot reads back as an empty directory: {reason}"
+                error.is_invalid_arguments(),
+                "a discarded node is gone; its slot reads back as an empty directory: {error}"
             );
-            let reason = move_failure(&repository, &state, mover, doomed_parent, "mover.bin").await;
+            let error = move_failure(&repository, &state, mover, doomed_parent, "mover.bin").await;
             assert!(
-                reason.contains("would go with it"),
-                "a destination staged for deletion would take the moved node with it: {reason}"
+                error.is_invalid_arguments(),
+                "a destination staged for deletion would take the moved node with it: {error}"
             );
 
             assert_eq!(
@@ -2300,35 +2218,35 @@ mod tests {
                 add_node(&repository, &state, directory, "nested", NodeFlags::NoFlags).await;
             let file = add_node(&repository, &state, ROOT_NODE, "leaf.bin", NodeFlags::File).await;
 
-            let reason = move_failure(&repository, &state, ROOT_NODE, directory, "root").await;
+            let error = move_failure(&repository, &state, ROOT_NODE, directory, "root").await;
             assert!(
-                reason.contains("does not name a movable node"),
-                "the root is the revision itself and has no parent to move it under: {reason}"
+                error.is_invalid_arguments(),
+                "the root is the revision itself and has no parent to move it under: {error}"
             );
-            let reason = move_failure(&repository, &state, directory, nested, "dir").await;
+            let error = move_failure(&repository, &state, directory, nested, "dir").await;
             assert!(
-                reason.contains("descendants"),
-                "a node moved into its own subtree takes the subtree out of the tree: {reason}"
+                error.is_invalid_arguments(),
+                "a node moved into its own subtree takes the subtree out of the tree: {error}"
             );
-            let reason = move_failure(&repository, &state, directory, directory, "dir").await;
+            let error = move_failure(&repository, &state, directory, directory, "dir").await;
             assert!(
-                reason.contains("descendants"),
-                "and so does a node moved into itself: {reason}"
+                error.is_invalid_arguments(),
+                "and so does a node moved into itself: {error}"
             );
-            let reason = move_failure(&repository, &state, file, file, "leaf.bin").await;
+            let error = move_failure(&repository, &state, file, file, "leaf.bin").await;
             assert!(
-                reason.contains("not a directory"),
-                "only a directory holds children: {reason}"
+                error.is_invalid_arguments(),
+                "only a directory holds children: {error}"
             );
-            let reason = move_failure(&repository, &state, file, ROOT_NODE, "leaf.bin").await;
+            let error = move_failure(&repository, &state, file, ROOT_NODE, "leaf.bin").await;
             assert!(
-                reason.contains("already under that parent by that name"),
-                "a move that changes nothing would record a move the tree never made: {reason}"
+                error.is_invalid_arguments(),
+                "a move that changes nothing would record a move the tree never made: {error}"
             );
-            let reason = move_failure(&repository, &state, file, ROOT_NODE, "with/slash").await;
+            let error = move_failure(&repository, &state, file, ROOT_NODE, "with/slash").await;
             assert!(
-                reason.contains("not storable"),
-                "a name the name table would refuse is caught before anything is relinked: {reason}"
+                error.is_invalid_arguments(),
+                "a name the name table would refuse is caught before anything is relinked: {error}"
             );
 
             assert_eq!(
@@ -2372,7 +2290,14 @@ mod tests {
                 add_node(&repository, &state, ROOT_NODE, "taken.bin", NodeFlags::File).await;
 
             state
-                .move_node(repository.clone(), node_id, destination, "taken.bin")
+                .node_move_staged(
+                    repository.clone(),
+                    node_id,
+                    destination,
+                    ("taken.bin", hash_string("taken.bin")),
+                    &state.moves_permit().await.expect("the moves permit"),
+                    false,
+                )
                 .await
                 .expect("the primitive moves what it is told to move");
 
@@ -2386,6 +2311,116 @@ mod tests {
                 "both children are there under one name, for the caller's check to have \
                  prevented"
             );
+        })
+        .await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn node_discard_on_a_served_state_asserts() {
+        with_state(|repository, state| async move {
+            let node = add_node(&repository, &state, ROOT_NODE, "doomed", NodeFlags::File).await;
+            state.mark_served();
+            let discarded = AssertUnwindSafe(async {
+                lore_revision::state::node_discard_fused(state.clone(), repository.clone(), node)
+                    .await
+            })
+            .catch_unwind()
+            .await;
+            assert!(discarded.is_err(), "the discard asserts");
+        })
+        .await;
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn node_discard_of_collected_nodes_on_a_served_state_asserts() {
+        with_state(|repository, state| async move {
+            let node = add_node(&repository, &state, ROOT_NODE, "doomed", NodeFlags::File).await;
+            state.mark_served();
+            let freed = AssertUnwindSafe(async {
+                lore_revision::state::node_discard_free(
+                    &state,
+                    &repository,
+                    &[node],
+                    Vec::new(),
+                    |_, _| {},
+                )
+                .await
+            })
+            .catch_unwind()
+            .await;
+            assert!(freed.is_err(), "the free asserts");
+        })
+        .await;
+    }
+
+    /// The process-wide total takes each find's steps once, on any thread, only while counting
+    /// is on; no other test here turns it on.
+    #[tokio::test]
+    async fn chain_steps_total_counts_only_while_enabled() {
+        with_state(|repository, state| async move {
+            use lore_revision::state::step_counting;
+            let dir = add_node(&repository, &state, ROOT_NODE, "dir", NodeFlags::NoFlags).await;
+            for name in ["a", "b", "c"] {
+                add_node(&repository, &state, dir, name, NodeFlags::File).await;
+            }
+            // The first attached is last in the chain, three steps from its head.
+            let find = || state.find_subnode(repository.clone(), dir, hash_string("a"));
+            let total = step_counting::total_chain_steps;
+
+            step_counting::set_chain_step_counting(false);
+            let off = total();
+            find().await.expect("a");
+            assert_eq!(total(), off, "a find is not counted while counting is off");
+
+            step_counting::set_chain_step_counting(true);
+            let (on, thread) = (total(), step_counting::thread_chain_steps());
+            find().await.expect("a");
+            let counted = (total() - on, step_counting::thread_chain_steps() - thread);
+            step_counting::set_chain_step_counting(false);
+            assert_eq!(counted.1, 3, "the find's three steps, on its thread");
+            assert!(
+                counted.0 >= 3,
+                "the total holds the find's steps: {counted:?}"
+            );
+
+            let after = total();
+            find().await.expect("a");
+            assert_eq!(total(), after, "counting stops when disabled");
+        })
+        .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_provider_marks_every_state_it_serves() {
+        with_state(|repository, state| async move {
+            assert!(
+                !state.is_served(),
+                "no State is served before a provider takes it"
+            );
+            let fs = lore_revision::fs::fuse::filesystem::FuseFilesystem::new(
+                repository.clone(),
+                state.clone(),
+                lore_revision::fs::fuse::attr::AttrContext {
+                    uid: 1000,
+                    gid: 1000,
+                    blksize: 1 << 17,
+                    base_time: 1_700_000_000_000,
+                },
+            )
+            .await
+            .expect("provider construction");
+            assert!(fs.state().is_served(), "the State the provider serves");
+            assert!(
+                state.is_served(),
+                "the zero revision is served as the caller's own State"
+            );
+
+            let next = State::new();
+            fs.publish(next.clone(), repository.clone(), None, None);
+            assert!(next.is_served(), "a published State is served");
         })
         .await;
     }
@@ -3717,8 +3752,11 @@ mod block_single_flight {
             self.inner.max_query_batch()
         }
 
-        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-            self.inner.clone().flush(sync_data).await
+        async fn flush(
+            self: Arc<Self>,
+            options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
+            self.inner.clone().flush(options).await
         }
 
         async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -4329,6 +4367,46 @@ mod block_single_flight {
             .await;
     }
 
+    /// A walk that attributes its entries holds the attribution load in a box of its own, so the
+    /// future of each entry, which walks a link's subtree through `enumerate_children`, does not
+    /// hold the delta block read.
+    #[tokio::test]
+    async fn an_attributed_walk_keeps_the_delta_read_out_of_its_future() {
+        LORE_CONTEXT
+            .scope(setup_test_execution(), async {
+                let (immutable_store, mutable_store, _execution) =
+                    test_store_create().await.expect("Failed to create stores");
+                let repository = Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                ));
+                let state = State::new();
+                let mut tree_walk = lore_revision::state::TreeWalk::default();
+
+                let walk = lore_revision::state::enumerate_children(
+                    state.clone(),
+                    repository.clone(),
+                    ROOT_NODE,
+                    lore_revision::util::path::RelativePath::new(),
+                    0,
+                    0,
+                    0,
+                    lore_revision::state::allow_all_repositories(),
+                    &mut tree_walk,
+                    true,
+                );
+                let delta_read = state.delta_block(repository);
+
+                assert!(
+                    size_of_val(&walk) < size_of_val(&delta_read),
+                    "an attributed walk holds {} bytes, the delta block read {}",
+                    size_of_val(&walk),
+                    size_of_val(&delta_read)
+                );
+            })
+            .await;
+    }
+
     /// A node block read holds its read of the current format, and the fallback to the older
     /// formats, which holds a read as large and the conversion, stays in a box of its own.
     #[tokio::test]
@@ -4376,14 +4454,9 @@ mod block_single_flight {
                     .find_subnode(repository.clone(), ROOT_NODE, hash_string("first"))
                     .await
                     .expect("the seeded node");
-                lore_revision::state::node_discard_patch(
-                    state.clone(),
-                    repository.clone(),
-                    first,
-                    |_, _| {},
-                )
-                .await
-                .expect("Failed to discard the seeded node");
+                lore_revision::state::node_discard_fused(state.clone(), repository.clone(), first)
+                    .await
+                    .expect("Failed to discard the seeded node");
                 let slot_metadata = || {
                     let state = state.clone();
                     let repository = repository.clone();

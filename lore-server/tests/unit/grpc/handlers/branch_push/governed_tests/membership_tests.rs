@@ -1145,3 +1145,193 @@ fn assert_file_queries(fixture: &Fixture, count: usize) {
         );
     }
 }
+
+/// A write that lands after the push's read-only name check and before its governed publish.
+#[derive(Clone, Copy, Debug)]
+enum Competing {
+    /// A governed branch delete commits through the coordinator.
+    Delete,
+    /// Another writer moves the branch generation without deleting the branch.
+    GenerationBump,
+}
+
+/// The push passes `ensure_name_maps_to_branch` (it reads, never writes), then stops at the
+/// governed publish. A competing write commits in that window. The publish must then refuse at
+/// the coordinator, which re-reads the locked branch row, and write no tip: the domain row, the
+/// `lore_mutable` projection, the outbox and the receipt all show a refused push.
+///
+/// A delete tombstones the branch, so the coordinator answers `TOMBSTONED_V1` (`NOT_FOUND`)
+/// before it compares generations. A bare generation bump reaches the generation compare
+/// (`CAS_MISMATCH_V1`, `ABORTED`), so both fences are pinned.
+async fn competing_write_after_the_name_check(url: &str, v1: bool, competing: Competing) {
+    use lore_postgres::domain::coordinator::BranchDeleteInput;
+
+    let fixture = Fixture::new(url).await;
+    let direct = direct_client(url).await;
+    // The fixture branch is the repository's default branch, which a delete refuses
+    // (`DEFAULT_BRANCH_V1`, checked before the generation fence). Point the default elsewhere so
+    // the pushed branch is an ordinary one.
+    let other_default = [0xEEu8; 16];
+    direct
+        .execute(
+            "UPDATE lore_domain_repositories SET default_branch_id = $2 WHERE repository_id = $1",
+            &[&fixture.repository.as_slice(), &other_default.as_slice()],
+        )
+        .await
+        .unwrap();
+
+    let mut push = Box::pin(fixture.push(v1));
+    until_paused(push.as_mut(), &fixture.store).await;
+
+    let before = fixture
+        .store
+        .inner
+        .branch_snapshot(&fixture.repository, &fixture.branch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(before.live);
+    match competing {
+        Competing::Delete => {
+            let clock = fixture
+                .store
+                .inner
+                .domain_operation_clock_get()
+                .await
+                .unwrap();
+            let tenant_scope_key = scope_key_target_repository(&fixture.repository).unwrap();
+            let key = ReceiptKey {
+                verified_issuer: "https://issuer.example/membership-delete".into(),
+                authenticated_subject: "membership-deleter".into(),
+                tenant_scope_key: tenant_scope_key.clone(),
+                operation_id: uuid_v7_at(clock),
+            };
+            let binding = OperationBinding {
+                method: lore_server::domain::PLATFORM_METHOD_BRANCH_DELETE.to_owned(),
+                scope: tenant_scope_key,
+                fingerprint_version: 1,
+                fingerprint: rand::random::<[u8; 32]>().to_vec(),
+                canonical_intent_digest: canonical_intent_digest(&CanonicalIntent::BranchDelete {
+                    repository_id: &fixture.repository,
+                    branch_id: &fixture.branch,
+                })
+                .unwrap(),
+            };
+            let PrepareResult::Prepared { token, .. } = fixture
+                .store
+                .inner
+                .domain_operation_prepare(&key, &binding, None, None)
+                .await
+                .unwrap()
+            else {
+                panic!("the competing delete must prepare");
+            };
+            let operation = GovernedOperation {
+                key,
+                binding,
+                prepare_token: token,
+            };
+            let deleted = fixture
+                .store
+                .inner
+                .branch_delete(
+                    &operation,
+                    &BranchDeleteInput {
+                        repository_id: fixture.repository.to_vec(),
+                        branch_id: fixture.branch.to_vec(),
+                        expected_generation: Some(before.generation),
+                        expected_name: before.name.clone(),
+                        expected_metadata_hash: before.metadata_hash.clone(),
+                        expected_latest_hash: before.latest_hash.clone(),
+                        delete_protected: false,
+                        legacy_default: false,
+                        projection: Vec::new(),
+                        events: Vec::new(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(deleted.outcome, DomainOutcome::Applied);
+        }
+        Competing::GenerationBump => {
+            direct
+                .execute(
+                    "UPDATE lore_domain_branches SET generation = generation + 1 WHERE repository_id = $1 AND branch_id = $2",
+                    &[&fixture.repository.as_slice(), &fixture.branch.as_slice()],
+                )
+                .await
+                .unwrap();
+        }
+    }
+    fixture.store.resume.notify_one();
+
+    let error = push
+        .await
+        .expect_err("a publish after a competing write must refuse");
+    assert_eq!(
+        error.code(),
+        match competing {
+            Competing::Delete => Code::NotFound,
+            Competing::GenerationBump => Code::Aborted,
+        },
+        "{error:?}"
+    );
+    let after = fixture
+        .store
+        .inner
+        .branch_snapshot(&fixture.repository, &fixture.branch)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.live, matches!(competing, Competing::GenerationBump));
+    // No tip, no projection write, no `branch.pushed` row, one rejected receipt.
+    fixture.assert_result(url, false).await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v0_delete_after_the_name_check_refuses_the_publish_and_writes_no_tip() {
+    let url = pg_url().expect("isolated PostgreSQL required");
+    Box::pin(competing_write_after_the_name_check(
+        &url,
+        false,
+        Competing::Delete,
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v1_delete_after_the_name_check_refuses_the_publish_and_writes_no_tip() {
+    let url = pg_url().expect("isolated PostgreSQL required");
+    Box::pin(competing_write_after_the_name_check(
+        &url,
+        true,
+        Competing::Delete,
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v0_generation_bump_after_the_name_check_refuses_the_publish_and_writes_no_tip() {
+    let url = pg_url().expect("isolated PostgreSQL required");
+    Box::pin(competing_write_after_the_name_check(
+        &url,
+        false,
+        Competing::GenerationBump,
+    ))
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v1_generation_bump_after_the_name_check_refuses_the_publish_and_writes_no_tip() {
+    let url = pg_url().expect("isolated PostgreSQL required");
+    Box::pin(competing_write_after_the_name_check(
+        &url,
+        true,
+        Competing::GenerationBump,
+    ))
+    .await;
+}

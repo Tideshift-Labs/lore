@@ -13,6 +13,7 @@ use lore_server::authnz::repository_authorizer::Grants;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedTokenOwned;
 use lore_server::protocol::storage::session::*;
+use lore_storage::CorrelationHold;
 use rand::random;
 
 /// A bare entry for the allocation tests, which only care about the fields they assert on.
@@ -27,6 +28,7 @@ fn bare_entry(repository: RepositoryId, correlation_id: &str, user_id: &str) -> 
         authorized_sources: Arc::new(DashSet::new()),
         declared: false,
         expires_at: None,
+        held: Vec::new(),
     }
 }
 
@@ -71,6 +73,7 @@ mod entry_permits {
             authorized_sources: Arc::new(DashSet::new()),
             declared: false,
             expires_at: None,
+            held: Vec::new(),
         }
     }
 
@@ -145,6 +148,7 @@ fn start_returns_a_nonzero_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     // A weaker claim than the name this test used to have
@@ -260,6 +264,7 @@ fn start_advances_the_session_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     let (id2, _) = map
@@ -271,6 +276,7 @@ fn start_advances_the_session_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert_ne!(id1, id2);
@@ -294,6 +300,7 @@ fn two_maps_never_issue_the_same_session_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     let (id2, _) = second
@@ -305,6 +312,7 @@ fn two_maps_never_issue_the_same_session_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
 
@@ -333,6 +341,7 @@ fn start_always_allocates_new_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     let (id2, _) = map
@@ -344,6 +353,7 @@ fn start_always_allocates_new_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert_ne!(id1, id2);
@@ -362,6 +372,7 @@ fn start_empty_correlation_generates_uuid() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     let (id2, corr2) = map
@@ -373,6 +384,7 @@ fn start_empty_correlation_generates_uuid() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert_ne!(id1, id2);
@@ -394,6 +406,7 @@ fn stop_removes_session() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert!(map.get(id).is_some());
@@ -420,6 +433,7 @@ fn stop_already_stopped_returns_not_found() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     map.stop(id).unwrap();
@@ -445,6 +459,7 @@ fn start_after_stop_allocates_new_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     map.stop(id1).unwrap();
@@ -457,6 +472,7 @@ fn start_after_stop_allocates_new_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert_ne!(id1, id2);
@@ -475,6 +491,7 @@ fn get_returns_entry_with_user_id() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     let entry = map.get(id).unwrap();
@@ -503,6 +520,7 @@ fn concurrent_session_limit() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     }
@@ -514,7 +532,8 @@ fn concurrent_session_limit() {
             Vec::new(),
             None,
             None,
-            false
+            false,
+            Vec::new(),
         ),
         Err(SessionError::LimitReached)
     );
@@ -535,6 +554,7 @@ fn limit_freed_by_stop() {
                 None,
                 None,
                 false,
+                Vec::new(),
             )
             .unwrap();
         ids.push(id);
@@ -547,7 +567,8 @@ fn limit_freed_by_stop() {
             Vec::new(),
             None,
             None,
-            false
+            false,
+            Vec::new(),
         ),
         Err(SessionError::LimitReached)
     );
@@ -560,6 +581,7 @@ fn limit_freed_by_stop() {
         None,
         None,
         false,
+        Vec::new(),
     )
     .unwrap();
 }
@@ -589,6 +611,7 @@ fn concurrent_starts_cannot_overbook_the_session_limit() {
                         None,
                         None,
                         false,
+                        Vec::new(),
                     )
                     .is_ok()
                 })
@@ -628,6 +651,7 @@ fn allocation_failure_refunds_the_claimed_session_slot() {
         None,
         None,
         false,
+        Vec::new(),
     );
 
     assert_eq!(result, Err(SessionError::CounterExhausted));
@@ -653,6 +677,7 @@ fn start_records_the_declared_flag_per_session() {
             None,
             None,
             true,
+            Vec::new(),
         )
         .unwrap();
     let (plain_id, _) = map
@@ -664,6 +689,7 @@ fn start_records_the_declared_flag_per_session() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .unwrap();
     assert!(map.get(declared_id).unwrap().declared);
@@ -684,7 +710,160 @@ fn start_from_records_the_declared_flag() {
             None,
             None,
             true,
+            Vec::new(),
         )
         .unwrap();
     assert!(map.get(id).unwrap().declared);
+}
+
+/// Maps sharing a counter skip zero, which names no session, as the counter wraps.
+#[test]
+fn shared_ids_skip_zero_as_the_counter_wraps() {
+    let map = SessionMap::sharing_ids(Arc::new(AtomicU32::new(u32::MAX)));
+    let repo = random::<RepositoryId>();
+
+    let (last, _) = map
+        .start(
+            repo,
+            "last".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+    let (wrapped, _) = map
+        .start(
+            repo,
+            "wrapped".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!((last, wrapped), (u32::MAX, 1));
+}
+
+/// A counter that wrapped onto an id still in use gives the next one, and the session holding the
+/// id keeps it.
+#[test]
+fn a_wrapped_counter_skips_an_id_still_in_use() {
+    let counter = Arc::new(AtomicU32::new(7));
+    let map = SessionMap::sharing_ids(counter.clone());
+    let (held, holder) = (random::<RepositoryId>(), random::<RepositoryId>());
+    let (id, _) = map
+        .start(
+            held,
+            "held".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+    counter.store(id, Ordering::Relaxed);
+
+    let (next, _) = map
+        .start(
+            holder,
+            "next".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+    assert_eq!(next, id + 1);
+    assert_eq!(map.get(id).map(|entry| entry.repository), Some(held));
+}
+
+/// An id one connection's map issued names no session in another's that shares its counter.
+#[test]
+fn an_id_from_one_connection_names_no_session_on_another() {
+    let counter = Arc::new(AtomicU32::new(1));
+    let (first, second) = (
+        SessionMap::sharing_ids(counter.clone()),
+        SessionMap::sharing_ids(counter),
+    );
+    let repo = random::<RepositoryId>();
+
+    let (issued, _) = first
+        .start(
+            repo,
+            "first".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+    let (other, _) = second
+        .start(
+            repo,
+            "second".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            Vec::new(),
+        )
+        .unwrap();
+
+    assert_ne!(issued, other);
+    assert!(second.get(issued).is_none());
+}
+
+/// A session keeps what it was started holding until it stops, and a session still open keeps
+/// its own until its map drops, as the map of a closed connection does.
+#[test]
+fn a_session_keeps_its_holds_until_it_stops_or_its_map_drops() {
+    let held = Arc::new(());
+    let hold = || -> Vec<CorrelationHold> { vec![Box::new(held.clone())] };
+    let map = SessionMap::default();
+    let repo = random::<RepositoryId>();
+
+    let (stopped, _) = map
+        .start(
+            repo,
+            "shared".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            hold(),
+        )
+        .unwrap();
+    map.start(
+        repo,
+        "shared".into(),
+        String::new(),
+        Vec::new(),
+        None,
+        None,
+        false,
+        hold(),
+    )
+    .unwrap();
+    assert_eq!(Arc::strong_count(&held), 3);
+
+    map.stop(stopped).unwrap();
+    assert_eq!(Arc::strong_count(&held), 2, "the stopped session's hold");
+
+    drop(map);
+    assert_eq!(Arc::strong_count(&held), 1, "the open session's hold");
 }

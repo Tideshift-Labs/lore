@@ -717,10 +717,10 @@ impl StorageService for LoreStorageService {
                         heal: if req.heal { 1 } else { 0 },
                     };
 
-                    msg.handle(
+                    msg.handle_with(
                         context,
                         self.local_store.clone(),
-                        self.repository_authorizer.clone(),
+                        self.immutable_store.clone(),
                     )
                     .await
                     .map(|resp| {

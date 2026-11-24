@@ -234,7 +234,10 @@ impl ImmutableStore for MembershipStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         self.inner.clone().flush(sync_data).await
     }
 

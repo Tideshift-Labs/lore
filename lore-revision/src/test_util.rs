@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! Probes a test reads and arms inside the library, built with the `test-util` feature.
+//! Probes a test reads and arms inside the library, points where it stops a branch write, and
+//! fixtures tests build on, built with the `test-util` feature.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -10,6 +12,34 @@ use tokio::sync::Notify;
 
 use crate::fs::filesystem_provider::DirectoryEntry;
 use crate::fs::filesystem_provider::FsError;
+use crate::repository::RemoteState;
+use crate::repository::RepositoryContext;
+
+/// A path-less context on fresh in-memory stores whose remote is in `state`, so everything but
+/// the remote is valid.
+pub async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+    context_built(state, |context| context).await
+}
+
+/// [`context_with_state`] with `build` applied, for a context set up through its builders.
+pub async fn context_built(
+    state: RemoteState,
+    build: impl FnOnce(RepositoryContext) -> RepositoryContext,
+) -> Arc<RepositoryContext> {
+    let (immutable, mutable) = crate::repository::create_client_memory_stores()
+        .await
+        .expect("in-memory stores should be creatable");
+    Arc::new(build(RepositoryContext::new_with_state(
+        None,
+        immutable,
+        mutable,
+        crate::lore::RepositoryId::default(),
+        crate::instance::InstanceId::default(),
+        state,
+        Arc::default(),
+        None,
+    )))
+}
 
 /// The tasks one walk spawns: counts those live, for a test to read the peak, holds each one
 /// before its work until released, so a test can see the tasks pile up, fails a listing where a
@@ -140,5 +170,110 @@ pub(crate) struct Live<'a>(&'a TaskProbe);
 impl Drop for Live<'_> {
     fn drop(&mut self) {
         self.0.live.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A point between two writes or reads of a branch create, restore, archive or protect, where a
+/// task run under [`step_branch_writes`] stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchStep {
+    /// A create has found no metadata to restore and read the mapping of its name, and not yet
+    /// checked its parent.
+    CreateNameRead,
+    /// A create has found no metadata to restore and not yet swapped in the branch's metadata.
+    CreateUnrestored,
+    /// A create has swapped in the branch's metadata and not yet claimed its name.
+    CreateMetadataStored,
+    /// A create has claimed its name and not yet stored the latest revision.
+    CreateNameClaimed,
+    /// A restore has read the branch's metadata and not yet made its checks.
+    RestoreMetadataRead,
+    /// A restore has made its checks and not yet recorded itself in the metadata.
+    RestoreChecked,
+    /// A restore has recorded the name it claims in the metadata and not yet claimed it.
+    RestoreRecorded,
+    /// A restore has claimed its name and not yet made its final swap.
+    RestoreNameClaimed,
+    /// A restore, an archive or a name lookup that caches the remote's metadata has swapped a
+    /// pending restore's record out of the metadata and not yet released the name it named.
+    PendingRestoreSettled,
+    /// An archive has read the branch's metadata and not yet looked up its name.
+    ArchiveMetadataRead,
+    /// An archive has looked up the branch's name and not yet swapped the metadata.
+    ArchiveLookedUp,
+    /// An archive has swapped the metadata and not yet released the name.
+    ArchiveReleasing,
+    /// A protect without a remote has read the branch's metadata and not yet swapped it.
+    ProtectMetadataRead,
+}
+
+/// Where a stepped task reports each step it reaches, and what it waits for to go on.
+#[derive(Clone)]
+struct Stepped {
+    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+    resume: Arc<Notify>,
+}
+
+tokio::task_local! {
+    static STEPPED: Stepped;
+}
+
+/// Runs `future`, stopping at each [`BranchStep`] it reaches: the step is sent on `reached`, and
+/// the task waits for a notification of `resume` before it goes on. Tasks `future` spawns don't
+/// stop.
+pub fn step_branch_writes<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<BranchStep>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    STEPPED.scope(Stepped { reached, resume }, future)
+}
+
+/// Stops this task at `step`, where it runs under [`step_branch_writes`].
+pub(crate) async fn branch_step(step: BranchStep) {
+    let Ok(stepped) = STEPPED.try_with(Stepped::clone) else {
+        return;
+    };
+    if stepped.reached.send(step).is_ok() {
+        stepped.resume.notified().await;
+    }
+}
+
+/// Where a task run under [`hold_unmount_drains`] reports that a FUSE unmount's drain found the
+/// inode table counting no lookups, and what it waits for to go on.
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct DrainHold {
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+}
+
+#[cfg(target_os = "linux")]
+tokio::task_local! {
+    static DRAIN_HOLD: DrainHold;
+}
+
+/// Runs `future`, stopping each FUSE unmount's drain it runs wherever the drain finds the inode
+/// table counting no lookups, before it waits for the count to settle: a `()` is sent on
+/// `reached`, and the drain waits for a notification of `resume` before it goes on. Tasks
+/// `future` spawns don't stop.
+#[cfg(target_os = "linux")]
+pub fn hold_unmount_drains<F: Future>(
+    reached: tokio::sync::mpsc::UnboundedSender<()>,
+    resume: Arc<Notify>,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    DRAIN_HOLD.scope(DrainHold { reached, resume }, future)
+}
+
+/// Stops this task where a FUSE unmount's drain has found the inode table counting no lookups,
+/// where it runs under [`hold_unmount_drains`].
+#[cfg(target_os = "linux")]
+pub(crate) async fn unmount_drain_emptied() {
+    let Ok(hold) = DRAIN_HOLD.try_with(DrainHold::clone) else {
+        return;
+    };
+    if hold.reached.send(()).is_ok() {
+        hold.resume.notified().await;
     }
 }

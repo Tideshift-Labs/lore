@@ -139,3 +139,215 @@ fn a_filesystem_error_keeps_its_kind_through_a_sync() {
     }));
     assert!(matches!(missing, SyncError::FileNotFound(_)), "{missing:?}");
 }
+
+/// A realize that fails answers its own error only once the task run beside it has ended, so
+/// the repository that task holds is released by the time the sync answers.
+#[tokio::test]
+async fn a_failed_realize_waits_for_the_task_beside_it() {
+    use lore_base::error::LocalModifications;
+    use lore_base::lore_spawn;
+    use lore_revision::fs::filesystem_provider::FsError;
+
+    let repository = Arc::new(());
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let held = repository.clone();
+    let beside = lore_spawn!(async move {
+        let _ = released.await;
+        drop(held);
+    });
+
+    let mut realizing = std::pin::pin!(realize_joining(beside, async {
+        Err(SyncError::from(FsError::from(LocalModifications)))
+    }));
+    assert!(
+        futures::poll!(realizing.as_mut()).is_pending(),
+        "the failed realize answered while the task beside it still ran"
+    );
+
+    release
+        .send(())
+        .expect("the task beside the realize is waiting");
+    let realized = realizing.await;
+    assert!(
+        matches!(realized, Err(SyncError::LocalModifications(_))),
+        "{realized:?}"
+    );
+    assert_eq!(
+        1,
+        Arc::strong_count(&repository),
+        "the task beside the realize still holds the repository"
+    );
+}
+
+/// A sync whose filesystem operation fails to begin starts no cache task, so nothing is left
+/// holding the repository once the sync answers. The test runtime runs one thread, so a task
+/// spawned and never awaited would still hold it at the check.
+#[tokio::test]
+async fn a_sync_that_cannot_begin_its_operation_leaves_the_repository_unheld() {
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::RepositoryContext;
+
+    use crate::fs::filesystem_provider::test_store_create;
+    use crate::helper::RepositoryContextCreationArgsExt;
+    use crate::helper::default_repository_creation_args;
+    use crate::helper::test_commit_tree;
+    use crate::helper::test_file_write;
+    use crate::helper::test_repository_create;
+
+    let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let instance = test_repository_create(
+                immutable.clone(),
+                mutable.clone(),
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            test_file_write(&instance.path.join("first.txt"), b"first");
+            let first = test_commit_tree(&instance, "First").await.revision();
+            test_file_write(&instance.path.join("second.txt"), b"second");
+            test_commit_tree(&instance, "Second").await;
+
+            let filesystem = Arc::new(TestFilesystemProvider::failing_begin());
+            let repository = Arc::new(
+                RepositoryContext::new(
+                    default_repository_creation_args(immutable, mutable)
+                        .with_path(&instance.path)
+                        .with_id(instance.repository.id)
+                        .with_instance_id(instance.repository.instance_id)
+                        .with_filesystem_provider(filesystem.clone()),
+                )
+                .with_write_token(instance.write_token.share()),
+            );
+
+            let synced = sync_boxed(
+                repository.clone(),
+                &instance.write_token,
+                SyncOptions {
+                    revision: Some(first.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+            assert!(synced.is_err(), "{synced:?}");
+            assert_eq!(
+                1,
+                filesystem.begins(),
+                "the sync never reached its operation"
+            );
+            assert_eq!(
+                1,
+                Arc::strong_count(&repository),
+                "a task the sync started still holds the repository"
+            );
+        })
+        .await;
+}
+
+/// The walk a sync runs between the remote's latest revision of the branch and the local one.
+mod branch_point {
+    use std::time::Duration;
+
+    use lore_base::error::NotAuthorized;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::BranchId;
+    use lore_base::types::Hash;
+    use lore_revision::instance::load_current_anchor_boxed;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::RepositoryContext;
+    use lore_transport::Connection;
+    use lore_transport::ProtocolError;
+
+    use super::*;
+    use crate::fs::filesystem_provider::test_store_create;
+    use crate::helper::RepositoryContextCreationArgsExt;
+    use crate::helper::default_repository_creation_args;
+    use crate::helper::test_commit_tree;
+    use crate::helper::test_file_write;
+    use crate::helper::test_repository_create;
+    use crate::paged_remote::Anchor;
+    use crate::paged_remote::PagedRemote;
+    use crate::paged_remote::remote_revision;
+
+    /// The result of a sync of an instance whose branch holds a local commit the remote lacks,
+    /// from the remote that `remote` builds for the branch. The sync is bounded by five seconds,
+    /// so that a walk that loops fails the test.
+    async fn sync_from(remote: impl FnOnce(BranchId) -> PagedRemote) -> Result<(), SyncError> {
+        let (immutable, mutable, execution) =
+            test_store_create().await.expect("creating the stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable.clone(),
+                    mutable.clone(),
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                test_file_write(&instance.path.join("local.txt"), b"local");
+                test_commit_tree(&instance, "Local").await;
+                let (_, branch) = load_current_anchor_boxed(&instance.repository)
+                    .await
+                    .expect("reading the current anchor");
+                let connection = Connection::detached_revision(
+                    Vec::new(),
+                    Ok(()),
+                    instance.repository.id,
+                    Arc::new(remote(branch)),
+                );
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable, mutable)
+                            .with_path(&instance.path)
+                            .with_id(instance.repository.id)
+                            .with_instance_id(instance.repository.instance_id)
+                            .with_remote(Ok(connection)),
+                    )
+                    .with_write_token(instance.write_token.share()),
+                );
+                let synced = sync_boxed(repository, &instance.write_token, SyncOptions::default());
+                tokio::time::timeout(Duration::from_secs(5), synced)
+                    .await
+                    .expect("the sync ends within five seconds")
+            })
+            .await
+    }
+
+    /// A sync whose walk between the remote's latest revision and the local one stops fails with
+    /// the walk's error, which keeps its code: `RevisionNotFound` naming the remote's latest where
+    /// the remote's page does not move the line, and the remote's `NotAuthorized` where its list
+    /// fails.
+    #[tokio::test]
+    async fn a_sync_whose_walk_stops_fails_with_the_walks_error() {
+        let remote_latest = remote_revision(3, Hash::default(), Hash::from([0xA0; 32])).await;
+        let top = remote_latest.signature;
+
+        let stopped = sync_from(|branch| {
+            PagedRemote::new(branch, top)
+                .holding([&remote_latest])
+                .page(Anchor::Signature(top), vec![(3, top)], top)
+        })
+        .await;
+        let refused = sync_from(|branch| {
+            PagedRemote::new(branch, top)
+                .failing(Anchor::Signature(top), ProtocolError::from(NotAuthorized))
+        })
+        .await;
+
+        assert_eq!(
+            (
+                stopped
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.as_revision_not_found())
+                    .map(|error| error.revision.clone()),
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.is_not_authorized()),
+            ),
+            (Some(top.to_string()), true),
+            "{stopped:?}; {refused:?}"
+        );
+    }
+}

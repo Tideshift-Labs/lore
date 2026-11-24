@@ -1006,8 +1006,9 @@ const HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
 const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
 async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
-    let mut endpoint = tonic::transport::Channel::from_shared(remote.to_string())
-        .internal_with(|| format!("connect: {remote}"))?;
+    let mut endpoint =
+        tonic::transport::Channel::from_shared(crate::uds::channel_uri(remote.to_string()))
+            .internal_with(|| format!("connect: {remote}"))?;
 
     let keep_alive_interval = std::env::var("LORE_HTTP2_KEEP_ALIVE_INTERVAL")
         .ok()
@@ -1021,7 +1022,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
         .http2_keep_alive_interval(Duration::from_secs(keep_alive_interval))
         .keep_alive_timeout(Duration::from_secs(keep_alive_timeout));
 
-    if remote.starts_with("https://") {
+    if endpoint.uri().scheme_str() == Some("https") {
         endpoint = endpoint
             .tls_config(grpc_client_tls_config())
             .internal_with(|| format!("configuring TLS for {remote}"))?;
@@ -1038,7 +1039,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     // Connect from a net-runtime task so the hyper/h2 driver tasks the
     // connection spawns are bound to the net runtime, isolated from compute and
     // file-I/O continuations on the core runtime.
-    let channel = match lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+    let channel = match lore_base::lore_spawn_net!(crate::uds::connect_channel(endpoint))
         .await
         .internal_with(|| format!("gRPC connection task to {remote}"))?
     {
@@ -1805,7 +1806,8 @@ const MAX_RECONNECTS_PER_OP: usize = 3;
 /// connections while failing every RPC on them reconnects successfully every round.
 ///
 /// The rebuild is boxed. It runs only after a lost channel, and inline it would make every
-/// request's future as large as a reconnect.
+/// request's future as large as a reconnect. It runs after the match ends, so the future does
+/// not hold an attempt's result across it.
 #[lore_macro::test_pub]
 async fn with_reconnect<T, Op, OpFut, Rebuild, RebuildFut>(
     connection: &GRPCConnection,
@@ -1821,9 +1823,10 @@ where
     for _ in 0..MAX_RECONNECTS_PER_OP {
         let reconnect_id = connection.reconnect.load(Ordering::Relaxed);
         match op().await {
-            Err(ProtocolError::Disconnected(_)) => Box::pin(rebuild(reconnect_id)).await?,
+            Err(ProtocolError::Disconnected(_)) => {}
             result => return result,
         }
+        Box::pin(rebuild(reconnect_id)).await?;
     }
     Err(ProtocolError::from(lore_base::error::Disconnected))
 }
@@ -2336,7 +2339,7 @@ impl Revision for GRPCRevision {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         // boxed: the classified future is over 16 KB on Windows
         Box::pin(with_reconnect_classified(
             &self.connection,
@@ -2400,11 +2403,21 @@ impl Revision for GRPCRevision {
         .await
     }
 
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
         with_reconnect_classified(
             &self.connection,
             GrpcRpc::RevisionBranchList,
-            || async { self.client.read().await.branch_list().await },
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_list(creator, include_deleted)
+                    .await
+            },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

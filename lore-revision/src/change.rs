@@ -90,6 +90,9 @@ bitflags! {
         // change keeps: the content is written and the bit left as a local modification. Set by
         // the verify, so a reset or a forced sync carries the bit the node names instead.
         const LocalMode = 0b1000000000;
+        // The working file holds the content the change ends at, so realizing the change carries
+        // its executable bit alone. Set by the verify.
+        const HoldsContent = 0b10000000000;
     }
 }
 bitflagsops!(Flags, u16);
@@ -105,6 +108,10 @@ impl Flags {
 
     pub fn is_local_mode(&self) -> bool {
         self.contains(Flags::LocalMode)
+    }
+
+    pub fn holds_content(&self) -> bool {
+        self.contains(Flags::HoldsContent)
     }
 
     pub fn is_merge(&self) -> bool {
@@ -127,8 +134,12 @@ impl Flags {
         self.contains(Flags::ConflictTheirs)
     }
 
+    /// Whether the change is a conflict that is neither resolved nor settled by taking one side.
     pub fn is_conflict_unresolved(&self) -> bool {
-        self.contains(Flags::Conflict) && !self.contains(Flags::ConflictResolved)
+        self.contains(Flags::Conflict)
+            && !self.contains(Flags::ConflictResolved)
+            && !self.contains(Flags::ConflictMine)
+            && !self.contains(Flags::ConflictTheirs)
     }
 }
 
@@ -285,6 +296,14 @@ impl NodeChange {
             && self.from.flags.contains(NodeFlags::File)
     }
 
+    /// Whether the change gives a file another executable bit, where the file keeps its identity.
+    /// A file deleted and added again is another file, which takes its own mode: its bit is no
+    /// change of the bit the first one held.
+    pub fn changes_mode(&self) -> bool {
+        is_one_file(&self.from, &self.to)
+            && crate::util::fs::mode_changed(self.from.mode, self.to.mode)
+    }
+
     /// The side the change resolves to: `from` for a delete, `to` otherwise.
     pub fn resolved_side(&self) -> &NodeChangeState {
         match self.action {
@@ -432,15 +451,66 @@ pub async fn is_conflict(
     Ok(false)
 }
 
+/// Whether the two sides hold one file, a file of the same identity.
+fn is_one_file(lhs: &NodeChangeState, rhs: &NodeChangeState) -> bool {
+    lhs.flags.contains(NodeFlags::File)
+        && rhs.flags.contains(NodeFlags::File)
+        && lhs.address.context == rhs.address.context
+}
+
+/// The executable bit a merge gives the file the source's change `source` and the target's change
+/// `target` both leave: the bit a side changes it to, and the target's where neither does. One bit
+/// from a common base can't be changed two ways, so the sides never conflict on it. `None` where
+/// the two leave no one file, such as where either deletes it or puts another file in its place.
+pub fn merged_mode(source: &NodeChange, target: &NodeChange) -> Option<u16> {
+    is_one_file(&source.to, &target.to).then(|| {
+        if source.changes_mode() {
+            source.to.mode
+        } else {
+            target.to.mode
+        }
+    })
+}
+
 /// The subtree moves between repositories along with a mount replaced between a directory and a
 /// link, so a change the other side of a merge made below it does not stand on its own.
 pub fn is_link_replacement(change: &NodeChange) -> bool {
+    replaced_types(change).is_some_and(|(from_type, to_type)| {
+        from_type == LoreNodeType::Link || to_type == LoreNodeType::Link
+    })
+}
+
+/// The type of node a change puts where a file stood, or a file where a directory stood. `None`
+/// for any other change.
+pub fn file_directory_replacement(change: &NodeChange) -> Option<LoreNodeType> {
+    replaced_types(change)
+        .filter(|types| {
+            matches!(
+                types,
+                (LoreNodeType::File, LoreNodeType::Directory)
+                    | (LoreNodeType::Directory, LoreNodeType::File)
+            )
+        })
+        .map(|(_, to_type)| to_type)
+}
+
+/// Whether the two sides of a conflict put nodes of different types at one path, which no merge
+/// below that path resolves.
+pub fn node_type_clash(source: &NodeChange, target: &NodeChange) -> bool {
+    source.to.mapping.node.is_valid_node_id()
+        && target.to.mapping.node.is_valid_node_id()
+        && source.to.flags.node_type() != target.to.flags.node_type()
+}
+
+/// The types of the node a change replaces and of the node it replaces it with, where the two
+/// differ.
+fn replaced_types(change: &NodeChange) -> Option<(LoreNodeType, LoreNodeType)> {
     if !change.from.mapping.node.is_valid_node_id() || !change.to.mapping.node.is_valid_node_id() {
-        return false;
+        return None;
     }
     let from_type = change.from.flags.node_type();
     let to_type = change.to.flags.node_type();
-    from_type != to_type && (from_type == LoreNodeType::Link || to_type == LoreNodeType::Link)
+    (from_type != to_type).then_some((from_type, to_type))
 }
 
 pub fn sort_by_path(changes: &mut [NodeChange]) {

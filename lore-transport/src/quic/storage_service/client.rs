@@ -88,6 +88,12 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use super::check_query_batch;
+use super::check_query_statuses;
+use super::read_fragment;
+use super::read_hash;
+use super::read_metadata;
+use super::read_resolved;
 use crate::auth::AuthEndpoint;
 use crate::auth::exchange::unsigned_identity_tokens;
 use crate::connection::Connection;
@@ -1011,25 +1017,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -1054,32 +1042,7 @@ impl Storage for StorageClient {
             })
             .await?;
 
-        let prefix = size_of::<Hash>() + size_of::<Fragment>();
-        if payload.len() < prefix {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
-                payload.len()
-            )));
-        }
-
-        let resolved_bytes = payload.split_to(size_of::<Hash>());
-        let resolved = Hash::from(&resolved_bytes[..]);
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get_resolved: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let (resolved, fragment) = read_resolved(&mut payload)?;
         Ok((resolved, fragment, payload))
     }
 
@@ -1093,16 +1056,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Fragment>() {
-            return Err(ProtocolError::internal(format!(
-                "get_metadata: expected {} bytes for Fragment, got {}",
-                size_of::<Fragment>(),
-                payload.len()
-            )));
-        }
-
-        let fragment = unsafe { payload.as_ptr().cast::<Fragment>().read_unaligned() };
-        Ok(fragment)
+        read_metadata(&payload)
     }
 
     async fn get_priority(
@@ -1115,25 +1069,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() < size_of::<Fragment>() {
-            return Err(ProtocolError::internal("get: Invalid server response"));
-        }
-
-        let fragment_bytes = payload.split_to(size_of::<Fragment>());
-        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-
-        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-            return Err(ProtocolError::internal(format!(
-                "get: invalid fragment {fragment:?}: {reason}"
-            )));
-        }
-        if payload.len() != fragment.size_payload as usize {
-            return Err(ProtocolError::internal(format!(
-                "get: Invalid server payload for fragment {fragment:?}, got {} bytes",
-                payload.len()
-            )));
-        }
-
+        let fragment = read_fragment(&mut payload, "get")?;
         Ok((fragment, payload))
     }
 
@@ -1187,13 +1123,8 @@ impl Storage for StorageClient {
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
         let address_count = address.len();
-        if address_count > MAX_BATCH {
-            return Err(ProtocolError::internal(format!(
-                "query: Invalid address batch count: {address_count}"
-            )));
-        }
+        check_query_batch(address_count)?;
 
         // Allocate a copy on the heap to avoid lifetime issues
         let address = Bytes::copy_from_slice(address.as_bytes());
@@ -1202,14 +1133,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != address_count {
-            return Err(ProtocolError::internal(format!(
-                "query: Server returned query payload of wrong size, expected {} got {}",
-                address_count,
-                payload.len()
-            )));
-        }
-
+        check_query_statuses(&payload, address_count)?;
         Ok(payload)
     }
 
@@ -1271,15 +1195,7 @@ impl Storage for StorageClient {
         })
         .await?;
 
-        if payload.len() != size_of::<Hash>() {
-            return Err(ProtocolError::internal(format!(
-                "mutable_load: Invalid server response, expected {} bytes got {}",
-                size_of::<Hash>(),
-                payload.len()
-            )));
-        }
-
-        Ok(Hash::from(&payload[..]))
+        read_hash(&payload, "mutable_load")
     }
 
     async fn mutable_store(

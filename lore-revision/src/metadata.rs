@@ -13,9 +13,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use futures::FutureExt;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_error_set::prelude::*;
 use lore_storage::ContentSource;
+use lore_storage::ReadOptions;
 use zerocopy::IntoBytes;
 
 use crate::errors::*;
@@ -28,7 +30,9 @@ use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::node::NodeID;
 use crate::repository::RepositoryContext;
+use crate::state::State;
 use crate::util::path::RelativePath;
 use crate::util::path::is_path_inside_repository;
 use crate::util::path::make_absolute;
@@ -216,6 +220,43 @@ where
     let outside =
         make_absolute(&user_path).forward_any::<E>("Failed to resolve the binary metadata path")?;
     store(ContentSource::owned_file(outside)).await
+}
+
+/// The node the user path `path` names in `state`, refused where `path` is inside a link: a node
+/// reached through a link is numbered in the linked tree, so `state` holds another file's metadata
+/// under it.
+pub(crate) async fn file_node_outside_links(
+    state: &State,
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+) -> Result<NodeID, MetadataErrors> {
+    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
+        .forward_any::<MetadataErrors>("resolving user path")?;
+    let node_link = state
+        .find_node_link(repository.clone(), relative_path.as_str())
+        .await
+        .map_matched_err("finding node", |m| match m {
+            MatchedStateErrors::NodeNotFound(traced) => MetadataErrors::FileNotFound(
+                FileNotFound {
+                    resource: path.to_string(),
+                }
+                .chain_err(traced, "the revision does not hold the path"),
+            ),
+            other => other.forward::<MetadataErrors>("finding node"),
+        })?;
+    if !node_link.is_valid() {
+        return Err(FileNotFound {
+            resource: path.to_string(),
+        }
+        .into());
+    }
+    if node_link.crosses_link(repository, state) {
+        return Err(NotSupported {
+            operation: format!("file metadata on `{relative_path}`, which is inside a link"),
+        }
+        .into());
+    }
+    Ok(node_link.node)
 }
 
 /// Which of a source revision's keys a merge or cherry-pick carries onto the
@@ -418,35 +459,52 @@ impl Metadata {
         Self { buffer }
     }
 
-    /// Read a stored metadata blob.
+    /// Read a stored metadata blob as [`Self::deserialize_with`] does, with the read options of
+    /// `repository` and the cache on.
+    ///
+    /// Returns the future of [`Self::deserialize_with`], without a future of its own.
+    #[inline]
+    pub fn deserialize(
+        repository: Arc<RepositoryContext>,
+        hash: Hash,
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
+        let options = immutable::read_options_from_repository(&repository).with_cache();
+        Self::deserialize_with(repository, hash, options)
+    }
+
+    /// Read a stored metadata blob with `options`, refusing one larger than
+    /// [`METADATA_MAX_SIZE`].
     ///
     /// This is the only way bytes this process did not write become a
     /// [`Metadata`], so it is the one place the entry chain has to be checked —
     /// a buffer built by [`Self::set`] is correct by construction and pays
     /// nothing. The check is one pass of integer arithmetic over the entries,
     /// against a fetch that dominates it.
-    pub async fn deserialize(
+    ///
+    /// Returns the read's future, built at the call, with the check mapped onto its output, so it
+    /// holds nothing beside the read.
+    #[inline]
+    pub fn deserialize_with(
         repository: Arc<RepositoryContext>,
         hash: Hash,
-    ) -> Result<Self, MetadataError> {
+        options: ReadOptions,
+    ) -> impl Future<Output = Result<Self, MetadataError>> {
         let address = Address {
             hash,
             context: Context::default(),
         };
-        let options = immutable::read_options_from_repository(&repository)
-            .with_cache()
-            .with_max_content_size(METADATA_MAX_SIZE as u64);
-        let buffer = immutable::read(
-            repository, address, None, /* No range, read all */
-            options,
+        immutable::read(
+            repository,
+            address,
+            None, /* No range, read all */
+            options.with_max_content_size(METADATA_MAX_SIZE as u64),
         )
-        .await
-        .forward::<MetadataError>("reading metadata")?;
-
-        let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
-        metadata.check_buffer()?;
-
-        Ok(metadata)
+        .map(|read| -> Result<Self, MetadataError> {
+            let buffer = read.forward::<MetadataError>("reading metadata")?;
+            let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
+            metadata.check_buffer()?;
+            Ok(metadata)
+        })
     }
 
     pub async fn serialize(

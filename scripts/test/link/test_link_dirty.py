@@ -14,6 +14,10 @@ from link_helpers import (
 )
 from test_utils import status_by_path
 
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
+
 
 @pytest.mark.smoke
 def test_link_dirty_inside_a_link_mounted_from_a_subfolder(new_lore_repo):
@@ -41,6 +45,8 @@ def test_link_dirty_inside_a_link_mounted_from_a_subfolder(new_lore_repo):
         parent_repo.dirty_move(modified, added)
     with pytest.raises(NotSupportedError):
         parent_repo.dirty_copy(DEFAULT_PARENT_FILE, added)
+    with pytest.raises(NotSupportedError):
+        parent_repo.dirty_copy(DEFAULT_PARENT_FILE, in_new_dir)
 
     parent_repo.write_files(
         {modified: "edited through the mount\n"}
@@ -219,3 +225,37 @@ def test_link_check_dirty_persists_verified_markers_inside_a_link(new_lore_repo)
         "Expected the link pin restored to the committed revision once no marker remains"
     )
     assert status_by_path(parent_repo) == {}
+
+
+@pytest.mark.smoke
+def test_link_switch_drops_the_dirty_marker_of_a_linked_file_it_restores(
+    new_lore_repo,
+):
+    """A switch to a branch pinning the link elsewhere restores a linked file
+    marked as deleted, and leaves no marker on it."""
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_files={"a.txt": "a\n"}
+    )
+    linked_file = f"{DEFAULT_LINK_MOUNT}/a.txt"
+    parent_repo.branch_create("feature")
+    link_repo.write_commit_push("v2", {"a.txt": "a2\n"})
+    parent_repo.link_update(
+        DEFAULT_LINK_MOUNT, pin=link_repo.branch_info().local_latest
+    )
+    parent_repo.commit("Pin v2")
+    parent_repo.push()
+    parent_repo.branch_switch("main")
+
+    parent_repo.remove_file(linked_file)
+    parent_repo.dirty(linked_file)
+    assert status_by_path(parent_repo).keys() == {linked_file}, (
+        "setup: the deleted linked file must be marked"
+    )
+
+    parent_repo.branch_switch("feature")
+
+    with parent_repo.open_file(linked_file, "r") as input_file:
+        assert input_file.read() == "a2\n", "the switch must restore the linked file"
+    assert status_by_path(parent_repo) == {}, (
+        "the restored linked file must stay unmarked"
+    )

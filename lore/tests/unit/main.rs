@@ -57,6 +57,9 @@ fn sandbox_machine_settings() {
         if !relaying_chosen_by_parent {
             std::env::set_var("LORE_USE_SERVICE", "0");
         }
+        // No executable to start a service from, so a call only the service may carry out fails
+        // here rather than starting one from a build a developer named for their own use.
+        std::env::remove_var("LORE_SERVICE_EXECUTABLE");
         std::env::set_var("LORE_GLOBAL_PATH", &sandbox);
         std::env::set_var("LORE_AUTH_PATH", &sandbox);
         std::env::set_var(

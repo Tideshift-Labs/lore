@@ -91,7 +91,9 @@ const AUTH_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) async fn connect_channel(
     auth_url: &str,
 ) -> Result<tonic::transport::Channel, ProtocolError> {
-    let endpoint = grpc_endpoint(auth_url);
+    // A process routed through a local socket dials it in plain text (`channel_uri` rewrites
+    // https:// to http://), so the TLS config below applies to network endpoints only.
+    let endpoint = crate::uds::channel_uri(grpc_endpoint(auth_url));
     let mut endpoint_config = tonic::transport::Endpoint::new(endpoint.clone())
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
         .connect_timeout(AUTH_CONNECT_TIMEOUT)
@@ -109,7 +111,7 @@ pub(super) async fn connect_channel(
     }
     // Connect from a net-runtime task so the channel's driver tasks are
     // bound to the net runtime.
-    lore_base::lore_spawn_net!(async move { endpoint_config.connect().await })
+    lore_base::lore_spawn_net!(crate::uds::connect_channel(endpoint_config))
         .await
         .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))

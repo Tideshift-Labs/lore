@@ -4,7 +4,9 @@ import os
 import re
 
 import pytest
+from error_types import NotSupportedError
 from link_helpers import (
+    DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
     assert_crr_clean,
     assert_mount_exposes,
@@ -13,9 +15,18 @@ from link_helpers import (
     remount,
 )
 from lore_parsers import parse_status_json
-from test_utils import unstaged_entries, working_tree_files
+from test_utils import (
+    has_staged_anchor,
+    status_by_path,
+    unstaged_entries,
+    working_tree_files,
+)
 
 from lore import Lore
+
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
 
 
 @pytest.mark.smoke
@@ -404,6 +415,65 @@ def test_link_staging(new_lore_repo):
     # Verify synchronized state matches all operations
     assert sync_test_repo.compare_file(repo, expected_file_path), (
         "Sync: File staged from within link should match"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_an_added_link_keeps_a_dirty_sibling_dirty(new_lore_repo):
+    """Unstaging an added link beside a dirtied file keeps the file dirty: the directories above
+    the link keep their dirty flag while the file below them holds one, so neither the flag nor
+    the staged state holding it is dropped."""
+    kept = "vendor/kept.txt"
+    link_path = "vendor/lib"
+    parent_repo = make_repo(
+        new_lore_repo, {kept: "kept\n", DEFAULT_PARENT_FILE: "baseline\n"}, "Baseline"
+    )
+    link_repo = make_repo(
+        new_lore_repo, {"linked.txt": "linked content\n"}, "Initial linked content"
+    )
+    parent_repo.write_files({kept: "edited\n"})
+    parent_repo.dirty([kept])
+    parent_repo.link_add(link_path, link_repo.get_id(), "/")
+
+    parent_repo.unstage(link_path)
+
+    entries = status_by_path(parent_repo)
+    assert entries.get(kept, {}).get("flagDirty") is True, (
+        f"Expected {kept} to stay dirty after the link's unstage, got: {entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_an_added_link_dirtied_through_its_mount_leaves_nothing(
+    new_lore_repo,
+):
+    """Unstaging an added link that an edit through its mount dirtied takes the link's dirty
+    flag with its staged ones: no directory above it stays dirty, so no staged state is left.
+
+    Unstaging an added link deletes the link's files from the mount, and refuses to delete one
+    that differs from the linked revision unless forced. `linked.txt` holds the edit, so the
+    unstage is forced to delete it with its local change."""
+    link_path = "vendor/lib"
+    parent_repo = make_repo(
+        new_lore_repo,
+        {"vendor/kept.txt": "kept\n", DEFAULT_PARENT_FILE: "baseline\n"},
+        "Baseline",
+    )
+    link_repo = make_repo(
+        new_lore_repo, {"linked.txt": "linked content\n"}, "Initial linked content"
+    )
+    parent_repo.link_add(link_path, link_repo.get_id(), "/")
+    linked_file = f"{link_path}/linked.txt"
+    parent_repo.write_files({linked_file: "edited through the mount\n"})
+    parent_repo.dirty([linked_file])
+
+    # Forced: the unstage deletes the link's files, and `linked.txt` holds a local change.
+    parent_repo.unstage(link_path, force=True)
+
+    entries = status_by_path(parent_repo)
+    assert entries == {}, f"Expected nothing staged or dirty, got: {entries}"
+    assert not has_staged_anchor(parent_repo), (
+        "Expected the unstage to leave no staged state"
     )
 
 
@@ -881,3 +951,55 @@ def test_link_stage_a_file_written_over_the_mount_replaces_the_link(new_lore_rep
     with clone.open_file("shared") as f:
         assert f.read() == "file\n", "shared must hold the replacement file"
     assert "No links found" in clone.link_list()
+
+
+_MOVED_FILE = "docs/a.txt"
+_LINKED_FILE = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+
+
+def _make_parent_with_link_and_moved_file(new_lore_repo) -> Lore:
+    parent, _ = make_parent_with_link(
+        new_lore_repo,
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n", _MOVED_FILE: "moved\n"},
+    )
+    return parent
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("from_path", "to_path"),
+    [
+        pytest.param(_MOVED_FILE, f"{DEFAULT_LINK_MOUNT}/a.txt", id="into"),
+        pytest.param(_MOVED_FILE, _LINKED_FILE, id="onto"),
+        pytest.param(_LINKED_FILE, "docs/linked.txt", id="out-of"),
+        pytest.param(_LINKED_FILE, f"{DEFAULT_LINK_MOUNT}/renamed.txt", id="within"),
+        pytest.param(DEFAULT_LINK_MOUNT, "vendor/moved", id="mount"),
+    ],
+)
+def test_link_stage_move_across_a_link_is_not_supported(
+    new_lore_repo, from_path, to_path
+):
+    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    parent.make_dirs(os.path.dirname(to_path))
+    parent.move(from_path, to_path)
+    before = status_by_path(parent)
+
+    with pytest.raises(NotSupportedError):
+        parent.stage_move(from_path, to_path)
+
+    assert status_by_path(parent) == before
+
+
+@pytest.mark.smoke
+def test_link_stage_move_outside_links(new_lore_repo):
+    parent = _make_parent_with_link_and_moved_file(new_lore_repo)
+    to_path = "vendor/a.txt"
+    parent.move(_MOVED_FILE, to_path)
+
+    parent.stage_move(_MOVED_FILE, to_path)
+
+    staged = {
+        path: (entry.get("action"), entry.get("fromPath"), entry.get("flagStaged"))
+        for path, entry in status_by_path(parent).items()
+    }
+    assert staged == {to_path: ("move", _MOVED_FILE, True)}

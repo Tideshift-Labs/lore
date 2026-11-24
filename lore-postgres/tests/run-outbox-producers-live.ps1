@@ -72,6 +72,7 @@ $cases = @(
     'branch_push_tip_advance_commits_exactly_one_row_with_branch_generation_and_revision_identity',
     'committed_row_idempotency_key_matches_the_pin_1_preimage',
     'metadata_cas_mismatch_leaves_no_row',
+    'zero_value_projection_deletes_the_row',
     'metadata_cas_success_commits_exactly_one_row_with_the_new_generation',
     'repository_create_exact_fingerprint_retry_leaves_no_second_row',
     'repository_create_name_taken_rejection_leaves_no_row_even_with_event_supplied',

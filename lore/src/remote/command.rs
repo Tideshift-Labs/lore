@@ -172,6 +172,7 @@ pub enum LoreCommand {
     FileAudit(crate::file::LoreFileAuditArgs),
     RepositoryInstanceDelete(crate::repository::LoreRepositoryInstanceDeleteArgs),
     RepositoryInstanceMove(crate::repository::LoreRepositoryInstanceMoveArgs),
+    RepositoryInstanceClone(crate::repository::LoreRepositoryInstanceCloneArgs),
     // FORK-LOCAL: appended after upstream's variants to preserve upstream bitcode discriminants.
     ManagedBranchPush(crate::branch::LoreManagedBranchPushArgs),
 }

@@ -1,13 +1,22 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Moved from `src/notification.rs` when the crate's lib test harness was turned off.
+//! The notification router (moved from `src/notification.rs` when the crate's lib test harness
+//! was turned off), and subscribing to a repository's notifications.
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 
+use lore_base::error::Disconnected;
+use lore_base::error::NotAuthorized;
 use lore_revision::lore::RepositoryId;
 use lore_revision::notification::*;
+use lore_revision::repository::RemoteState;
+use lore_revision::test_util::context_with_state;
+use lore_transport::ProtocolError;
+
+use crate::immutable::session_tests::under_execution_context;
 
 /// Installs `router` as the process-wide notification router for the life of
 /// this guard: serialized against every other guard of this type (the same
@@ -175,4 +184,31 @@ fn on_stream_close_delivers_the_full_close_shape_to_the_installed_router() {
     assert_eq!(recorded[0].1.status_code, close.status_code);
     assert_eq!(recorded[0].1.message, close.message);
     assert_eq!(recorded[0].1.trailers, close.trailers);
+}
+
+/// A subscription whose connect the remote refuses fails with the refusal, and one whose connect
+/// fails for any other reason fails as an internal error.
+#[tokio::test]
+async fn a_subscription_whose_connect_is_refused_fails_with_the_refusal() {
+    type Failed = fn(&NotificationError) -> bool;
+    let cases: [(ProtocolError, Failed); 2] = [
+        (
+            ProtocolError::from(NotAuthorized),
+            NotificationError::is_not_authorized,
+        ),
+        (
+            ProtocolError::from(Disconnected),
+            NotificationError::is_internal,
+        ),
+    ];
+    for (connect, failed) in cases {
+        let repository = context_with_state(RemoteState::Failed(connect.clone())).await;
+
+        let subscribed = under_execution_context(|| subscribe(repository)).await;
+
+        assert!(
+            subscribed.as_ref().is_err_and(failed),
+            "a connect failing with {connect:?}: got {subscribed:?}"
+        );
+    }
 }

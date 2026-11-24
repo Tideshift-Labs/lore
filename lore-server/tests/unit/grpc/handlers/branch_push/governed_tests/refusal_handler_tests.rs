@@ -77,7 +77,7 @@ impl MutableStore for OverloadedMutable {
     async fn list(self: Arc<Self>, _: Partition, _: KeyType) -> Result<KeyValueStream, StoreError> {
         panic!("unused list")
     }
-    async fn flush(self: Arc<Self>, _: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _: lore_storage::FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 }

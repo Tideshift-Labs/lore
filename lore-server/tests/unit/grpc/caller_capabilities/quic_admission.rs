@@ -332,7 +332,10 @@ impl ImmutableStore for CountingImmutableStore {
         self.inner.max_query_batch()
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         self.hit();
         self.inner.clone().flush(sync_data).await
     }
@@ -430,7 +433,10 @@ impl MutableStore for CountingMutableStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.inner.clone().flush(sync_data).await
     }
@@ -503,6 +509,7 @@ fn verifier_present() -> Arc<TokenVerification> {
         jwt_issuer: None,
         jwt_audience: None,
         jwt_typ: None,
+        exchange_issuer: None,
     }))
 }
 
@@ -544,6 +551,7 @@ fn service(
                 stores.mutable.clone(),
                 auth,
                 Arc::new(UserAgentFilter::default()),
+                lore_server::protocol::storage::session::SessionMap::default(),
             )
             .with_caller_capability_policy(policy);
             let (session_id, _) = service
@@ -556,6 +564,7 @@ fn service(
                     None,
                     None,
                     false,
+                    Vec::new(),
                 )
                 .expect("seed session");
             Service::V4(service, session_id)
@@ -832,6 +841,7 @@ async fn services_built_without_a_policy_stay_compatible() {
         stores.mutable.clone(),
         false,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     );
     let (session_id, _) = v4
         .session_map
@@ -843,6 +853,7 @@ async fn services_built_without_a_policy_stay_compatible() {
             None,
             None,
             false,
+            Vec::new(),
         )
         .expect("seed session");
     v4.run_request_handler(
@@ -921,6 +932,7 @@ fn declared_v4_service(
         stores.mutable.clone(),
         auth,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     )
     .with_caller_capability_policy(policy);
     let permissions = if write {
@@ -938,6 +950,7 @@ fn declared_v4_service(
             None,
             None,
             declared,
+            Vec::new(),
         )
         .expect("seed session");
     Service::V4(service, session_id)
@@ -1083,6 +1096,7 @@ async fn the_authorize_start_declaration_decides_the_sessions_writes() {
         stores.mutable.clone(),
         false,
         Arc::new(UserAgentFilter::default()),
+        lore_server::protocol::storage::session::SessionMap::default(),
     )
     .with_caller_capability_policy(STRICT);
 

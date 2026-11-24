@@ -1088,7 +1088,7 @@ mod hang {
                         assert!(outcome.is_ok(), "the commit succeeds locally: {outcome:?}");
                         // What the public entry does when a command ends: persist the state.
                         context
-                            .flush(true)
+                            .flush(lore_storage::FlushOptions::SYNC_DATA)
                             .await
                             .expect("flushing the repository state");
                         (

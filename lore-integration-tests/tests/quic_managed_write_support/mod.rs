@@ -302,6 +302,7 @@ impl ProbeFactory {
                     mutable.clone(),
                     false,
                     Arc::new(UserAgentFilter::default()),
+                    lore_server::protocol::storage::session::SessionMap::default(),
                 );
                 let inner = if probe.lenient {
                     inner

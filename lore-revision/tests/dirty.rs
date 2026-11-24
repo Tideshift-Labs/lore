@@ -19,10 +19,13 @@ mod tests {
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::Node;
     use lore_revision::node::NodeBlock;
+    use lore_revision::node::NodeExtFlags;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
+    use lore_revision::state::Ext;
+    use lore_revision::state::Mark;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use zerocopy::FromBytes;
@@ -93,14 +96,17 @@ mod tests {
 
                 // Mark the file as dirty
                 state_current
-                    .node_mark_dirty(
-                        repository.clone(),
+                    .node_mark(
+                        &repository,
                         file_link.node,
-                        NodeFlags::DirtyModify,
-                        true,
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
                     )
                     .await
-                    .expect("node_mark_dirty failed");
+                    .expect("node_mark failed");
 
                 // Verify the file node is dirty
                 let file_node = state_current
@@ -217,14 +223,17 @@ mod tests {
                     .await
                     .expect("Find a.txt failed");
                 state
-                    .node_mark_dirty(
-                        repository.clone(),
+                    .node_mark(
+                        &repository,
                         link_a.node,
-                        NodeFlags::DirtyModify,
-                        true,
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
                     )
                     .await
-                    .expect("mark_dirty a failed");
+                    .expect("node_mark a failed");
 
                 // Mark file b as dirty — parent is already dirty, so early-out should fire
                 let link_b = state
@@ -232,14 +241,17 @@ mod tests {
                     .await
                     .expect("Find b.txt failed");
                 state
-                    .node_mark_dirty(
-                        repository.clone(),
+                    .node_mark(
+                        &repository,
                         link_b.node,
-                        NodeFlags::DirtyModify,
-                        false, // mark_dirty=false to allow early-out
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            false,
+                        ),
                     )
                     .await
-                    .expect("mark_dirty b failed");
+                    .expect("node_mark b failed");
 
                 // Both should be dirty
                 let node_a = state
@@ -421,14 +433,17 @@ mod tests {
 
                 // Now mark it dirty (orthogonal — should coexist)
                 state_staged
-                    .node_mark_dirty(
-                        repository.clone(),
+                    .node_mark(
+                        &repository,
                         file_link.node,
-                        NodeFlags::DirtyModify,
-                        true,
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
                     )
                     .await
-                    .expect("mark_dirty failed");
+                    .expect("node_mark failed");
 
                 let node = state_staged
                     .node(repository.clone(), file_link.node)
@@ -508,9 +523,17 @@ mod tests {
 
                 // Mark as DirtyModify first
                 state
-                    .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
+                    .node_mark(
+                        &repository,
+                        link.node,
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
+                    )
                     .await
-                    .expect("mark_dirty modify failed");
+                    .expect("node_mark modify failed");
 
                 let node = state
                     .node(repository.clone(), link.node)
@@ -521,9 +544,17 @@ mod tests {
 
                 // Now re-mark as DirtyDelete — action should replace
                 state
-                    .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyDelete, true)
+                    .node_mark(
+                        &repository,
+                        link.node,
+                        Mark::dirty(
+                            NodeFlags::DirtyDelete,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
+                    )
                     .await
-                    .expect("mark_dirty delete failed");
+                    .expect("node_mark delete failed");
 
                 let node = state
                     .node(repository.clone(), link.node)
@@ -598,9 +629,17 @@ mod tests {
                     .await
                     .expect("Find file failed");
                 state_current
-                    .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
+                    .node_mark(
+                        &repository,
+                        link.node,
+                        Mark::dirty(
+                            NodeFlags::DirtyModify,
+                            Ext::Set(NodeExtFlags::NoFlags),
+                            true,
+                        ),
+                    )
                     .await
-                    .expect("mark_dirty failed");
+                    .expect("node_mark failed");
 
                 // Diff current (clean) vs current-with-dirty-flag
                 // The dirty node has same content but the Dirty flag — diff should report it
@@ -1032,7 +1071,7 @@ mod tests {
                     .await
                     .expect("the block must read back");
                 {
-                    let mut writer = block.write();
+                    let mut writer = block.write_for_tests();
                     let node = writer.node(Node::index(planted));
                     let (offset, length) = (node.name_offset, node.name_length);
                     node.name_hash = hash_string(".URC");
@@ -1044,7 +1083,7 @@ mod tests {
                     node.name_length = length;
                     writer.mark_dirty();
                 }
-                state.block_modified(block, block_index);
+                state.block_modified_for_tests(block, block_index);
                 state.set_parent_self(state.revision());
                 state.set_revision_number(0);
                 let token = repository
@@ -1481,7 +1520,8 @@ mod tests {
 
     /// A committed file keeps its node however staging has since changed it, so removing it and
     /// staging again stages its delete rather than dropping it: once respelled, once deleted and
-    /// added back, and once moved into a directory staging added and removed along with it.
+    /// added back, and once moved two levels into a directory staging added and removed along with
+    /// it.
     #[tokio::test]
     async fn staging_a_removed_committed_file_stages_its_delete_whatever_staging_did_to_it() {
         let mut failures = Vec::new();
@@ -1540,23 +1580,26 @@ mod tests {
                             "Item.txt"
                         }
                         _ => {
-                            std::fs::create_dir(path.join("new")).expect("Create dir failed");
+                            // Two levels down, so the check that the new directory drops
+                            // cleanly descends past its first.
+                            std::fs::create_dir_all(path.join("new/sub"))
+                                .expect("Create dir failed");
                             test_file_write(&path.join("new/keep.txt"), b"new");
                             stage_target(&fixture, "new", false).await;
-                            std::fs::rename(path.join("Item.txt"), path.join("new/Item.txt"))
+                            std::fs::rename(path.join("Item.txt"), path.join("new/sub/Item.txt"))
                                 .expect("Move failed");
                             file::stage::stage_move(
                                 repository.clone(),
                                 &fixture.write_token,
                                 path.join("Item.txt").to_string_lossy().into_owned(),
-                                path.join("new/Item.txt").to_string_lossy().into_owned(),
+                                path.join("new/sub/Item.txt").to_string_lossy().into_owned(),
                                 StageOptions::default(),
                             )
                             .await
                             .expect("Stage of the move failed");
                             std::fs::remove_dir_all(path.join("new")).expect("Delete failed");
                             stage_target(&fixture, "", false).await;
-                            "new/Item.txt"
+                            "new/sub/Item.txt"
                         }
                     };
 
@@ -1564,7 +1607,9 @@ mod tests {
                         State::deserialize_current_and_staged(repository.clone())
                             .await
                             .expect("Deserialize failed");
-                    let state_staged = state_staged.expect("Should have staged state");
+                    let Some(state_staged) = state_staged else {
+                        return Some(format!("{case}: nothing is staged"));
+                    };
                     let Ok(link) = state_staged
                         .find_node_link(repository.clone(), staged_path)
                         .await
@@ -1590,11 +1635,11 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Removes `path` below the fixture, a file or a whole directory.
+    /// Removes `path` below `root`, a file or a whole directory.
     // Test fixture writes; not subject to repository write-token discipline.
     #[allow(clippy::disallowed_methods)]
-    fn remove_path(fixture: &TestRepository, path: &str) {
-        let path = fixture.path.join(path);
+    fn remove_path(root: &std::path::Path, path: &str) {
+        let path = root.join(path);
         if path.is_dir() {
             std::fs::remove_dir_all(path).expect("Delete failed");
         } else {
@@ -1679,7 +1724,7 @@ mod tests {
 
                     write_path(&fixture, added, b"temporary");
                     stage_target(&fixture, added, false).await;
-                    remove_path(&fixture, removed);
+                    remove_path(&fixture.path, removed);
                     stage_target(&fixture, target, scan).await;
                     staged_marks_left(&fixture, case).await
                 }))
@@ -1708,7 +1753,7 @@ mod tests {
 
                 write_path(&fixture, "dir/temp", b"temporary");
                 stage_target(&fixture, "dir/temp", false).await;
-                remove_path(&fixture, "dir/temp");
+                remove_path(&fixture.path, "dir/temp");
                 dirty_paths(&fixture, &["dir/temp"]).await;
                 staged_marks_left(&fixture, "marked dirty").await
             }))
@@ -1750,7 +1795,7 @@ mod tests {
                     }
                     write_path(&fixture, added, b"temporary");
                     stage_target(&fixture, added, false).await;
-                    remove_path(&fixture, added);
+                    remove_path(&fixture.path, added);
                     stage_target(&fixture, "", false).await;
 
                     let (_, state_staged, _) =
@@ -1810,7 +1855,7 @@ mod tests {
                     .expect("Committed tree")
                     .hash_node;
 
-                remove_path(&fixture, "item.txt");
+                remove_path(&fixture.path, "item.txt");
                 dirty_paths(&fixture, &["item.txt"]).await;
 
                 let block_hashes = immutable::read(
@@ -1872,7 +1917,7 @@ mod tests {
                 write_path(&fixture, "Assets/a.txt", b"kept");
                 write_path(&fixture, "Assets/b.txt", b"removed");
                 stage_target(&fixture, "Assets", false).await;
-                remove_path(&fixture, "Assets/b.txt");
+                remove_path(&fixture.path, "Assets/b.txt");
                 stage_target(&fixture, "assets/b.txt", false).await;
 
                 let (_, state_staged, _) =
@@ -1920,7 +1965,7 @@ mod tests {
                 write_path(&fixture, "dir/a.txt", b"modified");
                 write_path(&fixture, "dir/phantom.txt", b"temporary");
                 dirty_paths(&fixture, &["dir/a.txt", "dir/phantom.txt"]).await;
-                remove_path(&fixture, "dir/phantom.txt");
+                remove_path(&fixture.path, "dir/phantom.txt");
 
                 file::stage::stage(
                     repository.clone(),
@@ -1990,7 +2035,7 @@ mod tests {
                 )
                 .await
                 .expect("Stage of the move failed");
-                remove_path(&fixture, "new");
+                remove_path(&fixture.path, "new");
                 stage_target(&fixture, "new/keep.txt", false).await;
 
                 let (_, state_staged, _) =
@@ -2124,6 +2169,11 @@ mod tests {
                     .await
                     .expect("Get dest node");
                 assert!(dest_node.is_dirty(), "dest dir should be dirty");
+                assert!(
+                    !dest_node.is_dirty_move() && !dest_node.is_staged(),
+                    "dest dir takes the base Dirty bit alone, flags {:#x}",
+                    dest_node.flags
+                );
             }))
             .await
             .expect("Test task failed");
@@ -2686,6 +2736,123 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// An unstage of a file whose content went back to the committed one clears the directories
+    /// above it only where nothing below keeps them dirty: a dirty sibling keeps the directory
+    /// dirty, and the anchor.
+    #[tokio::test]
+    async fn unstage_of_a_reverted_file_keeps_its_parent_dirty_for_a_sibling() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+                let stage_options = |scan| StageOptions {
+                    case_change: stage::StageCaseChange::Error,
+                    node_flags: NodeFlags::NoFlags,
+                    file_id: None,
+                    no_children: false,
+                    scan,
+                };
+
+                let subdir = path.join("src");
+                std::fs::create_dir_all(&subdir).expect("Create subdir failed");
+                std::fs::write(subdir.join("file.txt"), b"original").expect("Write failed");
+                std::fs::write(subdir.join("other.txt"), b"other").expect("Write failed");
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    stage_options(true),
+                )
+                .await
+                .expect("Stage failed");
+                commit::commit_boxed(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new("Initial".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+
+                // Both edited and marked dirty, file.txt alone staged, then reverted on disk.
+                std::fs::write(subdir.join("file.txt"), b"modified").expect("Write failed");
+                std::fs::write(subdir.join("other.txt"), b"other modified").expect("Write failed");
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![
+                        LoreString::from(subdir.join("file.txt").to_string_lossy().as_ref()),
+                        LoreString::from(subdir.join("other.txt").to_string_lossy().as_ref()),
+                    ]),
+                )
+                .await
+                .expect("Dirty failed");
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        subdir.join("file.txt").to_string_lossy().as_ref(),
+                    )]),
+                    stage_options(false),
+                )
+                .await
+                .expect("Stage failed");
+                std::fs::write(subdir.join("file.txt"), b"original").expect("Write failed");
+
+                file::unstage::unstage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        subdir.join("file.txt").to_string_lossy().as_ref(),
+                    )]),
+                    file::unstage::UnstageOptions::default(),
+                )
+                .await
+                .expect("Unstage failed");
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged =
+                    state_staged.expect("Anchor should exist (other.txt still dirty)");
+                let link_file = state_staged
+                    .find_node_link(repository.clone(), "src/file.txt")
+                    .await
+                    .expect("Find file.txt");
+                let node_file = state_staged
+                    .node(repository.clone(), link_file.node)
+                    .await
+                    .expect("Get file.txt");
+                assert!(
+                    !node_file.is_dirty() && !node_file.is_staged(),
+                    "the reverted file ends clean"
+                );
+                let link_other = state_staged
+                    .find_node_link(repository.clone(), "src/other.txt")
+                    .await
+                    .expect("Find other.txt");
+                let node_other = state_staged
+                    .node(repository.clone(), link_other.node)
+                    .await
+                    .expect("Get other.txt");
+                assert!(node_other.is_dirty_modify(), "other.txt stays dirty");
+                let parent = state_staged
+                    .node(repository.clone(), node_other.parent)
+                    .await
+                    .expect("Get parent");
+                assert!(parent.is_dirty(), "src stays dirty for other.txt");
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test]
     async fn reset_dirty_only_clears_dirty_with_parent_cleanup() {
         let (immutable_store, mutable_store, execution) =
@@ -2943,6 +3110,114 @@ mod tests {
                 assert!(
                     state_staged.is_none(),
                     "Anchor should be deleted after all dirty cleared"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of a dirty add discards its node and clears the directory it left only where
+    /// nothing below keeps it dirty: a dirty sibling keeps the directory dirty, and the anchor.
+    #[tokio::test]
+    async fn reset_of_a_dirty_add_keeps_its_parent_dirty_for_a_sibling() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+
+                let subdir = path.join("src");
+                std::fs::create_dir_all(&subdir).expect("Create subdir failed");
+                std::fs::write(subdir.join("a.txt"), b"aaa").expect("Write failed");
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage failed");
+                commit::commit_boxed(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new("Initial".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+
+                // A modify and an add in one directory, both marked dirty.
+                std::fs::write(subdir.join("a.txt"), b"aaa modified longer").expect("Write failed");
+                std::fs::write(subdir.join("new.txt"), b"new").expect("Write failed");
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![
+                        LoreString::from(subdir.join("a.txt").to_string_lossy().as_ref()),
+                        LoreString::from(subdir.join("new.txt").to_string_lossy().as_ref()),
+                    ]),
+                )
+                .await
+                .expect("Dirty failed");
+
+                file::reset::reset(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        subdir.join("new.txt").to_string_lossy().as_ref(),
+                    )]),
+                    LoreString::default(),
+                    file::reset::ResetOptions {
+                        purge: false,
+                        single_node: false,
+                    },
+                )
+                .await
+                .expect("Reset new.txt failed");
+
+                assert!(
+                    subdir.join("new.txt").exists(),
+                    "the reset of a dirty add keeps the file"
+                );
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Anchor should exist (a.txt still dirty)");
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "src/new.txt")
+                        .await
+                        .is_err_and(|error| error.is_node_not_found()),
+                    "the dirty add's node is discarded"
+                );
+                let link_a = state_staged
+                    .find_node_link(repository.clone(), "src/a.txt")
+                    .await
+                    .expect("Find a.txt");
+                let node_a = state_staged
+                    .node(repository.clone(), link_a.node)
+                    .await
+                    .expect("Get a");
+                assert!(node_a.is_dirty_modify(), "a.txt should still be dirty");
+                let parent = state_staged
+                    .node(repository.clone(), node_a.parent)
+                    .await
+                    .expect("Get parent");
+                assert!(
+                    parent.is_dirty(),
+                    "the directory the add left stays dirty for a.txt"
                 );
             }))
             .await
@@ -3459,6 +3734,35 @@ mod tests {
                     node.is_dirty_modify(),
                     "carried.txt should be dirty in the rebased state"
                 );
+
+                // Same size, so only the content tells it apart
+                std::fs::write(path.join("carried.txt"), b"ORIGINAL").expect("Write failed");
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    staged_revision,
+                    current_revision,
+                    false,
+                )
+                .await
+                .expect("Rebase failed");
+                assert!(
+                    rebased_revision.is_some(),
+                    "A file differing in content alone should stay dirty"
+                );
+
+                std::fs::write(path.join("carried.txt"), b"original").expect("Write failed");
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    staged_revision,
+                    current_revision,
+                    false,
+                )
+                .await
+                .expect("Rebase failed");
+                assert_eq!(
+                    rebased_revision, None,
+                    "A file holding the current content should leave nothing to stage"
+                );
             }))
             .await
             .expect("Test task failed");
@@ -3754,88 +4058,6 @@ mod tests {
         .await;
     }
 
-    /// Mounts at `mount` in `repository`'s staged tree a link to a repository whose tree holds the
-    /// file `src/Intermediate`, the link added there and not committed.
-    async fn mount_intermediate(
-        repository: &Arc<lore_revision::repository::RepositoryContext>,
-        mount: &str,
-    ) {
-        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked = repository.to_link_context(linked_id).await;
-        let token = repository
-            .try_write_token()
-            .expect("The repository was opened for writing");
-        let linked_tree = State::new();
-        let src = linked_tree
-            .node_add(
-                linked.clone(),
-                ROOT_NODE,
-                Node {
-                    name_hash: hash_string("src"),
-                    ..Default::default()
-                },
-                "src",
-            )
-            .await
-            .expect("Adding src failed");
-        linked_tree
-            .node_add(
-                linked.clone(),
-                src,
-                Node {
-                    flags: NodeFlags::File.bits(),
-                    name_hash: hash_string("Intermediate"),
-                    ..Default::default()
-                },
-                "Intermediate",
-            )
-            .await
-            .expect("Adding src/Intermediate failed");
-        linked_tree.set_revision_number(1);
-        let revision = linked_tree
-            .serialize(linked, token)
-            .await
-            .expect("Serializing the linked tree failed");
-
-        let staged = next_tree(repository).await;
-        let link = staged
-            .node_add(
-                repository.clone(),
-                ROOT_NODE,
-                Node {
-                    flags: NodeFlags::Link.bits(),
-                    name_hash: hash_string(mount),
-                    child: ROOT_NODE,
-                    address: Address {
-                        hash: revision,
-                        context: linked_id.into(),
-                    },
-                    ..Default::default()
-                },
-                mount,
-            )
-            .await
-            .expect("Adding the link failed");
-        staged
-            .link_add(
-                repository.clone(),
-                linked_id,
-                lore_revision::lore::BranchId::default(),
-                revision,
-                link,
-                lore_revision::link::LinkFlags::NoFlags,
-            )
-            .await
-            .expect("Registering the link failed");
-        let signature = staged
-            .serialize(repository.clone(), token)
-            .await
-            .expect("Serializing the staged tree failed");
-        lore_revision::instance::store_staged_anchor(repository, signature)
-            .await
-            .expect("Storing the staged anchor failed");
-    }
-
     /// A dirty mark of a file below a link mount, removed from the working tree, marks its removal
     /// where a directory-only rule names it: the path is asked about as the file the linked tree
     /// holds there.
@@ -3844,7 +4066,12 @@ mod tests {
         in_execution(async {
             let (repository, tempdir) = committed_repository("Intermediate/\n", &[]).await;
             let root = tempdir.to_path_buf();
-            mount_intermediate(&repository, "vendor").await;
+            mount_intermediate(
+                &repository,
+                "vendor",
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
             std::fs::create_dir_all(root.join("vendor/src")).expect("Create directory failed");
             file::dirty::dirty(
                 repository.clone(),
@@ -3860,6 +4087,74 @@ mod tests {
             );
         })
         .await;
+    }
+
+    /// A dirty move or copy onto the repository root is refused as invalid.
+    #[tokio::test]
+    async fn a_dirty_move_or_copy_onto_the_root_is_invalid() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &[]).await;
+            let at = |path: &str| {
+                tempdir
+                    .to_path_buf()
+                    .join(path)
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let moved = file::dirty::dirty_move(repository.clone(), at("seed.txt"), at("")).await;
+            let copied = file::dirty::dirty_copy(repository.clone(), at("seed.txt"), at("")).await;
+            assert!(
+                matches!(moved, Err(file::dirty::DirtyError::InvalidArguments(_)))
+                    && matches!(copied, Err(file::dirty::DirtyError::InvalidArguments(_))),
+                "a move or copy onto the root was not refused as invalid: {moved:?}, {copied:?}"
+            );
+        })
+        .await;
+    }
+
+    /// A dirty copy into a mount, or into new directories below one however deep they go, is
+    /// refused as not supported, whether the mount draws from another repository or from this one
+    /// at another revision. A copy into new directories outside links finds no parent.
+    #[tokio::test]
+    async fn a_dirty_copy_into_a_mount_is_not_supported() {
+        for from_this_repository in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = committed_repository("", &[]).await;
+                let linked_id = if from_this_repository {
+                    repository.id
+                } else {
+                    RepositoryId::from(uuid::Uuid::now_v7())
+                };
+                mount_intermediate(&repository, "vendor", linked_id).await;
+                let at = |path: &str| {
+                    tempdir
+                        .to_path_buf()
+                        .join(path)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                for to in ["vendor/src/copy.txt", "vendor/fresh/deeper/copy.txt"] {
+                    let copied =
+                        file::dirty::dirty_copy(repository.clone(), at("seed.txt"), at(to)).await;
+                    assert!(
+                        matches!(copied, Err(file::dirty::DirtyError::NotSupported(_))),
+                        "a copy to {to}, mounted from this repository {from_this_repository}, \
+                         was not refused as not supported: {copied:?}"
+                    );
+                }
+                let copied = file::dirty::dirty_copy(
+                    repository.clone(),
+                    at("seed.txt"),
+                    at("fresh/deeper/copy.txt"),
+                )
+                .await;
+                assert!(
+                    matches!(copied, Err(file::dirty::DirtyError::NodeNotFound(_))),
+                    "a copy into new directories outside links found a parent: {copied:?}"
+                );
+            })
+            .await;
+        }
     }
 
     /// A status of a tracked file the working tree replaced with a directory a directory-only rule
@@ -3945,23 +4240,104 @@ mod tests {
         }
     }
 
-    /// A dirty mark of a sparse tree marks no deletion of the files its view leaves out of the
-    /// working tree.
+    /// Marks `names` below `root` dirty, under force where `forced` says so.
+    async fn mark_dirty(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        root: &std::path::Path,
+        names: &[&str],
+        forced: bool,
+    ) {
+        let marking = file::dirty::dirty(repository.clone(), path_arguments(root, names));
+        if forced {
+            LORE_CONTEXT.scope(forced_execution(), marking).await
+        } else {
+            marking.await
+        }
+        .expect("Dirty failed");
+    }
+
+    /// A dirty mark of a sparse tree, forced or not, marks the deletion of the file in view the
+    /// working tree lacks and of no file the view leaves out, below a removed directory too, and
+    /// status lists only that deletion.
     #[tokio::test]
-    async fn a_dirty_mark_of_a_sparse_tree_marks_no_deletion() {
-        in_execution(async {
-            let (repository, tempdir) = sparse_repository().await;
-            file::dirty::dirty(repository.clone(), path_arguments(&tempdir, &["."]))
-                .await
-                .expect("Dirty failed");
-            let deleted = sparse_files_marked(&repository, Node::is_dirty_delete).await;
-            assert!(
-                deleted.is_empty(),
-                "a dirty mark of the tree marked the deletion of files the view excludes: \
-                 {deleted:?}"
-            );
-        })
-        .await;
+    async fn a_dirty_mark_of_a_sparse_tree_marks_no_deletion_the_view_excludes() {
+        const IN_VIEW: &str = "Game/Saved/Config/a.ini";
+        let cases: [(&[&str], &[&str], &[&str]); 5] = [
+            (&[IN_VIEW], &["."], &["D Game/Saved/Config/a.ini"]),
+            (&[IN_VIEW], &["Game"], &["D Game/Saved/Config/a.ini"]),
+            (
+                &[IN_VIEW],
+                &["top.txt", "Engine/Build/b.txt", IN_VIEW],
+                &["D Game/Saved/Config/a.ini"],
+            ),
+            (&["Game/Saved"], &["."], &["D Game/Saved/"]),
+            (
+                &["Engine/Build", IN_VIEW],
+                &["."],
+                &["D Game/Saved/Config/a.ini"],
+            ),
+        ];
+        for force in [false, true] {
+            for (removed, names, listed) in cases {
+                in_execution(async move {
+                    let (repository, tempdir) = sparse_repository().await;
+                    for path in removed {
+                        remove_path(&tempdir, path);
+                    }
+                    mark_dirty(&repository, &tempdir, names, force).await;
+                    let deleted = sparse_files_marked(&repository, Node::is_dirty_delete).await;
+                    assert_eq!(
+                        deleted,
+                        [IN_VIEW],
+                        "a dirty mark of {names:?}, forced {force}, with {removed:?} removed, \
+                         marked other deletions than of the file in view"
+                    );
+                    let deletions: Vec<String> = status_reported(&repository, None, false)
+                        .await
+                        .into_iter()
+                        .map(|(entry, _)| entry)
+                        .filter(|entry| entry.starts_with("D "))
+                        .collect();
+                    assert_eq!(
+                        deletions, listed,
+                        "status after a dirty mark of {names:?}, forced {force}, with \
+                         {removed:?} removed"
+                    );
+                })
+                .await;
+            }
+        }
+    }
+
+    /// A dirty mark of a path the view leaves out, forced or not, keeps the add a forced dirty
+    /// mark marked there after the working tree loses the file: a deletion driven by absence asks
+    /// the view, as a forced stage does.
+    #[tokio::test]
+    async fn a_dirty_mark_keeps_an_add_past_the_view_the_working_tree_lost() {
+        const ADDED: &str = "Engine/Build/new.txt";
+        for force in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = sparse_repository().await;
+                test_file_write(tempdir.join(ADDED).as_path(), b"new");
+                mark_dirty(&repository, &tempdir, &[ADDED], true).await;
+                assert!(
+                    next_node(&repository, ADDED).await.is_dirty_add(),
+                    "the forced dirty mark marked no add of {ADDED}"
+                );
+                remove_path(&tempdir, ADDED);
+                mark_dirty(&repository, &tempdir, &[ADDED], force).await;
+                let kept = next_tree(&repository)
+                    .await
+                    .find_node(repository.clone(), ADDED)
+                    .await
+                    .is_ok_and(|node| node.is_dirty_add());
+                assert!(
+                    kept,
+                    "a dirty mark, forced {force}, took back the add of {ADDED}"
+                );
+            })
+            .await;
+        }
     }
 
     /// A status scan of untracked files a directory-only rule names asks about each as the file it
@@ -4066,59 +4442,150 @@ mod tests {
             .expect("Test task failed");
     }
 
-    /// A status over a provider that holds its state, whose diff is exact, scans without `--scan`,
-    /// persists what it marks, and emits the summary of its scan.
+    /// A marking walk adding a directory it finds new marks the directory above it before it emits
+    /// the add, so a reader that stops listening, which ends the walk at that emit, leaves the add
+    /// under a dirty directory.
     #[tokio::test]
-    async fn a_status_over_an_exact_diff_persists_its_marks_and_emits_its_summary() {
+    async fn a_walk_ended_at_a_new_directorys_emit_leaves_its_parent_dirty() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                std::fs::create_dir_all(fixture.path.join("t")).expect("Create failed");
+                test_file_write(fixture.path.join("t/seed.txt").as_path(), b"seed");
+                test_commit_tree(&fixture, "Seed").await;
+                let (current, staged) = test_anchor_states(&repository).await;
+                std::fs::create_dir_all(fixture.path.join("t/n")).expect("Create failed");
+                test_file_write(fixture.path.join("t/n/added.txt").as_path(), b"added");
+
+                let operation =
+                    lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+                        repository.file_system().as_ref(),
+                    )
+                    .await
+                    .expect("Failed to start filesystem operation");
+                // Abandoned at once: the walk's first emit, the new directory's, finds no reader.
+                lore_revision::state::diff_filesystem(
+                    &operation,
+                    lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+                        repository: repository.clone(),
+                        state: staged.clone(),
+                    },
+                    lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+                        repository: repository.clone(),
+                        state: current.clone(),
+                    },
+                    None,
+                    lore_revision::filter::FilterMode::Full,
+                    lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+                    Arc::new(Vec::new()),
+                )
+                .await
+                .expect("Failed to diff filesystem")
+                .abandon()
+                .await;
+                operation
+                    .finalize()
+                    .await
+                    .expect("Failed to finish filesystem operation");
+
+                assert!(
+                    holds(&repository, &staged, "t/n").await,
+                    "the walk reached the add"
+                );
+                let t = staged
+                    .find_node_link(repository.clone(), "t")
+                    .await
+                    .expect("t is held")
+                    .node;
+                assert!(
+                    staged
+                        .node(repository.clone(), t)
+                        .await
+                        .expect("t reads")
+                        .is_dirty()
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Runs a status, scanning as `scan` asks, over a repository whose provider holds its state,
+    /// after a file is added there. Answers the adds the summary of the scan counted, if the status
+    /// emitted one, and how many adds named as the file it persisted marks for.
+    async fn status_over_an_exact_diff(scan: bool) -> (Option<u64>, usize) {
+        let (repository, tempdir) = committed_repository("", &[]).await;
+        test_file_write(tempdir.path().join("added.txt").as_path(), b"added");
+        let (exact, _) = test_holding_context(&repository);
+        let adds = Arc::new(std::sync::Mutex::new(None));
+        let captured = adds.clone();
+        let execution = Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                lore_revision::interface::LoreGlobalArgs::default(),
+                lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
+                    if let lore_revision::event::LoreEvent::RepositoryStatusSummary(data) = event {
+                        *captured.lock().expect("summary") = Some(data.adds);
+                    }
+                }))),
+                "test-user".to_string(),
+            ),
+        );
+
+        LORE_CONTEXT
+            .scope(
+                execution.clone(),
+                lore_revision::repository::status::status_boxed(
+                    exact.clone(),
+                    None,
+                    lore_revision::repository::status::StatusOptions {
+                        scan,
+                        ..scan_status_options()
+                    },
+                ),
+            )
+            .await
+            .expect("Status failed");
+        execution.dispatcher.drain().await;
+        let summary = *adds.lock().expect("summary");
+
+        let (_, staged, _) = State::deserialize_current_and_staged(exact.clone())
+            .await
+            .expect("Deserialize failed");
+        let staged = staged.expect("The status persisted no marks");
+        let marked = children_named(&exact, &staged, ROOT_NODE, "added.txt")
+            .await
+            .len();
+        (summary, marked)
+    }
+
+    /// A status over a provider that holds its state, whose diff is exact, scans without `--scan`
+    /// and persists what it marks. Unasked, it reports as a plain status does, with no summary of
+    /// the scan; asked for `--scan`, it emits one.
+    #[tokio::test]
+    async fn a_status_over_an_exact_diff_persists_its_marks_and_summarises_its_scan_when_asked() {
         #[allow(clippy::disallowed_methods)]
         runtime()
             .spawn(LORE_CONTEXT.scope(setup_test_execution(), async move {
-                let (repository, tempdir) = committed_repository("", &[]).await;
-                test_file_write(tempdir.path().join("added.txt").as_path(), b"added");
-                let (exact, _) = test_holding_context(&repository);
-                let adds = Arc::new(std::sync::Mutex::new(None));
-                let captured = adds.clone();
-                let execution = Arc::new(
-                    lore_revision::interface::ExecutionContext::new_client_with_user_id(
-                        lore_revision::interface::LoreGlobalArgs::default(),
-                        lore_revision::relay::EventDispatcher::new(Some(Box::new(move |event| {
-                            if let lore_revision::event::LoreEvent::RepositoryStatusSummary(data) =
-                                event
-                            {
-                                *captured.lock().expect("summary") = Some(data.adds);
-                            }
-                        }))),
-                        "test-user".to_string(),
-                    ),
-                );
-
-                LORE_CONTEXT
-                    .scope(
-                        execution.clone(),
-                        lore_revision::repository::status::status_boxed(
-                            exact.clone(),
-                            None,
-                            lore_revision::repository::status::StatusOptions {
-                                scan: false,
-                                ..scan_status_options()
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("Status failed");
-                execution.dispatcher.drain().await;
+                let (summary, marked) = status_over_an_exact_diff(false).await;
                 assert_eq!(
-                    *adds.lock().expect("summary"),
-                    Some(1),
-                    "The status emitted no summary of its scan"
+                    summary, None,
+                    "A plain status emitted a summary of its scan"
                 );
+                assert_eq!(marked, 1, "A plain status marked no add");
 
-                let (_, staged, _) = State::deserialize_current_and_staged(exact.clone())
-                    .await
-                    .expect("Deserialize failed");
-                let staged = staged.expect("The status persisted no marks");
-                let added = children_named(&exact, &staged, ROOT_NODE, "added.txt").await;
-                assert_eq!(added.len(), 1, "The status marked no add");
+                let (summary, marked) = status_over_an_exact_diff(true).await;
+                assert_eq!(
+                    summary,
+                    Some(1),
+                    "A status asked to scan emitted no summary of its scan"
+                );
+                assert_eq!(marked, 1, "A status asked to scan marked no add");
             }))
             .await
             .expect("Test task failed");
@@ -4200,6 +4667,291 @@ mod tests {
                         "{name} is marked exactly when a file below it is"
                     );
                 }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// `base.txt` and `src/file.txt`, staged and committed: a revision for the tests of the
+    /// discards below to start from.
+    async fn initial_commit(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        write_token: &lore_revision::repository::RepositoryWriteToken,
+        path: &std::path::Path,
+    ) {
+        std::fs::create_dir_all(path.join("src")).expect("Create src failed");
+        test_file_write(&path.join("base.txt"), b"base");
+        test_file_write(&path.join("src/file.txt"), b"original");
+        file::stage::stage(
+            repository.clone(),
+            write_token,
+            LoreArray::from_vec(vec![LoreString::from(path)]),
+            StageOptions {
+                case_change: stage::StageCaseChange::Error,
+                node_flags: NodeFlags::NoFlags,
+                file_id: None,
+                no_children: false,
+                scan: true,
+            },
+        )
+        .await
+        .expect("Stage failed");
+        commit::commit_boxed(
+            repository.clone(),
+            write_token,
+            CommitOptions::new("Initial".to_string()),
+        )
+        .await
+        .expect("Commit failed");
+    }
+
+    /// Writes `newdir/a.txt`, `newdir/sub/b.txt` and `newdir/sub/deeper/c.txt`, and marks
+    /// `newdir` dirty: an added directory with a subtree below it, every node a dirty add.
+    async fn dirty_new_directory(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        path: &std::path::Path,
+    ) {
+        std::fs::create_dir_all(path.join("newdir/sub/deeper")).expect("Create newdir failed");
+        test_file_write(&path.join("newdir/a.txt"), b"a");
+        test_file_write(&path.join("newdir/sub/b.txt"), b"b");
+        test_file_write(&path.join("newdir/sub/deeper/c.txt"), b"c");
+        file::dirty::dirty(
+            repository.clone(),
+            LoreArray::from_vec(vec![LoreString::from(
+                path.join("newdir").to_string_lossy().as_ref(),
+            )]),
+        )
+        .await
+        .expect("Dirty of newdir failed");
+        let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+        let staged = staged.expect("a staged State");
+        for name in ["newdir", "newdir/a.txt", "newdir/sub/deeper/c.txt"] {
+            let link = staged
+                .find_node_link(repository.clone(), name)
+                .await
+                .unwrap_or_else(|_| panic!("{name} is in the staged tree"));
+            let node = staged
+                .node(repository.clone(), link.node)
+                .await
+                .expect("reads");
+            assert!(node.is_dirty_add(), "{name} is a dirty add");
+        }
+    }
+
+    /// A directory added through dirty and removed from disk before it is staged goes with its
+    /// whole subtree at the next dirty: every slot below it is freed, none leaked.
+    #[tokio::test]
+    async fn dirty_reverted_add_of_a_directory_frees_its_subtree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let path = fixture.path.clone();
+                initial_commit(&repository, &fixture.write_token, &path).await;
+                dirty_new_directory(&repository, &path).await;
+
+                std::fs::remove_dir_all(path.join("newdir")).expect("Remove newdir failed");
+                test_file_write(&path.join("base.txt"), b"base, edited");
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![
+                        LoreString::from(path.join("newdir").to_string_lossy().as_ref()),
+                        LoreString::from(path.join("base.txt").to_string_lossy().as_ref()),
+                    ]),
+                )
+                .await
+                .expect("Second dirty failed");
+
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("the edit of base.txt keeps a staged State");
+                assert!(
+                    staged
+                        .find_node_link(repository.clone(), "newdir")
+                        .await
+                        .is_err(),
+                    "newdir is gone"
+                );
+                let leaked = test_leaked_slots(&staged, &repository).await;
+                assert!(
+                    leaked.is_empty(),
+                    "every slot of the subtree is freed: {leaked:?} leaked"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A reset of a directory added through dirty drops it from the staged tree with its whole
+    /// subtree, keeping the files on disk: every slot below it is freed, none leaked.
+    #[tokio::test]
+    async fn reset_of_a_dirty_added_directory_frees_its_subtree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+                initial_commit(&repository, write_token, &path).await;
+                dirty_new_directory(&repository, &path).await;
+                // A change the reset leaves, so the staged State stays.
+                test_file_write(
+                    &path.join("src/file.txt"),
+                    b"modified content that is longer",
+                );
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![LoreString::from(
+                        path.join("src/file.txt").to_string_lossy().as_ref(),
+                    )]),
+                )
+                .await
+                .expect("Dirty of src/file.txt failed");
+
+                file::reset::reset(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        path.join("newdir").to_string_lossy().as_ref(),
+                    )]),
+                    LoreString::default(),
+                    file::reset::ResetOptions {
+                        purge: false,
+                        single_node: false,
+                    },
+                )
+                .await
+                .expect("Reset failed");
+
+                assert!(
+                    path.join("newdir/sub/deeper/c.txt").exists(),
+                    "the files stay"
+                );
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("the edit of src/file.txt keeps a staged State");
+                assert!(
+                    staged
+                        .find_node_link(repository.clone(), "newdir")
+                        .await
+                        .is_err(),
+                    "newdir is gone from the staged tree"
+                );
+                let leaked = test_leaked_slots(&staged, &repository).await;
+                assert!(
+                    leaked.is_empty(),
+                    "every slot of the subtree is freed: {leaked:?} leaked"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A commit drops a directory added through dirty and never staged, with its whole subtree,
+    /// from the revision it writes: every slot below it is freed, none leaked. `newdir/sub` holds
+    /// no dirty flags, so the prune's walk does not enter it, and only the discard of `newdir`
+    /// frees it and the nodes below it.
+    #[tokio::test]
+    async fn commit_prunes_an_unstaged_added_directory_with_its_subtree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+                let path = fixture.path.clone();
+                initial_commit(&repository, write_token, &path).await;
+                dirty_new_directory(&repository, &path).await;
+                test_file_write(&path.join("base.txt"), b"base, edited");
+                file::stage::stage(
+                    repository.clone(),
+                    write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        path.join("base.txt").to_string_lossy().as_ref(),
+                    )]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: false,
+                    },
+                )
+                .await
+                .expect("Stage of base.txt failed");
+                let (_, staged, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                let staged = staged.expect("a staged State");
+                let sub = staged
+                    .find_node_link(repository.clone(), "newdir/sub")
+                    .await
+                    .expect("newdir/sub is in the staged tree")
+                    .node;
+                let block = staged
+                    .block(repository.clone(), NodeBlock::index(sub))
+                    .await
+                    .expect("the block of newdir/sub");
+                staged.node_edit_for_tests(&block, sub, Node::clear_dirty_flags);
+                let signature = staged
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Serializing the staged tree failed");
+                lore_revision::instance::store_staged_anchor(&repository, signature)
+                    .await
+                    .expect("Storing the staged anchor failed");
+
+                commit::commit_boxed(
+                    repository.clone(),
+                    write_token,
+                    CommitOptions::new("Second".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+
+                let (current, _, _) = State::deserialize_current_and_staged(repository.clone())
+                    .await
+                    .expect("Deserialize failed");
+                assert!(
+                    current
+                        .find_node_link(repository.clone(), "newdir")
+                        .await
+                        .is_err(),
+                    "the revision holds no newdir"
+                );
+                assert!(
+                    current
+                        .find_node_link(repository.clone(), "base.txt")
+                        .await
+                        .is_ok(),
+                    "and holds base.txt"
+                );
+                let leaked = test_leaked_slots(&current, &repository).await;
+                assert!(
+                    leaked.is_empty(),
+                    "every slot of the pruned subtree is freed: {leaked:?} leaked"
+                );
             }))
             .await
             .expect("Test task failed");
@@ -4341,6 +5093,1482 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// What a forced staging scan of a sparse tree finds past its view, with the action status
+    /// reports and the content the working tree holds: a new file at the top level, a new file in
+    /// a directory the tree holds, an edit of a committed file, and a new file in a directory the
+    /// tree does not hold.
+    const PAST_THE_VIEW: [(&str, &str, &[u8]); 4] = [
+        ("A", "new.txt", b"new at the top level"),
+        ("A", "Engine/new.txt", b"new in a committed directory"),
+        ("M", "Engine/Build/b.txt", b"edited"),
+        ("A", "New/new.txt", b"new in a new directory"),
+    ];
+
+    /// The [`sparse_repository`] holding [`PAST_THE_VIEW`] in its working tree, staged by a forced
+    /// staging scan.
+    async fn staged_past_the_view() -> (Arc<lore_revision::repository::RepositoryContext>, TempDir)
+    {
+        let (repository, tempdir) = sparse_repository().await;
+        let root = tempdir.to_path_buf();
+        for (_, path, content) in PAST_THE_VIEW {
+            let file = root.join(path);
+            std::fs::create_dir_all(file.parent().expect("A file has a parent"))
+                .expect("Create directory failed");
+            test_file_write(file.as_path(), content);
+        }
+        stage_paths(&repository, &root, &["."], true, true).await;
+        (repository, tempdir)
+    }
+
+    /// The content `revision` holds at `path`, read back from the store.
+    async fn committed_content(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        revision: Hash,
+        path: &str,
+    ) -> Vec<u8> {
+        let node = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Deserialize failed")
+            .find_node(repository.clone(), path)
+            .await
+            .unwrap_or_else(|err| panic!("No node at {path}: {err}"));
+        immutable::read(
+            repository.clone(),
+            node.address,
+            None,
+            immutable::read_options_from_repository(repository),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("Reading {path} failed: {err}"))
+        .to_vec()
+    }
+
+    /// The status entries of what [`PAST_THE_VIEW`] holds, staged.
+    fn staged_past_the_view_entries() -> Vec<(String, bool)> {
+        PAST_THE_VIEW
+            .iter()
+            .map(|(action, path, _)| (format!("{action} {path}"), true))
+            .collect()
+    }
+
+    /// Status lists what a forced staging scan staged past the view, each also asked about alone.
+    /// Beside it, the scan stages the new directory and restages the committed files the working
+    /// tree holds, and stages no delete of those it lacks.
+    #[tokio::test]
+    async fn status_lists_a_forced_stage_scan_past_the_view() {
+        in_execution(async {
+            let (repository, _tempdir) = staged_past_the_view().await;
+            let mut reported = status_reported(&repository, None, false).await;
+            reported.sort();
+            let mut expected = staged_past_the_view_entries();
+            expected.extend(
+                [
+                    "A New/",
+                    "M .loreignore",
+                    "M Game/Saved/Config/a.ini",
+                    "M seed.txt",
+                ]
+                .map(|entry| (entry.to_string(), true)),
+            );
+            expected.sort();
+            assert_eq!(reported, expected);
+            for (entry, (_, path, _)) in staged_past_the_view_entries()
+                .into_iter()
+                .zip(PAST_THE_VIEW)
+            {
+                assert_eq!(
+                    status_reported(&repository, Some(vec![relative_path(path)]), false).await,
+                    vec![entry],
+                    "status of {path}"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// A plain unstage follows the view, so it leaves what a forced staging scan staged past the
+    /// view staged, for the commit to take. A forced unstage takes it back, after which status
+    /// lists none of it: an edit left marked dirty past the view is not listed. A file the view
+    /// keeps in the new directory is taken back by either.
+    #[tokio::test]
+    async fn only_a_forced_unstage_takes_back_a_forced_stage_scan_past_the_view() {
+        for forced in [false, true] {
+            in_execution(async move {
+                let (repository, tempdir) = staged_past_the_view().await;
+                let in_view = "New/Saved/Config/in.ini";
+                write_working_file(&tempdir, in_view, b"in view");
+                stage_paths(&repository, &tempdir, &[in_view], false, false).await;
+                let in_view_staged = async || {
+                    status_reported(&repository, None, false)
+                        .await
+                        .contains(&(format!("A {in_view}"), true))
+                };
+                assert!(in_view_staged().await, "{in_view} is not staged");
+
+                unstage_path(&repository, &tempdir, ".", forced).await;
+                let mut listed: Vec<_> = status_reported(&repository, None, false)
+                    .await
+                    .into_iter()
+                    .filter(|(entry, _)| {
+                        PAST_THE_VIEW.iter().any(|(_, path, _)| {
+                            entry.split_once(' ').is_some_and(|(_, at)| at == *path)
+                        })
+                    })
+                    .collect();
+                listed.sort();
+                let mut staged = staged_past_the_view_entries();
+                staged.sort();
+                assert_eq!(listed, if forced { Vec::new() } else { staged });
+                assert!(!in_view_staged().await, "{in_view} is still staged");
+                if forced {
+                    return;
+                }
+
+                let revision = commit::commit_boxed(
+                    repository.clone(),
+                    repository
+                        .try_write_token()
+                        .expect("The repository was opened for writing"),
+                    CommitOptions::new("Past the view".to_string()),
+                )
+                .await
+                .expect("Commit failed");
+                for (_, path, content) in PAST_THE_VIEW {
+                    assert_eq!(
+                        committed_content(&repository, revision, path).await,
+                        content,
+                        "{path}"
+                    );
+                }
+                assert_eq!(
+                    revision_tree_faults(&repository, revision).await,
+                    Vec::new()
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A plain unstage of the tree leaves staged a move a forced stage took past the view, and the
+    /// directories above it with it: the commit records the move, in a tree whose directories are
+    /// their children's rehash.
+    #[tokio::test]
+    #[ignore = "an unstage clears the directories a staged move left, and the commit keeps their \
+                stale addresses"]
+    async fn a_plain_unstage_of_the_tree_keeps_a_move_staged_past_the_view() {
+        in_execution(async {
+            let (repository, tempdir) = sparse_repository().await;
+            let root = tempdir.to_path_buf();
+            let moved = "Engine/Build/moved.ini";
+            LORE_CONTEXT
+                .scope(
+                    forced_execution(),
+                    TreeEdit::Move("Game/Saved/Config/a.ini".to_string(), moved.to_string())
+                        .apply(&repository, &root),
+                )
+                .await;
+            unstage_path(&repository, &root, ".", false).await;
+            let mut expected = MergeCommitted::unchanged(Some(b"committed"));
+            expected.two_parents = false;
+            expected.change = Some(("V", false));
+            assert_eq!(commit_merge(&repository, moved).await, expected);
+            let (current, _) = lore_revision::instance::load_current_anchor_boxed(&repository)
+                .await
+                .expect("Anchor load failed");
+            assert_eq!(revision_tree_faults(&repository, current).await, Vec::new());
+        })
+        .await;
+    }
+
+    /// A plain unstage of the tree keeps the staged tree for a move a forced stage took past the
+    /// view from the root, which leaves nothing marked dirty and no directory staged: the commit
+    /// records the move.
+    #[tokio::test]
+    async fn a_plain_unstage_of_the_tree_keeps_the_staged_tree_for_a_move_past_the_view() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &["a.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            test_file_write(
+                root.join(lore_revision::repository::DOT_LORE)
+                    .join(lore_revision::repository::VIEW_FILTER)
+                    .as_path(),
+                b"/moved.txt\n",
+            );
+            let filter = lore_revision::repository::load_filter(&root).expect("Load filter failed");
+            let sparse = Arc::new(repository.to_filter_context(filter));
+            LORE_CONTEXT
+                .scope(
+                    forced_execution(),
+                    TreeEdit::Move("a.txt".to_string(), "moved.txt".to_string())
+                        .apply(&sparse, &root),
+                )
+                .await;
+            unstage_path(&sparse, &root, ".", false).await;
+            let mut expected = MergeCommitted::unchanged(Some(b"committed"));
+            expected.two_parents = false;
+            expected.change = Some(("V", false));
+            assert_eq!(commit_merge(&sparse, "moved.txt").await, expected);
+            let (current, _) = lore_revision::instance::load_current_anchor_boxed(&sparse)
+                .await
+                .expect("Anchor load failed");
+            assert_eq!(revision_tree_faults(&sparse, current).await, Vec::new());
+        })
+        .await;
+    }
+
+    /// A commit takes the content the working tree holds where a forced staging scan staged it
+    /// past the view.
+    #[tokio::test]
+    async fn a_commit_takes_a_forced_stage_scan_past_the_view_from_the_working_tree() {
+        in_execution(async {
+            let (repository, _tempdir) = staged_past_the_view().await;
+            let revision = commit::commit_boxed(
+                repository.clone(),
+                repository
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                CommitOptions::new("Past the view".to_string()),
+            )
+            .await
+            .expect("Commit failed");
+            for (_, path, content) in PAST_THE_VIEW {
+                assert_eq!(
+                    committed_content(&repository, revision, path).await,
+                    content,
+                    "{path}"
+                );
+            }
+        })
+        .await;
+    }
+
+    /// The file of the sparse fixture a merge changes past the view, what the merge brings to it,
+    /// and what the working tree holds there afterwards, of another size.
+    const MERGED_PAST_THE_VIEW: (&str, &[u8], &[u8]) =
+        ("Engine/Build/b.txt", b"merged", b"edited after the merge");
+
+    /// A file past the view the sparse fixture does not hold, which a merge adds.
+    const ADDED_PAST_THE_VIEW: &str = "Engine/Build/added.txt";
+
+    /// A change a branch of the merge fixture makes to the tree.
+    enum TreeEdit {
+        /// Writes the content to the file at the path.
+        Write(String, &'static [u8]),
+        /// Removes the file or the directory at the path.
+        Remove(String),
+        /// Moves the file at the first path to the second.
+        Move(String, String),
+    }
+
+    impl TreeEdit {
+        /// Makes the edit in the working tree below `root`, and stages it.
+        async fn apply(
+            &self,
+            repository: &Arc<lore_revision::repository::RepositoryContext>,
+            root: &std::path::Path,
+        ) {
+            match self {
+                TreeEdit::Write(path, content) => {
+                    write_working_file(root, path, content);
+                    stage_paths(repository, root, &[path], true, false).await;
+                }
+                TreeEdit::Remove(path) => {
+                    let full = root.join(path);
+                    // Test fixture writes; not subject to repository write-token discipline.
+                    #[allow(clippy::disallowed_methods)]
+                    if full.is_dir() {
+                        std::fs::remove_dir_all(&full).expect("Remove failed");
+                    } else {
+                        std::fs::remove_file(&full).expect("Remove failed");
+                    }
+                    stage_paths(repository, root, &[path], true, false).await;
+                }
+                TreeEdit::Move(from, to) => {
+                    let target = root.join(to);
+                    std::fs::create_dir_all(target.parent().expect("A file has a parent"))
+                        .expect("Create directory failed");
+                    // Test fixture writes; not subject to repository write-token discipline.
+                    #[allow(clippy::disallowed_methods)]
+                    std::fs::rename(root.join(from), &target).expect("Rename failed");
+                    lore_revision::file::stage::stage_move(
+                        repository.clone(),
+                        repository
+                            .try_write_token()
+                            .expect("The repository was opened for writing"),
+                        root.join(from).to_string_lossy().into_owned(),
+                        target.to_string_lossy().into_owned(),
+                        StageOptions::default(),
+                    )
+                    .await
+                    .expect("Stage move failed");
+                }
+            }
+        }
+
+        /// The paths the edit writes to, which the sparse fixture's tree may not hold.
+        fn targets(&self) -> Option<&str> {
+            match self {
+                TreeEdit::Write(path, _) | TreeEdit::Move(_, path) => Some(path),
+                TreeEdit::Remove(_) => None,
+            }
+        }
+    }
+
+    /// A repository read through the view of [`sparse_repository`], with a merge in progress of a
+    /// feature branch into the main branch. The feature branch's revisions make `feature`, one
+    /// revision for each list, and the main branch's revision makes `main` and an edit of its own.
+    async fn merge_in_progress(
+        feature: Vec<Vec<TreeEdit>>,
+        main: Vec<TreeEdit>,
+    ) -> (Arc<lore_revision::repository::RepositoryContext>, TempDir) {
+        let files: Vec<String> = SPARSE_FILES.iter().map(|file| file.to_string()).collect();
+        let (repository, tempdir) = committed_repository("", &files).await;
+        let root = tempdir.to_path_buf();
+        let token = repository
+            .try_write_token()
+            .expect("The repository was opened for writing");
+        let commit = async || {
+            commit::commit_boxed(repository.clone(), token, CommitOptions::new(String::new()))
+                .await
+                .expect("Commit failed");
+        };
+
+        let (base, main_branch) = lore_revision::instance::load_current_anchor_boxed(&repository)
+            .await
+            .expect("Anchor load failed");
+        lore_revision::branch::create::create(
+            repository.clone(),
+            token,
+            "feature".to_string(),
+            None,
+            String::new(),
+            false,
+        )
+        .await
+        .expect("Branch create failed");
+        let (_, feature_branch) = lore_revision::instance::load_current_anchor_boxed(&repository)
+            .await
+            .expect("Anchor load failed");
+        for revision in &feature {
+            for edit in revision {
+                edit.apply(&repository, &root).await;
+            }
+            commit().await;
+        }
+
+        lore_revision::instance::store_current_anchor_branch(&repository, main_branch)
+            .await
+            .expect("Anchor store failed");
+        lore_revision::instance::store_current_anchor(&repository, base)
+            .await
+            .expect("Anchor store failed");
+        let added: Vec<String> = feature
+            .iter()
+            .flatten()
+            .chain(&main)
+            .filter_map(TreeEdit::targets)
+            .filter(|path| !SPARSE_FILES.contains(path))
+            .map(str::to_string)
+            .collect();
+        for path in &added {
+            // Test fixture writes; not subject to repository write-token discipline.
+            #[allow(clippy::disallowed_methods)]
+            let _ = std::fs::remove_file(root.join(path));
+        }
+        for file in SPARSE_FILES {
+            write_working_file(&root, file, b"committed");
+        }
+        for edit in main
+            .iter()
+            .chain([&TreeEdit::Write("seed.txt".to_string(), b"main")])
+        {
+            edit.apply(&repository, &root).await;
+        }
+        commit().await;
+
+        test_file_write(
+            root.join(lore_revision::repository::DOT_LORE)
+                .join(lore_revision::repository::VIEW_FILTER)
+                .as_path(),
+            b"/*\n!*/Saved/Config/\n",
+        );
+        let filter = lore_revision::repository::load_filter(&root).expect("Load filter failed");
+        for path in SPARSE_FILES
+            .iter()
+            .copied()
+            .chain(added.iter().map(String::as_str))
+        {
+            let relative = lore_revision::util::path::RelativePath::new_from_initial_path(path)
+                .expect("A relative path");
+            if filter.excludes_tree(&relative, false, lore_revision::filter::FilterMode::View) {
+                // Test fixture writes; not subject to repository write-token discipline.
+                #[allow(clippy::disallowed_methods)]
+                let _ = std::fs::remove_file(root.join(path));
+            }
+        }
+        let sparse = Arc::new(repository.to_filter_context(filter));
+        let offline = Arc::new(
+            lore_revision::interface::ExecutionContext::new_client_with_user_id(
+                lore_revision::interface::LoreGlobalArgs::default().set_offline(),
+                lore_revision::relay::EventDispatcher::no_dispatch(),
+                "test-user".to_string(),
+            ),
+        );
+        LORE_CONTEXT
+            .scope(
+                offline,
+                Box::pin(lore_revision::branch::merge::merge_start(
+                    sparse.clone(),
+                    token,
+                    feature_branch,
+                    lore_revision::branch::merge::MergeStartOptions {
+                        message: String::new(),
+                        link_messages: std::collections::HashMap::new(),
+                        no_commit: true,
+                        scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: Default::default(),
+                    },
+                )),
+            )
+            .await
+            .expect("Merge failed");
+        (sparse, tempdir)
+    }
+
+    /// A repository read through the view of [`sparse_repository`], with a merge in progress that
+    /// staged a feature branch's write of `merged` to `path`, beside an edit of the main branch's.
+    async fn merged_past_the_view(
+        path: &str,
+        merged: &'static [u8],
+    ) -> (Arc<lore_revision::repository::RepositoryContext>, TempDir) {
+        merge_in_progress(
+            vec![vec![TreeEdit::Write(path.to_string(), merged)]],
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// What a merge commit holds at a path: the content and the size its node records, none where
+    /// it holds no file there, whether the commit has two parents, and the action its delta
+    /// records for the node there, or for the node the current revision held there where the
+    /// commit holds none, with whether it records a merge, none where it records no change.
+    #[derive(Debug, PartialEq)]
+    struct MergeCommitted {
+        file: Option<(String, u64)>,
+        two_parents: bool,
+        change: Option<(&'static str, bool)>,
+    }
+
+    impl MergeCommitted {
+        /// A merge commit holding `content` at a path, which its delta records as `action`,
+        /// merged.
+        fn merged(content: &[u8], action: &'static str) -> Self {
+            MergeCommitted {
+                file: Some((
+                    String::from_utf8_lossy(content).into_owned(),
+                    content.len() as u64,
+                )),
+                two_parents: true,
+                change: Some((action, true)),
+            }
+        }
+
+        /// A merge commit holding `content` at a path, which its delta records no change of.
+        fn unchanged(content: Option<&[u8]>) -> Self {
+            MergeCommitted {
+                file: content.map(|content| {
+                    (
+                        String::from_utf8_lossy(content).into_owned(),
+                        content.len() as u64,
+                    )
+                }),
+                two_parents: true,
+                change: None,
+            }
+        }
+    }
+
+    /// The letter `action`, a node delta's, stands for.
+    fn action_letter(action: u16) -> &'static str {
+        [
+            (lore_revision::change::FileAction::Add, "A"),
+            (lore_revision::change::FileAction::Keep, "M"),
+            (lore_revision::change::FileAction::Move, "V"),
+            (lore_revision::change::FileAction::Delete, "D"),
+        ]
+        .into_iter()
+        .find(|(known, _)| action == *known as u16)
+        .map_or("other", |(_, letter)| letter)
+    }
+
+    /// Commits what `repository` holds staged, and answers what the revision holds at `path`.
+    async fn commit_merge(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        path: &str,
+    ) -> MergeCommitted {
+        let (current, _) = lore_revision::instance::load_current_anchor_boxed(repository)
+            .await
+            .expect("Anchor load failed");
+        let held = State::deserialize(repository.clone(), current)
+            .await
+            .expect("Deserialize failed")
+            .find_node_link(repository.clone(), path)
+            .await
+            .ok()
+            .map(|link| link.node);
+        let revision = commit::commit_boxed(
+            repository.clone(),
+            repository
+                .try_write_token()
+                .expect("The repository was opened for writing"),
+            CommitOptions::new("Merge".to_string()),
+        )
+        .await
+        .expect("Commit failed");
+        let state = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Deserialize failed");
+        let link = state.find_node_link(repository.clone(), path).await.ok();
+        let change = match link.as_ref().map(|link| link.node).or(held) {
+            Some(node) => state
+                .node_delta(repository.clone(), node)
+                .await
+                .expect("The delta reads")
+                .map(|delta| {
+                    (
+                        action_letter(delta.action),
+                        lore_revision::change::Flags::from_bits_retain(delta.flags)
+                            .contains(lore_revision::change::Flags::Merge),
+                    )
+                }),
+            None => None,
+        };
+        let file = match link {
+            Some(link) => Some((
+                String::from_utf8_lossy(&committed_content(repository, revision, path).await)
+                    .into_owned(),
+                state
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("The node reads")
+                    .size,
+            )),
+            None => None,
+        };
+        MergeCommitted {
+            file,
+            two_parents: !state.parent_other().is_zero(),
+            change,
+        }
+    }
+
+    /// Writes `content` to the file at `path` below `root`, creating its directory.
+    fn write_working_file(root: &std::path::Path, path: &str, content: &[u8]) {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().expect("A file has a parent"))
+            .expect("Create directory failed");
+        test_file_write(file.as_path(), content);
+    }
+
+    /// Unstages `path` below `root`, under force where `forced` says so.
+    async fn unstage_path(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        root: &std::path::Path,
+        path: &str,
+        forced: bool,
+    ) {
+        let unstage = file::unstage::unstage(
+            repository.clone(),
+            repository
+                .try_write_token()
+                .expect("The repository was opened for writing"),
+            path_arguments(root, &[path]),
+            file::unstage::UnstageOptions::default(),
+        );
+        if forced {
+            LORE_CONTEXT.scope(forced_execution(), unstage).await
+        } else {
+            unstage.await
+        }
+        .expect("Unstage failed");
+    }
+
+    /// A forced staging scan over a file a merge staged past the view resolves the merge with the
+    /// working tree's file: the merge commit takes its content and size, and records it merged,
+    /// an add as an add. An empty file brings its mode, which the commit takes from the node.
+    #[tokio::test]
+    async fn a_forced_stage_scan_over_a_merge_past_the_view_takes_the_working_tree() {
+        let (modified, merged, edited) = MERGED_PAST_THE_VIEW;
+        for (path, action) in [(modified, "M"), (ADDED_PAST_THE_VIEW, "A")] {
+            in_execution(async move {
+                let (repository, tempdir) = merged_past_the_view(path, merged).await;
+                write_working_file(&tempdir, path, edited);
+                stage_paths(&repository, &tempdir, &["."], true, true).await;
+                assert_eq!(
+                    commit_merge(&repository, path).await,
+                    MergeCommitted::merged(edited, action),
+                    "{path}"
+                );
+            })
+            .await;
+        }
+        #[cfg(unix)]
+        in_execution(async move {
+            use std::os::unix::fs::PermissionsExt;
+
+            let (repository, tempdir) = merged_past_the_view(modified, merged).await;
+            let file = tempdir.join(modified);
+            write_working_file(&tempdir, modified, b"");
+            // Test fixture writes; not subject to repository write-token discipline.
+            #[allow(clippy::disallowed_methods)]
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                .expect("Setting the mode failed");
+            stage_paths(&repository, &tempdir, &["."], true, true).await;
+            assert_eq!(
+                commit_merge(&repository, modified).await,
+                MergeCommitted::merged(b"", "M")
+            );
+            assert!(committed_executable(&repository, modified).await);
+        })
+        .await;
+    }
+
+    /// Whether the file the current revision of `repository` holds at `path` is executable.
+    #[cfg(unix)]
+    async fn committed_executable(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        path: &str,
+    ) -> bool {
+        let (revision, _) = lore_revision::instance::load_current_anchor_boxed(repository)
+            .await
+            .expect("Anchor load failed");
+        let node = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Deserialize failed")
+            .find_node(repository.clone(), path)
+            .await
+            .expect("The revision holds the file");
+        let executable = lore_revision::node::NodeFileMode::Executable.bits();
+        node.mode & executable == executable
+    }
+
+    /// A second forced stage of a file a forced stage took over a merge past the view, emptied and
+    /// made executable since, takes the working tree's file again, its mode included: the merge
+    /// commit holds an empty executable file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_forced_stage_over_a_merge_past_the_view_takes_an_emptied_file_with_its_mode()
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        in_execution(async {
+            let (modified, merged, edited) = MERGED_PAST_THE_VIEW;
+            let (repository, tempdir) = merged_past_the_view(modified, merged).await;
+            write_working_file(&tempdir, modified, edited);
+            stage_paths(&repository, &tempdir, &["."], true, true).await;
+            write_working_file(&tempdir, modified, b"");
+            // Test fixture writes; not subject to repository write-token discipline.
+            #[allow(clippy::disallowed_methods)]
+            std::fs::set_permissions(
+                tempdir.join(modified),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .expect("Setting the mode failed");
+            stage_paths(&repository, &tempdir, &["."], true, true).await;
+            assert_eq!(
+                commit_merge(&repository, modified).await,
+                MergeCommitted::merged(b"", "M")
+            );
+            assert!(committed_executable(&repository, modified).await);
+        })
+        .await;
+    }
+
+    /// A forced unstage of a file a forced stage took from the working tree over a merge past the
+    /// view takes the current revision's file back, as the stage dropped the merged content: the
+    /// merge commit holds the current revision's file there, unchanged, or no file where the merge
+    /// added it, and no file whose content it did not store.
+    #[tokio::test]
+    async fn a_forced_unstage_takes_back_a_resolved_merge_past_the_view() {
+        let (modified, merged, edited) = MERGED_PAST_THE_VIEW;
+        for (path, expected) in [
+            (modified, MergeCommitted::unchanged(Some(b"committed"))),
+            (ADDED_PAST_THE_VIEW, MergeCommitted::unchanged(None)),
+        ] {
+            in_execution(async move {
+                let (repository, tempdir) = merged_past_the_view(path, merged).await;
+                write_working_file(&tempdir, path, edited);
+                stage_paths(&repository, &tempdir, &["."], true, true).await;
+                unstage_path(&repository, &tempdir, path, true).await;
+                assert_eq!(commit_merge(&repository, path).await, expected, "{path}");
+                let (current, _) = lore_revision::instance::load_current_anchor_boxed(&repository)
+                    .await
+                    .expect("Anchor load failed");
+                assert_eq!(
+                    revision_tree_faults(&repository, current).await,
+                    Vec::new(),
+                    "{path}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// Without a stage, the merge commit takes the content the merge staged past the view, whatever
+    /// the working tree holds there, and a dirty mark there changes nothing.
+    #[tokio::test]
+    async fn a_merge_past_the_view_commits_the_merged_content_unless_staged() {
+        for mark in [false, true] {
+            in_execution(async move {
+                let (path, merged, edited) = MERGED_PAST_THE_VIEW;
+                let (repository, tempdir) = merged_past_the_view(path, merged).await;
+                write_working_file(&tempdir, path, edited);
+                if mark {
+                    LORE_CONTEXT
+                        .scope(
+                            forced_execution(),
+                            file::dirty::dirty(
+                                repository.clone(),
+                                path_arguments(&tempdir, &[path]),
+                            ),
+                        )
+                        .await
+                        .expect("Forced dirty failed");
+                }
+                assert_eq!(
+                    commit_merge(&repository, path).await,
+                    MergeCommitted::merged(merged, "M"),
+                    "marked dirty: {mark}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// A merge that empties a file past the view, or adds an empty one there, stages a zero hash
+    /// with size 0, an empty file, and the merge commit takes it from the node: the working tree
+    /// holds no file there to read.
+    #[tokio::test]
+    async fn a_merge_past_the_view_commits_an_empty_file() {
+        let (modified, _, _) = MERGED_PAST_THE_VIEW;
+        for (path, action) in [(modified, "M"), (ADDED_PAST_THE_VIEW, "A")] {
+            in_execution(async move {
+                let (repository, _tempdir) = merged_past_the_view(path, b"").await;
+                assert_eq!(
+                    commit_merge(&repository, path).await,
+                    MergeCommitted::merged(b"", action),
+                    "{path}"
+                );
+            })
+            .await;
+        }
+    }
+
+    /// What a merge's feature branch does at the path a case of the merge table asks about.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TableChange {
+        None,
+        Modify,
+        Add,
+        Delete,
+        Move,
+        AddAddTheirs,
+        Empty,
+        DeleteReadd,
+        AddDirectory,
+        MoveIntoNewDirectory,
+        DeleteDirectory,
+        ModifyConflict,
+    }
+
+    /// What the user does at that path after the merge and before its commit, short of an
+    /// unstage.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TableAction {
+        Nothing,
+        DirtyMark,
+        /// A forced staging scan of the tree, over the user's edit.
+        StageOther,
+        /// A forced staging scan of the tree, over the content the merge staged.
+        StageSame,
+        /// A forced staging scan of the tree, over an empty file.
+        StageEmpty,
+        /// A forced stage of the path alone, over the user's edit.
+        StageNamed,
+        /// A staging scan of the tree, over the user's edit.
+        StagePlain,
+    }
+
+    /// What the user unstages after that, if anything.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TableUnstage {
+        None,
+        Path,
+        Directory,
+        Root,
+    }
+
+    /// What a user writes over a merged file in the merge table.
+    const TABLE_EDIT: &[u8] = b"edited after the merge";
+
+    /// A case of the merge table, set up to its commit: the repository, its working tree, the path
+    /// the case asks about, the path a move took the file from, the directory holding the path,
+    /// what the current revision holds at the path, or at the path a move took the file from, and
+    /// what the merge staged at the path.
+    struct TableMerge {
+        repository: Arc<lore_revision::repository::RepositoryContext>,
+        tempdir: TempDir,
+        path: String,
+        source: Option<String>,
+        directory: String,
+        current: Option<&'static [u8]>,
+        merged: Option<&'static [u8]>,
+    }
+
+    /// The paths and contents of a [`TableMerge`], in the order of its fields.
+    type TableCase = (
+        String,
+        Option<String>,
+        String,
+        Option<&'static [u8]>,
+        Option<&'static [u8]>,
+    );
+
+    /// A merge in progress over the sparse fixture whose feature branch made `change` in view or
+    /// past it, and the main branch an edit of its own. A conflict in view is resolved, to theirs
+    /// for an add/add one and to the user's file for a modify/modify one.
+    async fn table_merge(change: TableChange, in_view: bool) -> TableMerge {
+        let (directory, existing) = if in_view {
+            ("Game/Saved/Config", "Game/Saved/Config/a.ini")
+        } else {
+            ("Engine/Build", "Engine/Build/b.txt")
+        };
+        let added = format!("{directory}/added.txt");
+        let moved = format!("{directory}/moved.txt");
+        let new_directory = format!("{directory}/New");
+        let new_added = format!("{new_directory}/added.txt");
+        let new_moved = format!("{new_directory}/moved.txt");
+        let existing_edit = |content: &'static [u8]| TreeEdit::Write(existing.to_string(), content);
+        let (feature, main) = match change {
+            TableChange::None => (
+                vec![vec![TreeEdit::Write("top.txt".to_string(), b"feature")]],
+                Vec::new(),
+            ),
+            TableChange::Modify => (vec![vec![existing_edit(b"merged")]], Vec::new()),
+            TableChange::Empty => (vec![vec![existing_edit(b"")]], Vec::new()),
+            TableChange::Add => (
+                vec![vec![TreeEdit::Write(added.clone(), b"merged")]],
+                Vec::new(),
+            ),
+            TableChange::AddAddTheirs => (
+                vec![vec![TreeEdit::Write(added.clone(), b"theirs")]],
+                vec![TreeEdit::Write(added.clone(), b"mine")],
+            ),
+            TableChange::Delete => (
+                vec![vec![TreeEdit::Remove(existing.to_string())]],
+                Vec::new(),
+            ),
+            TableChange::DeleteReadd => (
+                vec![
+                    vec![TreeEdit::Remove(existing.to_string())],
+                    vec![existing_edit(b"merged")],
+                ],
+                Vec::new(),
+            ),
+            TableChange::Move => (
+                vec![vec![TreeEdit::Move(existing.to_string(), moved.clone())]],
+                Vec::new(),
+            ),
+            TableChange::AddDirectory => (
+                vec![vec![TreeEdit::Write(new_added.clone(), b"merged")]],
+                Vec::new(),
+            ),
+            TableChange::MoveIntoNewDirectory => (
+                vec![vec![TreeEdit::Move(
+                    existing.to_string(),
+                    new_moved.clone(),
+                )]],
+                Vec::new(),
+            ),
+            TableChange::DeleteDirectory => (
+                vec![vec![TreeEdit::Remove(directory.to_string())]],
+                Vec::new(),
+            ),
+            TableChange::ModifyConflict => (
+                vec![vec![existing_edit(b"theirs")]],
+                vec![existing_edit(b"mine")],
+            ),
+        };
+        let (repository, tempdir) = merge_in_progress(feature, main).await;
+        let root = tempdir.to_path_buf();
+        let token = repository
+            .try_write_token()
+            .expect("The repository was opened for writing");
+        if in_view && change == TableChange::AddAddTheirs {
+            lore_revision::branch::merge::merge_resolve_theirs(
+                repository.clone(),
+                token,
+                path_arguments(&root, &[&added]),
+            )
+            .await
+            .expect("Resolve theirs failed");
+        }
+        if in_view && change == TableChange::ModifyConflict {
+            write_working_file(&root, existing, b"resolved");
+            lore_revision::branch::merge::merge_resolve(
+                repository.clone(),
+                token,
+                path_arguments(&root, &[existing]),
+                lore_revision::branch::merge::MergeType::BranchMerge,
+            )
+            .await
+            .expect("Resolve failed");
+        }
+
+        let committed: Option<&'static [u8]> = Some(b"committed");
+        let (path, source, directory, current, merged): TableCase = match change {
+            TableChange::None => (
+                existing.to_string(),
+                None,
+                directory.to_string(),
+                committed,
+                committed,
+            ),
+            TableChange::Modify | TableChange::DeleteReadd => (
+                existing.to_string(),
+                None,
+                directory.to_string(),
+                committed,
+                Some(b"merged"),
+            ),
+            TableChange::Empty => (
+                existing.to_string(),
+                None,
+                directory.to_string(),
+                committed,
+                Some(b""),
+            ),
+            TableChange::Delete | TableChange::DeleteDirectory => (
+                existing.to_string(),
+                None,
+                directory.to_string(),
+                committed,
+                None,
+            ),
+            TableChange::Add => (added, None, directory.to_string(), None, Some(b"merged")),
+            TableChange::AddAddTheirs => (
+                added,
+                None,
+                directory.to_string(),
+                Some(b"mine"),
+                Some(b"theirs"),
+            ),
+            TableChange::Move => (
+                moved,
+                Some(existing.to_string()),
+                directory.to_string(),
+                committed,
+                committed,
+            ),
+            TableChange::AddDirectory => (new_added, None, new_directory, None, Some(b"merged")),
+            TableChange::MoveIntoNewDirectory => (
+                new_moved,
+                Some(existing.to_string()),
+                new_directory,
+                committed,
+                committed,
+            ),
+            TableChange::ModifyConflict => (
+                existing.to_string(),
+                None,
+                directory.to_string(),
+                Some(b"mine"),
+                Some(if in_view { b"resolved" } else { b"theirs" }),
+            ),
+        };
+        TableMerge {
+            repository,
+            tempdir,
+            path,
+            source,
+            directory,
+            current,
+            merged,
+        }
+    }
+
+    /// What is wrong with a revision's tree, as [`revision_tree_faults`] finds it.
+    #[derive(Debug, PartialEq)]
+    enum TreeFault {
+        /// A node that keeps the staged or dirty flags it holds.
+        Marked(lore_revision::node::NodeID, u16),
+        /// A file with a zero hash and the nonzero size it holds, content no commit stored.
+        Unstored(lore_revision::node::NodeID, u64),
+        /// A directory whose address is not its children's rehash.
+        NotRehashed(lore_revision::node::NodeID),
+    }
+
+    /// What is wrong with the tree of `revision`: a node that keeps a staged or dirty mark, a file
+    /// with a zero hash and a nonzero size, which is content no commit stored, or a directory whose
+    /// address is not its children's rehash, the root's against the hash the revision holds for it.
+    /// A tree that keeps a mark is not rehashed, as a rehash refuses a staged node.
+    async fn revision_tree_faults(
+        repository: &Arc<lore_revision::repository::RepositoryContext>,
+        revision: Hash,
+    ) -> Vec<TreeFault> {
+        let state = State::deserialize(repository.clone(), revision)
+            .await
+            .expect("Deserialize failed");
+        let marks = NodeFlags::Staged | NodeFlags::Dirty;
+        let mut faults = Vec::new();
+        let mut directories = Vec::new();
+        let mut pending = vec![ROOT_NODE];
+        while let Some(directory) = pending.pop() {
+            for child in state
+                .node_children(repository.clone(), directory)
+                .await
+                .expect("The children read")
+            {
+                let node = state
+                    .node(repository.clone(), child)
+                    .await
+                    .expect("The node reads");
+                if NodeFlags::from_bits_retain(node.flags).intersects(marks) {
+                    faults.push(TreeFault::Marked(child, node.flags));
+                }
+                if node.is_directory() {
+                    directories.push((child, node.address.hash));
+                    pending.push(child);
+                } else if node.is_file() && node.address.hash.is_zero() && node.size != 0 {
+                    faults.push(TreeFault::Unstored(child, node.size));
+                }
+            }
+        }
+        if !faults.is_empty() {
+            return faults;
+        }
+        let root_hash = state
+            .tree(repository.clone())
+            .await
+            .expect("The tree reads")
+            .hash_root;
+        for (directory, _) in &directories {
+            state
+                .node_mark(
+                    repository,
+                    *directory,
+                    Mark::staged(NodeFlags::Staged, true),
+                )
+                .await
+                .expect("Marking the directory failed");
+        }
+        commit::rehash_directory(repository.clone(), state.clone(), ROOT_NODE)
+            .await
+            .expect("Rehash failed");
+        for (directory, hash) in directories.into_iter().chain([(ROOT_NODE, root_hash)]) {
+            let rehashed = state
+                .node(repository.clone(), directory)
+                .await
+                .expect("The node reads")
+                .address
+                .hash;
+            if rehashed != hash {
+                faults.push(TreeFault::NotRehashed(directory));
+            }
+        }
+        faults
+    }
+
+    /// Runs one case of the merge table, and answers what the merge commit holds at its path and
+    /// what is wrong with its tree and, for a move, at the path the move took the file from.
+    async fn table_case(
+        change: TableChange,
+        in_view: bool,
+        action: TableAction,
+        unstage: TableUnstage,
+        forced: bool,
+    ) -> (TableMerge, MergeCommitted, Vec<String>) {
+        let case = table_merge(change, in_view).await;
+        let (repository, root, path) = (&case.repository, case.tempdir.to_path_buf(), &case.path);
+        let written: Option<&[u8]> = match action {
+            TableAction::Nothing => None,
+            TableAction::DirtyMark
+            | TableAction::StageOther
+            | TableAction::StageNamed
+            | TableAction::StagePlain => Some(TABLE_EDIT),
+            TableAction::StageSame => case.merged,
+            TableAction::StageEmpty => Some(b""),
+        };
+        if let Some(content) = written {
+            write_working_file(&root, path, content);
+        }
+        match action {
+            TableAction::Nothing => {}
+            TableAction::DirtyMark => {
+                LORE_CONTEXT
+                    .scope(
+                        forced_execution(),
+                        file::dirty::dirty(repository.clone(), path_arguments(&root, &[path])),
+                    )
+                    .await
+                    .expect("Forced dirty failed");
+            }
+            TableAction::StageOther | TableAction::StageSame | TableAction::StageEmpty => {
+                stage_paths(repository, &root, &["."], true, true).await;
+            }
+            TableAction::StageNamed => stage_paths(repository, &root, &[path], false, true).await,
+            TableAction::StagePlain => stage_paths(repository, &root, &["."], true, false).await,
+        }
+        match unstage {
+            TableUnstage::None => {}
+            TableUnstage::Path => unstage_path(repository, &root, path, forced).await,
+            TableUnstage::Directory => {
+                unstage_path(repository, &root, &case.directory, forced).await;
+            }
+            TableUnstage::Root => unstage_path(repository, &root, ".", forced).await,
+        }
+        let committed = commit_merge(repository, path).await;
+        let (current, _) = lore_revision::instance::load_current_anchor_boxed(repository)
+            .await
+            .expect("Anchor load failed");
+        let left_out = table_left_out(change, in_view, action, unstage, forced);
+        let mut faults: Vec<String> = revision_tree_faults(repository, current)
+            .await
+            .into_iter()
+            .filter(|fault| {
+                !(matches!(left_out, TableLeftOut::Tree(_))
+                    && matches!(fault, TreeFault::NotRehashed(_)))
+            })
+            .map(|fault| format!("{fault:?}"))
+            .collect();
+        if let Some(source) = case.source.as_ref() {
+            let held = State::deserialize(repository.clone(), current)
+                .await
+                .expect("Deserialize failed")
+                .find_node_link(repository.clone(), source)
+                .await
+                .is_ok();
+            let unstaged = unstage != TableUnstage::None && (forced || in_view);
+            // A commit leaves out a move an unstage left unstaged: the file stays at its source.
+            if unstaged {
+                let content = if held {
+                    Some(committed_content(repository, current, source).await)
+                } else {
+                    None
+                };
+                if content.as_deref() != case.current {
+                    faults.push(format!("the commit holds {content:?} at {source}"));
+                }
+            } else if held {
+                faults.push(format!("the commit holds {source}, which the merge moved"));
+            }
+        }
+        (case, committed, faults)
+    }
+
+    /// What the merge table leaves out of a case, and why.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum TableLeftOut {
+        /// Nothing: the case is checked whole.
+        Nothing,
+        /// The check that each directory is its children's rehash, for the reason given.
+        Tree(&'static str),
+        /// The whole case, for the reason given.
+        Case(&'static str),
+    }
+
+    /// What the merge table leaves out of a case whose unstage reaches a change the merge staged,
+    /// which an unstage does not take out of the merge: an unstage that reaches the path, a forced
+    /// one or one in view, where the merge changed it, and a forced unstage of the tree, which
+    /// reaches every change the merge staged.
+    ///
+    /// A forced unstage of the path or of its directory, past the view, of the resolution a forced
+    /// stage made of the change, takes the current revision's file back, at the path or, for a
+    /// move, at the path the move took the file from, so the table checks the content there. It
+    /// leaves out the rehash of the tree, whose directories the merge staged and the unstage
+    /// clears. An unstage of a new directory a merge added, or of the tree, reaches the merge's add
+    /// of the directory, and of a file the merge moved into it.
+    fn table_left_out(
+        change: TableChange,
+        in_view: bool,
+        action: TableAction,
+        unstage: TableUnstage,
+        forced: bool,
+    ) -> TableLeftOut {
+        let reaches = match unstage {
+            TableUnstage::None => false,
+            TableUnstage::Root if forced => true,
+            _ => (forced || in_view) && change != TableChange::None,
+        };
+        let directory = matches!(unstage, TableUnstage::Directory | TableUnstage::Root);
+        let resolved = !in_view
+            && forced
+            && matches!(unstage, TableUnstage::Path | TableUnstage::Directory)
+            && matches!(
+                action,
+                TableAction::StageOther | TableAction::StageEmpty | TableAction::StageNamed
+            );
+        if !reaches {
+            TableLeftOut::Nothing
+        } else if change == TableChange::MoveIntoNewDirectory && directory {
+            TableLeftOut::Case("a file moved into a directory the merge added")
+        } else if change == TableChange::AddDirectory && directory {
+            TableLeftOut::Case("an unstage that reaches a directory the merge added")
+        } else if resolved && change != TableChange::None {
+            TableLeftOut::Tree("an unstage that reaches the directories a merge staged")
+        } else {
+            TableLeftOut::Case("an unstage that reaches a merge's change")
+        }
+    }
+
+    /// What the merge commit of a case of the merge table holds at its path, as the rulings on
+    /// merges past the view have it, or `None` for a case a gap filed apart leaves open.
+    ///
+    /// An unstage that reaches the path, a forced one or one in view, takes the current
+    /// revision's file back, and a commit leaves out a move it leaves unstaged, so the path a move
+    /// took the file to holds nothing. A forced stage takes the working tree's file, and so does a stage
+    /// in view. Without either, a commit takes the merge's change, read from the working tree in
+    /// view, where the user's edit of a merged file counts, and from the staged node past it.
+    fn table_expected(
+        case: &TableMerge,
+        change: TableChange,
+        in_view: bool,
+        action: TableAction,
+        unstage: TableUnstage,
+        forced: bool,
+    ) -> Option<MergeCommitted> {
+        let unstaged = unstage != TableUnstage::None && (forced || in_view);
+        let deletes = matches!(change, TableChange::Delete | TableChange::DeleteDirectory);
+        // A dirty mark over a staged delete replaces it with a modify.
+        if !unstaged && deletes && action == TableAction::DirtyMark {
+            return None;
+        }
+        if unstaged {
+            return Some(MergeCommitted::unchanged(
+                case.current.filter(|_| case.source.is_none()),
+            ));
+        }
+        let merged = change != TableChange::None;
+        let staged = match action {
+            TableAction::StageOther | TableAction::StageEmpty | TableAction::StageNamed => true,
+            TableAction::StagePlain => in_view,
+            _ => false,
+        };
+        let file = match action {
+            TableAction::DirtyMark | TableAction::StagePlain if !merged && !staged => case.current,
+            TableAction::DirtyMark if in_view => Some(TABLE_EDIT),
+            TableAction::Nothing | TableAction::StageSame | TableAction::DirtyMark => case.merged,
+            TableAction::StagePlain if !in_view => case.merged,
+            TableAction::StageOther | TableAction::StageNamed | TableAction::StagePlain => {
+                Some(TABLE_EDIT)
+            }
+            TableAction::StageEmpty => Some(&b""[..]),
+        };
+        let action_letter = match change {
+            TableChange::Add | TableChange::AddDirectory => "A",
+            TableChange::Move | TableChange::MoveIntoNewDirectory => "V",
+            _ if file.is_none() => "D",
+            _ => "M",
+        };
+        let changed = if !merged {
+            staged.then_some(("M", false))
+        } else {
+            Some((action_letter, true))
+        };
+        let mut expected = MergeCommitted::unchanged(file);
+        expected.change = changed;
+        Some(expected)
+    }
+
+    /// A plain unstage of the tree leaves a merge's change past the view staged, and the
+    /// directories above it with it: the merge commit holds the merge's change, and a tree whose
+    /// directories are their children's rehash.
+    #[tokio::test]
+    async fn a_plain_unstage_of_the_tree_leaves_a_merge_past_the_view_staged() {
+        in_execution(async {
+            let (_, committed, faults) = table_case(
+                TableChange::Modify,
+                false,
+                TableAction::Nothing,
+                TableUnstage::Root,
+                false,
+            )
+            .await;
+            assert_eq!(
+                (committed, faults),
+                (MergeCommitted::merged(b"merged", "M"), Vec::new())
+            );
+        })
+        .await;
+    }
+
+    /// A forced stage of a file a merge moved past the view keeps the move: the merge commit
+    /// records a move of the working tree's file.
+    #[tokio::test]
+    async fn a_forced_stage_of_a_merged_move_past_the_view_keeps_the_move() {
+        in_execution(async {
+            let (_, committed, faults) = table_case(
+                TableChange::Move,
+                false,
+                TableAction::StageOther,
+                TableUnstage::None,
+                false,
+            )
+            .await;
+            assert_eq!(
+                (committed, faults),
+                (MergeCommitted::merged(TABLE_EDIT, "V"), Vec::new())
+            );
+        })
+        .await;
+    }
+
+    /// A forced stage of a file a stage moved keeps the move, with the edit made since: the
+    /// commit records a move to the new path, of the working tree's content.
+    #[tokio::test]
+    async fn a_forced_stage_of_a_staged_move_keeps_the_move() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &["a.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            TreeEdit::Move("a.txt".to_string(), "b.txt".to_string())
+                .apply(&repository, &root)
+                .await;
+            write_working_file(&root, "b.txt", TABLE_EDIT);
+            stage_paths(&repository, &root, &["b.txt"], false, true).await;
+            let mut expected = MergeCommitted::unchanged(Some(TABLE_EDIT));
+            expected.two_parents = false;
+            expected.change = Some(("V", false));
+            assert_eq!(commit_merge(&repository, "b.txt").await, expected);
+        })
+        .await;
+    }
+
+    /// The staged comparison status runs keeps a node past the view only where something is
+    /// staged at or below it, below a directory a stage added too: a committed file a dirty move
+    /// took into such a directory past the view, beside a file a forced stage added, is not listed.
+    #[tokio::test]
+    async fn status_leaves_out_a_file_dirty_moved_below_a_directory_added_past_the_view() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &["moved.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            test_file_write(
+                root.join(lore_revision::repository::DOT_LORE)
+                    .join(lore_revision::repository::VIEW_FILTER)
+                    .as_path(),
+                b"/New/Hidden/\n",
+            );
+            let filter = lore_revision::repository::load_filter(&root).expect("Load filter failed");
+            let sparse = Arc::new(repository.to_filter_context(filter));
+            write_working_file(&root, "New/Hidden/b.txt", b"hidden");
+            stage_paths(&sparse, &root, &["New/Hidden/b.txt"], false, true).await;
+            // Test fixture writes; not subject to repository write-token discipline.
+            #[allow(clippy::disallowed_methods)]
+            std::fs::rename(root.join("moved.txt"), root.join("New/Hidden/moved.txt"))
+                .expect("Rename failed");
+            file::dirty::dirty_move(
+                sparse.clone(),
+                root.join("moved.txt").to_string_lossy().into_owned(),
+                root.join("New/Hidden/moved.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .await
+            .expect("Dirty move failed");
+            let listed: Vec<String> = status_reported(&sparse, None, false)
+                .await
+                .into_iter()
+                .map(|(entry, _)| entry)
+                .filter(|entry| entry.contains("New/Hidden/moved.txt"))
+                .collect();
+            assert_eq!(listed, Vec::<String>::new());
+        })
+        .await;
+    }
+
+    /// The merge table: twelve changes a merge makes at a path, in view and past it, under seven
+    /// actions a user can take there before the merge commit, each without an unstage and with a
+    /// plain and a forced unstage of the path, of its directory and of the tree. The merge commit
+    /// succeeds. Short of what [`table_left_out`] leaves out, it holds at the path what
+    /// [`table_expected`] says, where that says anything, and records the change's action there,
+    /// and its tree holds no node that keeps a staged or dirty mark, no file with a zero hash and
+    /// a nonzero size, no directory whose address is not its children's rehash, and no file at the
+    /// path a move took it from, where no unstage reached the move.
+    #[tokio::test]
+    async fn a_merge_commit_holds_what_the_user_made_of_the_merge() {
+        let changes = [
+            TableChange::None,
+            TableChange::Modify,
+            TableChange::Add,
+            TableChange::Delete,
+            TableChange::Move,
+            TableChange::AddAddTheirs,
+            TableChange::Empty,
+            TableChange::DeleteReadd,
+            TableChange::AddDirectory,
+            TableChange::MoveIntoNewDirectory,
+            TableChange::DeleteDirectory,
+            TableChange::ModifyConflict,
+        ];
+        let actions = [
+            TableAction::Nothing,
+            TableAction::DirtyMark,
+            TableAction::StageOther,
+            TableAction::StageSame,
+            TableAction::StageEmpty,
+            TableAction::StageNamed,
+            TableAction::StagePlain,
+        ];
+        let unstages = [
+            (TableUnstage::None, false),
+            (TableUnstage::Path, false),
+            (TableUnstage::Path, true),
+            (TableUnstage::Directory, false),
+            (TableUnstage::Directory, true),
+            (TableUnstage::Root, false),
+            (TableUnstage::Root, true),
+        ];
+        let running = Arc::new(tokio::sync::Semaphore::new(32));
+        let mut tasks = Vec::new();
+        for change in changes {
+            for in_view in [false, true] {
+                for action in actions {
+                    for (unstage, forced) in unstages {
+                        let left_out = table_left_out(change, in_view, action, unstage, forced);
+                        if matches!(left_out, TableLeftOut::Case(_)) {
+                            continue;
+                        }
+                        let running = running.clone();
+                        #[allow(clippy::disallowed_methods)]
+                        let task = runtime().spawn(LORE_CONTEXT.scope(
+                            setup_test_execution(),
+                            async move {
+                                let _permit = running.acquire().await.expect("A permit");
+                                let (case, committed, mut faults) =
+                                    table_case(change, in_view, action, unstage, forced).await;
+                                if let Some(expected) =
+                                    table_expected(&case, change, in_view, action, unstage, forced)
+                                    && committed != expected
+                                {
+                                    faults.push(format!("holds {committed:?}, not {expected:?}"));
+                                }
+                                faults
+                            },
+                        ));
+                        tasks.push(((change, in_view, action, unstage, forced), task));
+                    }
+                }
+            }
+        }
+        let mut failures = Vec::new();
+        for (case, task) in tasks {
+            match task.await {
+                Ok(faults) => failures.extend(faults.into_iter().map(|f| format!("{case:?}: {f}"))),
+                Err(err) => failures.push(format!("{case:?}: {err}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Rebasing the staged state, as a sync or a branch switch does, carries a dirty mark on a

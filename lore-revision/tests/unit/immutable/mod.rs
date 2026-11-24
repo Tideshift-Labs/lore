@@ -3,5 +3,5 @@
 
 mod cache_tests;
 mod remote_store_tests;
-mod serving;
-mod session_tests;
+pub(crate) mod serving;
+pub(crate) mod session_tests;

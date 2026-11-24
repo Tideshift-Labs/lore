@@ -25,11 +25,12 @@ def name_service_executable(
 ) -> dict[str, str]:
     """Names the executable under test as the service.
 
-    `service start` needs an executable to spawn, and commands relaying to a
-    service need an executable to start one when none is running. Setting it
-    here rather than in each test ensures no test can leave it out, and that
-    the service serving a test is always the build being tested rather than
-    whichever Lore is installed on the machine running the suite.
+    Commands relaying to a service need an executable to start one when none is
+    running, and `service start` and a virtual clone's commands start the named
+    one in place of the `lore` that ran them. Setting it here rather than in
+    each test ensures no test can leave it out, and that the service serving a
+    test is always the build being tested rather than whichever Lore is
+    installed on the machine running the suite.
 
     A test that names one itself keeps it.
     """
@@ -52,6 +53,11 @@ LORE_TEST_SERVICE_SOCKET_VAR = "LORE_TEST_SERVICE_SOCKET"
 # Set to have the suite start that service itself, from the build under test,
 # and stop it when the run ends.
 LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
+
+# Names the VFS, such as `fuse`, of every repository a test creates or clones where
+# the test names none. A virtual clone is mounted by the service, so a run setting
+# it takes one too. See `docs/developing/code-standards/testing.md`.
+LORE_TEST_VFS_VAR = "LORE_TEST_VFS"
 
 # Lines the client prints about the service. They are matched rather than
 # parsed, so they are kept here next to each other: each one pairs with a string

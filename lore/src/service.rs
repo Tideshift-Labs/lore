@@ -15,7 +15,6 @@ use lore_revision::event::LoreServiceStatusEventData;
 use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
-use lore_revision::lore::execution_context;
 use lore_revision::lore_info;
 use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
@@ -25,8 +24,9 @@ use crate::call::no_repository_call;
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
-use crate::remote::call::service_call_over;
+use crate::remote::call::run_service_call;
 use crate::remote::service_process::ServiceProcessError;
+use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::collect_exited_services;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
@@ -45,9 +45,10 @@ pub struct LoreServiceStartArgs {}
 
 /// Start the Lore service process, unless one is already running.
 ///
-/// Connects to the running service, and starts one when nothing is listening.
-/// Succeeds once a service is reachable, whether it was already running or was
-/// started here.
+/// Connects to the running service, and starts one when nothing is listening: from the
+/// executable named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`, else from this
+/// program's own where it runs the service ([`crate::serve_from_this_executable`]). Succeeds
+/// once a service is reachable, whether it was already running or was started here.
 ///
 /// # Events
 ///
@@ -87,9 +88,11 @@ fn start_local(
         // The connection is proof that a service is reachable and nothing more.
         // A start asks for one to be running, not for anything to be sent to it,
         // so it is closed again here.
-        connect_or_spawn_service().await.map(|_connection| {
-            lore_info!("Lore service is running");
-        })
+        connect_or_spawn_service(ServiceStart::NamedOrThisProgram)
+            .await
+            .map(|_connection| {
+                lore_info!("Lore service is running");
+            })
     })
 }
 
@@ -145,9 +148,12 @@ async fn stop_local(
             // service is asked to exit. `force` is read from the execution context: read from
             // `globals` before they move, it would keep a second copy of them in the future of
             // `stop_local`.
+            // SWFS mounts are closed as the service exits, once it takes no more commands.
+            #[cfg(target_os = "linux")]
             if let Some(manager) = MountManagerState::mount_manager() {
                 manager
-                    .unmount_all(execution_context().globals().force())
+                    .fuse()
+                    .unmount_all(lore_revision::lore::execution_context().globals().force())
                     .await
                     .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
             }
@@ -162,7 +168,7 @@ async fn stop_local(
     // on a service that is running and must not be what starts one.
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            let status = service_call_over(connection, globals, args.into(), callback).await;
+            let status = run_service_call(Some(connection), globals, args.into(), callback).await;
             if status != 0 {
                 return status;
             }
@@ -430,7 +436,7 @@ async fn status_local(
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
             // Service is running; relay the status command to it.
-            service_call_over(connection, globals, args.into(), callback).await
+            run_service_call(Some(connection), globals, args.into(), callback).await
         }
         Ok(None) => {
             // No service is listening; emit not-running status.
@@ -468,7 +474,8 @@ fn emit_status_from_service() {
         .unwrap_or_default();
 
     // Get mount count from MountManagerState.
-    let swfs_mount_count = MountManagerState::mount_manager().map_or(0, |m| m.mount_count() as u32);
+    let swfs_mount_count =
+        MountManagerState::mount_manager().map_or(0, |m| m.swfs().mount_count() as u32);
 
     // Emit ServiceStatus event.
     LoreEvent::ServiceStatus(LoreServiceStatusEventData {

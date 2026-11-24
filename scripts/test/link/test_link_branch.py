@@ -3,17 +3,23 @@
 import re
 
 import pytest
-from error_types import LinkDivergedError
+from error_types import BranchDivergedError, LinkDivergedError
 from link_helpers import (
     DEFAULT_LINK_MOUNT,
     DEFAULT_PARENT_FILE,
+    build_nested_link_repos_at,
     make_parent_with_link,
     make_repo,
     remote_branch_entries,
+    remount,
 )
-from lore_parsers import parse_jsonl
+from lore_parsers import parse_jsonl, parse_status_json
 
 from lore import Lore
+
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
 
 
 @pytest.mark.smoke
@@ -736,17 +742,260 @@ def test_link_push_tells_a_layer_from_a_link(new_lore_repo):
     parent_repo.stage("vendor/lib/linked.txt")
     parent_repo.commit("Edit through the mount")
 
-    # A link is pushed once per parent revision walked, so the kinds are
-    # collected as a set rather than counted.
-    kinds = {
+    kinds = sorted(
         (event["flagLink"], event["flagLayer"])
         for event in parse_jsonl(parent_repo.push(json=True), "branchPush")
-    }
-
-    assert kinds == {(False, False), (False, True), (True, False)}, (
-        "Push must report the parent as neither a link nor a layer, the layer as "
-        f"a layer, and the link as a link, got {kinds}"
     )
+
+    assert kinds == [(False, False), (False, True), (True, False)], (
+        "Push must report the parent as neither a link nor a layer, the layer as "
+        f"a layer, and the link as a link, each once, got {kinds}"
+    )
+
+
+def _current_revision(repo: Lore) -> str:
+    """The revision `status` reports the working copy at."""
+    match = re.search(r"On branch \S+ revision \d+ -> (\w+)", repo.status())
+    assert match, "status must report the current revision"
+    return match.group(1)
+
+
+def _tracks(repo: Lore, link_path: str) -> bool:
+    """Whether the link at `link_path` follows its parent's branch."""
+    entries = parse_jsonl(repo.link_list(json=True), "linkEntry")
+    return bool(next(e for e in entries if e["linkPath"] == link_path)["tracking"])
+
+
+def _assert_link_follows_feature(repo: Lore, source: Lore):
+    assert re.search(
+        rf"Link\s+{source.get_id()}.*?Branch:\s+feature\b[^\n]*\[tracking\]",
+        repo.link_list(),
+        re.DOTALL,
+    ), "the link must follow the parent onto the new branch"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("pin", [None, "main@LATEST"], ids=["latest", "pin"])
+def test_link_update_along_the_parent_branch_keeps_the_link_tracking(
+    new_lore_repo, pin
+):
+    """A `link update` to a revision on the parent's branch keeps the link
+    following the parent's branch: a branch created over it starts at the
+    parent's revision, and a later update on main reaches it through a merge."""
+    parent, source = make_parent_with_link(new_lore_repo)
+    assert (
+        f"{DEFAULT_LINK_MOUNT} is already up to date; not pinned"
+        in parent.link_update(DEFAULT_LINK_MOUNT)
+    ), "updating a link whose repository has not moved must say it pins nothing"
+    source.write_commit_push("Advance", {"advanced.txt": "advanced\n"})
+    parent.link_update(DEFAULT_LINK_MOUNT, pin=pin)
+    parent.commit("Move the link")
+    parent.push()
+    assert _tracks(parent, DEFAULT_LINK_MOUNT), "the link must follow main"
+    start = _current_revision(parent)
+
+    parent.branch_create("feature")
+
+    assert parent.branch_info().local_latest == start, (
+        "a branch over a tracking link must start at the parent's revision"
+    )
+    assert _current_revision(parent) == start
+    parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
+
+    parent.branch_switch("main")
+    source.write_commit_push("Advance again", {"again.txt": "again\n"})
+    parent.link_update(DEFAULT_LINK_MOUNT)
+    parent.commit("Move the link on main")
+    parent.push()
+    parent.branch_switch("feature")
+    parent.branch_merge("main", message="Merge main")
+    parent.push()
+
+    _assert_link_follows_feature(parent, source)
+    with parent.open_file(f"{DEFAULT_LINK_MOUNT}/again.txt", "r") as input_file:
+        assert input_file.read() == "again\n", "the merge must carry the update"
+
+
+def _stage_an_edit(parent: Lore, _source: Lore):
+    parent.write_files({"staged.txt": "staged\n"})
+    parent.stage("staged.txt")
+
+
+def _stage_a_link_removal(parent: Lore, _source: Lore):
+    parent.link_remove(DEFAULT_LINK_MOUNT)
+
+
+def _stage_a_remount(parent: Lore, source: Lore):
+    remount(parent, DEFAULT_LINK_MOUNT, source.get_id(), "/sub", message=None)
+
+
+def _stage_a_divergent_merge(parent: Lore, _source: Lore):
+    """Stages the merge of main's latest, which another clone pushed, into a
+    local commit on main."""
+    other = parent.clone()
+    other.write_commit_push("Remote change", {"remote.txt": "remote\n"})
+    parent.write_files({"local.txt": "local\n"})
+    parent.stage("local.txt")
+    parent.commit("Local change")
+    parent.branch_merge_start("main", no_commit=True)
+
+
+def _branch_over_a_link_on_another_branch(new_lore_repo, stage) -> tuple[Lore, Lore]:
+    """Parent on a new `feature` branch, created over a link that `link update`
+    pinned to another branch of the linked repository, with what `stage` stages
+    before the branch was created, and the linked repository."""
+    parent, source = make_parent_with_link(
+        new_lore_repo,
+        link_files={"linked.txt": "linked content\n", "sub/inner.txt": "inner\n"},
+    )
+    source.branch_create("release")
+    source.write_commit_push("Release", {"release.txt": "release\n"})
+    parent.link_update(DEFAULT_LINK_MOUNT, pin="release@LATEST")
+    parent.commit("Pin the link to release")
+    parent.push()
+    assert not _tracks(parent, DEFAULT_LINK_MOUNT), "the link must name release"
+    stage(parent, source)
+
+    parent.branch_create("feature")
+
+    assert _current_revision(parent) == parent.branch_info().local_latest, (
+        "the working copy must stand on the revision the new branch starts at"
+    )
+    return parent, source
+
+
+@pytest.mark.smoke
+def test_branch_created_over_a_link_on_another_branch_keeps_a_staged_edit_staged(
+    new_lore_repo,
+):
+    """An edit staged before the branch was created stays staged, outside the
+    revision the branch starts at, and is committed by the first commit."""
+    parent, _source = _branch_over_a_link_on_another_branch(
+        new_lore_repo, _stage_an_edit
+    )
+
+    staged = parse_status_json(parent.status(json=True))
+    assert [entry["path"] for entry in staged] == ["staged.txt"], (
+        f"the edit must still be staged, got {staged}"
+    )
+
+    parent.commit("First commit")
+    parent.push()
+    clone = parent.clone(branch="feature")
+    with clone.open_file("staged.txt", "r") as input_file:
+        assert input_file.read() == "staged\n", "the first commit must carry the edit"
+
+
+@pytest.mark.smoke
+def test_branch_created_over_a_link_on_another_branch_merges_a_staged_merge_into_it(
+    new_lore_repo,
+):
+    """A merge of main's latest into a local commit, staged before the branch
+    was created, merges main's latest into the new branch, which pushes."""
+    parent, _source = _branch_over_a_link_on_another_branch(
+        new_lore_repo, _stage_a_divergent_merge
+    )
+    remote_main = parent.branch_info("main").remote_latest
+
+    parent.commit("Merge main")
+    parent.push()
+
+    merge = parent.revision_info().merge.split()
+    assert merge[1:] == [remote_main], (
+        f"the merge must take main's latest {remote_main} as its second parent, "
+        f"got {merge}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "stage_link_change",
+    [_stage_a_link_removal, _stage_a_remount],
+    ids=["remove", "remount"],
+)
+def test_branch_created_over_a_staged_link_change_keeps_the_link_on_it_once_unstaged(
+    new_lore_repo, stage_link_change
+):
+    """A link on another branch that a staged removal or remount replaces
+    follows the new branch once the change is unstaged, and the branch takes a
+    commit and pushes."""
+    parent, source = _branch_over_a_link_on_another_branch(
+        new_lore_repo, stage_link_change
+    )
+
+    parent.unstage(".")
+
+    _assert_link_follows_feature(parent, source)
+    parent.write_commit_push("First commit", {"feature.txt": "on feature\n"})
+    assert _current_revision(parent) == parent.branch_info().local_latest
+
+
+@pytest.mark.smoke
+def test_branch_created_over_nested_links_takes_a_commit(new_lore_repo):
+    """A link added inside another keeps the outer link tracking, so a branch
+    created over them starts at the parent's revision and takes its first
+    commit. Pushing it needs the nested repository's branch, which branch
+    creation does not make."""
+    parent, _b, _c, b_mount, _nested_mount = build_nested_link_repos_at(
+        new_lore_repo, "vendor", "nested"
+    )
+    assert _tracks(parent, b_mount), "the outer link must follow main"
+    start = _current_revision(parent)
+
+    parent.branch_create("feature")
+    assert parent.branch_info().local_latest == start
+    assert _current_revision(parent) == start
+
+    parent.write_files({"feature.txt": "on feature\n"})
+    parent.stage("feature.txt")
+    parent.commit("First commit")
+
+    assert _current_revision(parent) == parent.branch_info().local_latest
+
+
+def _stage_a_link_add(new_lore_repo) -> tuple[Lore, Lore]:
+    """Parent with a link staged by `link add` and not committed, and the
+    linked repository."""
+    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    source = make_repo(new_lore_repo, {"linked.txt": "linked content\n"})
+    parent.link_add(DEFAULT_LINK_MOUNT, source.get_id(), "/")
+    return parent, source
+
+
+def _stage_a_link_update(new_lore_repo) -> tuple[Lore, Lore]:
+    """Parent with a committed link that a staged `link update` repins, and the
+    linked repository."""
+    parent, source = make_parent_with_link(new_lore_repo)
+    source.write_commit_push("Advance", {"advanced.txt": "advanced\n"})
+    parent.link_update(DEFAULT_LINK_MOUNT)
+    return parent, source
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "stage_link", [_stage_a_link_add, _stage_a_link_update], ids=["add", "update"]
+)
+def test_branch_created_over_a_staged_link_branches_the_linked_repository(
+    new_lore_repo, stage_link
+):
+    """A link only staged, added or repinned, gets the new branch in the linked
+    repository, and the first commit on the branch pins the link to it and
+    pushes."""
+    parent, source = stage_link(new_lore_repo)
+
+    parent.branch_create("feature")
+
+    cascaded = [
+        e["id"] for e in remote_branch_entries(source) if e["name"] == "feature"
+    ]
+    assert cascaded == [parent.branch_info("feature").id], (
+        f"branch create must make the branch in the linked repository, got {cascaded}"
+    )
+
+    parent.commit("Commit the staged link")
+    parent.push()
+
+    _assert_link_follows_feature(parent, source)
 
 
 @pytest.mark.smoke
@@ -768,6 +1017,138 @@ def test_link_push_onto_a_moved_link_branch_fails_as_diverged(new_lore_repo):
 
     with pytest.raises(LinkDivergedError):
         parent.push()
+
+
+@pytest.mark.smoke
+def test_link_push_reports_every_diverged_link(new_lore_repo):
+    """A push that stops at several diverged links names each of them."""
+    parent, first_link = make_parent_with_link(new_lore_repo, "vendor/first")
+    second_link = make_repo(new_lore_repo, {"linked.txt": "second linked content\n"})
+    parent.link_add("vendor/second", second_link.get_id(), "/")
+    parent.commit("Add a second link")
+    parent.push()
+
+    for link_repo in (first_link, second_link):
+        link_repo.clone().write_commit_push(
+            "Move linked main", {"linked.txt": "moved on upstream\n"}
+        )
+    edits = {
+        "vendor/first/linked.txt": "edited through the first mount\n",
+        "vendor/second/linked.txt": "edited through the second mount\n",
+    }
+    parent.write_files(edits)
+    parent.stage(list(edits))
+    parent.commit("Edit through both mounts")
+
+    with pytest.raises(LinkDivergedError) as failure:
+        parent.push(json=True)
+
+    output = str(failure.value)
+    completes = parse_jsonl(output, "complete")
+    error_logs = [log for log in parse_jsonl(output, "log") if log["level"] == "error"]
+    assert [complete["status"] for complete in completes] == [52], completes
+    # The failing completion logs its own error, beside one line for the other failure.
+    assert len(error_logs) == 2, error_logs
+
+
+@pytest.mark.smoke
+def test_push_of_a_diverged_layer_pushes_nothing(new_lore_repo):
+    """A push whose layer has diverged fails before it pushes the repository."""
+    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    layer_repo: Lore = new_lore_repo(parent.name + "_layer")
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {"lay/layered.txt": b"layer content"})
+    parent.layer_add("lay", layer_repo, "lay/")
+    pushed = parent.branch_info().remote_latest
+
+    layer_repo.write_commit_push(
+        "Move layer main", {"lay/layered.txt": b"moved on upstream"}
+    )
+    edits = {
+        "lay/layered.txt": "edited through the parent\n",
+        DEFAULT_PARENT_FILE: "edited\n",
+    }
+    parent.write_files(edits)
+    parent.stage(list(edits))
+    parent.commit("Edit the layer and the parent")
+
+    with pytest.raises(BranchDivergedError):
+        parent.push()
+
+    assert parent.branch_info().remote_latest == pushed
+
+
+def make_parent_reaching_shared_twice(new_lore_repo) -> tuple[Lore, Lore]:
+    """Returns (parent, shared): the parent links `first` and `second`, each of
+    which links `shared` at `<name>/shared`, all pushed."""
+    parent = make_repo(new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"})
+    shared = make_repo(new_lore_repo, {"shared.txt": "shared content\n"})
+    for name in ("first", "second"):
+        middle = make_repo(new_lore_repo, {f"{name}.txt": f"{name} content\n"})
+        parent.link_add(name, middle.get_id(), "/")
+        parent.commit(f"Link {name}")
+        parent.push()
+        parent.link_add(f"{name}/shared", shared.get_id(), "/")
+        parent.commit(f"Link the shared repository in {name}")
+        parent.push()
+    return parent, shared
+
+
+@pytest.mark.smoke
+def test_link_push_of_diverged_revisions_of_one_branch_pushes_nothing(new_lore_repo):
+    """Edits made through two mounts of one linked branch, each on the revision
+    its mount pins, are diverged revisions of that branch: the push fails as a
+    diverged link before it pushes either."""
+    parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
+    pushed = shared.branch_info().remote_latest
+    for name in ("first", "second"):
+        mounted_file = f"{name}/shared/{name}-edit.txt"
+        parent.write_files({mounted_file: f"edited through {name}\n"})
+        parent.stage(mounted_file)
+        parent.commit(f"Edit the shared repository through {name}")
+
+    with pytest.raises(LinkDivergedError):
+        parent.push()
+
+    assert shared.branch_info().remote_latest == pushed
+
+
+@pytest.mark.smoke
+def test_link_push_pushes_a_repository_two_links_reach_once(new_lore_repo):
+    """Two linked repositories that both link a third push the third once, at the
+    newest revision either of them names, which holds the other."""
+    parent, shared = make_parent_reaching_shared_twice(new_lore_repo)
+
+    # Each edit lands on the shared branch's latest revision, which the second
+    # mount is moved onto first, so the revisions the two name are on one line.
+    for name in ("first", "second"):
+        if name == "second":
+            first_pin = re.search(
+                r"Link path: first/shared .*?Revision:\s*(\w+)",
+                parent.link_list(),
+                re.DOTALL,
+            ).group(1)
+            parent.link_update(f"{name}/shared", pin=first_pin)
+            parent.commit(f"Move {name}/shared onto the first edit")
+        mounted_file = f"{name}/shared/{name}-edit.txt"
+        parent.write_files({mounted_file: f"edited through {name}\n"})
+        parent.stage(mounted_file)
+        parent.commit(f"Edit the shared repository through {name}")
+
+    shared_pushes = [
+        event
+        for event in parse_jsonl(parent.push(json=True), "branchPush")
+        if event["repository"] == shared.get_id()
+    ]
+
+    assert len(shared_pushes) == 1, (
+        "Both links reach the shared repository on one branch, which should be "
+        f"pushed once, got {len(shared_pushes)}: {shared_pushes}"
+    )
+    verify = parent.clone()
+    assert verify.file_exists("first/shared/first-edit.txt")
+    assert verify.file_exists("second/shared/first-edit.txt")
+    assert verify.file_exists("second/shared/second-edit.txt")
 
 
 @pytest.mark.smoke

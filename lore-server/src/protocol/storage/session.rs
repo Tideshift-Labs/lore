@@ -8,7 +8,9 @@ use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
 use dashmap::DashSet;
+use dashmap::mapref::entry::Entry;
 use lore_revision::lore::RepositoryId;
+use lore_storage::CorrelationHold;
 
 use crate::authnz::repository_authorizer::Action;
 use crate::authnz::repository_authorizer::Grants;
@@ -149,6 +151,9 @@ pub struct SessionEntry {
     /// would refuse the same token on gRPC. `None` without a verified token (auth off), which
     /// never expires.
     pub expires_at: Option<u64>,
+    /// What the stores keep for the session's correlation id, given up as the session ends
+    /// (stopped, swept as expired, or dropped with the map).
+    pub held: Vec<CorrelationHold>,
 }
 
 impl SessionEntry {
@@ -193,6 +198,10 @@ pub struct SessionMap {
     /// Admission slots claimed before allocation. Unlike `DashMap::len` followed by insert, the
     /// compare-and-swap makes the limit one atomic decision across concurrent starts.
     active_sessions: AtomicU32,
+    /// The sequence ids are drawn from: `None` for [`NEXT_SESSION_ID`], the process-wide one;
+    /// `Some` for a counter shared by a set of maps ([`SessionMap::sharing_ids`], upstream's UDS
+    /// machine server). Either way ids wrap past zero and skip an id still in use here.
+    sequence: Option<Arc<AtomicU32>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -200,6 +209,16 @@ pub enum SessionError {
     LimitReached,
     CounterExhausted,
     NotFound,
+}
+
+/// The correlation id a session runs under: the one its client names, or a fresh one for a
+/// client that names none.
+pub fn correlation_id_or_new(correlation_id: String) -> String {
+    if correlation_id.is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        correlation_id
+    }
 }
 
 impl SessionMap {
@@ -246,7 +265,7 @@ impl SessionMap {
                 reason = "synchronous entry claim; nothing awaits while the shard lock is held"
             )]
             let vacancy = self.entries.entry(id);
-            if let dashmap::mapref::entry::Entry::Vacant(vacant) = vacancy {
+            if let Entry::Vacant(vacant) = vacancy {
                 vacant.insert(entry);
                 return Ok(id);
             }
@@ -254,11 +273,24 @@ impl SessionMap {
         Err(SessionError::CounterExhausted)
     }
 
+    /// A map drawing its session ids from `counter`, shared with other maps, so an id a closed
+    /// connection handed out names no session on another until the counter wraps. Zero, which
+    /// means no session, is skipped when the counter wraps, and so is an id still in use here.
+    ///
+    /// FORK-LOCAL (Tideshift): a map built with [`SessionMap::default`] draws from
+    /// [`NEXT_SESSION_ID`] instead, and keeps the fork's admission slots and expiry sweep either way.
+    pub fn sharing_ids(counter: Arc<AtomicU32>) -> Self {
+        Self {
+            sequence: Some(counter),
+            ..Self::default()
+        }
+    }
+
     /// Start a new session. Always allocates a fresh session ID — deduplication
     /// is the client's responsibility (`StorageConnector`).
     #[expect(
         clippy::too_many_arguments,
-        reason = "one field per SessionEntry input; FORK-LOCAL (Tideshift, WP-124) added `declared`"
+        reason = "one field per SessionEntry input; FORK-LOCAL (Tideshift, WP-124) added `declared`, upstream v0.14 `held`"
     )]
     pub fn start(
         &self,
@@ -269,12 +301,13 @@ impl SessionMap {
         grants: Option<Grants>,
         token: Option<Arc<VerifiedTokenOwned>>,
         declared: bool,
+        held: Vec<CorrelationHold>,
     ) -> Result<(u32, String), SessionError> {
         // FORK-LOCAL (Tideshift, WP-124): before claiming a slot, so a slot a superseded session
         // held is free for this one.
         self.sweep_expired(now_unix_secs());
         self.start_from(
-            &NEXT_SESSION_ID,
+            self.sequence.as_deref().unwrap_or(&*NEXT_SESSION_ID),
             repository,
             correlation_id,
             user_id,
@@ -282,6 +315,7 @@ impl SessionMap {
             grants,
             token,
             declared,
+            held,
         )
     }
 
@@ -301,6 +335,7 @@ impl SessionMap {
         grants: Option<Grants>,
         token: Option<Arc<VerifiedTokenOwned>>,
         declared: bool,
+        held: Vec<CorrelationHold>,
     ) -> Result<(u32, String), SessionError> {
         self.active_sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -308,11 +343,7 @@ impl SessionMap {
             })
             .map_err(|_err| SessionError::LimitReached)?;
 
-        let correlation_id = if correlation_id.is_empty() {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            correlation_id
-        };
+        let correlation_id = correlation_id_or_new(correlation_id);
         let expires_at = token
             .as_ref()
             .map(|token| token.claims.expires.saturating_add(TOKEN_EXP_LEEWAY_SECS));
@@ -329,6 +360,7 @@ impl SessionMap {
                 authorized_sources: Arc::new(DashSet::new()),
                 declared,
                 expires_at,
+                held,
             },
         ) {
             Ok(session_id) => session_id,

@@ -18,6 +18,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use lore_storage::CallerBuffer;
+use lore_storage::FlushOptions;
 use lore_storage::Loan;
 use lore_storage::LocalImmutableStore;
 use lore_storage::LocalMutableStore;
@@ -28,6 +29,7 @@ use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::ImmutableStore;
+use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::Lookup;
 use parking_lot::Mutex;
 use parking_lot::RwLock;
@@ -49,6 +51,9 @@ use crate::shim;
 
 /// Exit code of a run that saw a violation and stopped at once, keeping the store as it was.
 pub const EXIT_VIOLATION: u8 = 99;
+
+/// Mixed into a run's seed to randomly choose whether its store defers eviction flushes.
+const DEFER_SEED: u64 = 0x6465_6665_725f_6576;
 
 tokio::task_local! {
     /// Set in a task spawned to outlive the operation that started it, on the claim that
@@ -348,12 +353,19 @@ fn sizes(args: &Args, name: &str, default: &str) -> Vec<usize> {
 async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     let config = Config::load_or_create(dir, args).map_err(|err| err.to_string())?;
     let journal = Arc::new(Journal::open(dir).map_err(|err| err.to_string())?);
-    let mut rng = Rng::new(args.number("run-seed", journal.generation()) ^ config.seed);
+    let run_seed = args.number("run-seed", journal.generation()) ^ config.seed;
+    let mut rng = Rng::new(run_seed);
     let flush_background = match args.get("flush-background") {
         Some(value) => value == "true",
         None => rng.chance(0.5),
     };
     let flush_delay = args.number("flush-delay", rng.below(3));
+    // Uses a separate random generator to preserve the run's other seeded draws. Selected only when
+    // background flushing is enabled, the only combination in which deferral takes effect.
+    let defer_eviction_flush = match args.get("defer-eviction-flush") {
+        Some(value) => value == "true",
+        None => flush_background && Rng::new(run_seed ^ DEFER_SEED).chance(0.5),
+    };
     let options = Options::from_args(args, flush_delay);
     let mut mix_spec = args.string("mix", "");
     if config.real_hash && !mix_spec.contains("verify=") {
@@ -367,7 +379,7 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         report_repairs(&journal);
     }
     journal.log(format_args!(
-        "g start pid={} flush_background={flush_background} flush_delay={flush_delay}",
+        "g start pid={} flush_background={flush_background} flush_delay={flush_delay} defer_eviction_flush={defer_eviction_flush}",
         std::process::id()
     ));
     let overlaps = coverage::Overlaps::new(kind_names());
@@ -378,13 +390,16 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
     // index load, and released once the workers are spawned.
     let (store, opening_claim) = LocalImmutableStore::new_claimed(
         Some(dir.to_path_buf()),
-        config.settings(flush_background, flush_delay),
+        ImmutableStoreSettings {
+            defer_eviction_flush,
+            ..config.settings(flush_background, flush_delay)
+        },
     )
     .await
     .map_err(|err| format!("open: {err}"))?;
     let opening_claim = opening_claim.filter(|_| options.spans > 0);
     println!(
-        "opened generation {} in {:.3}s (flush_background={flush_background}, flush_delay={flush_delay})",
+        "opened generation {} in {:.3}s (flush_background={flush_background}, flush_delay={flush_delay}, defer_eviction_flush={defer_eviction_flush})",
         journal.generation(),
         opened.elapsed().as_secs_f64()
     );
@@ -498,7 +513,13 @@ async fn run(dir: &Path, args: &Args) -> Result<u8, String> {
         "flush" | "sync" => {
             let sync = work.options.end == "sync";
             let id = journal.flush_start(Store::Immutable, sync, work.options.strong_flushes);
-            let flushed = dyn_store.clone().flush(sync).await;
+            let flushed = dyn_store
+                .clone()
+                .flush(FlushOptions {
+                    sync_data: sync,
+                    ..FlushOptions::default()
+                })
+                .await;
             if let Err(err) = &flushed {
                 eprintln!("final flush failed: {err}");
                 work.unexpected("final flush", &err.to_string());
@@ -1254,7 +1275,12 @@ impl Work {
         let running = self.overlaps.start(kind as usize);
         let sync = kind == Kind::FlushSync;
         let id = self.journal.flush_start(Store::Immutable, sync, false);
-        let result = store.flush(sync).await;
+        let result = store
+            .flush(FlushOptions {
+                sync_data: sync,
+                ..FlushOptions::default()
+            })
+            .await;
         self.journal.flush_end(Store::Immutable, id, result.is_ok());
         drop(running);
         self.record(kind, result.map_err(|err| err.to_string()));
@@ -1549,7 +1575,12 @@ impl Work {
                 let id =
                     self.journal
                         .flush_start(Store::Immutable, sync, self.options.strong_flushes);
-                let result = store.flush(sync).await;
+                let result = store
+                    .flush(FlushOptions {
+                        sync_data: sync,
+                        ..FlushOptions::default()
+                    })
+                    .await;
                 self.journal.flush_end(Store::Immutable, id, result.is_ok());
                 result.map_err(|err| err.to_string())
             }
@@ -1706,7 +1737,14 @@ impl Work {
         let id = self
             .journal
             .flush_start(Store::Mutable, sync, self.options.strong_flushes);
-        let result = lore_storage::MutableStore::flush(store, sync).await;
+        let result = lore_storage::MutableStore::flush(
+            store,
+            FlushOptions {
+                sync_data: sync,
+                ..FlushOptions::default()
+            },
+        )
+        .await;
         self.journal.flush_end(Store::Mutable, id, result.is_ok());
         result.map_err(|err| err.to_string())
     }
@@ -1938,7 +1976,7 @@ impl Work {
         let id = self
             .journal
             .flush_start(Store::Immutable, false, self.options.strong_flushes);
-        let flushed = self.dyn_store().flush(false).await;
+        let flushed = self.dyn_store().flush(FlushOptions::default()).await;
         self.journal
             .flush_end(Store::Immutable, id, flushed.is_ok());
         match flushed {

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic;
 
+use lore_storage::FlushOptions;
 use lore_storage::Hash;
 use lore_storage::Partition;
 use lore_storage::immutable_store::ImmutableStore;
@@ -16,6 +17,8 @@ use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
 use crate::store_fixture::wait_for;
+
+mod removal;
 
 fn write_bucket_file(path: &Path, version: u32) {
     let entry = MutableStoreEntry::default();
@@ -220,7 +223,8 @@ async fn a_flush_writes_a_bucket_whose_claimed_write_did_not_land() {
     let writing = group.flush_lock.clone().lock_owned().await;
     assert!(group.dirty[0].swap(false, atomic::Ordering::Relaxed));
     let flushing: Arc<dyn MutableStore> = store.clone();
-    let mut flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let mut flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(200), &mut flush)
             .await
@@ -268,7 +272,8 @@ async fn a_flush_skips_no_group_whose_claimed_write_did_not_land() {
         lore_storage::test_util::pause_at(PausePoint::Scanning),
     ];
     let flushing: Arc<dyn MutableStore> = store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     scanning[0].reached.notified().await;
     scanning[0].resume.notify_one();
     scanning[1].reached.notified().await;
@@ -324,7 +329,10 @@ async fn a_list_that_cannot_read_a_bucket_fails() {
         );
         let keys = store_keys(&store, Partition::default(), 2).await;
         let flushing: Arc<dyn MutableStore> = store;
-        flushing.flush(false).await.expect("flush");
+        flushing
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         keys
     };
     let store = |path: PathBuf| async move {
@@ -383,7 +391,7 @@ async fn fanned_out_store(dir: &Path) -> Arc<LocalMutableStore> {
     );
     let writing: Arc<dyn MutableStore> = store.clone();
     store_spread_keys(&writing, 0..6).await;
-    writing.flush(false).await.expect("flush");
+    writing.flush(FlushOptions::default()).await.expect("flush");
     assert!(
         store.group[7].bucket_count.load(atomic::Ordering::Relaxed) > 1,
         "the group fanned out"
@@ -521,7 +529,11 @@ async fn a_list_leaves_out_no_key_a_fan_out_moves() {
     for pause in &sending {
         pause.reached.notified().await;
     }
-    store.clone().flush(false).await.expect("flush");
+    store
+        .clone()
+        .flush(FlushOptions::default())
+        .await
+        .expect("flush");
     assert!(
         group.bucket_count.load(atomic::Ordering::Relaxed) > 1,
         "the flush fanned the group out"
@@ -559,7 +571,11 @@ async fn a_list_leaves_out_no_key_a_fan_out_moves_while_it_walks() {
     );
     let store: Arc<dyn MutableStore> = local.clone();
     store_spread_keys(&store, 0..6).await;
-    store.clone().flush(false).await.expect("flush");
+    store
+        .clone()
+        .flush(FlushOptions::default())
+        .await
+        .expect("flush");
     let group = local.group[7].clone();
     let walked_level = group.bucket_count.load(atomic::Ordering::Relaxed);
     assert_eq!(walked_level, 32);
@@ -593,7 +609,7 @@ async fn a_list_leaves_out_no_key_a_fan_out_moves_while_it_walks() {
     walking.reached.notified().await;
     let mut flushing = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { store.flush(false).await })
+        lore_base::lore_spawn!(async move { store.flush(FlushOptions::default()).await })
     };
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(50), &mut flushing)
@@ -686,7 +702,7 @@ async fn a_list_whose_stream_is_unread_holds_back_no_flush() {
         .expect("lists");
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store.clone().flush(false),
+        store.clone().flush(FlushOptions::default()),
     )
     .await
     .expect("no producer holds its group's layout while its stream is unread")
@@ -859,7 +875,11 @@ async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_
         std::fs::create_dir_all(&blocked).expect("block the bucket's rename");
         std::fs::write(blocked.join("blocker"), b"x").expect("block the bucket's rename");
         assert!(
-            dyn_store.clone().flush(false).await.is_err(),
+            dyn_store
+                .clone()
+                .flush(FlushOptions::default())
+                .await
+                .is_err(),
             "the commit's rename fails"
         );
         std::fs::remove_dir_all(&blocked).expect("unblock the bucket");
@@ -875,7 +895,11 @@ async fn a_commit_failing_after_its_pending_marker_is_rolled_forward_before_any_
             .await
             .expect("store the newer value");
         LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
     }
 
     let reopened: Arc<dyn MutableStore> = Arc::new(
@@ -955,7 +979,8 @@ async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_it
 
         let first = lore_storage::test_util::pause_at(PausePoint::Serializing);
         let flushing = store.clone();
-        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        let flush =
+            lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
         first.reached.notified().await;
         let second = lore_storage::test_util::pause_at(PausePoint::Serializing);
         first.resume.notify_one();
@@ -972,7 +997,11 @@ async fn a_flush_dropped_while_its_commit_writes_new_files_runs_the_commit_to_it
             group.bucket_count.load(atomic::Ordering::Relaxed),
             "the dropped flush's commit ran to its end"
         );
-        store.clone().flush(false).await.expect("the next flush");
+        store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("the next flush");
     }
 
     let reopened: Arc<dyn MutableStore> = Arc::new(
@@ -1026,7 +1055,10 @@ async fn a_group_directory_that_cannot_be_read_fails_the_open() {
         );
         let dyn_store: Arc<dyn MutableStore> = store.clone();
         store_spread_keys(&dyn_store, 0..6).await;
-        dyn_store.flush(false).await.expect("flush");
+        dyn_store
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
         store.group[7].bucket_count.load(atomic::Ordering::Relaxed)
     };
     assert!(level > 1, "the group fanned out");
@@ -1106,7 +1138,8 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
 
         let committing = lore_storage::test_util::pause_at(PausePoint::Committing);
         let flushing = dyn_store.clone();
-        let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+        let flush =
+            lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
         committing.reached.notified().await;
         flush.abort();
         assert!(flush.await.is_err(), "the flush was dropped");
@@ -1123,7 +1156,11 @@ async fn a_flush_dropped_while_its_commit_writes_level_pending_runs_the_commit_t
             .await
             .expect("store the newer value");
         LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
-        dyn_store.clone().flush(false).await.expect("flush");
+        dyn_store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush");
     }
 
     let reopened: Arc<dyn MutableStore> = Arc::new(
@@ -1189,7 +1226,8 @@ async fn a_store_opened_while_a_dropped_flush_commits_waits_for_the_commit() {
 
     let mut serializing = lore_storage::test_util::pause_at(PausePoint::Serializing);
     let flushing = store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     for _ in 1..6 {
         serializing.reached.notified().await;
         let next = lore_storage::test_util::pause_at(PausePoint::Serializing);
@@ -1271,7 +1309,8 @@ async fn a_group_flush_left_by_a_dropped_flush_releases_the_flock_once_it_ends()
 
     let serializing = lore_storage::test_util::pause_at(PausePoint::Serializing);
     let flushing = store.clone();
-    let flush = lore_base::lore_spawn!(async move { flushing.flush(false).await });
+    let flush =
+        lore_base::lore_spawn!(async move { flushing.flush(FlushOptions::default()).await });
     serializing.reached.notified().await;
     flush.abort();
     assert!(flush.await.unwrap_err().is_cancelled());
@@ -1315,16 +1354,25 @@ async fn a_second_commit_failing_after_its_pending_marker_keeps_every_entry_in_i
         );
         // Bucket 0 is left empty at 32 buckets, so that only the commit replaces its file.
         store_spread_keys(&store, 1..3).await;
-        store.clone().flush(false).await.expect("flush at level 1");
+        store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush at level 1");
         store_spread_keys(&store, 3..7).await;
         let blocked = format_bucket_path(&dir.path().join("mutable"), 7, 0);
         let level_one = dir.path().join("level_one_bucket");
         std::fs::rename(&blocked, &level_one).expect("hold the level-1 file");
-        super::fail_commit_at_rename(&blocked, || store.clone().flush(false)).await;
+        super::fail_commit_at_rename(&blocked, || store.clone().flush(FlushOptions::default()))
+            .await;
         std::fs::rename(&level_one, &blocked).expect("restore the level-1 file");
 
         store_spread_keys(&store, 7..10).await;
-        store.clone().flush(false).await.expect("the next flush");
+        store
+            .clone()
+            .flush(FlushOptions::default())
+            .await
+            .expect("the next flush");
     }
 
     let reopened = Arc::new(
@@ -1404,7 +1452,10 @@ async fn a_delayed_flush_rolls_a_pending_commit_forward_before_it_writes_a_bucke
         let dyn_store: Arc<dyn MutableStore> = store.clone();
         store_spread_keys(&dyn_store, 0..6).await;
         let blocked = format_bucket_path(&dir.path().join("mutable"), 7, 0);
-        super::fail_commit_at_rename(&blocked, || dyn_store.clone().flush(false)).await;
+        super::fail_commit_at_rename(&blocked, || {
+            dyn_store.clone().flush(FlushOptions::default())
+        })
+        .await;
 
         LocalMutableStore::flush_delayed(Arc::downgrade(&store), 7, 0).await;
 
@@ -1492,7 +1543,7 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
     }
     dyn_store
         .clone()
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .expect("flush at level 1");
     let group_path = dir.path().join("mutable").join("index").join("07");
@@ -1504,7 +1555,7 @@ async fn a_fan_out_commit_removes_new_files_it_did_not_write() {
     }
     dyn_store
         .clone()
-        .flush(false)
+        .flush(FlushOptions::default())
         .await
         .expect("flush fanning out");
     assert_eq!(
@@ -1635,6 +1686,87 @@ async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
     }
 }
 
+/// A flush asked for `fast_flush` writes each bucket file in place, keeping the file, and one not
+/// asked for it through a renamed temporary file, with and without `sync_data`. Either way it leaves
+/// no temporary file, and the store reopens with every entry. The second flush is the one observed:
+/// the first commits the groups' level, which renames `.new` files whatever the options.
+#[tokio::test]
+async fn a_flush_writes_bucket_files_in_place_only_with_fast_flush() {
+    use lore_storage::mutable_store::MutableStore;
+    for fast_flush in [false, true] {
+        for sync_data in [false, true] {
+            let dir = lore_base::test_util::TempDir::new("ms_fast_flush_");
+            let partition = Partition::default();
+            let root = dir.path().join("mutable").join("index");
+            let mut stored = Vec::new();
+            {
+                let store = Arc::new(
+                    LocalMutableStore::new(
+                        Some(dir.path()),
+                        client_settings(),
+                        make_in_memory_immutable().await,
+                    )
+                    .await
+                    .expect("store opens"),
+                );
+                let dyn_store: Arc<dyn MutableStore> = store.clone();
+                let mut before = None;
+                // The second batch's keys are in the first's groups, so it grows their files.
+                for batch in [0xABu8, 0xCD] {
+                    for index in 0..32u8 {
+                        let mut key = Hash::default();
+                        key.data_mut()[0] = index;
+                        key.data_mut()[1] = batch;
+                        let value = Hash::from_u64(u64::from(batch) << 8 | u64::from(index));
+                        dyn_store
+                            .clone()
+                            .store(partition, key, value, KeyType::BranchMetadata)
+                            .await
+                            .expect("store succeeds");
+                        stored.push((key, value));
+                    }
+                    dyn_store
+                        .clone()
+                        .flush(FlushOptions {
+                            sync_data,
+                            fast_flush,
+                        })
+                        .await
+                        .expect("flush succeeds");
+                    match &before {
+                        None => before = Some(super::bucket_files(&root)),
+                        Some(before) => super::assert_rewritten(&root, before, fast_flush),
+                    }
+                }
+            }
+
+            let store = Arc::new(
+                LocalMutableStore::new(
+                    Some(dir.path()),
+                    client_settings(),
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .expect("store reopens"),
+            );
+            let dyn_store: Arc<dyn MutableStore> = store.clone();
+            for (key, value) in &stored {
+                let loaded = dyn_store
+                    .clone()
+                    .load(partition, *key, KeyType::BranchMetadata)
+                    .await
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "fast flush {fast_flush} sync data {sync_data}: {key} reads back as \
+                             {err:?}"
+                        )
+                    });
+                assert_eq!(loaded, *value);
+            }
+        }
+    }
+}
+
 /// A store at the flat 256-bucket layout — every legacy store, and every server store —
 /// gains no markers: such a group already reads back at the level it was written at.
 #[tokio::test]
@@ -1727,7 +1859,10 @@ async fn a_marked_group_keeps_the_level_it_recorded() {
         let _ = store_keys(&store, partition, 8).await;
         let dyn_store: Arc<dyn MutableStore> = store.clone();
         // A real flush commits the level through the two-phase path.
-        dyn_store.flush(false).await.expect("flush succeeds");
+        dyn_store
+            .flush(FlushOptions::default())
+            .await
+            .expect("flush succeeds");
     }
 
     let before: Vec<(PathBuf, Vec<u8>)> = level_markers(&index_root)
@@ -1825,7 +1960,7 @@ async fn store_recovers_from_zero_filled_bucket_and_remains_usable() {
             .store(partition, key, value, KeyType::BranchMetadata)
             .await
             .unwrap();
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     // initial_fan_out_level=1 → bucket index is always 0; group is (typed) key[0].
@@ -1904,7 +2039,7 @@ async fn an_unsynced_flush_replaces_the_bucket_file() {
         )
         .await
         .unwrap();
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
     let written = std::fs::read(&bucket_path).unwrap();
     let link = dir.path().join("last_written");
     std::fs::hard_link(&bucket_path, &link).unwrap();
@@ -1919,7 +2054,7 @@ async fn an_unsynced_flush_replaces_the_bucket_file() {
         )
         .await
         .unwrap();
-    store.clone().flush(false).await.unwrap();
+    store.clone().flush(FlushOptions::default()).await.unwrap();
 
     assert_eq!(
         std::fs::read(&link).unwrap(),
@@ -1933,20 +2068,24 @@ async fn an_unsynced_flush_replaces_the_bucket_file() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn local_mutable_store_satisfies_conformance_battery() {
-    let store = lore_storage::local::mutable_store::create(
-        None::<&std::path::Path>,
+    lore_storage::mutable_conformance::verify_mutable_store(
+        make_in_memory_mutable().await,
+        lore_storage::mutable_conformance::Capabilities::new("LocalMutableStore"),
+    )
+    .await;
+}
+
+/// A local mutable store kept in memory, with default settings.
+pub(crate) async fn make_in_memory_mutable() -> Arc<LocalMutableStore> {
+    create(
+        None::<&Path>,
         MutableStoreSettings::default(),
         make_in_memory_immutable().await,
     )
     .await
-    .expect("create store");
-    lore_storage::mutable_conformance::verify_mutable_store(
-        store,
-        lore_storage::mutable_conformance::Capabilities::new("LocalMutableStore"),
-    )
-    .await;
+    .expect("Failed to create in-memory mutable store")
 }
 
 async fn make_in_memory_immutable() -> Arc<dyn ImmutableStore> {
@@ -2256,7 +2395,7 @@ async fn a_store_drops_what_another_one_changed_underneath_it() {
             .store(partition, key, value, KeyType::BranchMetadata)
             .await
             .unwrap();
-        writer.clone().flush(true).await.unwrap();
+        writer.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     }
 
     assert_eq!(
@@ -2312,12 +2451,12 @@ async fn a_write_holds_the_store_until_flushed_and_an_idle_flush_is_silent() {
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     store_keys(&store, Partition::default(), 1).await;
     assert!(lock.is_held(), "an unflushed write holds the store");
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held(), "and the flush that settles it releases it");
 
     let epoch = dir.to_path_buf().join("mutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert_eq!(
         std::fs::read(&epoch).ok(),
         before,
@@ -2345,7 +2484,7 @@ async fn a_listing_keeps_the_store_claimed_while_it_reads() {
     );
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     store_keys(&store, Partition::default(), 1).await;
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held());
 
     // Holds the first producer that has read its group, so it is still at work.
@@ -2392,7 +2531,7 @@ async fn a_listing_keeps_the_store_claimed_past_the_span_it_started_in() {
     );
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
     store_keys(&store, Partition::default(), 1).await;
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held());
 
     let span = store.clone().hold_for_command().await.unwrap();
@@ -2444,7 +2583,7 @@ async fn a_load_announces_nothing_and_a_compare_and_swap_holds_the_store() {
         .unwrap(),
     );
     let lock = store.lock.clone().expect("a disk-backed store has a lock");
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held());
     let epoch = dir.to_path_buf().join("mutable").join("epoch");
     let before = std::fs::read(&epoch).ok();
@@ -2482,7 +2621,7 @@ async fn a_load_announces_nothing_and_a_compare_and_swap_holds_the_store() {
         "and keeps the store claimed until it is flushed"
     );
 
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     assert!(!lock.is_held(), "which releases it");
 }
 
@@ -2511,7 +2650,7 @@ async fn a_compare_and_swap_to_the_stored_value_flags_nothing() {
         .store(Partition::default(), key, value, KeyType::BranchMetadata)
         .await
         .unwrap();
-    store.clone().flush(true).await.unwrap();
+    store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
     let (group_index, bucket_index) = populated_bucket(&store).await;
     let flagged = || store.group[group_index].dirty[bucket_index].load(atomic::Ordering::Relaxed);
     assert!(!flagged(), "the flush wrote the stored value");
@@ -2696,7 +2835,7 @@ async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
             )
             .await
             .unwrap();
-        store.clone().flush(true).await.unwrap();
+        store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
         assert!(!lock.is_held());
 
         let (group_index, bucket_index) = populated_bucket(&store).await;
@@ -2712,7 +2851,14 @@ async fn a_change_that_fails_to_reach_disk_keeps_its_flag_and_the_claim() {
         group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
 
         assert!(
-            store.clone().flush(sync_data).await.is_err(),
+            store
+                .clone()
+                .flush(FlushOptions {
+                    sync_data,
+                    ..FlushOptions::default()
+                })
+                .await
+                .is_err(),
             "sync_data {sync_data}: the bucket cannot be written"
         );
         assert!(
@@ -2782,7 +2928,7 @@ async fn a_write_inside_a_span_keeps_both_flocks_past_the_span_until_flushed() {
         if delayed {
             run_delayed_flush(&store).await;
         } else {
-            store.clone().flush(true).await.unwrap();
+            store.clone().flush(FlushOptions::SYNC_DATA).await.unwrap();
         }
         assert_eq!(
             locks.each_ref().map(|lock| lock.is_held()),
@@ -2813,7 +2959,7 @@ async fn a_group_flush_left_by_a_dropped_flush_holds_its_group_until_it_ends() {
     let in_flight = lore_storage::test_util::hold_store_write();
     let flush = {
         let store = store.clone();
-        lore_base::lore_spawn!(async move { store.flush(false).await })
+        lore_base::lore_spawn!(async move { store.flush(FlushOptions::default()).await })
     };
     in_flight.issued.notified().await;
     flush.abort();
@@ -2849,34 +2995,6 @@ async fn populated_bucket(store: &LocalMutableStore) -> (usize, usize) {
         }
     }
     panic!("a store populates a bucket");
-}
-
-/// **A flush settles a bucket it has nothing to write for**, so an emptied bucket
-/// above the committed level does not keep the store claimed.
-#[tokio::test]
-async fn a_flush_settles_an_emptied_bucket_it_has_nothing_to_write_for() {
-    use lore_storage::mutable_store::MutableStore;
-
-    let dir = lore_base::test_util::TempDir::new("ms_empty_settle_");
-    let store = Arc::new(
-        LocalMutableStore::new(
-            Some(dir.to_path_buf()),
-            client_settings(),
-            make_in_memory_immutable().await,
-        )
-        .await
-        .unwrap(),
-    );
-    let lock = store.lock.clone().expect("a disk-backed store has a lock");
-    let _ = store.group[0].bucket(0);
-    store.group[0].dirty[0].store(true, atomic::Ordering::Relaxed);
-
-    store.clone().flush(true).await.unwrap();
-    assert!(
-        !store.group[0].dirty[0].load(atomic::Ordering::Relaxed),
-        "the flag was settled"
-    );
-    assert!(!lock.is_held(), "so nothing keeps the store claimed");
 }
 
 /// **A reload takes the levels a fresh survey read and drops every flag**, for the

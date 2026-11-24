@@ -132,7 +132,7 @@ mod pooled {
 
     /// The read paths hold one lazy session per repository for its lifetime. Resolving it to
     /// a pooled session is what spreads those reads.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lazy_session_resolved_to_a_pool_spreads_requests() {
         let server = TestStorageServer::start();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -148,7 +148,7 @@ mod pooled {
 
     /// Every operation of a resolved lazy session reads what it resolved to without the lock its
     /// resolutions take.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_resolved_lazy_session_serves_while_its_resolution_lock_is_held() {
         let server = TestStorageServer::start();
         let session = lazy_over(pool_over(&server, 2).await, Arc::default());
@@ -165,7 +165,7 @@ mod pooled {
 
     /// Invalidating a resolved lazy session drops what it resolved to, so the next operation
     /// resolves again.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_invalidated_resolved_lazy_session_resolves_again() {
         let server = TestStorageServer::start();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -183,7 +183,7 @@ mod pooled {
 
     /// Requests in flight at once are served by every connection at once: the server holds each
     /// until every connection has one, so the fetches finish only when the pool spreads them.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn requests_in_flight_are_served_by_every_connection_at_once() {
         const CONNECTIONS: usize = 4;
         let server = TestStorageServer::start_gathering(CONNECTIONS);
@@ -203,7 +203,7 @@ mod pooled {
 
     /// A pool that fails to start on one connection stops the sessions it started on the others,
     /// those whose start was still in flight when it failed included.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pool_that_fails_to_start_stops_the_sessions_it_started() {
         let serving = TestStorageServer::start();
         let refusing = TestStorageServer::start_refusing_sessions();
@@ -216,6 +216,7 @@ mod pooled {
             .await;
 
         assert!(started.is_err_and(|err| err.is_slow_down()));
+        assert_eq!(connector.session_starts(), 1);
         wait_until(
             || serving.started_sessions_per_connection() == [1, 1],
             "a session start the failed pool left running never reached the server",
@@ -229,7 +230,7 @@ mod pooled {
     }
 
     /// A pool start dropped while its session starts are in flight stops the sessions they open.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_pool_start_stops_the_sessions_in_flight() {
         let (server, release) = TestStorageServer::start_holding_session_starts();
         let connector = Arc::new(StorageConnector::new(server.connect(2).await));
@@ -260,7 +261,7 @@ mod pooled {
 
     /// A pool start dropped while one of its session starts is held stops each session already
     /// started without waiting for the held start to end.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_pool_start_stops_each_session_as_its_start_ends() {
         let serving = TestStorageServer::start();
         let (holding, release) = TestStorageServer::start_holding_session_starts();
@@ -295,7 +296,7 @@ mod pooled {
     /// Pool starts racing for one partition under one correlation id all take the winner's pool,
     /// and the sessions the loser started stop. The second start begins once the first's starts
     /// reach the server, so each held start is on a stream of its own.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn racing_pool_starts_share_the_winners_pool_and_stop_the_losers_sessions() {
         let (server, release) = TestStorageServer::start_holding_session_starts();
         let connector = Arc::new(StorageConnector::new(server.connect(2).await));
@@ -329,5 +330,31 @@ mod pooled {
             "the losing start's sessions were left open",
         )
         .await;
+    }
+
+    /// The connector counts one `session_start` fan-out per pool it starts, however many
+    /// connections the pool starts a session on, and none for a pool it hands out again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_starts_counts_one_per_pool_started() {
+        let server = TestStorageServer::start();
+        let connector = StorageConnector::new(server.connect(2).await);
+        let pool_for = async |correlation_id: &str| {
+            connector
+                .session_pool(
+                    partition(),
+                    correlation_id,
+                    Connection::detached(Vec::new()),
+                )
+                .await
+                .expect("a pool")
+        };
+
+        let first = pool_for("first").await;
+        let again = pool_for("first").await;
+        let _second = pool_for("second").await;
+
+        assert!(Arc::ptr_eq(&first, &again));
+        assert_eq!(connector.session_starts(), 2);
+        assert_eq!(server.started_sessions_per_connection(), [2, 2]);
     }
 }

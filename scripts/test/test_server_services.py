@@ -467,14 +467,6 @@ class TestThinClientServesData:
         )
 
 
-def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
-    """The repository id and latest revision signature as the raw bytes the
-    thin-client wire expects."""
-    latest = repo.branch_info().local_latest
-    assert len(latest) == 64, f"Expected a full revision signature, got {latest!r}"
-    return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
-
-
 def _tree_address(nodes: list, path: str):
     matches = [node for node in nodes if node.path == path]
     assert len(matches) == 1, f"Expected one tree entry for {path}, got {matches}"
@@ -497,23 +489,23 @@ def test_thin_client_diff_content_addresses_match_the_tree_at_the_same_path(
     repo: Lore = new_lore_repo()
     repo.write_commit_push("Initial commit", {"own.txt": "initial content\n"})
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = thin_client.wire_identity(repo)
 
     repo.write_commit_push(None, {"own.txt": "parent content, revised\n"})
 
-    _, after = _wire_identity(repo)
+    _, after = thin_client.wire_identity(repo)
 
     target, authorization = thin_client_credentials(repo)
     address_before = _tree_address(
         thin_client.revision_tree(
             target, repository_id, before, authorization=authorization
-        ),
+        ).nodes,
         "own.txt",
     )
     address_after = _tree_address(
         thin_client.revision_tree(
             target, repository_id, after, authorization=authorization
-        ),
+        ).nodes,
         "own.txt",
     )
     assert address_after.context, (

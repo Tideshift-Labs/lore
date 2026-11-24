@@ -1724,6 +1724,69 @@ async fn branch_delete_projection_removes_only_its_own_row() {
     );
 }
 
+/// A projection of an all-zero value is an absent key in the mutable-store contract: the
+/// coordinator deletes the row instead of writing a zero row. A non-zero value still upserts.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn zero_value_projection_deletes_the_row() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let store = store(&url).await;
+    let db = client(&url).await;
+    PostgresMutableStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .expect("install the lore_mutable schema for the projection write");
+    let (repository_id, branch_id) =
+        create_repository_with_one_extra_branch(&store, &db, "v014-zero-projection").await;
+
+    let key_type = KeyType::BranchId as i16;
+    let key = rand::random::<[u8; 32]>().to_vec();
+    db.execute(
+        "INSERT INTO lore_mutable (partition, key_type, key, value) VALUES ($1, $2, $3, $4)",
+        &[
+            &repository_id,
+            &key_type,
+            &key,
+            &rand::random::<[u8; 32]>().to_vec(),
+        ],
+    )
+    .await
+    .expect("seed the row the zero projection will remove");
+
+    let (delete_op, _w) = admitted_operation(&store, "branch_delete").await;
+    let mut input = branch_delete_input(
+        repository_id.clone(),
+        branch_id.clone(),
+        vec![branch_deleted_event(branch_id.clone(), Vec::new())],
+    )
+    .await;
+    input.projection = vec![ProjectionWrite {
+        partition: repository_id.clone(),
+        key_type,
+        key: key.clone(),
+        value: Some(vec![0u8; 32]),
+    }];
+    store
+        .branch_delete(&delete_op, &input)
+        .await
+        .expect("branch delete must succeed");
+
+    let row: Option<Vec<u8>> = db
+        .query_opt(
+            "SELECT value FROM lore_mutable WHERE partition = $1 AND key_type = $2 AND key = $3",
+            &[&repository_id, &key_type, &key],
+        )
+        .await
+        .expect("query the projected row")
+        .map(|row| row.get("value"));
+    assert_eq!(
+        row, None,
+        "a zero-valued projection must delete the row, not store a zero row"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // metadata_compare_and_swap
 // ---------------------------------------------------------------------------

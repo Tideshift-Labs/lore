@@ -37,7 +37,7 @@ pub trait Protocol: Send + Sync {
         credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
-    /// Connect to remote revision service
+    /// Connect to remote revision service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
@@ -47,9 +47,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Revision>, ProtocolError>;
+    ) -> Result<Arc<dyn Revision>, ProtocolError> {
+        crate::grpc::revision(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote repository service
+    /// Connect to remote repository service, over gRPC as every protocol reaches it.
     async fn repository(
         &self,
         connection: Weak<Connection>,
@@ -57,9 +67,11 @@ pub trait Protocol: Send + Sync {
         auth_endpoint: &AuthEndpoint,
         identity: &str,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Repository>, ProtocolError>;
+    ) -> Result<Arc<dyn Repository>, ProtocolError> {
+        crate::grpc::repository(connection, remote_url, auth_endpoint, identity, credentials).await
+    }
 
-    /// Connect to remote admin service
+    /// Connect to remote admin service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
@@ -69,9 +81,19 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Admin>, ProtocolError>;
+    ) -> Result<Arc<dyn Admin>, ProtocolError> {
+        crate::grpc::admin(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote lock service
+    /// Connect to remote lock service, over gRPC as every protocol reaches it.
     #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
@@ -81,14 +103,26 @@ pub trait Protocol: Send + Sync {
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Result<Arc<dyn Lock>, ProtocolError>;
+    ) -> Result<Arc<dyn Lock>, ProtocolError> {
+        crate::grpc::lock(
+            connection,
+            remote_url,
+            auth_endpoint,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
+    }
 
-    /// Connect to remote environment service
+    /// Connect to remote environment service, over gRPC as every protocol reaches it.
     async fn environment(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-    ) -> Result<Arc<dyn Environment>, ProtocolError>;
+    ) -> Result<Arc<dyn Environment>, ProtocolError> {
+        crate::grpc::environment(connection, remote_url).await
+    }
 
     /// Connect to the domain-operation receipt rail (CR-029, WP-120).
     ///
@@ -231,10 +265,10 @@ pub trait Storage: Send + Sync {
     /// Get only the fragment metadata for an address — no payload bytes.
     ///
     /// Use this when the caller needs `Fragment` (`flags`, `size_payload`, `size_content`) but
-    /// not the payload bytes — e.g. existence-with-size queries, metadata audits. Saves one
-    /// full payload transfer per address vs. `get`. The default implementation falls back to
-    /// `get` and discards the payload, so transports that haven't been updated still work;
-    /// gRPC and QUIC override with optimized wire-level metadata-only paths.
+    /// not the payload bytes, for example to learn whether an address exists and its size. It
+    /// saves one payload transfer per address over `get`. The default implementation falls back
+    /// to `get` and discards the payload; the gRPC, QUIC and socket clients override it with a
+    /// metadata-only request.
     async fn get_metadata(
         &self,
         session_id: u32,
@@ -501,9 +535,9 @@ pub trait Storage: Send + Sync {
 /// Revision protocol
 #[async_trait]
 pub trait Revision: Send + Sync {
-    /// Create a branch with the given identifier and name (must match) and parent branch stack
-    /// Will return the current LATEST pointer to allow the caller to distinguish created branch
-    /// and an already existing branch.
+    /// Create a branch with the given identifier and name and parent branch stack.
+    /// Returns the branch's record, whose latest revision tells a created branch from one that
+    /// already existed.
     async fn branch_create(
         &self,
         branch: BranchId,
@@ -511,7 +545,7 @@ pub trait Revision: Send + Sync {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError>;
+    ) -> Result<BranchRecord, ProtocolError>;
 
     /// Destroy the given branch
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError>;
@@ -534,8 +568,13 @@ pub trait Revision: Send + Sync {
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError>;
 
-    /// List all branches
-    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
+    /// List the live branches, and the archived ones too with `include_deleted`; with `creator`,
+    /// only those it created.
+    async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError>;
 
     /// List at most `limit` branches. `None` means enumeration exceeded the limit.
     /// Implementations must stop consuming the stream when the limit is exceeded.

@@ -227,7 +227,7 @@ impl ImmutableStore for RpcStore {
     fn max_query_batch(&self) -> Option<usize> {
         None
     }
-    async fn flush(self: Arc<Self>, _: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _: lore_storage::FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
     async fn verify(self: Arc<Self>, _: bool) -> Result<(), StoreError> {

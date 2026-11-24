@@ -40,7 +40,6 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
-use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum SetError {
@@ -191,18 +190,11 @@ async fn set_file_task(
     formats: &[MetadataType],
     events: bool,
 ) -> Result<(), SetError> {
-    let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
-        .forward::<SetError>("Invalid path")?;
-
-    let node_link = state
-        .find_node_link(repository.clone(), relative_path.as_str())
+    let node = super::file_node_outside_links(&state, &repository, path)
         .await
-        .forward_any::<SetError>("Invalid node")?;
-    if !node_link.is_valid() {
-        return Err(SetError::internal("Invalid node"));
-    }
+        .forward_any::<SetError>("finding the path's node")?;
 
-    let metadata_node = node::node_to_file_metadata(node_link.node);
+    let metadata_node = node::node_to_file_metadata(node);
     let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
     let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
@@ -260,7 +252,6 @@ async fn set_file_task(
 
         if dirtied {
             state.block_file_metadata_modified(metadata_block, metadata_block_index);
-            state.mark_dirty();
         }
 
         break;
@@ -377,6 +368,8 @@ pub async fn set_file(
 
     const MAX_TASK_COUNT: usize = 1000;
 
+    // Nothing reaches the staged anchor until every task has succeeded, so a batch that fails on
+    // one path, such as one inside a link, sets none of them.
     let mut offset = 0;
     let mut tasks = JoinSet::new();
     let mut join_failure = None;

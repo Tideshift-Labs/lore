@@ -13,6 +13,7 @@ use lore_credential::token_store::Refreshed;
 use lore_credential::token_store::RemoteIdentity;
 use lore_credential::token_store::RemovedRefreshToken;
 use lore_credential::token_store::TokenMap;
+use lore_credential::token_store::TokenStoreError;
 use lore_credential::token_store::acquire_authentication_refresh;
 use lore_credential::token_store::load_refresh_expires;
 use lore_credential::token_store::load_user_token;
@@ -453,7 +454,7 @@ fn granting(
     token: &'static str,
     refresh_token: Option<&'static str>,
     presented: &std::sync::Mutex<Vec<String>>,
-) -> impl FnOnce(String) -> std::future::Ready<Refreshed<std::io::Error>> {
+) -> impl FnOnce(String) -> std::future::Ready<Refreshed<TokenStoreError>> {
     move |refresh| {
         presented.lock().unwrap().push(refresh);
         std::future::ready(Refreshed::Token {
@@ -661,7 +662,7 @@ async fn a_refresh_does_not_overwrite_an_intervening_login() {
         )
         .await
         .expect("store intervening login");
-        Refreshed::<std::io::Error>::Token {
+        Refreshed::<TokenStoreError>::Token {
             token: from_refresh.clone(),
             refresh_token: Some("refresh-new".to_owned()),
             refresh_expires: 0,
@@ -703,7 +704,7 @@ async fn authentication_refresh_lease_serializes_same_identity_and_rereads_winne
         async move {
             refresh_user_token(REFRESH_AUTH_ENDPOINT, "alice", &expired, move |refresh| {
                 presented.lock().unwrap().push(refresh);
-                std::future::ready(Refreshed::<std::io::Error>::Unsent(refused()))
+                std::future::ready(Refreshed::<TokenStoreError>::Unsent(refused()))
             })
             .await
         }
@@ -875,8 +876,8 @@ fn jwt(subject: &str, exp: u64, serial: u32) -> String {
 const EXPIRED: u64 = 1_000_000_000;
 const VALID: u64 = 2_000_000_000;
 
-fn refused() -> std::io::Error {
-    std::io::Error::other("as scripted")
+fn refused() -> TokenStoreError {
+    TokenStoreError::internal("as scripted")
 }
 
 const LOGIN_REFRESH_EXPIRES: u64 = 1_900_000_000_000;
@@ -914,7 +915,7 @@ fn grant(
     token: String,
     refresh_token: Option<&'static str>,
     presented: &std::sync::Mutex<Vec<String>>,
-) -> impl FnOnce(String) -> std::future::Ready<Refreshed<std::io::Error>> {
+) -> impl FnOnce(String) -> std::future::Ready<Refreshed<TokenStoreError>> {
     move |refresh| {
         presented.lock().unwrap().push(refresh);
         std::future::ready(Refreshed::Token {
@@ -1054,7 +1055,7 @@ async fn a_refused_refresh_token_is_dropped() {
     })
     .await;
 
-    assert!(result.is_err_and(|err| err.is_internal()));
+    assert!(result.is_err_and(|err| err.is_not_authenticated()));
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
     assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
     let stored = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
@@ -1075,7 +1076,7 @@ async fn an_unsent_refresh_keeps_the_refresh_token() {
     })
     .await;
 
-    assert!(result.is_err_and(|err| err.is_internal()));
+    assert!(result.is_err_and(|err| err.is_disconnected()));
     assert_eq!(
         stored_login(ENDPOINT, "alice").await,
         Some((Some("refresh-1".to_owned()), None))
@@ -1101,7 +1102,7 @@ async fn a_failed_refresh_drops_the_refresh_token() {
     })
     .await;
 
-    assert!(result.is_err_and(|err| err.is_internal()));
+    assert!(result.is_err_and(|err| err.is_not_authenticated()));
     assert_eq!(stored_login(ENDPOINT, "alice").await, Some((None, None)));
     assert_eq!(load_refresh_expires(ENDPOINT, "alice").await, None);
 }
@@ -1151,7 +1152,7 @@ async fn a_cancelled_refresh_leaves_the_refresh_token_removed() {
     let started = tokio::sync::Notify::new();
     let refresh = refresh_user_token(ENDPOINT, "alice", &expired, |_| {
         started.notify_one();
-        std::future::pending::<Refreshed<std::io::Error>>()
+        std::future::pending::<Refreshed<TokenStoreError>>()
     });
     tokio::select! {
         result = refresh => panic!("the refresh ended without waiting for the grant: {result:?}"),
@@ -1201,7 +1202,7 @@ async fn concurrent_refreshes_present_the_refresh_token_once() {
         refresh_user_token(ENDPOINT, "alice", &expired, |refresh| async {
             presented.lock().unwrap().push(refresh);
             tokio::task::yield_now().await;
-            Refreshed::<std::io::Error>::Token {
+            Refreshed::<TokenStoreError>::Token {
                 token: fresh.clone(),
                 refresh_token: Some("refresh-2".to_owned()),
                 refresh_expires: GRANT_REFRESH_EXPIRES,

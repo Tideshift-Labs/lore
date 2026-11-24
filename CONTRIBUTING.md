@@ -69,6 +69,12 @@ For smoke tests:
 uv run pytest
 ```
 
+The SWFS tests need the EpicVFS driver, which is not publicly available. If you don't have it, skip them:
+
+```sh
+uv run pytest -m "smoke and not swfs"
+```
+
 ## Before you code
 
 For anything beyond a trivial fix, **open a GitHub Issue before writing code:**
@@ -79,13 +85,15 @@ For anything beyond a trivial fix, **open a GitHub Issue before writing code:**
 
 Wait for a maintainer to weigh in before investing significant effort.
 
-For large or cross-cutting changes, check whether a [Lore Enhancement Proposal](#lore-enhancement-proposals) is required before any code is written.
+For large or cross-cutting changes, check early whether a [Lore Enhancement Proposal](#lore-enhancement-proposals) is required. The implementation can't be merged until the LEP is accepted.
 
 ## Development workflow
 
 ### Code standards
 
-Read the full code standards in [`docs/developing/code-standards/`](docs/developing/code-standards/) before writing your first line.
+Read the full code standards in [`docs/developing/code-standards/`](docs/developing/code-standards/) before writing your first line. Performance comes first, including the number and size of allocations: see the [performance checks](docs/developing/code-standards/code-review.md#performance). Your change is reviewed against [code-review.md](docs/developing/code-standards/code-review.md), so read it before you write the change as well.
+
+AI tools follow [`AGENTS.md`](AGENTS.md) and the skills in `.claude/skills/`, which route to the same standards.
 
 ### Formatting and linting
 
@@ -137,14 +145,15 @@ Because the MIT license doesn't include an express patent grant, the DCO sign-of
 
 1. Fork the repository.
 2. Make your changes and ensure all tests pass and linting is clean.
-3. Add or update tests for the behavior you're changing.
-4. If the change affects what Lore does (client, server, API, protocol or stored data), add a release note to [`docs/release-notes/`](docs/release-notes/README.md) rather than editing `docs/release-notes.md`.
-5. Open a pull request targeting `main`. The PR description should cover:
+3. Add or update tests for the behavior you're changing, as [What a change tests](docs/developing/code-standards/testing.md#what-a-change-tests) describes. A bug fix comes with a test that fails without it.
+4. Check your change against [code-review.md](docs/developing/code-standards/code-review.md) before you open the pull request.
+5. If the change affects what Lore does (client, server, API, protocol or stored data), add a release note to [`docs/release-notes/`](docs/release-notes/README.md) rather than editing `docs/release-notes.md`.
+6. Open a pull request targeting `main`. The PR description should cover:
    - **What:** what does this PR do?
    - **Why:** what problem does it solve? Link to the GitHub Issue.
    - **How:** a brief description of your approach, especially if non-obvious.
    - **Testing:** how did you verify the change works?
-6. Every commit must include `Signed-off-by:` as described above.
+7. Every commit must include `Signed-off-by:` as described above.
 
 Keep PRs focused. One logical change per PR.
 
@@ -152,13 +161,13 @@ Keep PRs focused. One logical change per PR.
 
 Expect at least one round of feedback before a PR is merged.
 
-A PR requires **two approvals** from Maintainers to merge.
+A PR requires **one approval** from a Maintainer to merge.
 
 Address each piece of feedback, then re-request review. Maintainer decisions are final. If feedback isn't clear, ask.
 
 ## Lore Enhancement Proposals
 
-An LEP is required before implementing any change that affects:
+An accepted LEP is required before merging any change that affects:
 
 - The Lore wire protocol or on-disk format
 - Public APIs (`lore` CLI commands, `lore-capi`, language bindings)
@@ -167,7 +176,7 @@ An LEP is required before implementing any change that affects:
 
 For everything else, an Issue and PR are sufficient.
 
-LEPs live in [`docs/proposals/`](docs/proposals/). Copy [`docs/proposals/lep-template.md`](docs/proposals/lep-template.md) to a new file named `YYYY-MM-DD-your-feature.md`, fill it out, and open a pull request. The LEP must be accepted before implementation begins. See the [LEP README](docs/proposals/README.md) for the full lifecycle and writing guidelines.
+LEPs live in [`docs/proposals/`](docs/proposals/). Copy [`docs/proposals/lep-template.md`](docs/proposals/lep-template.md) to a new file named `YYYY-MM-DD-your-feature.md`, fill it out, and open a pull request. The LEP must be accepted before its implementation is merged. Implementation work may start while the LEP is under discussion. See the [LEP README](docs/proposals/README.md) for the full lifecycle and writing guidelines.
 
 ## Documentation
 

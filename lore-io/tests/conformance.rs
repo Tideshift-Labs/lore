@@ -6,6 +6,7 @@
 use bytes::Bytes;
 use futures::future::join_all;
 use lore_base::test_util::TempDir;
+use lore_base::test_util::file_identity;
 use lore_io::BackendKind;
 use lore_io::IoDriver;
 use lore_io::OpenOptions;
@@ -474,6 +475,46 @@ async fn remove_dir_all_keeping_keeps_each_boundary_and_its_ancestors() {
     }
 }
 
+/// A tree is renamed aside, then removed from there, so neither name is left, and a second call
+/// finds nothing left to remove.
+#[tokio::test]
+async fn remove_dir_all_in_background_renames_the_tree_aside_and_removes_it() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-remove-in-background-");
+        let path = dir.child("tree");
+        let aside = dir.child("tree.aside");
+        driver.create_dir_all(path.join("a/b")).await.unwrap();
+        driver
+            .write_file_bytes(
+                path.join("a/b/file.txt"),
+                Bytes::from_static(b"content"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let (removed_from, removed) = driver
+            .remove_dir_all_in_background(&path, Some(aside.clone()), false)
+            .await;
+
+        removed.expect("removes the tree");
+        assert_eq!(removed_from, aside);
+        assert!(
+            driver.symlink_stat(&path).await.is_err(),
+            "the path is free"
+        );
+        assert!(
+            driver.symlink_stat(&aside).await.is_err(),
+            "the tree is gone"
+        );
+        driver
+            .remove_dir_all_in_background(&path, Some(aside.clone()), false)
+            .await
+            .1
+            .expect("removing a missing tree is Ok");
+    }
+}
+
 /// A listing yields every child with the metadata the walk resolved for it, and ends. The
 /// entries arrive in whatever order the walk finds them, so the test compares them as a set.
 #[tokio::test]
@@ -552,6 +593,51 @@ async fn holds_name_exactly_answers_for_a_name_the_filesystem_holds() {
             verdict(false),
             "a missing directory holds no children"
         );
+    }
+}
+
+/// Two paths name one entry where they reach one file, symbolic links followed: the same path, a
+/// link to it, and another spelling where the file system folds case. Another file, a path naming
+/// nothing and a path through a file never do, and a first path naming nothing is answered as
+/// naming nothing.
+#[tokio::test]
+async fn names_one_entry_answers_for_paths_reaching_one_file() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-namesoneentry-");
+        for name in ["Rock.mesh", "Other.mesh"] {
+            driver
+                .write_file_bytes(dir.child(name), Bytes::from_static(b"data"), false)
+                .await
+                .unwrap();
+        }
+        driver.create_dir_all(dir.child("Meshes")).await.unwrap();
+        let folds_case = driver.stat(dir.child("ROCK.MESH")).await.is_ok();
+        let linked = file_link(&dir.child("Rock.mesh"), &dir.child("link"));
+
+        let mut cases = vec![
+            ("Rock.mesh", "Rock.mesh", Some(true)),
+            ("Rock.mesh", "ROCK.MESH", Some(folds_case)),
+            ("Meshes", "MESHES", Some(folds_case)),
+            ("Rock.mesh", "Other.mesh", Some(false)),
+            ("Rock.mesh", "absent", Some(false)),
+            ("Rock.mesh", "Other.mesh/child", Some(false)),
+            ("absent", "Rock.mesh", None),
+            ("Other.mesh/child", "Rock.mesh", None),
+        ];
+        if linked {
+            cases.push(("Rock.mesh", "link", Some(true)));
+        }
+        for (from, to, one) in cases {
+            assert_eq!(
+                driver
+                    .names_one_entry(dir.child(from), dir.child(to))
+                    .await
+                    .expect("an answer"),
+                one,
+                "{from} and {to}, {}",
+                driver.backend_name()
+            );
+        }
     }
 }
 
@@ -1651,6 +1737,7 @@ async fn write_file_segments_roundtrip() {
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
                 true,
+                (),
             )
             .await
             .unwrap();
@@ -1691,6 +1778,49 @@ async fn write_file_segments_atomic_replaces_target() {
     }
 }
 
+/// A write over an existing longer file writes into that file, rather than replacing it, and leaves
+/// it holding the new contents alone, with and without a sync.
+#[tokio::test]
+async fn write_file_segments_writes_over_a_file_in_place() {
+    for driver in drivers() {
+        for durable in [false, true] {
+            let dir = TempDir::new("lore-io-write-in-place-");
+            let previous = pattern(8192, 71);
+            driver
+                .write_file_bytes(dir.child("data"), Bytes::copy_from_slice(&previous), false)
+                .await
+                .unwrap();
+            let identity = file_identity(&dir.child("data"));
+
+            let segments: Vec<Vec<u8>> = vec![pattern(16, 72), pattern(2048, 73)];
+            let flat: Vec<u8> = segments.concat();
+            driver
+                .write_file_segments(
+                    dir.child("data"),
+                    &OpenOptions::new().write(true).create(true).truncate(true),
+                    segments,
+                    durable,
+                    (),
+                )
+                .await
+                .unwrap();
+            let read = driver.read_file_bytes(dir.child("data")).await.unwrap();
+            assert_eq!(
+                &read[..],
+                &flat[..],
+                "{} durable {durable}",
+                driver.backend_name()
+            );
+            assert_eq!(
+                file_identity(&dir.child("data")),
+                identity,
+                "{} durable {durable}: the write replaced the file",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
 /// An atomic write that fails removes its temporary file, here one whose rename meets a directory.
 #[tokio::test]
 async fn a_failed_atomic_write_leaves_no_temporary_file() {
@@ -1723,9 +1853,10 @@ async fn a_failed_atomic_write_leaves_no_temporary_file() {
     }
 }
 
-/// The completion is dropped once the write has landed, the rename included, whether or not the
-/// call is still awaited, so a caller that drops the call part way learns from it when the write
-/// it abandoned is on disk. Observed through a completion that reads the file as it is dropped.
+/// The completion is dropped once the write has landed, the rename of an atomic write included,
+/// whether or not the call is still awaited, so a caller that drops the call part way learns from
+/// it when the write it abandoned is on disk. Observed through a completion that reads the file as
+/// it is dropped.
 #[tokio::test]
 async fn the_completion_is_dropped_once_the_write_has_landed() {
     struct Landed {
@@ -1740,22 +1871,35 @@ async fn the_completion_is_dropped_once_the_write_has_landed() {
     }
 
     for driver in drivers() {
-        for awaited in [true, false] {
+        for (awaited, in_place) in [(true, false), (false, false), (true, true), (false, true)] {
             let dir = TempDir::new("lore-io-completion-");
             let data = pattern(4096, 61);
             let (read, landed) = std::sync::mpsc::channel();
             let options = OpenOptions::new().write(true).create(true).truncate(true);
-            let write = driver.write_file_segments_atomic(
-                dir.child("data.tmp"),
-                dir.child("data"),
-                &options,
-                vec![data.clone()],
-                true,
-                Landed {
-                    path: dir.child("data"),
-                    read,
-                },
-            );
+            let completion = Landed {
+                path: dir.child("data"),
+                read,
+            };
+            let write: std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::io::Result<()>> + '_>,
+            > = if in_place {
+                Box::pin(driver.write_file_segments(
+                    dir.child("data"),
+                    &options,
+                    vec![data.clone()],
+                    true,
+                    completion,
+                ))
+            } else {
+                Box::pin(driver.write_file_segments_atomic(
+                    dir.child("data.tmp"),
+                    dir.child("data"),
+                    &options,
+                    vec![data.clone()],
+                    true,
+                    completion,
+                ))
+            };
             if awaited {
                 write.await.unwrap();
             } else {
@@ -1768,7 +1912,8 @@ async fn the_completion_is_dropped_once_the_write_has_landed() {
             assert_eq!(
                 read.as_deref(),
                 Some(&data[..]),
-                "{} awaited {awaited}: the completion was dropped before the write landed",
+                "{} awaited {awaited} in place {in_place}: the completion was dropped before the \
+                 write landed",
                 driver.backend_name()
             );
         }

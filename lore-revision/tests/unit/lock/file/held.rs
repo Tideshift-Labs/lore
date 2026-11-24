@@ -374,7 +374,7 @@ fn a_staged_edit_names_its_path() {
             .await
             .expect("staging the edit");
             repository
-                .flush(true)
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
                 .await
                 .expect("flushing the staged change");
         }));
@@ -477,7 +477,10 @@ fn a_staged_delete_names_the_deleted_path() {
             )
             .await
             .expect("staging the delete");
-            repository.flush(true).await.expect("flushing");
+            repository
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .expect("flushing");
         }));
     rig.server
         .set_status_locks(vec![(F.to_owned(), HOLDER.to_owned())]);
@@ -523,7 +526,10 @@ fn a_staged_move_names_its_source_and_target() {
             )
             .await
             .expect("staging the move");
-            repository.flush(true).await.expect("flushing");
+            repository
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .expect("flushing");
         }));
 
     let (_, changed) = rig
@@ -585,7 +591,10 @@ fn a_push_from_behind_the_remote_changes_no_paths() {
             ))
             .await
             .expect("committing");
-            repository.flush(true).await.expect("flushing");
+            repository
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .expect("flushing");
             tip
         }));
     assert_ne!(tip, base);
@@ -649,7 +658,10 @@ fn stage_directory_move(rig: &Rig) {
             )
             .await
             .expect("staging the directory move");
-            repository.flush(true).await.expect("flushing");
+            repository
+                .flush(lore_storage::FlushOptions::SYNC_DATA)
+                .await
+                .expect("flushing");
         }));
 }
 

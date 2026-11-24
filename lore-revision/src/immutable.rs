@@ -34,6 +34,7 @@ use crate::lore::VecBytes;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::lore_warn;
+use crate::repository::LocalReads;
 use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
@@ -136,8 +137,18 @@ fn ambient_managed_uploads() -> Option<Arc<lore_storage::managed_uploads::Manage
 
 /// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
 /// context uploads and the call is not a dry run.
+///
+/// A repository that caches content locally ([`RepositoryContext::disable_cache`] unset, as every
+/// SWFS instance's is) keeps the payloads it writes as it keeps those it reads, even one the write
+/// makes durable on the remote. Without it the store keeps the entry and drops the payload, which a
+/// plain instance can afford, as its working tree holds the file, and an SWFS instance cannot: it
+/// serves the file from the store, offline. Kept with [`WriteOptions::with_keep_local`] rather than
+/// `local_cache_priority`, which the fragment records and every store fetching it then honours.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
-    let flags = WriteOptions::default();
+    let mut flags = WriteOptions::default();
+    if !repository.disable_cache() {
+        flags = flags.with_keep_local();
+    }
     let dry_run =
         crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run());
     if !repository.disable_upload() && !dry_run {
@@ -154,8 +165,12 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
             let globals = context.globals();
             (globals.sync_data(), globals.trust_remote())
         });
+    let local_reads = repository.local_reads;
     ReadOptions {
+        local: local_reads != LocalReads::Skip,
         cache: !repository.disable_cache(),
+        no_local_write: local_reads == LocalReads::Skip,
+        strict_local: local_reads == LocalReads::Strict,
         direct_write: repository.direct_file_write(),
         sync_data,
         trust_remote,
@@ -216,16 +231,18 @@ pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc
 ///
 /// Going through [`RepositoryContext::session_pool`] rather than the connection is
 /// the point: the context holds the pool it resolved, so a command's operations take it
-/// without a lookup on the connection, and the context decides whether the connection pins
-/// it as well.
+/// without a lookup on the connection. A context with an endpoint takes the endpoint's pool,
+/// which the connection does not pin; one without decides whether the connection pins it.
+///
+/// Returns the pool's future mapped, without a future of its own.
 #[lore_macro::test_pub]
-async fn pooled_session(
-    repository: &Arc<RepositoryContext>,
-    correlation_id: &str,
-) -> Result<Arc<StorageSession>, ProtocolError> {
-    Ok(Arc::new(StorageSession::pooled(
-        repository.session_pool(correlation_id).await?,
-    )))
+pub(crate) fn pooled_session<'a>(
+    repository: &'a Arc<RepositoryContext>,
+    correlation_id: &'a str,
+) -> impl Future<Output = Result<Arc<StorageSession>, ProtocolError>> + 'a {
+    futures::FutureExt::map(repository.session_pool(correlation_id), |pool| {
+        pool.map(|pool| Arc::new(StorageSession::pooled(pool)))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +312,9 @@ pub async fn store_raw_remote_retry(
             Err(ProtocolError::Disconnected(_)) => {
                 return Err(Disconnected.into());
             }
+            Err(err) if is_refusal(&err) => {
+                return Err(err.forward("storing fragment to remote"));
+            }
             Err(err) => {
                 return Err(ImmutableError::internal_with_context(
                     err,
@@ -339,17 +359,45 @@ pub fn load_raw(
 // Read path -- delegates to lore-storage with session
 // ---------------------------------------------------------------------------
 
-/// Stream the given data range to `sender`, returning the number of bytes that will arrive.
+/// Load the root fragment of the content `address` names, and its expanded payload, as
+/// [`lore_storage::load_root`] loads it.
 ///
-/// `None` streams the whole content, so the count is `size_content` as it always was. A range
-/// is clamped to the content and only the fragments it touches are fetched.
-///
-/// Returns [`lore_storage::read_stream`]'s future mapped to the count, holding `repository` until it
-/// completes, without a future of its own.
+/// Returns that future with its error forwarded, holding `repository` until it completes, without
+/// a future of its own.
 #[inline]
-pub fn read_stream(
+pub fn load_root(
     repository: Arc<RepositoryContext>,
     address: Address,
+    options: ReadOptions,
+) -> impl Future<Output = Result<(Fragment, Bytes), ImmutableError>> {
+    let session = resolve_session(&repository);
+    lore_storage::load_root(
+        repository.immutable_store(),
+        repository.id,
+        address,
+        options,
+        session,
+    )
+    .map(move |loaded| {
+        drop(repository);
+        loaded.forward::<ImmutableError>("loading root fragment")
+    })
+}
+
+/// Stream the given data range to `sender`, from the root fragment `fragment` and expanded payload
+/// `buffer` that [`load_root`] loaded for `address`, returning the number of bytes that will arrive.
+///
+/// `None` streams the whole content. A range is clamped to the content and only the fragments it
+/// touches are fetched.
+///
+/// Returns [`lore_storage::stream_root`]'s future mapped to the count, holding `repository` until it
+/// completes, without a future of its own.
+#[inline]
+pub fn stream_root(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
     range: Option<Range<usize>>,
     options: ReadOptions,
     sender: Sender<Result<Bytes, lore_storage::StorageError>>,
@@ -357,14 +405,15 @@ pub fn read_stream(
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = resolve_session(&repository);
-    lore_storage::read_stream(store, partition, address, range, options, sender, session).map(
-        move |streamed| {
-            drop(repository);
-            streamed
-                .map(|(_fragment, streamed)| streamed.end - streamed.start)
-                .forward::<ImmutableError>("reading immutable data")
-        },
+    lore_storage::stream_root(
+        store, partition, address, fragment, buffer, range, options, sender, session,
     )
+    .map(move |streamed| {
+        drop(repository);
+        streamed
+            .map(|streamed| streamed.end - streamed.start)
+            .forward::<ImmutableError>("streaming immutable data")
+    })
 }
 
 /// Read the given data range from a fragment which can be a large data set
@@ -649,6 +698,9 @@ pub fn write_from_file_with_tracker(
 /// Whether a file still holds content already stored is [`file_matches`], which measures against
 /// the fragmentation that content was stored under.
 ///
+/// Content a virtual filesystem serves from the store is stored under the address it names, so
+/// that address's hash answers without reading it.
+///
 /// Returns [`lore_storage::hash_file`]'s future with its error forwarded, without a future of its
 /// own.
 #[inline]
@@ -656,8 +708,49 @@ pub fn hash_file(
     repository: Arc<RepositoryContext>,
     source: &lore_storage::ContentSource<'_>,
 ) -> impl Future<Output = Result<Hash, ImmutableError>> {
-    lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
-        .map(|hashed| hashed.forward::<ImmutableError>("hashing file"))
+    match virtual_immutable(source) {
+        Some((address, _)) => futures::future::Either::Left(std::future::ready(Ok(address.hash))),
+        None => futures::future::Either::Right(
+            lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
+                .map(|hashed| hashed.forward::<ImmutableError>("hashing file")),
+        ),
+    }
+}
+
+/// The whole content `source` holds, which the caller budgets for holding resident.
+///
+/// `lore_storage` reads no virtual content, so content a virtual filesystem serves from the store
+/// is read from `repository`'s immutable store, and fetched from the remote where it is not local.
+pub async fn read_source(
+    repository: &Arc<RepositoryContext>,
+    source: &lore_storage::ContentSource<'_>,
+) -> Result<Bytes, ImmutableError> {
+    match virtual_immutable(source) {
+        Some((address, _)) => {
+            read(
+                repository.clone(),
+                address,
+                None,
+                read_options_from_repository(repository),
+            )
+            .await
+        }
+        None => source
+            .read_all()
+            .await
+            .forward::<ImmutableError>("reading file"),
+    }
+}
+
+/// The address and size of content a virtual filesystem serves from the immutable store, and
+/// `None` for any other source.
+pub fn virtual_immutable(source: &lore_storage::ContentSource<'_>) -> Option<(Address, u64)> {
+    match source {
+        lore_storage::ContentSource::Virtual(
+            lore_storage::content::VirtualContent::Immutable { address, size },
+        ) => Some((*address, *size)),
+        _ => None,
+    }
 }
 
 /// Whether `source` still holds the content `previous` addresses, fetching fragment metadata
@@ -744,14 +837,15 @@ pub(crate) type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
 #[lore_macro::test_pub]
 enum Fetch {
     /// A payload fetched: its fragment, marked durable as the remote holds it, the payload as
-    /// fetched, for a fragment list the list it expands to, and whether it overwrites a corrupt
-    /// local copy.
+    /// fetched, for a fragment list the list it expands to, whether it overwrites a corrupt local
+    /// copy, and whether its flight stored it locally already, which leaves the cache no put.
     Fetched {
         address: Address,
         fragment: Fragment,
         payload: Bytes,
         list: Option<Bytes>,
         replace: bool,
+        stored: bool,
     },
     /// The fragment at this address turned local while the get waited for its permit, so nothing
     /// was fetched. With `cache_fragmented` the next round queries it again, which walks a list
@@ -811,7 +905,9 @@ fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
 /// same content in flight shares one get, checked on receipt and healed once as a read's fetch is,
 /// unless the command trusts the remote ([`read_options_from_repository`]), and never decompressed
 /// beyond what that check or a fragment list's walk needs. It joins with the local probe off, as
-/// the cache looked locally already.
+/// the cache looked locally already, and keeping nothing, as [`cache_through`] stores every fetch
+/// itself, but one its flight stored for a read in its store that followed it, unless it is to
+/// `replace` the local copy, which that store may not have overwritten.
 ///
 /// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
 /// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
@@ -830,6 +926,7 @@ fn fetch_to_cache(
     replace: bool,
 ) -> impl Future<Output = Fetch> {
     async move {
+        let mut stored = false;
         let fetched = {
             let mut permit = match &permits {
                 None => None,
@@ -855,19 +952,17 @@ fn fetch_to_cache(
                 repository.id,
                 address,
                 options,
+                None,
                 || lore_storage::read::fetch_remote(&remote_storage, address, options),
                 || drop(permit.take()),
             )
             .await
             {
                 Ok(Flown::Local(_)) => return Fetch::Local(address),
-                Ok(Flown::Fetched(fetched)) => {
-                    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
-                        Ok((fetched.raw, None))
-                    } else {
-                        let raw = fetched.raw.clone();
-                        fetched.take(true).map(|(_, list)| (raw, Some(list)))
-                    }
+                Ok(Flown::Fetched(fetched)) => raw_and_list(fetched),
+                Ok(Flown::Stored(fetched)) => {
+                    stored = !replace;
+                    raw_and_list(fetched)
                 }
                 Err(error) => Err(error),
             }
@@ -879,9 +974,22 @@ fn fetch_to_cache(
                 payload,
                 list,
                 replace,
+                stored,
             },
             Err(error) => Fetch::Failed(Box::new(error.forward("fetching fragment to cache"))),
         }
+    }
+}
+
+/// The payload of `fetched` as stored, and for a fragment list the list it expands to.
+fn raw_and_list(
+    fetched: lore_storage::read::Loaded,
+) -> Result<((Fragment, Bytes), Option<Bytes>), lore_storage::error::StorageError> {
+    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+        Ok((fetched.raw, None))
+    } else {
+        let raw = fetched.raw.clone();
+        fetched.take(true).map(|(_, list)| (raw, Some(list)))
     }
 }
 
@@ -916,7 +1024,8 @@ async fn push_local_list_children(
 /// ([`fetch_to_cache`]). Once connected, every fragment that can be cached is, and the answer is
 /// the failure to connect, the first failure to query, fetch, check or store a fragment, or else
 /// how many fragments it fetched, by its own get or one it joined: a fragment found local after
-/// waiting for a cache get permit is not fetched.
+/// waiting for a cache get permit is not fetched. A context reading from the remote alone
+/// ([`RepositoryContext::reading_remote_only`]) cannot cache: its cache fails with `NotSupported`.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -952,8 +1061,8 @@ impl Cached {
 }
 
 /// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
-/// failure to connect to the remote is an error, and a session that cannot be started fails each
-/// fetch.
+/// failure to connect to the remote, or a context reading from the remote alone, is an error, and
+/// a session that cannot be started fails each fetch.
 pub async fn cache_counted(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
@@ -987,9 +1096,17 @@ pub async fn cache_counted(
 /// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
 /// starts its server-side sessions again once a fetch invalidates them, and the connection's cache
 /// get permits they take ([`cache_through`]).
+///
+/// Every cache takes its session here, so this refuses a context reading from the remote alone
+/// ([`RepositoryContext::reading_remote_only`]) before anything is asked of the remote.
 pub(crate) async fn cache_session(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Arc<StorageSession>, CacheGets), ImmutableError> {
+    if repository.local_reads == LocalReads::Skip {
+        return Err(ImmutableError::from(NotSupported {
+            operation: "caching on a context that reads from the remote alone".to_owned(),
+        }));
+    }
     let remote_result: Result<_, ImmutableError> = repository
         .remote()
         .await
@@ -1146,16 +1263,17 @@ pub(crate) async fn cache_through(
              store_tasks: &mut JoinSet<Result<(), StoreError>>,
              additional_address: &mut Vec<Address>,
              failure: &mut Option<Box<ImmutableError>>| {
-                let (address, fragment, payload, list, replace) = match result {
+                let (address, fragment, payload, list, replace, stored) = match result {
                     Ok(Fetch::Fetched {
                         address,
                         fragment,
                         payload,
                         list,
                         replace,
+                        stored,
                     }) => {
                         total_bytes += payload.len() as u64;
-                        (address, fragment, payload, list, replace)
+                        (address, fragment, payload, list, replace, stored)
                     }
                     Ok(Fetch::Local(address)) => {
                         total_already_local += 1;
@@ -1181,6 +1299,9 @@ pub(crate) async fn cache_through(
 
                 if cache_fragmented && let Some(list) = list {
                     push_subfragments(list, address.context, additional_address);
+                }
+                if stored {
+                    return;
                 }
 
                 let repository = repository.clone();

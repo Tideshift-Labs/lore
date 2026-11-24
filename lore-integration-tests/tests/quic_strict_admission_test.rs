@@ -139,6 +139,7 @@ mod quic_strict_admission_tests {
             jwt_issuer: None,
             jwt_audience: Some(vec![AUDIENCE.to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -270,6 +271,7 @@ mod quic_strict_admission_tests {
                         mutable.clone(),
                         true,
                         Arc::new(UserAgentFilter::default()),
+                        lore_server::protocol::storage::session::SessionMap::default(),
                     )
                     .with_caller_capability_policy(policy);
                     Box::new(StreamHandler::new(

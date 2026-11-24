@@ -35,6 +35,7 @@ from service_util import (
     LORE_SERVICE_SOCKET_VAR,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
+    LORE_TEST_VFS_VAR,
     remove_service_claim,
     service_supported,
     stop_lore_service,
@@ -43,6 +44,13 @@ from service_util import (
 from lore import Lore, lore_test_env
 
 logger = logging.getLogger(__name__)
+
+# The tests fork a child for every lore they run, while gRPC may serve or call
+# in this process. With fork support on, gRPC restarts its poller in each child,
+# and on macOS the poller logs to the child's stderr before it execs, which the
+# tests read as the command's output. No test uses gRPC in a forked child. gRPC
+# reads the setting when it first initializes, after this module is imported.
+os.environ["GRPC_ENABLE_FORK_SUPPORT"] = "false"
 
 
 def pytest_addoption(parser):
@@ -137,22 +145,6 @@ def pytest_addoption(parser):
             "Off by default: the suite writes about ten gigabytes per session, "
             "so it is removed as it goes. Turn this on to inspect the state a "
             "failing test left behind, including the server log."
-        ),
-    )
-    parser.addoption(
-        "--swfs",
-        action="store_true",
-        default=False,
-        help=(
-            "Run the tests that mount a repository through SWFS. Off by "
-            "default, because mounting needs two things the harness cannot "
-            "arrange for itself: a client built with `--features swfs` "
-            "against SWFS_LIB_DIR, and the epicvfs filesystem driver started, "
-            "which takes an elevated session. Neither is visible from the "
-            "outside -- the binary reports no feature list -- and a run "
-            "without them does not fail, it hangs: the SWFS library parks the "
-            "service process when it cannot reach the driver, so the client "
-            "waiting on it blocks until the per-test timeout kills the worker."
         ),
     )
 
@@ -667,6 +659,11 @@ def lore_service_socket():
     remove_service_claim(socket_name)
 
 
+# The executable a test relayed to the shared service names for starting one: a
+# path that does not exist, so the failure to start it says what happened.
+SHARED_SERVICE_GONE = "/the-shared-lore-service-of-this-run-stopped"
+
+
 @pytest.fixture(autouse=True)
 def _relays_to_the_shared_service(request, monkeypatch):
     """Carries out every command of the test in the service named by
@@ -675,21 +672,46 @@ def _relays_to_the_shared_service(request, monkeypatch):
 
     A test that manages a service of its own, through `lore_service_runner`,
     keeps it and this run's socket, and a test marked `runs_in_process` keeps
-    its commands in their own process. No executable is named, so a command that
-    finds the shared service gone fails rather than starting one of its own.
-    Each call carries the test's global and auth paths, which the service reads
-    in place of its own.
+    its commands in their own process. The executable named for starting a
+    service does not exist, so a command that finds the shared service gone
+    fails rather than starting one of its own. Naming none would not do: a
+    command in a virtual clone, and `lore service start`, then start one from
+    the `lore` that ran them. Each call carries the test's global and auth
+    paths, which the service reads in place of its own.
     """
-    socket_name = os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
-    if (
-        socket_name
+    if _relayed_to_the_shared_service(request):
+        monkeypatch.setenv("LORE_USE_SERVICE", "1")
+        monkeypatch.setenv(
+            LORE_SERVICE_SOCKET_VAR, os.environ[LORE_TEST_SERVICE_SOCKET_VAR]
+        )
+        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", SHARED_SERVICE_GONE)
+
+
+def _relayed_to_the_shared_service(request) -> bool:
+    """Whether the shared service carries out the test's commands."""
+    return bool(
+        os.environ.get(LORE_TEST_SERVICE_SOCKET_VAR)
         and "lore_service_runner" not in request.fixturenames
         and request.node.get_closest_marker("runs_in_process") is None
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forces_the_vfs_only_where_the_shared_service_serves(request, monkeypatch):
+    """Keeps `LORE_TEST_VFS` in force only for a test whose commands the shared
+    service carries out, as only a service mounts a virtual clone, and that does
+    not choose its repositories' VFS itself.
+
+    A test that manages a service of its own stops and starts it, which takes
+    its virtual clones with it, and a test marked `runs_in_process` reaches no
+    service. A test marked `own_vfs` asserts on what the VFS it names, or the
+    lack of one, does.
+    """
+    if os.environ.get(LORE_TEST_VFS_VAR) and (
+        not _relayed_to_the_shared_service(request)
+        or request.node.get_closest_marker("own_vfs") is not None
     ):
-        monkeypatch.setenv("LORE_USE_SERVICE", "1")
-        monkeypatch.setenv(LORE_SERVICE_SOCKET_VAR, socket_name)
-        # Blank rather than unset, so `name_service_executable` leaves it so.
-        monkeypatch.setenv("LORE_SERVICE_EXECUTABLE", " ")
+        monkeypatch.delenv(LORE_TEST_VFS_VAR)
 
 
 @pytest.fixture(scope="function")
@@ -825,14 +847,48 @@ def lore_grpc_target(request, lore_main_server_ports):
     return f"{host}:{lore_main_server_ports['grpc']}"
 
 
+def _local_server_disabled(config) -> bool:
+    """Whether the run launches no main loreserver of its own."""
+    return config.getoption("--disable-local-server") or config.getoption(
+        "--disable-auto-server"
+    )
+
+
 @pytest.fixture(scope="session")
-def lore_main_server_ports(request, tmp_path_factory):
+def launches_main_server(request, tmp_path_factory) -> bool:
+    """Whether this process launches the main loreserver.
+
+    With the local server disabled, none does. Without xdist, this process does.
+    Under xdist, every worker shares one server, which
+    the first worker to set this fixture up launches: it claims the launch by
+    creating `lore_server.claim` in the shared directory, and the others wait
+    for the ports it publishes. A worker named in advance would not do: a worker
+    whose tests are all skipped, or that is given none, sets up no session
+    fixture, and the others would wait for a server nobody launches. The shared
+    directory is the controller's basetemp, which every session starts empty,
+    so no claim is left from an earlier one.
+    """
+    if _local_server_disabled(request.config):
+        return False
+    if _get_worker_id(request) is None:
+        return True
+    claim = _get_shared_tmp_dir(tmp_path_factory) / "lore_server.claim"
+    try:
+        os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return False
+    return True
+
+
+@pytest.fixture(scope="session")
+def lore_main_server_ports(request, tmp_path_factory, launches_main_server):
     """Resolve the main loreserver's {quic, grpc, http, internal} ports.
 
     For each port: if its CLI option was explicitly passed, use that value;
-    otherwise ask the OS for a free ephemeral port. Under pytest-xdist, gw0
-    resolves first and publishes the ports via lore_server_info.json so
-    secondary workers connect to the ports gw0 actually launched on.
+    otherwise allocate one with `allocate_free_port`. Under pytest-xdist, the
+    worker that launches the server resolves them and publishes them via
+    lore_server_info.json, so the other workers connect to the ports it
+    actually launched on.
     """
     cli_values = {
         "quic": request.config.getoption("--lore-remote-quic-port"),
@@ -874,7 +930,20 @@ def lore_main_server_ports(request, tmp_path_factory):
             ),
         }
 
-    worker_id = _get_worker_id(request)
+    # With the local server disabled, no worker publishes ports to wait for.
+    if _local_server_disabled(request.config) or _get_worker_id(request) is None:
+        return resolve_locally()
+
+    info_path = _get_shared_tmp_dir(tmp_path_factory) / "lore_server_info.json"
+
+    if launches_main_server:
+        # A launch that fails before it starts says so, so the other workers
+        # report the failure rather than time out waiting for it.
+        try:
+            return resolve_locally()
+        except Exception:
+            info_path.write_text(json.dumps({"status": "failed"}))
+            raise
 
     # Fast path: if all four ports are CLI-supplied, every worker can compute
     # the same values from CLI args alone — no cross-worker port discovery
@@ -883,24 +952,11 @@ def lore_main_server_ports(request, tmp_path_factory):
     # setup (key copy / openssl) as buffer time before its own polling clock
     # starts.
     if all(v is not None for v in cli_values.values()):
-        if worker_id == "gw0":
-            shared_tmp = _get_shared_tmp_dir(tmp_path_factory)
-            (shared_tmp / "lore_server_info.json").unlink(missing_ok=True)
         return resolve_locally()
 
-    if worker_id is None:
-        return resolve_locally()
-
-    shared_tmp = _get_shared_tmp_dir(tmp_path_factory)
-    info_path = shared_tmp / "lore_server_info.json"
-
-    if worker_id == "gw0":
-        # Clear any stale info file from a killed prior session before allocating.
-        info_path.unlink(missing_ok=True)
-        return resolve_locally()
-
-    # Dynamic-allocation mode: secondary workers must wait for gw0 to publish
-    # the ports it actually picked, since they can't predict them.
+    # Dynamic-allocation mode: the other workers must wait for the launching
+    # worker to publish the ports it actually picked, since they can't predict
+    # them.
     for _ in range(30):
         if info_path.exists():
             try:
@@ -909,21 +965,34 @@ def lore_main_server_ports(request, tmp_path_factory):
                 sleep(1)
                 continue
             if info.get("status") == "failed":
-                pytest.fail("Lore server failed to start on gw0")
+                pytest.fail("Lore server failed to start on the worker launching it")
             if info.get("status") == "running" and "ports" in info:
                 return info["ports"]
         sleep(1)
-    pytest.fail("Timed out waiting for Lore server ports from gw0")
+    pytest.fail(
+        "Timed out waiting for the Lore server's ports from the worker launching it"
+    )
 
 
 @pytest.fixture(scope="session")
-def lore_local_server_config(request, tmp_path_factory, lore_main_server_ports):
-    # remove_when_done=False: under xdist this server belongs to gw0 but serves
-    # every worker, so it is still in use when gw0's session ends. The
-    # controller's sweep takes its root once all of them have stopped.
-    return generate_server_config(
-        request, tmp_path_factory, lore_main_server_ports, remove_when_done=False
-    )
+def lore_local_server_config(
+    request, tmp_path_factory, lore_main_server_ports, launches_main_server
+):
+    # remove_when_done=False: under xdist this server belongs to the worker that
+    # launched it but serves every worker, so it is still in use when that
+    # worker's session ends. The controller's sweep takes its root once all of
+    # them have stopped.
+    try:
+        return generate_server_config(
+            request, tmp_path_factory, lore_main_server_ports, remove_when_done=False
+        )
+    except Exception:
+        # As in lore_main_server_ports: the other workers report the failure
+        # rather than time out waiting for the launch.
+        if launches_main_server and _get_worker_id(request) is not None:
+            info_path = _get_shared_tmp_dir(tmp_path_factory) / "lore_server_info.json"
+            info_path.write_text(json.dumps({"status": "failed"}))
+        raise
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -933,27 +1002,23 @@ def auto_lore_local_server(
     lore_server_executable_path,
     tmp_path_factory,
     lore_main_server_ports,
+    launches_main_server,
 ):
     """
     Runs loreserver locally.
 
-    Under pytest-xdist, gw0 launches the server and writes a status file;
+    Under pytest-xdist, the worker that claimed the launch (see
+    launches_main_server) launches the server and writes a status file; the
     other workers block in lore_main_server_ports until that file appears.
     The xdist controller's pytest_sessionfinish hook handles teardown after
-    all workers complete. Without xdist, behavior is identical to before
-    (fixture owns full lifecycle).
+    all workers complete. Without xdist, the fixture owns the server's full
+    lifecycle.
     """
-    disabled = request.config.getoption(
-        "--disable-local-server"
-    ) or request.config.getoption("--disable-auto-server")
-    if disabled:
+    if _local_server_disabled(request.config):
         yield
         return
 
-    worker_id = _get_worker_id(request)
-
-    if worker_id is None:
-        # Not xdist — original behavior (fixture owns full lifecycle)
+    if _get_worker_id(request) is None:
         (server_root, server_env) = lore_local_server_config
         yield from lore_local_server(
             server_root, server_env, lore_server_executable_path
@@ -963,8 +1028,8 @@ def auto_lore_local_server(
     shared_tmp = _get_shared_tmp_dir(tmp_path_factory)
     info_path = shared_tmp / "lore_server_info.json"
 
-    if worker_id == "gw0":
-        # Primary: launch server, publish readiness + ports in one atomic write.
+    if launches_main_server:
+        # Primary: launch server, publish readiness + ports in one write.
         (server_root, server_env) = lore_local_server_config
         try:
             server_proc, server_log_path, server_log_fd = launch_lore_server(
@@ -991,12 +1056,13 @@ def auto_lore_local_server(
         # Do NOT kill here — controller's pytest_sessionfinish handles it.
         server_log_fd.close()
     else:
-        # Secondary: wait for gw0's server to be ready before tests start.
+        # Secondary: wait for the shared server to be ready before tests start.
         # In dynamic-allocation mode, lore_main_server_ports already blocked
         # until ports were published, so this poll typically returns instantly.
         # In fast-path (all CLI ports set), this is the only wait — and it
         # runs *after* lore_local_server_config has done its file-copy /
-        # keygen work, giving gw0 buffer time before this clock starts.
+        # keygen work, giving the launching worker buffer time before this
+        # clock starts.
         for _ in range(30):
             if info_path.exists():
                 try:
@@ -1005,12 +1071,16 @@ def auto_lore_local_server(
                     sleep(1)
                     continue
                 if info.get("status") == "failed":
-                    pytest.fail("Lore server failed to start on gw0")
+                    pytest.fail(
+                        "Lore server failed to start on the worker launching it"
+                    )
                 if info.get("status") == "running":
                     break
             sleep(1)
         else:
-            pytest.fail("Timed out waiting for Lore server to start on gw0")
+            pytest.fail(
+                "Timed out waiting for the worker launching the Lore server to start it"
+            )
         yield
 
 
@@ -1125,6 +1195,11 @@ def pytest_configure(config):
         "markers",
         "runs_in_process(reason): keep the test's commands in their own process when "
         "LORE_TEST_SERVICE_SOCKET relays the rest of the run to a service",
+    )
+    config.addinivalue_line(
+        "markers",
+        "own_vfs(reason): keep the VFS the test names, or none, when LORE_TEST_VFS "
+        "names one for every repository of the run",
     )
     config.addinivalue_line(
         "markers",

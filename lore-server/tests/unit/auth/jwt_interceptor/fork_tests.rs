@@ -44,6 +44,7 @@ fn interceptor() -> JWTInterceptor {
         jwt_issuer: Some(vec!["https://issuer.example".into()]),
         jwt_audience: Some(vec!["lore".into()]),
         jwt_typ: None,
+        exchange_issuer: None,
     }))
 }
 

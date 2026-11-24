@@ -1214,7 +1214,7 @@ mod tests {
                         .await
                         .expect("Failed to read a block");
                     block
-                        .deserialize_nametable(repository.clone())
+                        .deserialize_nametable_for_tests(repository.clone())
                         .await
                         .expect("Failed to read a name table");
                     let index = node::Node::index(node);
@@ -1247,17 +1247,6 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
-    }
-
-    /// Whether the file system under `dir` holds one case variation of a name and answers
-    /// lookups in any other. A mount can be either on any platform, so a test that needs two
-    /// spellings to be two paths asks rather than assumes.
-    fn case_insensitive(dir: &std::path::Path) -> bool {
-        let probe = dir.join("CaseProbe");
-        std::fs::write(&probe, b"").expect("write probe");
-        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
-        std::fs::remove_file(&probe).expect("remove probe");
-        insensitive
     }
 
     /// Committed files under a directory the file system now spells in another case, staged
@@ -1385,7 +1374,7 @@ mod tests {
             .await
             .expect("read block");
         block
-            .deserialize_nametable(repository.clone())
+            .deserialize_nametable_for_tests(repository.clone())
             .await
             .expect("read name table");
         let index = node::Node::index(node);
@@ -2962,41 +2951,42 @@ mod tests {
         .await;
     }
 
-    /// A staging scan of an unchanged sparse tree stages no deletion of the files its view leaves
-    /// out of the working tree, forced or not: forcing passes the ignore file, not the view.
+    /// A stage of an unchanged sparse tree stages no deletion of the files its view leaves out of
+    /// the working tree, scanning or not, forced or not: a forced stage walks the tree as a scan
+    /// does, and a deletion driven by absence asks the view.
     #[tokio::test]
     async fn a_stage_scan_of_a_sparse_tree_stages_no_deletion() {
-        for force in [false, true] {
+        for (scan, force) in [(false, false), (false, true), (true, false), (true, true)] {
             in_execution(async move {
                 let (repository, tempdir) = sparse_repository().await;
-                stage_paths(&repository, &tempdir, &["."], true, force).await;
+                stage_paths(&repository, &tempdir, &["."], scan, force).await;
                 let deleted = sparse_files_marked(&repository, node::Node::is_staged_delete).await;
                 assert!(
                     deleted.is_empty(),
-                    "a stage scan, forced {force}, staged the deletion of files the view \
-                     excludes: {deleted:?}"
+                    "a stage, scanning {scan} and forced {force}, staged the deletion of files \
+                     the view excludes: {deleted:?}"
                 );
             })
             .await;
         }
     }
 
-    /// A staging scan keeps what the view excludes below a directory removed from a sparse tree,
-    /// forced or not.
+    /// A stage keeps what the view excludes below a directory removed from a sparse tree, scanning
+    /// or not, forced or not.
     #[tokio::test]
     async fn a_stage_scan_of_a_sparse_tree_keeps_what_the_view_excludes_below_a_removed_directory()
     {
-        for force in [false, true] {
+        for (scan, force) in [(false, false), (false, true), (true, false), (true, true)] {
             in_execution(async move {
                 let (repository, tempdir) = sparse_repository().await;
                 std::fs::remove_dir_all(tempdir.join("Engine")).expect("Delete failed");
                 std::fs::remove_dir_all(tempdir.join("Game/Content")).expect("Delete failed");
-                stage_paths(&repository, &tempdir, &["."], true, force).await;
+                stage_paths(&repository, &tempdir, &["."], scan, force).await;
                 let deleted = sparse_files_marked(&repository, node::Node::is_staged_delete).await;
                 assert!(
                     deleted.is_empty(),
-                    "a stage scan, forced {force}, staged the deletion of files the view \
-                     excludes: {deleted:?}"
+                    "a stage, scanning {scan} and forced {force}, staged the deletion of files \
+                     the view excludes: {deleted:?}"
                 );
             })
             .await;

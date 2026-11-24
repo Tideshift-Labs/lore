@@ -232,7 +232,10 @@ pub(crate) async fn restore(
         .await
         .forward::<RestoreError>("loading current anchor")?;
 
-    let remote_head = if let Ok(remote) = repository.remote().await {
+    let remote_head = if let Some(remote) = absent_unless_refused::<_, _, RestoreError>(
+        repository.remote().await,
+        "connecting to the remote",
+    )? {
         branch::load_remote(remote.clone(), repository.id, current_branch)
             .await
             .forward::<RestoreError>("loading remote head")?
@@ -445,9 +448,13 @@ pub(crate) async fn restore(
     .await
     .forward::<RestoreError>("preparing commit metadata")?;
 
-    commit::prune_dirty_for_commit(state_staged.clone(), repository.clone())
-        .await
-        .forward::<RestoreError>("pruning dirty nodes before rehash")?;
+    commit::prune_dirty_for_commit(
+        state_staged.clone(),
+        repository.clone(),
+        head_state.revision(),
+    )
+    .await
+    .forward::<RestoreError>("pruning dirty nodes before rehash")?;
 
     let modified_times = commit::rehash_tree_in_operation(
         repository.clone(),

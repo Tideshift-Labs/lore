@@ -4,7 +4,9 @@ import logging
 import os
 import pytest
 import re
+import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from lore import Lore
@@ -18,6 +20,10 @@ from lore_parsers import (
 )
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 from test_utils import revision_metadata_keys, status_by_path
+
+pytestmark = pytest.mark.own_vfs(
+    "layers repositories, which a virtual clone does not hold"
+)
 
 
 logger = logging.getLogger(__name__)
@@ -2293,6 +2299,23 @@ def _stage_layer_change(repo: Lore) -> None:
 
 
 @pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_layer_sync_gives_a_file_its_bit_alone(new_lore_repo):
+    """A sync that advances a layer to a revision changing only a file's executable bit gives the
+    file the bit: the working tree holds its content, so the bit is all the sync has to carry."""
+    repo, layer_repo = _setup_layer_behind(new_lore_repo, advance_layer=False)
+    os.chmod(os.path.join(layer_repo.path, LAYER_FILE), 0o755)
+    layer_repo.stage(LAYER_FILE)
+    layer_repo.commit("Give the layer file the executable bit")
+    layer_repo.push()
+
+    repo.sync()
+
+    mode = os.stat(os.path.join(repo.path, LAYER_FILE)).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
+
+
+@pytest.mark.smoke
 def test_layer_sync_refused_with_staged_layer_content(new_lore_repo):
     """A sync that would advance a layer holding staged content is refused,
     naming the offending layer.
@@ -3410,3 +3433,49 @@ def test_layer_status_lists_staged_changes_below_an_ignored_mount(new_lore_repo)
     assert [(e.get("path"), e.get("action"), e.get("flagStaged")) for e in entries] == [
         ("vendor/x/a.txt", "keep", True)
     ], f"status lists {entries}"
+
+
+@pytest.mark.smoke
+def test_sync_drops_the_dirty_marker_of_a_layer_file_it_restores(new_lore_repo):
+    """A sync that restores a layer file a scan recorded as deleted leaves no
+    marker on it, and keeps the marker of a layer file it did not touch. The
+    layer's source `Src/` differs in case from the `src/` its tree holds."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {"src/restored.txt": b"one", "src/edited.txt": b"edited"}
+    )
+    repo.layer_add("mnt", layer_repo, "Src/")
+
+    other = repo.clone(name=repo.name + "_other")
+    other.write_commit_push(None, {MAIN_FILE: b"main content v2"})
+    layer_repo.write_commit_push(None, {"src/restored.txt": b"two"})
+
+    repo.remove_file("mnt/restored.txt")
+    repo.write_files({"mnt/edited.txt": b"edited locally"})
+    repo.status(scan=True)
+    assert _marked(repo) == [
+        ("mnt/edited.txt", "keep", True),
+        ("mnt/restored.txt", "delete", True),
+    ], "setup: the scan must mark both layer files"
+
+    repo.sync()
+
+    with repo.open_file("mnt/restored.txt", "rb") as f:
+        assert f.read() == b"two", "the sync must restore the layer file"
+    assert _marked(repo) == [("mnt/edited.txt", "keep", True)], (
+        "only the layer file the sync left alone may stay marked, as modified"
+    )
+    summary = parse_status_summary_json(repo.status(scan=True, json=True))
+    assert summary["hashChecks"] == 0, (
+        f"the times the sync recorded must answer for the files it wrote, got {summary}"
+    )
+
+
+def _marked(repo: Lore) -> list[tuple[str, str, bool]]:
+    return [
+        (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
+        for entry in parse_status_json(repo.status(json=True))
+    ]

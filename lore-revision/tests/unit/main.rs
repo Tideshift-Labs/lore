@@ -13,24 +13,32 @@ mod case_folding;
 mod change;
 mod commit;
 mod dependency;
+/// The fixtures of the move tests, shared with the process-isolated tests of a commit's dirty
+/// moves.
+#[path = "../support/dirty_move_fixture.rs"]
+mod dirty_move_fixture;
 mod dispatch;
 mod event;
 mod exact_selection;
 mod file;
 mod filter;
 mod filter_walk;
+mod find;
 mod fs;
 mod global;
 /// The fixtures the crate's process-isolated tests include, shared with these.
 #[path = "../helper.rs"]
 mod helper;
 mod history;
+mod hooked_store;
 mod immutable;
 mod infer;
 mod instance;
+mod instance_delete;
 mod instance_in_use_retry;
 mod instance_move_rollback;
 mod interface;
+mod layer;
 mod link;
 #[cfg(feature = "test_seams")]
 mod live_fixture;
@@ -41,6 +49,8 @@ mod node;
 mod notification;
 mod paged_remote;
 mod protocol;
+mod records;
+mod refusal;
 mod relay;
 mod repository;
 mod revision;

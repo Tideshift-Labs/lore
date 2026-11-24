@@ -97,7 +97,13 @@ async fn apply_projection_without_authorizing(
         ))
     });
     for w in ordered {
-        match &w.value {
+        // A zero value is an absent key in the mutable-store contract, so a
+        // projection of zero removes the row rather than storing a zero row.
+        let value = w
+            .value
+            .as_ref()
+            .filter(|value| value.iter().any(|byte| *byte != 0));
+        match value {
             Some(value) => {
                 tx.execute(
                     "INSERT INTO lore_mutable (partition, key_type, key, value) \

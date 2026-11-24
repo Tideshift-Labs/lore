@@ -1255,7 +1255,7 @@ impl LiveRepository {
             .expect("recording the fixture repository metadata hash");
 
         repository
-            .flush(true)
+            .flush(lore_storage::FlushOptions::SYNC_DATA)
             .await
             .expect("flushing the fixture repository");
 

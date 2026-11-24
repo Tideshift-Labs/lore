@@ -8,6 +8,7 @@ pub mod connection;
 pub mod domain_receipt;
 pub mod error;
 pub mod grpc;
+pub mod local_socket;
 pub mod outcome;
 pub mod quic;
 pub mod replay;
@@ -17,6 +18,7 @@ pub mod test_util;
 pub mod tls;
 pub mod traits;
 pub mod types;
+pub mod uds;
 pub mod unmanaged_write;
 pub mod util;
 

@@ -232,6 +232,7 @@ pub struct ReplicationClientImpl {
 pub use MockReplicationClientImpl as ReplicationClient;
 #[cfg(not(feature = "mock-replication-client"))]
 pub use ReplicationClientImpl as ReplicationClient;
+use lore_storage::FlushOptions;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 
@@ -656,7 +657,7 @@ impl ImmutableStore for GrpcReplica {
         None
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 

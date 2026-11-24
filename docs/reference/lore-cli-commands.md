@@ -48,6 +48,9 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore repository instance`↴](#lore-repository-instance)
 * [`lore repository instance list`↴](#lore-repository-instance-list)
 * [`lore repository instance prune`↴](#lore-repository-instance-prune)
+* [`lore repository instance delete`↴](#lore-repository-instance-delete)
+* [`lore repository instance move`↴](#lore-repository-instance-move)
+* [`lore repository instance clone`↴](#lore-repository-instance-clone)
 * [`lore repository config`↴](#lore-repository-config)
 * [`lore repository config get`↴](#lore-repository-config-get)
 * [`lore repository update-path`↴](#lore-repository-update-path)
@@ -233,7 +236,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to. Read from `LORE_IDENTITY_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service. Read from `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table and is kept in the shell history
-* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10; always 1 when `LORE_UDS_SOCKET` names a socket)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
@@ -241,6 +244,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--search-nearest` — Set to search for nearest match when matching revisions
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--fast-flush` — Have the command's flushes write the local stores' index in place rather than replacing each of its files through a temporary file. Faster where creating files is slow, but if the process stops or a write fails while a file is being written, the store drops every entry that file held, including those of revisions and branches not yet pushed
 * `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash verified. For machines where performance comes first, such as a build server streaming from a server in its own backend
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
@@ -372,7 +376,7 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -382,9 +386,11 @@ Create a repository in the given directory
   - `default`:
     Use whichever VFS system is preferred based on the user's system
   - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with no remote
+  - `fuse`:
+    A writable virtual clone: a Linux FUSE mount served by the Lore service
 
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
 
@@ -393,7 +399,7 @@ Create a repository in the given directory
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone writes no files and reads them from the remote when a command needs them.
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -409,7 +415,7 @@ A clone needs the remote, so `--offline` does not keep it from connecting: it pr
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -419,15 +425,17 @@ A clone needs the remote, so `--offline` does not keep it from connecting: it pr
   - `default`:
     Use whichever VFS system is preferred based on the user's system
   - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with no remote
+  - `fuse`:
+    A writable virtual clone: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -624,6 +632,9 @@ Instance management
 
 * `list` — List all registered instances for this repository
 * `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
+* `delete` — Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated directories
+* `move` — Move the current instance to a new path
+* `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot share them unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and the path must not be inside another instance. While the clone runs, commands on the instance, and commands from other processes on every instance over the store, wait for it where they open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes any file. An instance move renames the instance before it opens the store, so a move makes the clone fail, or on Windows is refused while the clone lists one of its directories
 
 
 
@@ -640,6 +651,42 @@ List all registered instances for this repository
 Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 **Usage:** `lore repository instance prune`
+
+
+
+## `lore repository instance delete`
+
+Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated directories
+
+**Usage:** `lore repository instance delete`
+
+
+
+## `lore repository instance move`
+
+Move the current instance to a new path
+
+**Usage:** `lore repository instance move <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Target path to move the instance to
+
+
+
+## `lore repository instance clone`
+
+Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot share them unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and the path must not be inside another instance. While the clone runs, commands on the instance, and commands from other processes on every instance over the store, wait for it where they open the store. An instance delete waits too, since it opens the store to deregister the instance before it removes any file. An instance move renames the instance before it opens the store, so a move makes the clone fail, or on Windows is refused while the clone lists one of its directories
+
+**Usage:** `lore repository instance clone [OPTIONS] <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Path to create the clone at; it must not exist, and must be on the instance's volume for the clone to share its data blocks
+
+###### **Options:**
+
+* `--allow-copy` — Copy the instance's files where the clone cannot share their data blocks, rather than refusing. A copy takes as long as writing every file, and commands wait for it as they wait for every clone
 
 
 
@@ -1223,7 +1270,7 @@ Synchronize to a given state of a repository
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -1617,7 +1664,7 @@ File commands
 
 * `info` — Get info about the given file or directory
 * `metadata` — Manage metadata of a given file or directory
-* `dependency` — Manage file dependencies
+* `dependency` — Manage file dependencies of files outside links
 * `stage` — Stage changes for commit
 * `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no content is read or staged)
 * `unstage` — Unstage changes to a file or directory
@@ -1712,7 +1759,7 @@ Set metadata on for a staged file
 
 ## `lore file dependency`
 
-Manage file dependencies
+Manage file dependencies of files outside links
 
 **Usage:** `lore file dependency <COMMAND>`
 
@@ -1785,11 +1832,13 @@ List dependencies or dependents for files
 
 Stage changes for commit.
 
-Directory paths (including `.`) stage only files already marked dirty under that directory; clean or unmarked files are skipped. Mark files first with `lore file dirty` (or `lore status --scan` to reconcile dirty flags in bulk), or pass `--scan` here to walk the filesystem and stage in one pass.
+Without `--scan` or `--force`, directory paths (including `.`) stage only files already marked dirty under that directory; clean or unmarked files are skipped. Mark files first with `lore file dirty` (or `lore status --scan` to reconcile dirty flags in bulk), or pass `--scan` here to walk the filesystem and stage in one pass.
 
 Specific file paths are checked against the filesystem and staged if content differs from the current revision, regardless of their dirty flag.
 
 `--scan` walks the filesystem under the given paths, marks every detected modification/add/delete dirty, and stages them in one step.
+
+`--force` walks a directory path as `--scan` does and stages everything in it but Lore's own entries, past the ignore file and the view: unchanged files included, with the deletion of what the working tree no longer holds, except what the view leaves out.
 
 **Usage:** `lore file stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
@@ -1819,7 +1868,7 @@ Specific file paths are checked against the filesystem and staged if content dif
 
    Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
-   Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+   Without `--scan` or `--force`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
 
@@ -1930,9 +1979,7 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
-  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
-  excludes are restored
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
@@ -2367,7 +2414,7 @@ Pass `--scan` to walk the filesystem under the given paths, reconcile every file
 
 Clone a remote repository into the given path
 
-A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone writes no files and reads them from the remote when a command needs them.
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2383,7 +2430,7 @@ A clone needs the remote, so `--offline` does not keep it from connecting: it pr
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -2393,15 +2440,17 @@ A clone needs the remote, so `--offline` does not keep it from connecting: it pr
   - `default`:
     Use whichever VFS system is preferred based on the user's system
   - `swfs`:
-    Use Epic's Split Write File System as the Virtual File System
+    Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with no remote
+  - `fuse`:
+    A writable virtual clone: a Linux FUSE mount served by the Lore service
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2415,11 +2464,13 @@ A clone needs the remote, so `--offline` does not keep it from connecting: it pr
 
 Stage changes for commit.
 
-Directory path (including `.`): stages only files already marked dirty under that directory. No filesystem walk is performed; clean or unmarked files are skipped. Mark files first with `lore dirty` (or `lore status --scan` to reconcile in bulk), or pass `--scan` here to discover and stage in one pass.
+Without `--scan` or `--force`, a directory path (including `.`) stages only files already marked dirty under that directory. No filesystem walk is performed; clean or unmarked files are skipped. Mark files first with `lore dirty` (or `lore status --scan` to reconcile in bulk), or pass `--scan` here to discover and stage in one pass.
 
 Specific file path: checked against the filesystem and staged if its on-disk content differs from the current revision, regardless of its dirty flag.
 
 `--scan`: forces a filesystem walk under the given paths, marks modified, added, and deleted files dirty, and stages them in one step. Use this when changes were made externally without going through `lore dirty`, or to recover after losing track of dirty state.
+
+`--force`: walks a directory path as `--scan` does and stages everything in it but Lore's own entries, past the ignore file and the view: unchanged files included, with the deletion of what the working tree no longer holds, except what the view leaves out. `lore --force stage .` stages the whole working tree.
 
 **Usage:** `lore stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
@@ -2449,7 +2500,7 @@ Specific file path: checked against the filesystem and staged if its on-disk con
 
    Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
-   Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+   Without `--scan` or `--force`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
 
@@ -2560,9 +2611,7 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
-  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
-  excludes are restored
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
@@ -2651,7 +2700,7 @@ Synchronize to a repository state
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
-* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2733,9 +2782,9 @@ Query the lock status given a branch, owner or path
 
 ###### **Options:**
 
-* `--branch <branch-name>` — Branch to query locks on
-* `--owner <owner-id>` — Owner to query locks belonging to them
-* `--path <path>` — Path to query lock information on
+* `--branch <branch-name>` — Branch to query locks on: every branch by default, or the current branch with `--path`
+* `--owner <owner-id>` — Owner to query locks belonging to them. Can't be combined with `--path`
+* `--path <path>` — Path to query lock information on. Can't be combined with `--owner`
 
 
 

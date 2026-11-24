@@ -235,6 +235,9 @@ struct PoolState {
     queue: VecDeque<Arc<dyn Job>>,
     idle: usize,
     running: usize,
+    /// Threads of the pool's cap lent out by [`SyscallPool::lend`], which the pool starts no
+    /// thread of its own for while they are lent.
+    lent: usize,
     queue_high_water: usize,
     threads_high_water: usize,
 }
@@ -258,6 +261,9 @@ pub struct PoolStats {
     pub queue_high_water: usize,
     /// The cap `threads` never exceeds.
     pub max_threads: usize,
+    /// Threads of the cap lent out, which `threads` stays below the cap by once the idle threads
+    /// past it have woken and ended.
+    pub lent: usize,
 }
 
 #[lore_macro::test_pub]
@@ -265,6 +271,65 @@ struct PoolInner {
     state: Mutex<PoolState>,
     work_available: Condvar,
     max_threads: usize,
+}
+
+/// Threads of a [`SyscallPool`]'s cap that [`SyscallPool::lend`] lent, given back when dropped.
+#[lore_macro::test_pub]
+pub(crate) struct Lent<'a> {
+    pool: &'a SyscallPool,
+    count: usize,
+}
+
+impl Lent<'_> {
+    /// How many threads were lent.
+    #[lore_macro::test_pub]
+    pub(crate) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Takes over the threads `other` holds, which the same pool lent, so they are given back with
+    /// these.
+    #[lore_macro::test_pub]
+    pub(crate) fn absorb(&mut self, mut other: Lent<'_>) {
+        debug_assert!(std::ptr::eq(self.pool, other.pool), "lent by another pool");
+        self.count += std::mem::take(&mut other.count);
+    }
+
+    /// Gives `count` of the threads back before the rest, as when the work they were lent to
+    /// could not start them, and starts a thread in each slot given back for a job that queued
+    /// while they were lent and that no idle thread will take, so the queue drains at the full
+    /// cap again rather than waiting for a later submission to start one.
+    #[lore_macro::test_pub]
+    pub(crate) fn give_back(&mut self, count: usize) {
+        let count = count.min(self.count);
+        if count == 0 {
+            return;
+        }
+        self.count -= count;
+        let inner = &self.pool.inner;
+        let spawn = {
+            let mut state = inner.state.lock();
+            state.lent -= count;
+            let room = inner.max_threads.saturating_sub(state.running + state.lent);
+            let spawn = room.min(state.queue.len().saturating_sub(state.idle));
+            state.running += spawn;
+            state.threads_high_water = state.threads_high_water.max(state.running);
+            spawn
+        };
+        for started in 0..spawn {
+            if spawn_worker_thread(Arc::clone(inner)).is_err() {
+                self.pool.run_without_workers(spawn - started);
+                break;
+            }
+        }
+    }
+}
+
+impl Drop for Lent<'_> {
+    /// Gives every thread still lent back, as [`Lent::give_back`] does.
+    fn drop(&mut self) {
+        self.give_back(self.count);
+    }
 }
 
 /// Bounded pool of threads dedicated to running blocking syscalls.
@@ -286,6 +351,7 @@ impl SyscallPool {
                     queue: VecDeque::new(),
                     idle: 0,
                     running: 0,
+                    lent: 0,
                     queue_high_water: 0,
                     threads_high_water: 0,
                 }),
@@ -300,21 +366,64 @@ impl SyscallPool {
         GLOBAL.get_or_init(|| SyscallPool::new(configured_max_threads()))
     }
 
+    /// Lends up to `wanted` threads of the pool's cap to work that runs them itself, for as long
+    /// as the [`Lent`] is held. The pool lends at most half its cap in all, and no thread busy with
+    /// work; its idle threads past the cap end as they wake. So, once those have ended, the threads
+    /// it runs and the threads lent stay within its cap, and at least half the cap stays for every
+    /// other file operation. May lend none.
+    #[lore_macro::test_pub]
+    pub(crate) fn lend(&self, wanted: usize) -> Lent<'_> {
+        let mut state = self.inner.state.lock();
+        let busy = state.running - state.idle;
+        let lendable = (self.inner.max_threads / 2)
+            .saturating_sub(state.lent)
+            .min(self.inner.max_threads.saturating_sub(busy + state.lent));
+        let count = wanted.min(lendable);
+        state.lent += count;
+        if count > 0 {
+            // Lent threads can leave more threads running than the cap allows; idle ones end at
+            // once rather than at their keep-alive.
+            self.inner.work_available.notify_all();
+        }
+        Lent { pool: self, count }
+    }
+
     #[lore_macro::test_pub]
     pub(crate) fn submit<T, F>(&self, work: F) -> SyscallTask<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let task = Arc::new(Task {
-            state: Mutex::new(TaskState::Pending {
-                work: Some(work),
-                waker: None,
-            }),
-        });
-        let job: Arc<dyn Job> = task.clone();
-        let completion: Arc<dyn Completion<T>> = task;
+        let (job, task) = new_task(work);
+        self.enqueue(job);
+        task
+    }
 
+    /// Runs `work` on a thread of its own, outside the pool and its cap, for work that holds its
+    /// thread for minutes and would hold a pool thread from every other file operation as long.
+    /// The thread is named `name` and ends with the work. It counts against no pool cap: each call
+    /// adds a thread for as long as its work runs. Where the system refuses the thread, the work
+    /// goes to the pool.
+    #[lore_macro::test_pub]
+    pub(crate) fn run_on_own_thread<T, F>(&self, name: &str, work: F) -> SyscallTask<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let (job, task) = new_task(work);
+        let runner = Arc::clone(&job);
+        if std::thread::Builder::new()
+            .name(name.to_string())
+            .spawn(move || runner.run())
+            .is_err()
+        {
+            self.enqueue(job);
+        }
+        task
+    }
+
+    /// Queues `job` for a pool thread, starting one where none is idle and the cap allows.
+    fn enqueue(&self, job: Arc<dyn Job>) {
         let spawn_worker = {
             let mut state = self.inner.state.lock();
             state.queue.push_back(job);
@@ -322,7 +431,7 @@ impl SyscallPool {
             if state.idle > 0 {
                 self.inner.work_available.notify_one();
                 false
-            } else if state.running < self.inner.max_threads {
+            } else if state.running + state.lent < self.inner.max_threads {
                 state.running += 1;
                 state.threads_high_water = state.threads_high_water.max(state.running);
                 true
@@ -333,8 +442,6 @@ impl SyscallPool {
         if spawn_worker && spawn_worker_thread(Arc::clone(&self.inner)).is_err() {
             self.run_without_worker();
         }
-
-        SyscallTask { completion }
     }
 
     /// A snapshot of the pool's occupancy. Taken under the pool's own lock, so it is consistent
@@ -349,7 +456,18 @@ impl SyscallPool {
             threads_high_water: state.threads_high_water,
             queue_high_water: state.queue_high_water,
             max_threads: self.inner.max_threads,
+            lent: state.lent,
         }
+    }
+
+    /// Recovers from the operating system refusing the first of `unstarted` worker threads whose
+    /// slots were reserved together: gives back the slots of the threads after it, then recovers
+    /// from the refused one as [`Self::run_without_worker`] does.
+    #[lore_macro::test_pub]
+    fn run_without_workers(&self, unstarted: usize) {
+        // The slots of the threads after the refused one are given back first, as its own is.
+        self.inner.state.lock().running -= unstarted - 1;
+        self.run_without_worker();
     }
 
     /// Recovers from the operating system refusing a worker thread.
@@ -381,6 +499,23 @@ impl SyscallPool {
     }
 }
 
+/// A task for `work`, as the queue or a thread runs it and as its caller awaits it.
+fn new_task<T, F>(work: F) -> (Arc<dyn Job>, SyscallTask<T>)
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let task = Arc::new(Task {
+        state: Mutex::new(TaskState::Pending {
+            work: Some(work),
+            waker: None,
+        }),
+    });
+    let job: Arc<dyn Job> = task.clone();
+    let completion: Arc<dyn Completion<T>> = task;
+    (job, SyscallTask { completion })
+}
+
 /// Starts a worker thread, reporting refusal rather than panicking: a host that has already
 /// exhausted its thread budget is exactly the environment this pool is sized for, and the
 /// caller has a reserved slot to give back.
@@ -398,6 +533,12 @@ fn worker_loop(inner: &PoolInner) {
         let job = {
             let mut state = inner.state.lock();
             loop {
+                // Lending can leave more threads running than the cap allows; the surplus ends
+                // here, and the threads within the cap take the queued work.
+                if state.running + state.lent > inner.max_threads {
+                    state.running -= 1;
+                    break None;
+                }
                 if let Some(job) = state.queue.pop_front() {
                     break Some(job);
                 }

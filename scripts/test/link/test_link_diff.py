@@ -3,7 +3,7 @@
 import os
 
 import pytest
-from link_helpers import make_repo, parse_revision_diff
+from link_helpers import make_parent_with_link, make_repo, parse_revision_diff
 from lore_parsers import parse_status_json
 from thin_client import (
     ACTION_ADD,
@@ -11,10 +11,14 @@ from thin_client import (
     NODE_TYPE_FILE,
     NODE_TYPE_LINK,
     revision_diff,
+    revision_diff_with_partitions,
     revision_tree,
+    wire_identity,
 )
 
-from lore import Lore
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
 
 
 @pytest.mark.smoke
@@ -410,6 +414,67 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     )
 
 
+def _changed_paths(diff_output: str) -> list[str]:
+    """The working tree paths `lore file diff` output reports changed, sorted."""
+    return sorted(
+        line[4:]
+        for line in diff_output.splitlines()
+        if line.startswith("+++ ") and line != "+++ /dev/null"
+    )
+
+
+def _status_entries(repo, path: str) -> list[tuple[str, str]]:
+    """The (path, action) pairs of an unstaged `lore status` scoped to `path`, sorted."""
+    return sorted(
+        (entry["path"].replace("\\", "/"), entry["action"])
+        for entry in parse_status_json(repo.status(path, unstaged=True, json=True))
+    )
+
+
+@pytest.mark.smoke
+def test_link_diff_scoped_to_mount_matches_unscoped_over_a_nested_link(
+    new_lore_repo,
+):
+    """A link added inside a linked repository is reported the same way by a
+    diff scoped to the outer mount as by a diff over the whole parent, and a
+    status scoped to the outer mount reports nothing while it is untouched and
+    an edit inside the nested link under its full mount path.
+    """
+    outer_mount = "libs/b"
+    outer_file = f"{outer_mount}/b-root.txt"
+    nested_file = f"{outer_mount}/nested/c-data/inner.txt"
+
+    parent_repo, _ = make_parent_with_link(
+        new_lore_repo, outer_mount, {"b-root.txt": "b\n"}
+    )
+    pre_nested_revision = parent_repo.branch_info().local_latest
+    repo_c = make_repo(new_lore_repo, {"c-data/inner.txt": "c v1\n"})
+    parent_repo.link_add(f"{outer_mount}/nested", repo_c.get_id(), "/")
+    parent_repo.commit("Link C inside B")
+    parent_repo.push()
+    assert _status_entries(parent_repo, outer_mount) == []
+
+    parent_repo.write_files({outer_file: "b edited\n"})
+
+    unscoped = _changed_paths(
+        parent_repo.file_diff(source=pre_nested_revision, no_pager=True)
+    )
+    scoped = _changed_paths(
+        parent_repo.file_diff(
+            paths=outer_mount, source=pre_nested_revision, no_pager=True
+        )
+    )
+    assert scoped == [outer_file]
+    assert scoped == [path for path in unscoped if path.startswith(f"{outer_mount}/")]
+
+    parent_repo.write_files({nested_file: "locally modified\n"})
+
+    assert _status_entries(parent_repo, outer_mount) == [
+        (outer_file, "keep"),
+        (nested_file, "keep"),
+    ]
+
+
 @pytest.mark.smoke
 def test_link_pin_update_revision_diff_reports_link_and_content(new_lore_repo):
     """A pin update must surface both the link itself and the linked
@@ -598,14 +663,6 @@ def test_link_add_remove_revision_diff_reports_link_only(new_lore_repo):
 # ---------------------------------------------------------------------------
 
 
-def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
-    """The repository id and latest revision signature as the raw bytes the
-    thin-client wire expects."""
-    latest = repo.branch_info().local_latest
-    assert len(latest) == 64, f"Expected a full revision signature, got {latest!r}"
-    return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
-
-
 def _mount_changes(changes: list, link_path: str) -> list:
     """Every diff entry describing the link node at `link_path`."""
     return [
@@ -633,12 +690,12 @@ def test_thin_client_tree_discriminates_tracking_from_pinned(
     repo.push()
 
     target, authorization = thin_client_credentials(repo)
-    repository_id, signature = _wire_identity(repo)
+    repository_id, signature = wire_identity(repo)
     nodes = {
         node.path: node
         for node in revision_tree(
             target, repository_id, signature, authorization=authorization
-        )
+        ).nodes
     }
     for path in ("tracked", "pinned", "own.txt"):
         assert path in nodes, f"{path} missing from tree: {sorted(nodes)}"
@@ -677,14 +734,14 @@ def test_thin_client_diff_reports_tracking_on_added_link(
     link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
     repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -715,13 +772,13 @@ def test_thin_client_diff_reports_tracking_on_removed_link(
     repo.commit()
     repo.push()
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     repo.link_remove(link_path)
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -753,7 +810,7 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     repo.commit()
     repo.push()
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
         output_file.writelines(["linked content, revised\n"])
@@ -763,7 +820,7 @@ def test_thin_client_diff_reports_tracking_on_moved_pin(
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -801,14 +858,14 @@ def test_thin_client_diff_partitions_added_link_under_linked_repository(
     link_repo = make_repo(new_lore_repo, {"inner.txt": "initial content\n"})
     repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     link_path = "linked"
     repo.link_add(link_path, link_repo.get_id(), "/")
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -840,13 +897,13 @@ def test_thin_client_diff_partitions_removed_link_under_linked_repository(
     repo.commit()
     repo.push()
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     repo.link_remove(link_path)
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -879,7 +936,7 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
     repo.commit()
     repo.push()
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
         output_file.writelines(["linked content, revised\n"])
@@ -889,7 +946,7 @@ def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -923,14 +980,14 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
     second_repo = make_repo(new_lore_repo, {"second.txt": "initial content\n"})
     repo = make_repo(new_lore_repo, {"own.txt": "initial content\n"})
 
-    repository_id, before = _wire_identity(repo)
+    repository_id, before = wire_identity(repo)
 
     repo.link_add("first", first_repo.get_id(), "/")
     repo.link_add("second", second_repo.get_id(), "/")
     repo.commit()
     repo.push()
 
-    _, after = _wire_identity(repo)
+    _, after = wire_identity(repo)
     target, authorization = thin_client_credentials(repo)
     changes = revision_diff(
         target, repository_id, before, after, authorization=authorization
@@ -947,3 +1004,47 @@ def test_thin_client_diff_partitions_each_link_under_its_own_repository(
             f"Mount path {link_path} mounts {link_repo.get_id()}, so its entries "
             f"must be partitioned there, got {mount_changes}"
         )
+
+
+@pytest.mark.smoke
+def test_thin_client_three_way_diff_partitions_pin_moved_over_unchanged_content(
+    new_lore_repo, lore_grpc_target
+):
+    """A branch that moves a link's pin to a revision with the same mounted
+    content diverges from main in a 3-way diff. The content walk finds nothing
+    under the link, and the stream must still announce the linked repository,
+    as it does to a caller who may not read it."""
+    link_repo = make_repo(
+        new_lore_repo,
+        {
+            "mounted/stable.txt": "stable mounted content\n",
+            "outside/v1.txt": "outside v1\n",
+        },
+    )
+    pin_v1 = link_repo.branch_info().local_latest
+    link_repo.write_commit_push("v2 changes only outside/", {"outside/v2.txt": "v2\n"})
+    pin_v2 = link_repo.branch_info().local_latest
+
+    repo = make_repo(new_lore_repo, {"README.txt": "baseline\n"})
+    link_path = "libs/shared"
+    repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
+    repo.commit("Add link at v1, mounting mounted/")
+    repo.push()
+
+    repo.branch_create("feature")
+    repo.link_update(link_path, pin=pin_v2)
+    repo.commit("Move the pin to v2 (no mounted/ change)")
+    repo.push()
+    repository_id, source = wire_identity(repo)
+
+    repo.branch_switch("main")
+    repo.write_commit_push("Diverge main", {"README.txt": "main moved on\n"})
+    _, target = wire_identity(repo)
+
+    _, partitions = revision_diff_with_partitions(
+        lore_grpc_target, repository_id, source, target
+    )
+    assert partitions == [link_repo.get_id()], (
+        f"The moved pin names revisions of {link_repo.get_id()}, so the stream "
+        f"must announce it, got {partitions}"
+    )

@@ -175,11 +175,13 @@ impl MutableStore for PostgresMutableStore {
             )
             .await
             .map_err(db_err)?;
-        match row {
-            Some(row) => {
-                let value: Vec<u8> = row.get("value");
-                Ok(Hash::from(value.as_slice()))
-            }
+        // A stored zero is an absent key (trait contract); an older build could
+        // leave such a row.
+        match row
+            .map(|row| Hash::from(row.get::<_, Vec<u8>>("value").as_slice()))
+            .filter(|value| !value.is_zero())
+        {
+            Some(value) => Ok(value),
             None => Err(not_found(key)),
         }
     }
@@ -253,6 +255,7 @@ impl MutableStore for PostgresMutableStore {
             )
             .await
             .map_err(db_err)?;
+        let row_present = current.is_some();
         let current = current
             .map(|row| {
                 let current: Vec<u8> = row.get("value");
@@ -260,22 +263,34 @@ impl MutableStore for PostgresMutableStore {
             })
             .unwrap_or_default();
 
-        if current != expected {
+        // A mismatch writes nothing. A swap to the value held writes nothing too,
+        // except that a zero row an older build left (it reads as absent) is
+        // removed by a matching swap from zero to zero, so no zero row remains.
+        let stale_zero_row = row_present && current.is_zero();
+        if current != expected || (value == current && !stale_zero_row) {
             tx.commit().await.map_err(db_err)?;
             return Ok(current);
         }
 
-        // CAS retains a zero-valued row, matching LocalMutableStore. `load`
-        // exposes zero as absence, but a later zero-expected CAS can still use
-        // the row as its predecessor.
-        tx.execute(
-            "INSERT INTO lore_mutable (partition, key_type, key, value) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (partition, key_type, key) DO UPDATE SET value = EXCLUDED.value",
-            &[&part, &kt, &k, &value.data().as_slice()],
-        )
-        .await
-        .map_err(db_err)?;
+        if value.is_zero() {
+            // A swap to zero removes the key and leaves no row (trait contract).
+            tx.execute(
+                "DELETE FROM lore_mutable \
+                 WHERE partition = $1 AND key_type = $2 AND key = $3",
+                &[&part, &kt, &k],
+            )
+            .await
+            .map_err(db_err)?;
+        } else {
+            tx.execute(
+                "INSERT INTO lore_mutable (partition, key_type, key, value) \
+                 VALUES ($1, $2, $3, $4) \
+                 ON CONFLICT (partition, key_type, key) DO UPDATE SET value = EXCLUDED.value",
+                &[&part, &kt, &k, &value.data().as_slice()],
+            )
+            .await
+            .map_err(db_err)?;
+        }
         tx.commit().await.map_err(db_err)?;
         Ok(current)
     }
@@ -289,19 +304,24 @@ impl MutableStore for PostgresMutableStore {
         let _t = self.instruments.start("list", self.pool.status());
         let client = self.pool.get().await.map_err(pool_err)?;
         let kt = key_type as i16;
+        // A key holding zero is absent and left out (trait contract), filtered in
+        // the query so the one rule holds for every reader of these rows.
+        let zero = Hash::default();
+        let zero = zero.data().as_slice();
         // A null partition matches all partitions (trait contract).
         let rows = if partition.is_zero() {
             client
                 .query(
-                    "SELECT key, value FROM lore_mutable WHERE key_type = $1",
-                    &[&kt],
+                    "SELECT key, value FROM lore_mutable WHERE key_type = $1 AND value <> $2",
+                    &[&kt, &zero],
                 )
                 .await
         } else {
             client
                 .query(
-                    "SELECT key, value FROM lore_mutable WHERE partition = $1 AND key_type = $2",
-                    &[&partition.data().as_slice(), &kt],
+                    "SELECT key, value FROM lore_mutable \
+                     WHERE partition = $1 AND key_type = $2 AND value <> $3",
+                    &[&partition.data().as_slice(), &kt, &zero],
                 )
                 .await
         }
@@ -317,7 +337,10 @@ impl MutableStore for PostgresMutableStore {
         Ok(stream)
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        _options: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         // Writes are durable on commit; nothing to flush.
         Ok(())
     }

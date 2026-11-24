@@ -29,6 +29,8 @@ use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::with_operation;
+use crate::hash::hash_string;
+use crate::hash::hash_string_bytes;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -44,7 +46,6 @@ use crate::node;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
-use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
@@ -57,6 +58,7 @@ use crate::revision;
 use crate::revision::sync::SyncRealizeStats;
 use crate::runtime::execution_context;
 use crate::state;
+use crate::state::Clear;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -204,6 +206,10 @@ pub struct ResetStats {
 
     /// The mounts a purge leaves to each layer's own walk, none where the reset does not purge.
     layer_mounts: Vec<RelativePath>,
+
+    /// The dirty adds the walks drop, discarded once every walk has drained, each with the
+    /// directories marked dirty as added it leaves empty.
+    discards: state::WalkDiscards,
 }
 
 impl Default for ResetStats {
@@ -217,6 +223,7 @@ impl Default for ResetStats {
             file_inflight_count: AtomicU64::new(0),
             directory_inflight: AtomicU64::new(0),
             layer_mounts: Vec::new(),
+            discards: state::WalkDiscards::emptying_adds(),
         }
     }
 }
@@ -336,13 +343,25 @@ struct ResetWalk {
     file_tx: mpsc::Sender<ResetFileWorkItem>,
 }
 
-/// Walk each path in turn, handing every file it reaches to the consumer.
-///
-/// Reports the first failure, having stopped at it: a path the user named and a target that
-/// cannot be resolved are both refusals, and the paths after one are left alone rather than
-/// half-applied. A path that does not name anything inside the repository is reported
-/// ignored and skipped.
+/// Walk each path in turn, handing every file it reaches to the consumer, and discard the dirty
+/// adds the walks dropped, also after a failure.
 async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
+    let failure = reset_walk_paths(&walk).await;
+    let discarded = walk
+        .stats
+        .discards
+        .apply()
+        .await
+        .forward::<ResetError>("Discarding the dirty adds the reset dropped")
+        .err();
+    failure.or(discarded)
+}
+
+/// Walk each path in turn, reporting the first failure, having stopped at it: a path the user
+/// named and a target that cannot be resolved are both refusals, and the paths after one are
+/// left alone rather than half-applied. A path that does not name anything inside the
+/// repository is reported ignored and skipped.
+async fn reset_walk_paths(walk: &ResetWalk) -> Option<ResetError> {
     for relative_path in walk.paths.iter() {
         let walked = match walk.target.state_for(&walk.repository, relative_path).await {
             Ok(state_target) => {
@@ -618,12 +637,14 @@ pub async fn reset(
         )
         .await
         .map_err(|err| {
-            ResetError::RevisionNotFound(
-                RevisionNotFound {
-                    revision: revision_spec,
-                }
-                .chain_err_from(err, "target revision not found"),
-            )
+            forward_refusal_or(err, "resolving the target revision", |err| {
+                ResetError::RevisionNotFound(
+                    RevisionNotFound {
+                        revision: revision_spec,
+                    }
+                    .chain_err_from(err, "target revision not found"),
+                )
+            })
         })?;
         state::State::deserialize(repository.clone(), resolved)
             .await
@@ -782,16 +803,20 @@ pub async fn reset_to_last_merged(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     let branch_name = branch.to_string();
-    let branch = branch::resolve(repository.clone(), branch.as_str())
-        .await
-        .map_err(|err| {
-            ResetError::BranchNotFound(
+    let branch = match branch::resolve(repository.clone(), branch.as_str()).await {
+        Ok(resolved) => resolved,
+        Err(err) if is_refusal(&err) => {
+            return Err(err).forward_any("resolving branch for last-merged reset");
+        }
+        Err(err) => {
+            return Err(ResetError::BranchNotFound(
                 BranchNotFound {
                     branch: branch_name.clone(),
                 }
                 .chain_err_from(err, "branch for last-merged reset not found"),
-            )
-        })?;
+            ));
+        }
+    };
 
     let branch_current = current_branch;
     if branch.id == branch_current {
@@ -899,7 +924,9 @@ async fn reset_staged_links_under_paths(
         link::list_staged_node_paths(&state_current, &state_staged, repository.clone())
             .await
             .map_err(|err| {
-                ResetError::internal(format!("Failed to list staged link nodes: {err}"))
+                forward_refusal_or(err, "listing staged link nodes", |err| {
+                    ResetError::internal_with_context(err, "listing staged link nodes")
+                })
             })?;
     if staged_link_paths.is_empty() {
         return Ok(0);
@@ -986,18 +1013,22 @@ async fn resolve_last_merged_target(
     relative_path: &RelativePath,
 ) -> Result<Arc<State>, ResetError> {
     let mut state_start = state_current;
-    let node_link = state_start
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .unwrap_or_default();
+    let node_link = absent_unless_refused::<_, _, ResetError>(
+        state_start
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await,
+        "finding the node",
+    )?
+    .unwrap_or_default();
     if !node_link.is_valid() {
         lore_debug!("Find state where node exist: {relative_path}");
         let revision = state_start.revision();
         if revision != branch_point {
             let parent = state_start.parent_self();
-            if let Ok(state) =
-                find_start_state(repository.clone(), parent, branch_point, relative_path).await
-            {
+            if let Some(state) = absent_unless_refused::<_, _, ResetError>(
+                find_start_state(repository.clone(), parent, branch_point, relative_path).await,
+                "finding the last revision holding the node",
+            )? {
                 state_start = state;
                 lore_debug!(
                     "Found revision where node exist: {relative_path} in {} -> {}",
@@ -1022,15 +1053,18 @@ async fn resolve_last_merged_target(
         let state_branch_point = state::State::deserialize(repository.clone(), branch_point)
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
-        if let Ok(state_merge) = find_merge_state(
-            repository.clone(),
-            state_start,
-            state_branch_point.clone(),
-            branch_id,
-            relative_path,
-        )
-        .await
-        {
+        if let Some(state_merge) = absent_unless::<_, _, ResetError>(
+            find_merge_state(
+                repository.clone(),
+                state_start,
+                state_branch_point.clone(),
+                branch_id,
+                relative_path,
+            )
+            .await,
+            |err| is_refusal(err) || err.is_not_supported(),
+            "finding the last merge from the branch",
+        )? {
             lore_debug!(
                 "Found revision where node was merged from branch: {relative_path} in merge revision {} -> {}",
                 state_merge.revision(),
@@ -1129,6 +1163,15 @@ where
     }
 }
 
+fn last_merged_inside_link(relative_path: &RelativePath) -> ResetError {
+    NotSupported {
+        operation: format!(
+            "Resetting {relative_path} inside a link to its last merge from a branch"
+        ),
+    }
+    .into()
+}
+
 async fn find_start_state(
     repository: Arc<RepositoryContext>,
     parent: Hash,
@@ -1141,10 +1184,13 @@ async fn find_start_state(
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
 
-        let node_link = state_parent
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
+        let node_link = absent_unless_refused::<_, _, ResetError>(
+            state_parent
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await,
+            "finding the node",
+        )?
+        .unwrap_or_default();
         if node_link.is_valid() {
             return Ok(state_parent);
         }
@@ -1178,18 +1224,35 @@ async fn find_merge_state(
             state.parent_self(),
             state.parent_other()
         );
+        let node_link = state
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await
+            .map_err(|err| {
+                forward_refusal_or(err, "finding the node", |err| {
+                    ResetError::internal_with_context(err, "Failed to find node")
+                })
+            });
+
+        if let Ok(node_link) = &node_link
+            && node_link.crosses_link(&repository, &state)
+        {
+            return Err(last_merged_inside_link(relative_path));
+        }
+
         if !state.parent_other().is_zero()
-            && let Ok(state_merged) =
-                state::State::deserialize(repository.clone(), state.parent_other()).await
-            && state_merged.branch(repository.clone()).await == branch
+            && let Some(state_merged) = absent_unless_refused::<_, _, ResetError>(
+                state::State::deserialize(repository.clone(), state.parent_other()).await,
+                "reading the merged-in parent",
+            )?
+            && absent_unless_refused::<_, _, ResetError>(
+                state_merged.recorded_branch(repository.clone()).await,
+                "reading the merged-in parent's branch",
+            )? == Some(branch)
         {
             return Ok(state);
         }
 
-        let node_link = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .map_err(|err| ResetError::internal_with_context(err, "Failed to find node"))?;
+        let node_link = node_link?;
 
         let node_id = node_link.node;
 
@@ -1325,25 +1388,15 @@ async fn reset_walk_named_path(
 
     let node_name = relative_path.name().to_string();
 
-    let node_link = state_target
-        .find_node_link(repository.clone(), state_path.as_str())
+    let found = state_target
+        .find_relative_held(repository.clone(), ROOT_NODE, state_path.as_str())
         .await;
 
-    match node_link {
-        Ok(node_link) => {
-            let (target_repository, target_state_current) = node_link
-                .resolve(repository.clone(), state_target.clone())
-                .await
-                .forward::<ResetError>("Failed to deserialize revision state")?;
-
-            // For staged state, only resolve through links (not for same-repo nodes)
-            // to avoid re-deserializing to the wrong revision, which loses dirty flags
-            let current_state_staged = if node_link.repository != repository.id {
-                let (_, resolved_staged) = node_link
-                    .resolve(repository.clone(), state_staged.clone())
-                    .await
-                    .forward::<ResetError>("Failed to deserialize revision state")?;
-                resolved_staged
+    match found {
+        Ok((node_link, (target_repository, target_state_current))) => {
+            let current_state_staged = if !Arc::ptr_eq(&target_state_current, &state_target) {
+                refuse_staged(&state_staged, &repository, &state_path).await?;
+                target_state_current.clone()
             } else {
                 state_staged.clone()
             };
@@ -1353,14 +1406,22 @@ async fn reset_walk_named_path(
                 .await
                 .forward::<ResetError>("Failed to find node")?;
 
+            let replacement = replacing_dirty_add(
+                &current_state_staged,
+                &target_repository,
+                node_link.node,
+                node.name_hash,
+            )
+            .await?;
+
             reset_walk_node(
                 ResetContext {
                     operation: operation.clone(),
-                    repository: target_repository,
+                    repository: target_repository.clone(),
                     state_target: target_state_current,
-                    state_staged: current_state_staged,
+                    state_staged: current_state_staged.clone(),
                     options,
-                    stats,
+                    stats: stats.clone(),
                     file_tx,
                 },
                 relative_path,
@@ -1369,103 +1430,76 @@ async fn reset_walk_named_path(
                 node,
                 parent_states,
             )
-            .await
+            .await?;
+
+            if let Some(replacement) = replacement {
+                stats
+                    .discards
+                    .queue(current_state_staged, target_repository, vec![replacement]);
+            }
+            Ok(())
         }
         Err(e) if e.is_node_not_found() => {
             // A path absent from the target revision is one of: a file committed
             // in the current revision but added after the target (delete it so the
             // working tree matches the target, unless the view excludes it, which
             // only --purge deletes), a pending dirty-add, or an untracked file (keep
-            // on disk unless --purge, discarding add tracking).
+            // on disk unless --purge, discarding add tracking). A path inside a link is refused,
+            // since its node is numbered in the linked tree, not in `state_staged`.
             let mut delete_path = options.purge;
             if let Ok(staged_link) = state_staged
                 .find_node_link(repository.clone(), state_path.as_str())
                 .await
             {
-                let staged_node = state_staged
-                    .node(repository.clone(), staged_link.node)
-                    .await
-                    .forward::<ResetError>("Failed to find staged node")?;
-
-                // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
-                // store, so the link is still staged here.
-                if staged_node.is_link() && execution_context().globals().dry_run() {
-                    return Ok(());
-                }
-                if staged_node.is_staged() {
-                    return Err(InvalidArguments {
-                        reason: "Failed to reset staged node".into(),
+                if staged_link.crosses_link(&repository, &state_staged) {
+                    return Err(NotSupported {
+                        operation: format!(
+                            "Resetting {relative_path} inside a link, which the target revision \
+                             does not hold"
+                        ),
                     }
                     .into());
                 }
+                // The flags alone, so the record is not held across the awaits below.
+                let (staged, dirty_add, link, directory) = state_staged
+                    .node(repository.clone(), staged_link.node)
+                    .await
+                    .forward::<ResetError>("Failed to find staged node")
+                    .map(|node| {
+                        (
+                            node.is_staged(),
+                            node.is_dirty_add(),
+                            node.is_link(),
+                            node.is_directory(),
+                        )
+                    })?;
 
-                if staged_node.is_dirty_add() {
+                // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
+                // store, so the link is still staged here.
+                if link && execution_context().globals().dry_run() {
+                    return Ok(());
+                }
+                if staged {
+                    return Err(staged_node_refusal());
+                }
+
+                if dirty_add {
                     lore_trace!(
                         "Reset dirty add {}, discarding staged node and keeping the file",
                         relative_path.as_str()
                     );
-
-                    let block_index = NodeBlock::index(staged_link.node);
-                    let node_index = Node::index(staged_link.node);
-                    let block = state_staged
-                        .block(repository.clone(), block_index)
-                        .await
-                        .forward::<ResetError>("Failed to get staged block")?;
-                    {
-                        let mut writer = block.write();
-                        writer.node(node_index).clear_all_change_flags();
-                        writer.mark_dirty();
-                    }
-                    state_staged.block_modified(block.clone(), block_index);
-                    state_staged.mark_dirty();
-
-                    crate::state::node_discard_patch(
+                    stats.discards.queue(
                         state_staged.clone(),
                         repository.clone(),
-                        staged_link.node,
-                        |_discarded_node_id, _flags| {},
-                    )
-                    .await
-                    .forward::<ResetError>("Failed to discard reset dirty add node")?;
-
-                    // Dirty parent cleanup
-                    let mut parent_id = staged_node.parent;
-                    while parent_id.is_valid_node_id() {
-                        if state_staged
-                            .node_has_dirty_children(repository.clone(), parent_id)
-                            .await
-                            .forward::<ResetError>("Failed to check dirty children")?
-                        {
-                            break;
-                        }
-                        let parent_block_index = NodeBlock::index(parent_id);
-                        let parent_node_index = Node::index(parent_id);
-                        let parent_block = state_staged
-                            .block(repository.clone(), parent_block_index)
-                            .await
-                            .forward::<ResetError>("Failed to get parent block")?;
-                        let parent_node = parent_block.node(parent_node_index);
-                        let next_parent = parent_node.parent;
-                        let dirtied = {
-                            let mut writer = parent_block.write();
-                            writer.node(parent_node_index).clear_dirty_flags();
-                            writer.mark_dirty()
-                        };
-                        if dirtied {
-                            state_staged.block_modified(parent_block, parent_block_index);
-                            state_staged.mark_dirty();
-                        }
-                        if parent_id == ROOT_NODE {
-                            break;
-                        }
-                        parent_id = next_parent;
-                    }
+                        vec![staged_link.node],
+                    );
                 } else if !delete_path {
-                    let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
+                    let (_, excluded) = repository.filter.child_emit_unless_forced(
                         execution_context().globals().force(),
+                        FilterMode::empty(),
                         parent_states,
                         &relative_path,
-                        staged_node.is_directory(),
+                        directory,
                         FilterMode::View,
                     );
                     delete_path = !excluded;
@@ -1480,6 +1514,83 @@ async fn reset_walk_named_path(
         }
         Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
+}
+
+/// Refuses `state_path` where the staged tree holds it as staged, read through the staged tree's
+/// own links: inside a link, the staged revision can number its nodes other than the target's pin.
+async fn refuse_staged(
+    state_staged: &State,
+    repository: &Arc<RepositoryContext>,
+    state_path: &RelativePath,
+) -> Result<(), ResetError> {
+    let (staged_link, held) = match state_staged
+        .find_relative(repository.clone(), ROOT_NODE, state_path.as_str())
+        .await
+    {
+        Ok(found) => found,
+        Err(err) if err.is_node_not_found() => return Ok(()),
+        Err(err) => return Err(err).forward::<ResetError>("Failed to find staged node"),
+    };
+    let staged = state_staged
+        .found_node(repository.clone(), &staged_link, held)
+        .await
+        .forward::<ResetError>("Failed to find staged node")?
+        .is_staged();
+    if staged {
+        return Err(staged_node_refusal());
+    }
+    Ok(())
+}
+
+/// The refusal of a reset that would discard a staged change.
+fn staged_node_refusal() -> ResetError {
+    InvalidArguments {
+        reason: "Failed to reset staged node".into(),
+    }
+    .into()
+}
+
+/// The dirty add standing beside `node_id` in `state_staged` under the same name, which took its
+/// place on disk. Only a deleted node is replaced, and the add is linked after it, so it lies
+/// ahead of `node_id` in the chain.
+async fn replacing_dirty_add(
+    state_staged: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    name_hash: u64,
+) -> Result<Option<NodeID>, ResetError> {
+    let Ok(staged_node) = state_staged.node(repository.clone(), node_id).await else {
+        return Ok(None);
+    };
+    if !staged_node.is_dirty_delete() {
+        return Ok(None);
+    }
+    let Some(sibling) = state_staged
+        .find_subnode_ahead_of(repository.clone(), staged_node.parent, node_id, name_hash)
+        .await
+        .forward::<ResetError>("Failed to search the staged siblings")?
+    else {
+        return Ok(None);
+    };
+    let sibling_node = state_staged
+        .node(repository.clone(), sibling)
+        .await
+        .forward::<ResetError>("Failed to find staged node")?;
+    Ok(sibling_node.is_dirty_add().then_some(sibling))
+}
+
+/// `dirty_adds` is sorted by name hash.
+fn replaced_dirty_adds(
+    dirty_adds: &[(NodeID, u64)],
+    node_id: NodeID,
+    name_hash: u64,
+) -> impl Iterator<Item = NodeID> + '_ {
+    let start = dirty_adds.partition_point(|&(_, hash)| hash < name_hash);
+    dirty_adds[start..]
+        .iter()
+        .take_while(move |&&(_, hash)| hash == name_hash)
+        .filter(move |&&(id, _)| id != node_id)
+        .map(|&(id, _)| id)
 }
 
 /// Removes `relative_path` from the working tree, counted against the tally `is_directory`
@@ -1549,7 +1660,7 @@ async fn purge_path(
                 stats,
                 repository_root,
                 relative_path,
-                Vec::new(),
+                None,
             ))
             .await;
         }
@@ -1591,8 +1702,9 @@ async fn reset_walk_node(
     } = ctx;
 
     let force = execution_context().globals().force();
-    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+    let (states, excluded) = repository.filter.child_emit_unless_forced(
         force,
+        FilterMode::empty(),
         parent_states,
         &relative_path,
         node.is_directory(),
@@ -1610,59 +1722,27 @@ async fn reset_walk_node(
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if let Ok(staged_block) = state_staged.block(repository.clone(), block_index).await {
-        let staged_node = staged_block.node(node_index);
-        if staged_node.is_staged() {
-            return Err(InvalidArguments {
-                reason: "Failed to reset staged node".into(),
-            }
-            .into());
+    // The flags alone, so neither the block nor the record is held across the clear below.
+    let staged_flags = state_staged
+        .block(repository.clone(), block_index)
+        .await
+        .ok()
+        .map(|staged_block| {
+            let staged_node = staged_block.node(node_index);
+            (staged_node.is_staged(), staged_node.is_dirty())
+        });
+    if let Some((staged, dirty)) = staged_flags {
+        if staged {
+            return Err(staged_node_refusal());
         }
 
-        // Clear Dirty flag if set (reset restores file to current revision)
-        if staged_node.is_dirty() {
-            let dirtied = {
-                let mut block_writer = staged_block.write();
-                block_writer.node(node_index).clear_dirty_flags();
-                block_writer.mark_dirty()
-            };
-            if dirtied {
-                state_staged.block_modified(staged_block, block_index);
-                state_staged.mark_dirty();
-            }
-
-            // Dirty parent cleanup
-            let mut parent_id = staged_node.parent;
-            while parent_id.is_valid_node_id() {
-                if state_staged
-                    .node_has_dirty_children(repository.clone(), parent_id)
-                    .await
-                    .forward::<ResetError>("Failed to check dirty children")?
-                {
-                    break;
-                }
-                let parent_block_index = NodeBlock::index(parent_id);
-                let parent_node_index = Node::index(parent_id);
-                let parent_block = state_staged
-                    .block(repository.clone(), parent_block_index)
-                    .await
-                    .forward::<ResetError>("Failed to get parent block")?;
-                let parent_node = parent_block.node(parent_node_index);
-                let next_parent = parent_node.parent;
-                let dirtied = {
-                    let mut block_writer = parent_block.write();
-                    block_writer.node(parent_node_index).clear_dirty_flags();
-                    block_writer.mark_dirty()
-                };
-                if dirtied {
-                    state_staged.block_modified(parent_block, parent_block_index);
-                    state_staged.mark_dirty();
-                }
-                if parent_id == ROOT_NODE {
-                    break;
-                }
-                parent_id = next_parent;
-            }
+        // Clear Dirty flag if set (reset restores file to current revision), then a dirty clear's
+        // climb clears each parent that nothing below keeps dirty, up to one already clean.
+        if dirty {
+            state_staged
+                .node_clear(&repository, node_id, Clear::Dirty)
+                .await
+                .forward::<ResetError>("Failed to clear the dirty flags")?;
         }
     }
 
@@ -1805,22 +1885,31 @@ async fn reset_walk_directory(
             &stats,
             repository.require_path()?,
             &directory_path,
-            Vec::new(),
+            None,
         ))
         .await;
     }
 
     let mut child_dirs: JoinSet<Result<(), ResetError>> = JoinSet::new();
-    let mut node_children_names: Vec<String> = vec![];
+    let mut held: Vec<HeldChild> = vec![];
     let mut failure: Option<ResetError> = None;
     let mut cycle = SiblingCycleGuard::new(node_id);
+    let mut dirty_adds = state_staged
+        .node_dirty_add_children(repository.clone(), node_id)
+        .await
+        .forward::<ResetError>("Listing the staged children")?;
+    dirty_adds.sort_unstable_by_key(|&(_, name_hash)| name_hash);
+    let mut replaced = Vec::new();
 
     while let Some(child_node_id) = child_node_iter {
-        let Ok(child_node) = state_target.node(repository.clone(), child_node_id).await else {
-            failure = Some(ResetError::internal(
-                "Failed deserializing state node block",
-            ));
-            break;
+        let child_node = match state_target.node(repository.clone(), child_node_id).await {
+            Ok(child_node) => child_node,
+            Err(err) => {
+                failure = Some(forward_refusal_or(err, "reading a node block", |err| {
+                    ResetError::internal_with_context(err, "Failed deserializing state node block")
+                }));
+                break;
+            }
         };
 
         if let Err(err) = child_node
@@ -1831,19 +1920,35 @@ async fn reset_walk_directory(
             break;
         }
 
-        let Some(child_node_name) = state_target
+        let child_node_name = match state_target
             .node_name_clone_or_skip(repository.clone(), child_node_id)
             .await
-            .forward::<ResetError>("Failed to get node name")?
-        else {
-            child_node_iter = child_node.sibling();
-            continue;
+            .forward::<ResetError>("Failed to get node name")
+        {
+            Ok(Some(name)) => name,
+            Ok(None) => {
+                child_node_iter = child_node.sibling();
+                continue;
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
         };
 
         let child_node_path = directory_path.join(&child_node_name);
         if options.purge {
-            node_children_names.push(child_node_name.clone());
+            held.push(HeldChild {
+                folded: child_node.name_hash,
+                exact: hash_string_bytes(child_node_name.as_bytes()),
+                node: child_node_id,
+            });
         }
+        replaced.extend(replaced_dirty_adds(
+            &dirty_adds,
+            child_node_id,
+            child_node.name_hash,
+        ));
 
         if child_node.is_directory() || child_node.is_link() {
             // Directory/link work recurses; gate via directory_inflight.
@@ -1922,21 +2027,24 @@ async fn reset_walk_directory(
             .flatten();
         failure = failure.or(inner.err());
     }
-
     if let Some(err) = failure {
         return Err(err);
     }
+    stats
+        .discards
+        .queue(state_staged, repository.clone(), replaced);
 
     if !options.purge {
         return Ok(());
     }
 
+    let held = HeldChildren::new(state_target, repository.clone(), held);
     Box::pin(purge_untracked_children(
         &operation,
         &stats,
         repository.require_path()?,
         &directory_path,
-        node_children_names,
+        Some(held),
     ))
     .await
 }
@@ -1945,32 +2053,31 @@ async fn reset_walk_directory(
 /// does not, which is what `--purge` adds to restoring the ones it does. No filter is asked:
 /// an untracked path is removed whether an ignore rule or the view matches it or not.
 ///
-/// `node_children_names` names the children the revision holds, each of them settled by the
-/// walk already, restored or, where the view excludes it, removed. It is sorted here to be
-/// matched against each filesystem entry by binary search. The temporary file a write in progress
-/// holds beside a child the revision holds is left alone. An entry [`is_reserved_node_name`]
-/// answers for, such as `.lore` or `.urc`, and a nested repository, a directory holding `.lore`,
-/// are left in place at any depth, with the
-/// directories leading to them. What stands at a layer mount
-/// is left to the layer's own walk, whatever its kind, and a directory on the way to one is
-/// purged around it.
+/// `held` holds the children the revision holds, each of them settled by the walk already,
+/// restored or, where the view excludes it, removed, and an entry [`HeldChildren::leaves`] answers
+/// for is left in place. An entry [`is_reserved_node_name`] answers for, such as `.lore` or
+/// `.urc`, and a nested repository, a directory holding `.lore`, are left in place at any depth,
+/// with the directories leading to them. What stands at a layer mount is left to the layer's own
+/// walk, whatever its kind, and a directory on the way to one is purged around it.
 ///
 /// Each removal runs in a task, and the tasks are drained to [`MAX_CONCURRENT_TREE_TASKS`] after
 /// each spawn. The first failure, of the listing, a removal or a purge around a mount, ends the
 /// listing, and it is answered once the tasks still live have been awaited.
 ///
 /// A directory the working tree does not hold has nothing to purge.
+#[lore_macro::test_pub]
 async fn purge_untracked_children(
     operation: &Arc<InstanceOperationImpl>,
     stats: &Arc<ResetStats>,
     repository_root: &Path,
     directory_path: &RelativePath,
-    mut node_children_names: Vec<String>,
+    held: Option<HeldChildren>,
 ) -> Result<(), ResetError> {
     if !operation
         .file_info(directory_path)
         .await
-        .is_ok_and(|info| info.is_dir())
+        .forward_any::<ResetError>("Failed to describe a directory to purge")?
+        .is_dir()
     {
         return Ok(());
     }
@@ -1982,12 +2089,6 @@ async fn purge_untracked_children(
             format!("Failed to list directory files in {directory_path}")
         })?;
 
-    node_children_names.sort_unstable();
-    let holds = |name: &str| {
-        node_children_names
-            .binary_search_by(|held| held.as_str().cmp(name))
-            .is_ok()
-    };
     let mut probe: Option<PathBuf> = None;
     let mut tasks = JoinSet::new();
     let mut failure = None;
@@ -2003,7 +2104,14 @@ async fn purge_untracked_children(
                 }
             };
         let name = filesystem_child.name.as_str();
-        if is_reserved_node_name(name) || holds(name) || is_write_in_progress(name, holds) {
+        if is_reserved_node_name(name) {
+            continue;
+        }
+        if let Some(held) = held.as_ref()
+            && held
+                .leaves(operation, directory_path, name, filesystem_child.name_hash)
+                .await
+        {
             continue;
         }
 
@@ -2021,7 +2129,7 @@ async fn purge_untracked_children(
                     stats,
                     repository_root,
                     &child_path,
-                    Vec::new(),
+                    None,
                 ))
                 .await
             {
@@ -2091,12 +2199,134 @@ async fn purge_untracked_children(
 #[cfg(feature = "test-util")]
 pub static PURGE_TASKS: crate::test_util::TaskProbe = crate::test_util::TaskProbe::new();
 
-/// Whether `name` is the temporary file a write in progress puts a child `holds` answers for in
-/// place through. The storage layer names it from the child's extension: `a.txt.~loretemp` for
-/// `a.txt`, and `a..~loretemp` for `a`, which has none.
-fn is_write_in_progress(name: &str, holds: impl Fn(&str) -> bool) -> bool {
-    name.strip_suffix(TEMP_FILE_EXTENSION)
-        .is_some_and(|written| holds(written) || written.strip_suffix('.').is_some_and(&holds))
+/// A child the target revision holds in a directory a purge lists.
+#[lore_macro::test_pub]
+struct HeldChild {
+    /// The hash of its name folded, which [`hash_string`] gives.
+    folded: u64,
+    /// The hash of its name as spelled, which [`hash_string_bytes`] gives.
+    exact: u64,
+    node: NodeID,
+}
+
+/// The children the target revision holds in a directory a purge lists, sorted by the folded hash
+/// of their names, with the tree to read a child's name from.
+#[lore_macro::test_pub]
+struct HeldChildren {
+    state: Arc<State>,
+    repository: Arc<RepositoryContext>,
+    children: Vec<HeldChild>,
+}
+
+impl HeldChildren {
+    #[lore_macro::test_pub]
+    fn new(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        mut children: Vec<HeldChild>,
+    ) -> Self {
+        children.sort_unstable_by_key(|child| child.folded);
+        Self {
+            state,
+            repository,
+            children,
+        }
+    }
+
+    /// Whether the purge leaves the entry `name` of `directory`, folding to `folded`: one a child
+    /// [`holds`](Self::holds), or the temporary file a write in progress puts such a child in
+    /// place through. The storage layer names that from the child's extension: `a.txt.~loretemp`
+    /// for `a.txt`, and `a..~loretemp` for `a`, which has none.
+    async fn leaves(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        folded: u64,
+    ) -> bool {
+        if self.holds(operation, directory, name, name, folded).await {
+            return true;
+        }
+        let Some(written) = name.strip_suffix(TEMP_FILE_EXTENSION) else {
+            return false;
+        };
+        for written in std::iter::once(written).chain(written.strip_suffix('.')) {
+            if self
+                .holds(operation, directory, name, written, hash_string(written))
+                .await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a child holds the entry `name` of `directory`, which stands for the name `written`
+    /// its start spells, folding to `folded`: a child spelled as `written`, or one whose name it
+    /// only folds to unless [`names_the_child`](Self::names_the_child) answers that the entry is
+    /// another one. It is then an entry of its own, as on a file system that does not fold case,
+    /// and the purge removes it beside the child the reset restores.
+    async fn holds(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        written: &str,
+        folded: u64,
+    ) -> bool {
+        let first = self.children.partition_point(|child| child.folded < folded);
+        let folding = || {
+            self.children[first..]
+                .iter()
+                .take_while(move |child| child.folded == folded)
+        };
+        let exact = hash_string_bytes(written.as_bytes());
+        if folding().any(|child| child.exact == exact) {
+            return true;
+        }
+        let suffix = &name[written.len()..];
+        for child in folding() {
+            if Box::pin(self.names_the_child(operation, directory, name, suffix, child.node)).await
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether the purge holds the entry `name` of `directory` as the child at `node`, compared
+    /// with the child's name followed by `suffix`, which is how the entry spells past the name it
+    /// stands for: all but where the entry is there and that names another entry. An entry gone at
+    /// the check, as a directory the reset of the child replaces is for a moment, is held, since
+    /// its name may name the child once the reset has written it; so is one that cannot be told
+    /// apart from the child, and one folding to a child whose name the tree cannot read. An
+    /// untracked hard link to the child, under a name that folds to the child's, names the child's
+    /// file and is held too.
+    ///
+    /// A cold path, boxed by its caller: it reads the child's name from the tree.
+    async fn names_the_child(
+        &self,
+        operation: &InstanceOperationImpl,
+        directory: &RelativePath,
+        name: &str,
+        suffix: &str,
+        node: NodeID,
+    ) -> bool {
+        let Ok(mut child) = self
+            .state
+            .node_name_clone(self.repository.clone(), node)
+            .await
+        else {
+            return true;
+        };
+        child.push_str(suffix);
+        !matches!(
+            operation
+                .names_one_entry(&directory.join(name), &directory.join(&child))
+                .await,
+            Ok(Some(false))
+        )
+    }
 }
 
 /// Drain the file work channel and run per-file reset work. Each task

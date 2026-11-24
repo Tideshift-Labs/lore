@@ -1445,6 +1445,18 @@ fn unjournaled_result(
     }
 }
 
+/// `status`, the failure of the unary `request`, as a protocol error. `Unavailable` reads as
+/// `SlowDown`, a server too loaded to take the request, which the general conversion reads as a
+/// lost connection. A refusal of the credentials keeps its code, and any other failure is internal.
+fn unary_error(status: tonic::Status, request: &'static str) -> ProtocolError {
+    match status.code() {
+        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
+        tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => ProtocolError::from(status),
+        tonic::Code::Unimplemented => ProtocolError::internal(format!("unsupported: {request}")),
+        _ => ProtocolError::internal_with_context(status, request),
+    }
+}
+
 impl StorageService {
     /// The connection this service sends on, for the crate's own tests. An accessor rather
     /// than `test_pub` on the struct, which would also publish its private stream caches.
@@ -1707,10 +1719,7 @@ impl StorageService {
             .query(req)
             .await
             .map(|res| res.into_inner())
-            .map_err(|err| match err.code() {
-                tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                _ => ProtocolError::internal_with_context(err, "query"),
-            })?;
+            .map_err(|err| unary_error(err, "query"))?;
 
         let mut buffer = BytesMut::with_capacity(res.results.len());
         for value in res.results.iter() {
@@ -1764,10 +1773,8 @@ impl StorageService {
             .await
             .map(|res| res.into_inner())
             .map_err(|err| match err.code() {
-                tonic::Code::Unavailable => ProtocolError::from(SlowDown),
                 tonic::Code::NotFound => ProtocolError::from(NotFound),
-                tonic::Code::Unimplemented => ProtocolError::internal("unsupported: verify"),
-                _ => ProtocolError::internal_with_context(err, "verify"),
+                _ => unary_error(err, "verify"),
             })
             .map(|res| VerifyResult {
                 corrupted: res.corrupted,
@@ -1886,10 +1893,8 @@ impl StorageService {
             .await
             .map(|res| res.into_inner())
             .map_err(|err| match err.code() {
-                tonic::Code::Unavailable => ProtocolError::from(SlowDown),
                 tonic::Code::NotFound => ProtocolError::from(NotFound),
-                tonic::Code::Unimplemented => ProtocolError::internal("unsupported: mutable_load"),
-                _ => ProtocolError::internal_with_context(err, "mutable_load"),
+                _ => unary_error(err, "mutable_load"),
             })?;
 
         Ok(Hash::from(&res.value[..]))
@@ -1937,11 +1942,7 @@ impl StorageService {
             .mutable_store(req)
             .await
             .map(|_| ())
-            .map_err(|err| match err.code() {
-                tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                tonic::Code::Unimplemented => ProtocolError::internal("unsupported: mutable_store"),
-                _ => ProtocolError::internal_with_context(err, "mutable_store"),
-            })
+            .map_err(|err| unary_error(err, "mutable_store"))
     }
 
     pub async fn mutable_compare_and_swap(
@@ -1992,11 +1993,7 @@ impl StorageService {
             .mutable_compare_and_swap(req)
             .await
             .map(|res| res.into_inner())
-            .map_err(|err| match err.code() {
-                tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                tonic::Code::Unimplemented => ProtocolError::internal("unsupported: mutable_cas"),
-                _ => ProtocolError::internal_with_context(err, "mutable_cas"),
-            })?;
+            .map_err(|err| unary_error(err, "mutable_cas"))?;
 
         Ok(Hash::from(&res.current_value[..]))
     }

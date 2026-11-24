@@ -10,12 +10,14 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use lore_base::error::AddressNotFound;
+    use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::FragmentFlags;
     use lore_base::types::Hash;
+    use lore_base::types::HealResult;
     use lore_base::types::KeyType;
     use lore_base::types::Partition;
     use lore_revision::fragment::generate_random;
@@ -56,6 +58,10 @@ mod tests {
         max_query_batch: Option<usize>,
         /// Errors the next puts return, in order, before `succeed` decides again.
         put_errors: std::sync::Mutex<std::collections::VecDeque<StoreError>>,
+        /// A gate each `put` waits at once recorded, for a test holding a write under way.
+        put_gate: Option<Arc<tokio::sync::Semaphore>>,
+        /// A gate each `get` waits at once recorded, for a test holding a read under way.
+        get_gate: Option<Arc<tokio::sync::Semaphore>>,
     }
 
     /// What a succeeding store hands back from `get` where a test has not named a payload of its
@@ -236,7 +242,10 @@ mod tests {
             }
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
     }
@@ -310,6 +319,9 @@ mod tests {
             _address: Address,
         ) -> Result<StoreGetData, StoreError> {
             self.track_invocation("get");
+            if let Some(gate) = &self.get_gate {
+                let _passed = gate.acquire().await.expect("the gate stays open");
+            }
 
             if !self.succeed {
                 return Err(StoreError::internal("Mock store failure"));
@@ -336,6 +348,9 @@ mod tests {
                 .write()
                 .unwrap()
                 .push((fragment, payload.as_ref().map(Bytes::len)));
+            if let Some(gate) = &self.put_gate {
+                let _passed = gate.acquire().await.expect("the gate stays open");
+            }
 
             if let Some(error) = self.put_errors.lock().unwrap().pop_front() {
                 return Err(error);
@@ -402,13 +417,135 @@ mod tests {
             self.max_query_batch
         }
 
-        async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+        async fn flush(
+            self: Arc<Self>,
+            _options: lore_storage::FlushOptions,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
 
         async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
             Ok(())
         }
+
+        async fn heal(
+            self: Arc<Self>,
+            _partition: Partition,
+            _address: Address,
+        ) -> Result<HealResult, StoreError> {
+            self.track_invocation("heal");
+            Ok(HealResult::Healed)
+        }
+    }
+
+    /// A heal reaches the local tier and the durable store, which holds the copy the local tier was
+    /// filled from.
+    #[tokio::test]
+    async fn a_heal_reaches_the_local_tier_and_the_durable_store() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let (local_store, durable_store) = (
+                    Arc::new(TestStore::failing()),
+                    Arc::new(TestStore::succeeding()),
+                );
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let (_, address, _) = generate_random();
+
+                let healed = composite_store
+                    .heal(random::<RepositoryId>(), address)
+                    .await;
+
+                assert!(matches!(healed, Ok(HealResult::Healed)), "{healed:?}");
+                let heals =
+                    |store: &TestStore<'_>| store.invocations.read().unwrap().get("heal").copied();
+                assert_eq!(heals(&durable_store), Some(1));
+                assert_eq!(heals(&local_store), Some(1));
+            })
+            .await;
+    }
+
+    /// A heal that arrives while a read's payload is written to the local tier waits for the
+    /// write, so it checks the copy the write leaves rather than finding none and leaving a
+    /// corrupt payload the durable store served to be served again.
+    #[tokio::test]
+    async fn a_heal_waits_for_the_local_write_a_read_started() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                // A local store that misses every read and holds every write at the gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(gate.clone()),
+                    ..TestStore::failing()
+                });
+                let durable_store = Arc::new(TestStore::succeeding());
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+
+                composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the read");
+                assert_eq!(
+                    composite_store.caching(),
+                    (1, DEFAULT_PAYLOAD.len() as u64),
+                    "the write and its payload are counted while it runs"
+                );
+                let mut healing = std::pin::pin!(composite_store.clone().heal(repository, address));
+                assert!(
+                    futures::poll!(healing.as_mut()).is_pending(),
+                    "the heal waits for the local write"
+                );
+                assert_eq!(
+                    count(&local_store, "heal"),
+                    0,
+                    "no heal before the write ends"
+                );
+
+                gate.add_permits(1);
+                let healed = tokio::time::timeout(tokio::time::Duration::from_secs(5), healing)
+                    .await
+                    .expect("the heal ends once the write has");
+                assert!(matches!(healed, Ok(HealResult::Healed)), "{healed:?}");
+                assert_eq!(count(&local_store, "put"), 1);
+                assert_eq!(count(&local_store, "heal"), 1);
+                assert_eq!(count(&durable_store, "heal"), 1);
+                // The write's count ends before its hold, which the heal waited for.
+                assert_eq!(
+                    composite_store.caching(),
+                    (0, 0),
+                    "the ended write is no longer counted"
+                );
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1199,7 +1336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicas_get_metadata_results_not_cached_locally() {
+    async fn replicas_get_metadata_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1279,15 +1416,15 @@ mod tests {
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
 
-                // and the local store won't have the cache because composite store won't
-                // cache read replicas
+                // and the local store should have the cache because composite store will
+                // populate it out of band
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
                     .get_metadata(repository, address)
                     .await
-                    .expect("replica confirmation failed");
-                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -1446,11 +1583,207 @@ mod tests {
                 })
                 .await
                 .expect("the cache write lands");
-                local_store.clone().flush(true).await.expect("flush");
+                local_store
+                    .clone()
+                    .flush(lore_storage::FlushOptions::SYNC_DATA)
+                    .await
+                    .expect("flush");
                 assert!(
                     !lock.is_held(),
                     "the flock goes once the cache write has ended and been flushed"
                 );
+            })
+            .await;
+    }
+
+    /// **A read arriving while the local write of what the durable store served is under way takes
+    /// the result the first read fetched,** without the content the first read's check expanded.
+    /// Neither the local store nor the in-flight read has it for that read otherwise, and it would
+    /// fetch the address again; once the write ends, a read the local store still misses asks the
+    /// durable store again.
+    #[tokio::test]
+    async fn a_read_during_the_local_write_of_a_durable_result_takes_that_result() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                // A local store that misses every read and holds every write at the gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(gate.clone()),
+                    ..TestStore::failing()
+                });
+                // A durable store whose reads carry the content a check on receipt expanded.
+                let mut durable = TestStore::succeeding();
+                if let Some(data) = durable.get_immutable_result.as_mut() {
+                    data.content = data.payload.clone().map(|payload| (data.fragment, payload));
+                }
+                let durable_store = Arc::new(durable);
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+
+                let first = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the first read");
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&local_store, "put") == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the local write starts");
+                let second = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("the second read");
+
+                assert_eq!(
+                    count(&durable_store, "get"),
+                    1,
+                    "the second read takes the first one's result"
+                );
+                assert_eq!(second.payload, first.payload);
+                assert!(first.content.is_some());
+                assert!(second.content.is_none(), "the held result keeps no content");
+
+                gate.add_permits(1);
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&durable_store, "get") < 2 {
+                        composite_store
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("a read after the write");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("a read after the write asks the durable store again");
+            })
+            .await;
+    }
+
+    /// **A read waiting on another read's fetch from the durable store takes the fetched result
+    /// whole, content included, while a read arriving during the local write of that result takes
+    /// the result held for it, without the content.** The test's runtime runs one task at a time,
+    /// so a read seen to have missed the local store has also subscribed to the fetch in flight.
+    #[tokio::test]
+    async fn reads_awaiting_a_fetch_get_its_content_and_reads_during_the_local_write_do_not() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let (get_gate, put_gate) = (
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                    Arc::new(tokio::sync::Semaphore::new(0)),
+                );
+                // A local store that misses every read and holds every write at its gate.
+                let local_store = Arc::new(TestStore {
+                    put_gate: Some(put_gate.clone()),
+                    ..TestStore::failing()
+                });
+                // A durable store that holds every read at its gate, and whose reads carry the
+                // content a check on receipt expanded.
+                let mut durable = TestStore {
+                    get_gate: Some(get_gate.clone()),
+                    ..TestStore::succeeding()
+                };
+                if let Some(data) = durable.get_immutable_result.as_mut() {
+                    data.content = data.payload.clone().map(|payload| (data.fragment, payload));
+                }
+                let durable_store = Arc::new(durable);
+                let composite_store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+                let count = |store: &Arc<TestStore<'static>>, verb: &str| {
+                    store
+                        .invocations
+                        .read()
+                        .unwrap()
+                        .get(verb)
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let repository: Partition = random::<RepositoryId>();
+                let (_, address, _) = generate_random();
+                let read = || {
+                    let store = composite_store.clone();
+                    lore_spawn!(async move { store.get(repository, address).await })
+                };
+
+                let fetching = read();
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&durable_store, "get") == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the first read reaches the durable store");
+                let waiting = read();
+                tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+                    while count(&local_store, "get") < 2 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the second read misses the local store");
+                get_gate.add_permits(1);
+                let fetched = fetching
+                    .await
+                    .expect("the first read's task")
+                    .expect("the first read");
+                let waited = waiting
+                    .await
+                    .expect("the second read's task")
+                    .expect("the second read");
+                let during_write = composite_store
+                    .clone()
+                    .get(repository, address)
+                    .await
+                    .expect("a read during the local write");
+
+                assert_eq!(
+                    count(&durable_store, "get"),
+                    1,
+                    "the reads share the first one's fetch"
+                );
+                assert!(fetched.content.is_some());
+                assert_eq!(waited.payload, fetched.payload);
+                assert!(
+                    waited.content.is_some(),
+                    "the read waiting on the fetch takes its content"
+                );
+                assert_eq!(during_write.payload, fetched.payload);
+                assert!(
+                    during_write.content.is_none(),
+                    "the held result keeps no content"
+                );
+                put_gate.add_permits(1);
             })
             .await;
     }
@@ -1516,7 +1849,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replicas_get_results_not_cached_locally() {
+    async fn replicas_get_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1591,20 +1924,20 @@ mod tests {
                 // now composite get should find the address
                 let result = composite_store
                     .clone()
-                    .get_metadata(repository, address)
+                    .get(repository, address)
                     .await
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
 
-                // and the local store won't have the cache because composite store won't
-                // cache read replicas
+                // and the local store should have the cache, payload included, because
+                // composite store will populate it out of band
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
                     .get(repository, address)
                     .await
-                    .expect_err("get success");
-                assert!(result.is_address_not_found());
+                    .expect("local confirmation failed");
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -1677,7 +2010,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replica_query_match_full_results_not_cached_locally() {
+    async fn replica_query_match_full_results_are_cached_locally() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution.clone(), async move {
@@ -1730,10 +2063,10 @@ mod tests {
                     .clone()
                     .put(repository, address, fragment, Some(payload), false)
                     .await
-                    .expect("Put to durable failed");
+                    .expect("Put to replica failed");
 
-                // query via composite: replica resolves MatchFull with a non-zero partition.
-                // because the results came from the replica no caching takes place
+                // query via composite: replica resolves MatchFull with a non-zero partition, so
+                // a background get_metadata is spawned to populate the local store
                 let mut results = [StoreMatchResult::default()];
                 composite_store
                     .clone()
@@ -1743,16 +2076,16 @@ mod tests {
                 assert!(matches!(results[0].match_made, StoreMatch::MatchFull));
                 assert!(!results[0].partition.is_zero());
 
-                // wait for an erroneous background cache write-back
+                // wait for the background cache write-back
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                // local store should not have the metadata cached
+                // local store should now have the metadata cached
                 let result = local_store
                     .clone()
                     .get_metadata(repository, address)
                     .await
                     .expect("local get_metadata failed");
-                assert!(matches!(result.match_made, StoreMatch::MatchNone));
+                assert!(matches!(result.match_made, StoreMatch::MatchFull));
             })
             .await;
     }
@@ -2473,10 +2806,11 @@ mod tests {
                 .await;
         }
 
-        /// A read back answered by a replica is not cached locally by the read, so the copy is
-        /// what records the destination there.
+        /// A read back answered by a replica is cached locally by the read itself, so the
+        /// destination is written to the local store once, as when the durable store answers. The
+        /// copy, not the replica, confirms the destination durable, and that write records it.
         #[tokio::test]
-        async fn records_the_destination_locally_when_a_replica_answers_the_read() {
+        async fn writes_the_destination_locally_once_when_a_replica_answers_the_read() {
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2502,6 +2836,12 @@ mod tests {
                     );
                     assert_eq!(count(&replica, "get"), 1);
                     assert_eq!(count(&local, "put"), 1);
+                    let (recorded, _) = local.puts.read().unwrap()[0];
+                    assert_ne!(
+                        recorded.flags & FragmentFlags::PayloadStoredDurable.bits(),
+                        0,
+                        "the copy confirmed the destination durable, so the local record says so"
+                    );
                 })
                 .await;
         }
@@ -3721,6 +4061,7 @@ mod tests {
         use lore_revision::lore::RepositoryId;
         use lore_revision::store::composite::CompositeStore;
         use lore_revision::store::composite::CompositeStoreBuilder;
+        use lore_revision::store::composite::ReadReplicaSelection;
         use lore_storage::ImmutableStore;
         use lore_storage::StoreError;
         use lore_storage::StoreGetData;
@@ -3881,7 +4222,10 @@ mod tests {
                 None
             }
 
-            async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+            async fn flush(
+                self: Arc<Self>,
+                _options: lore_storage::FlushOptions,
+            ) -> Result<(), StoreError> {
                 Ok(())
             }
 
@@ -3975,6 +4319,69 @@ mod tests {
                             1,
                             "inflight dedup should collapse concurrent gets into a single durable get"
                         );
+                    })
+                    .await;
+            }
+
+            /// Callers share one remote read, so with one try per read one replica is asked for
+            /// all of them.
+            #[tokio::test]
+            async fn round_robin_shared_read_sends_one_replica_request() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let durable = Arc::new(DelayStore::succeeding(
+                            fragment,
+                            payload.clone(),
+                            FAN_OUT_DELAY,
+                        ));
+                        let replicas: Vec<Arc<DelayStore>> = (0..3)
+                            .map(|_| {
+                                Arc::new(DelayStore::succeeding(
+                                    fragment,
+                                    payload.clone(),
+                                    FAN_OUT_DELAY,
+                                ))
+                            })
+                            .collect();
+                        let mut builder = CompositeStoreBuilder::default()
+                            .with_local("local".to_string(), create_empty_local().await)
+                            .expect("local should work")
+                            .with_durable("durable".to_string(), durable)
+                            .expect("durable should work")
+                            .with_read_replica_selection(ReadReplicaSelection::RoundRobin)
+                            .with_round_robin_tries(Some(std::num::NonZeroUsize::MIN), None);
+                        for (index, replica) in replicas.iter().enumerate() {
+                            builder = builder.with_replica(
+                                format!("read-replica-{index}"),
+                                replica.clone(),
+                                true,
+                                false,
+                            );
+                        }
+                        let composite = Arc::new(builder.build().expect("build should work"));
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get(repository, address).await
+                            }));
+                        }
+                        for handle in handles {
+                            let (_, got_payload) = handle
+                                .await
+                                .expect("task panicked")
+                                .and_then(StoreGetData::into_payload)
+                                .expect("get failed");
+                            assert_eq!(got_payload, payload);
+                        }
+
+                        let replica_gets: u32 = replicas.iter().map(|r| r.get_count()).sum();
+                        assert_eq!(replica_gets, 1);
                     })
                     .await;
             }
@@ -4101,6 +4508,43 @@ mod tests {
                             1,
                             "inflight dedup should collapse concurrent get_metadata calls into a single durable lookup even on failure"
                         );
+                    })
+                    .await;
+            }
+
+            /// A durable store that refuses the caller is not read as holding nothing: every
+            /// listener is handed the refusal.
+            #[tokio::test]
+            async fn durable_refusal_answers_every_listener_with_the_refusal() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution.clone(), async move {
+                        let repository: Partition = random::<RepositoryId>();
+                        let address = random::<Address>();
+
+                        let durable = Arc::new(DelayStore::failing(
+                            StoreError::from(lore_base::error::NotAuthorized),
+                            FAN_OUT_DELAY,
+                        ));
+                        let composite = composite_over(durable.clone()).await;
+
+                        let mut handles = Vec::with_capacity(NUM_CONCURRENT);
+                        for _ in 0..NUM_CONCURRENT {
+                            let store = composite.clone();
+                            handles.push(lore_spawn!(async move {
+                                store.get_metadata(repository, address).await
+                            }));
+                        }
+
+                        for handle in handles {
+                            let error = handle
+                                .await
+                                .expect("task panicked")
+                                .expect_err("get_metadata reports the refusal");
+                            assert!(error.is_not_authorized(), "{error:?}");
+                        }
+
+                        assert_eq!(durable.get_metadata_count(), 1);
                     })
                     .await;
             }
@@ -4289,7 +4733,7 @@ mod tests {
             }
         }
 
-        fn create_peer_info(name: &str) -> PeerInfo {
+        pub(super) fn create_peer_info(name: &str) -> PeerInfo {
             PeerInfo {
                 id: name.to_string(),
                 address: "0.0.0.0".to_string(),
@@ -4733,6 +5177,7 @@ mod tests {
 
         use async_trait::async_trait;
         use bytes::Bytes;
+        use lore_base::error::AddressNotFound;
         use lore_base::error::SlowDown;
         use lore_base::runtime::LORE_CONTEXT;
         use lore_base::types::Address;
@@ -4762,6 +5207,8 @@ mod tests {
             get_metadata_count: AtomicU32,
             resolve_count: AtomicU32,
             reads: Reads,
+            /// The sequence this store's reads follow in place of `reads`, with this store's index.
+            sequence: Option<(usize, Arc<ReadSequence>)>,
         }
 
         /// How a `CountingStore` answers the reads it counts.
@@ -4777,6 +5224,31 @@ mod tests {
             Panic,
             /// Reads fail with `SlowDown`, as an overloaded store does.
             SlowDown,
+            /// Reads find nothing, whatever the wrapped store holds.
+            Miss,
+            /// Reads find the content under another partition only.
+            Partial,
+        }
+
+        /// A script that the stores of one test share: the n-th read any of them receives waits
+        /// the n-th delay and then reads as the n-th `Reads` says. Reads past the script miss.
+        struct ReadSequence {
+            steps: Vec<(Duration, Reads)>,
+            /// Which store each read reached, and when, in the order they arrived.
+            requests: std::sync::Mutex<Vec<(usize, std::time::Instant)>>,
+        }
+
+        impl ReadSequence {
+            fn new(steps: Vec<(Duration, Reads)>) -> Arc<Self> {
+                Arc::new(Self {
+                    steps,
+                    requests: Default::default(),
+                })
+            }
+
+            fn requests(&self) -> Vec<(usize, std::time::Instant)> {
+                self.requests.lock().unwrap().clone()
+            }
         }
 
         impl std::fmt::Debug for CountingStore {
@@ -4793,7 +5265,37 @@ mod tests {
                     get_metadata_count: AtomicU32::new(0),
                     resolve_count: AtomicU32::new(0),
                     reads: Reads::Answer,
+                    sequence: None,
                 }
+            }
+
+            fn sequenced(
+                inner: Arc<dyn ImmutableStore>,
+                index: usize,
+                sequence: Arc<ReadSequence>,
+            ) -> Self {
+                Self {
+                    sequence: Some((index, sequence)),
+                    ..Self::wrapping(inner)
+                }
+            }
+
+            /// How this read answers, after the wait its step names.
+            async fn next_reads(&self) -> Reads {
+                let Some((index, sequence)) = &self.sequence else {
+                    return self.reads;
+                };
+                let (delay, reads) = {
+                    let mut requests = sequence.requests.lock().unwrap();
+                    requests.push((*index, std::time::Instant::now()));
+                    sequence
+                        .steps
+                        .get(requests.len() - 1)
+                        .copied()
+                        .unwrap_or((Duration::ZERO, Reads::Miss))
+                };
+                tokio::time::sleep(delay).await;
+                reads
             }
 
             fn with_reads(inner: Arc<dyn ImmutableStore>, reads: Reads) -> Self {
@@ -4803,9 +5305,9 @@ mod tests {
                 }
             }
 
-            async fn intercept_read(&self) -> Result<(), StoreError> {
-                match self.reads {
-                    Reads::Answer => Ok(()),
+            async fn intercept_read(reads: Reads) -> Result<(), StoreError> {
+                match reads {
+                    Reads::Answer | Reads::Miss | Reads::Partial => Ok(()),
                     Reads::Stall => std::future::pending().await,
                     Reads::Fail => Err(StoreError::internal("replica read failed")),
                     Reads::Panic => panic!("replica read panicked"),
@@ -4832,8 +5334,16 @@ mod tests {
                 address: Address,
             ) -> Result<StoreGetData, StoreError> {
                 self.get_metadata_count.fetch_add(1, Ordering::SeqCst);
-                self.intercept_read().await?;
-                self.inner.clone().get_metadata(partition, address).await
+                let reads = self.next_reads().await;
+                Self::intercept_read(reads).await?;
+                if matches!(reads, Reads::Miss) {
+                    return Ok(StoreGetData::default());
+                }
+                let mut data = self.inner.clone().get_metadata(partition, address).await?;
+                if matches!(reads, Reads::Partial) {
+                    data.match_made = StoreMatch::MatchHash;
+                }
+                Ok(data)
             }
 
             async fn query(
@@ -4843,11 +5353,22 @@ mod tests {
                 results: &mut [lore_storage::StoreMatchResult],
             ) -> Result<(), StoreError> {
                 self.resolve_count.fetch_add(1, Ordering::SeqCst);
-                self.intercept_read().await?;
+                let reads = self.next_reads().await;
+                Self::intercept_read(reads).await?;
+                if matches!(reads, Reads::Miss) {
+                    results.fill(lore_storage::StoreMatchResult::default());
+                    return Ok(());
+                }
                 self.inner
                     .clone()
                     .query(partition, addresses, results)
-                    .await
+                    .await?;
+                if matches!(reads, Reads::Partial) {
+                    for result in results.iter_mut() {
+                        result.match_made = StoreMatch::MatchHash;
+                    }
+                }
+                Ok(())
             }
 
             async fn get(
@@ -4856,7 +5377,11 @@ mod tests {
                 address: Address,
             ) -> Result<StoreGetData, StoreError> {
                 self.get_count.fetch_add(1, Ordering::SeqCst);
-                self.intercept_read().await?;
+                let reads = self.next_reads().await;
+                Self::intercept_read(reads).await?;
+                if matches!(reads, Reads::Miss) {
+                    return Err(StoreError::from(AddressNotFound::from(address)));
+                }
                 self.inner.clone().get(partition, address).await
             }
 
@@ -4919,8 +5444,11 @@ mod tests {
                 self.inner.max_query_batch()
             }
 
-            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-                self.inner.clone().flush(sync_data).await
+            async fn flush(
+                self: Arc<Self>,
+                options: lore_storage::FlushOptions,
+            ) -> Result<(), StoreError> {
+                self.inner.clone().flush(options).await
             }
 
             async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
@@ -4959,11 +5487,11 @@ mod tests {
             .expect("should create in-memory store")
         }
 
-        async fn build_composite_with_read_replicas(
+        async fn builder_with_read_replicas(
             durable: Arc<dyn ImmutableStore>,
             replicas: Vec<Arc<dyn ImmutableStore>>,
             durable_delay: Duration,
-        ) -> Arc<CompositeStore> {
+        ) -> CompositeStoreBuilder {
             let mut builder = CompositeStoreBuilder::default()
                 .with_local("local".to_string(), make_store().await)
                 .expect("local should work")
@@ -4973,9 +5501,17 @@ mod tests {
                 builder =
                     builder.with_replica(format!("read-replica-{index}"), replica, true, false);
             }
+            builder.with_durable_delay(durable_delay)
+        }
+
+        async fn build_composite_with_read_replicas(
+            durable: Arc<dyn ImmutableStore>,
+            replicas: Vec<Arc<dyn ImmutableStore>>,
+            durable_delay: Duration,
+        ) -> Arc<CompositeStore> {
             Arc::new(
-                builder
-                    .with_durable_delay(durable_delay)
+                builder_with_read_replicas(durable, replicas, durable_delay)
+                    .await
                     .build()
                     .expect("build should work"),
             )
@@ -5019,6 +5555,44 @@ mod tests {
 
         async fn missing_replicas() -> Vec<Arc<dyn ImmutableStore>> {
             vec![make_store().await, make_store().await]
+        }
+
+        /// What the composite's local store serves for `address` once the background cache write
+        /// of a remote answer has landed. Panics if it does not land within `PROMPTLY`.
+        async fn cached_locally(
+            composite: &Arc<CompositeStore>,
+            repository: Partition,
+            address: Address,
+        ) -> StoreGetData {
+            tokio::time::timeout(PROMPTLY, async {
+                loop {
+                    if let Ok(cached) = composite.local().get(repository, address).await {
+                        break cached;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the remote answer should be cached locally")
+        }
+
+        /// A composite whose only holder of the content is a read replica, which stores it with
+        /// `flags`. The durable store is empty.
+        async fn composite_reading_from_replica(
+            repository: Partition,
+            address: Address,
+            mut fragment: Fragment,
+            payload: Bytes,
+            flags: lore_base::types::FragmentFlags,
+        ) -> Arc<CompositeStore> {
+            fragment.flags |= flags.bits();
+            let replica = make_store().await;
+            replica
+                .clone()
+                .put(repository, address, fragment, Some(payload), false)
+                .await
+                .expect("put to replica failed");
+            build_composite_with_read_replicas(make_store().await, vec![replica], LONG_DELAY).await
         }
 
         mod get {
@@ -5071,6 +5645,135 @@ mod tests {
                             0,
                             "durable get must not be called when replica responds within the delay window"
                         );
+                    })
+                    .await;
+            }
+
+            /// A `get` answered by a read replica is cached locally, so the next `get` asks no
+            /// remote store.
+            #[tokio::test]
+            async fn replica_answer_serves_the_next_get_locally() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+
+                        let replica_inner = make_store().await;
+                        replica_inner
+                            .clone()
+                            .put(repository, address, fragment, Some(payload.clone()), false)
+                            .await
+                            .expect("put to replica failed");
+                        let replica = Arc::new(CountingStore::wrapping(replica_inner));
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            vec![replica.clone()],
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        let get = || async {
+                            let (_, got_payload) = composite
+                                .clone()
+                                .get(repository, address)
+                                .await
+                                .and_then(lore_storage::StoreGetData::into_payload)
+                                .expect("get should succeed");
+                            assert_eq!(got_payload, payload);
+                        };
+
+                        get().await;
+                        cached_locally(&composite, repository, address).await;
+                        get().await;
+
+                        assert_eq!(replica.get_count.load(Ordering::SeqCst), 1);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// A replica answer is not confirmed durable by the composite's durable store, so the
+            /// local copy keeps the durable bit the replica reported. Where the replica holds it
+            /// only locally, the cached copy is protected from eviction: it may be the only copy
+            /// this composite can still reach.
+            #[tokio::test]
+            async fn a_replica_answer_held_only_locally_there_is_not_evicted() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let composite = composite_reading_from_replica(
+                            repository,
+                            address,
+                            fragment,
+                            payload.clone(),
+                            lore_base::types::FragmentFlags::empty(),
+                        )
+                        .await;
+
+                        composite
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("get should succeed via replica");
+                        cached_locally(&composite, repository, address).await;
+                        composite
+                            .local()
+                            .evict(0, false, None)
+                            .await
+                            .expect("evict failed");
+
+                        let (_, kept) = composite
+                            .local()
+                            .get(repository, address)
+                            .await
+                            .and_then(lore_storage::StoreGetData::into_payload)
+                            .expect("the local copy should survive eviction");
+                        assert_eq!(kept, payload);
+                    })
+                    .await;
+            }
+
+            /// A replica answer the replica reports as durable keeps that bit locally, so the
+            /// cached copy stays evictable.
+            #[tokio::test]
+            async fn a_replica_answer_durable_there_stays_evictable() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let composite = composite_reading_from_replica(
+                            repository,
+                            address,
+                            fragment,
+                            payload,
+                            lore_base::types::FragmentFlags::PayloadStoredDurable,
+                        )
+                        .await;
+
+                        composite
+                            .clone()
+                            .get(repository, address)
+                            .await
+                            .expect("get should succeed via replica");
+                        cached_locally(&composite, repository, address).await;
+                        composite
+                            .local()
+                            .evict(0, false, None)
+                            .await
+                            .expect("evict failed");
+
+                        composite
+                            .local()
+                            .get(repository, address)
+                            .await
+                            .expect_err("the durable local copy should have been evicted");
                     })
                     .await;
             }
@@ -5832,6 +6535,958 @@ mod tests {
 
                         assert_eq!(match_result.match_made, StoreMatch::MatchFull);
                         assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+        }
+
+        mod read_replica_selection {
+            use std::collections::HashMap;
+            use std::num::NonZeroUsize;
+
+            use async_trait::async_trait;
+            use lore_revision::cluster::peer::PeerInfo;
+            use lore_revision::store::composite::DEFAULT_ROUND_ROBIN_MAX_TRIES;
+            use lore_revision::store::composite::ReadReplicaSelection;
+            use lore_revision::store::composite::ReplicationTarget;
+            use lore_revision::store::composite::replica_factory::ReplicaFactory;
+            use lore_revision::store::composite::replica_factory::ReplicaTargets;
+
+            use super::*;
+            use crate::tests::TestStore;
+            use crate::tests::topology::create_peer_info;
+
+            /// Enough read replicas that a read sent to every one of them is told apart from a
+            /// read sent to some.
+            const NUM_REPLICAS: usize = 3;
+
+            /// Long against the time a test store takes to answer, so a try that waits it out is
+            /// told apart from one that does not.
+            const TRY_LIMIT: Duration = Duration::from_millis(200);
+
+            fn default_max_tries() -> u32 {
+                DEFAULT_ROUND_ROBIN_MAX_TRIES.get() as u32
+            }
+
+            async fn counting_replicas(reads: Reads) -> Vec<Arc<CountingStore>> {
+                let mut replicas = Vec::with_capacity(NUM_REPLICAS);
+                for _ in 0..NUM_REPLICAS {
+                    replicas.push(Arc::new(CountingStore::with_reads(
+                        make_store().await,
+                        reads,
+                    )));
+                }
+                replicas
+            }
+
+            /// Replicas that hold the content and follow `sequence`.
+            async fn sequenced_replicas(
+                repository: Partition,
+                address: Address,
+                fragment: Fragment,
+                payload: Bytes,
+                sequence: &Arc<ReadSequence>,
+            ) -> Vec<Arc<dyn ImmutableStore>> {
+                let mut replicas = Vec::with_capacity(NUM_REPLICAS);
+                for index in 0..NUM_REPLICAS {
+                    let inner = make_store().await;
+                    inner
+                        .clone()
+                        .put(repository, address, fragment, Some(payload.clone()), false)
+                        .await
+                        .expect("put to replica failed");
+                    replicas.push(
+                        Arc::new(CountingStore::sequenced(inner, index, sequence.clone()))
+                            as Arc<dyn ImmutableStore>,
+                    );
+                }
+                replicas
+            }
+
+            fn as_stores(replicas: &[Arc<CountingStore>]) -> Vec<Arc<dyn ImmutableStore>> {
+                replicas
+                    .iter()
+                    .map(|replica| replica.clone() as Arc<dyn ImmutableStore>)
+                    .collect()
+            }
+
+            /// The requests each replica received, as `count` names them.
+            fn requests(
+                replicas: &[Arc<CountingStore>],
+                count: fn(&CountingStore) -> &AtomicU32,
+            ) -> Vec<u32> {
+                replicas
+                    .iter()
+                    .map(|replica| count(replica).load(Ordering::SeqCst))
+                    .collect()
+            }
+
+            fn total_requests(
+                replicas: &[Arc<CountingStore>],
+                count: fn(&CountingStore) -> &AtomicU32,
+            ) -> u32 {
+                requests(replicas, count).iter().sum()
+            }
+
+            /// Checks that `sequence` saw `tries` requests, each to the replica after the one
+            /// before it in list order.
+            fn assert_consecutive_tries(sequence: &ReadSequence, tries: usize) {
+                let tried: Vec<usize> = sequence
+                    .requests()
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect();
+                assert_eq!(tried.len(), tries, "tried {tried:?}");
+                for pair in tried.windows(2) {
+                    assert_eq!(pair[1], (pair[0] + 1) % NUM_REPLICAS, "tried {tried:?}");
+                }
+            }
+
+            async fn round_robin_builder(
+                durable: Arc<dyn ImmutableStore>,
+                replicas: Vec<Arc<dyn ImmutableStore>>,
+                durable_delay: Duration,
+            ) -> CompositeStoreBuilder {
+                builder_with_read_replicas(durable, replicas, durable_delay)
+                    .await
+                    .with_read_replica_selection(ReadReplicaSelection::RoundRobin)
+            }
+
+            /// A round robin composite whose durable reads wait `LONG_DELAY` for the replicas, so a
+            /// read that completes within `PROMPTLY` did not wait for the delay.
+            async fn round_robin_over(
+                durable: Arc<dyn ImmutableStore>,
+                replicas: Vec<Arc<dyn ImmutableStore>>,
+            ) -> Arc<CompositeStore> {
+                Arc::new(
+                    round_robin_builder(durable, replicas, LONG_DELAY)
+                        .await
+                        .build()
+                        .expect("build should work"),
+                )
+            }
+
+            /// As [`round_robin_over`], with tries that wait `TRY_LIMIT` each.
+            async fn round_robin_with_try_limit(
+                durable: Arc<dyn ImmutableStore>,
+                replicas: Vec<Arc<dyn ImmutableStore>>,
+                durable_delay: Duration,
+            ) -> Arc<CompositeStore> {
+                Arc::new(
+                    round_robin_builder(durable, replicas, durable_delay)
+                        .await
+                        .with_round_robin_tries(None, Some(TRY_LIMIT))
+                        .build()
+                        .expect("build should work"),
+                )
+            }
+
+            async fn get_promptly(
+                composite: &Arc<CompositeStore>,
+                repository: Partition,
+                address: Address,
+            ) -> Bytes {
+                let (_, payload) =
+                    tokio::time::timeout(PROMPTLY, composite.clone().get(repository, address))
+                        .await
+                        .expect("get should not wait out the durable delay")
+                        .and_then(StoreGetData::into_payload)
+                        .expect("get should succeed");
+                payload
+            }
+
+            async fn get_metadata_promptly(
+                composite: &Arc<CompositeStore>,
+                repository: Partition,
+                address: Address,
+            ) -> StoreMatch {
+                tokio::time::timeout(
+                    PROMPTLY,
+                    composite.clone().get_metadata(repository, address),
+                )
+                .await
+                .expect("get_metadata should not wait out the durable delay")
+                .expect("get_metadata should succeed")
+                .match_made
+            }
+
+            async fn query_promptly(
+                composite: &Arc<CompositeStore>,
+                repository: Partition,
+                address: Address,
+            ) -> StoreMatch {
+                tokio::time::timeout(
+                    PROMPTLY,
+                    lore_storage::immutable_store::query_one(
+                        &(composite.clone() as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    ),
+                )
+                .await
+                .expect("query should not wait out the durable delay")
+                .expect("query should succeed")
+                .match_made
+            }
+
+            /// A read that has no round robin tries, such as every fan-out read, must not carry
+            /// their state and timer, so an operation holds them boxed: it is smaller than its own
+            /// timer and the tries together.
+            #[test]
+            fn an_operation_does_not_hold_its_round_robin_tries() {
+                use lore_revision::store::composite::CompositeOperation;
+                use lore_revision::store::composite::Tries;
+
+                type Query = std::future::Ready<Result<(), StoreError>>;
+                type Builder = fn(Arc<dyn ImmutableStore>) -> Query;
+
+                let operation = size_of::<CompositeOperation<(), Query, Builder>>();
+                let timer = size_of::<Option<tokio::time::Sleep>>();
+                let tries = size_of::<Tries<Builder>>();
+                assert!(
+                    operation < timer + tries,
+                    "the operation holds {operation} bytes, its timer {timer} and the tries {tries}"
+                );
+            }
+
+            #[tokio::test]
+            async fn fan_out_get_sends_one_request_to_every_replica() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let replicas = counting_replicas(Reads::Miss).await;
+                        let composite = build_composite_with_read_replicas(
+                            durable.clone(),
+                            as_stores(&replicas),
+                            LONG_DELAY,
+                        )
+                        .await;
+
+                        assert_eq!(get_promptly(&composite, repository, address).await, payload);
+                        assert_eq!(
+                            requests(&replicas, |replica| &replica.get_count),
+                            vec![1; NUM_REPLICAS]
+                        );
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_get_that_misses_sends_max_tries_replica_requests() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let replicas = counting_replicas(Reads::Miss).await;
+                        let composite =
+                            round_robin_over(durable.clone(), as_stores(&replicas)).await;
+
+                        assert_eq!(get_promptly(&composite, repository, address).await, payload);
+                        assert_eq!(
+                            total_requests(&replicas, |replica| &replica.get_count),
+                            default_max_tries()
+                        );
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_get_metadata_that_misses_sends_max_tries_replica_requests() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let replicas = counting_replicas(Reads::Miss).await;
+                        let composite =
+                            round_robin_over(durable.clone(), as_stores(&replicas)).await;
+
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_eq!(
+                            total_requests(&replicas, |replica| &replica.get_metadata_count),
+                            default_max_tries()
+                        );
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_query_that_misses_sends_max_tries_replica_requests() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let replicas = counting_replicas(Reads::Miss).await;
+                        let composite =
+                            round_robin_over(durable.clone(), as_stores(&replicas)).await;
+
+                        assert_eq!(
+                            query_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_eq!(
+                            total_requests(&replicas, |replica| &replica.resolve_count),
+                            default_max_tries()
+                        );
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// The `get_metadata` a durable full match starts to fill the local cache is a read of
+            /// its own, and follows the same selection.
+            #[tokio::test]
+            async fn round_robin_query_cache_fill_sends_max_tries_replica_requests() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let replicas = counting_replicas(Reads::Miss).await;
+                        let composite = Arc::new(
+                            round_robin_builder(durable.clone(), as_stores(&replicas), LONG_DELAY)
+                                .await
+                                .with_cache_metadata(true, None)
+                                .build()
+                                .expect("build should work"),
+                        );
+
+                        assert_eq!(
+                            query_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        // The durable store is asked only once every try has missed, so its count
+                        // marks the cache fill as past the replica stage.
+                        tokio::time::timeout(PROMPTLY, async {
+                            while durable.get_metadata_count.load(Ordering::SeqCst) == 0 {
+                                tokio::time::sleep(Duration::from_millis(5)).await;
+                            }
+                        })
+                        .await
+                        .expect("the cache fill should reach the durable store");
+
+                        assert_eq!(
+                            total_requests(&replicas, |replica| &replica.resolve_count),
+                            default_max_tries()
+                        );
+                        assert_eq!(
+                            total_requests(&replicas, |replica| &replica.get_metadata_count),
+                            default_max_tries()
+                        );
+                    })
+                    .await;
+            }
+
+            /// Each read takes one turn of the rotation, so reads that each settle on their first
+            /// try start at successive replicas.
+            #[tokio::test]
+            async fn round_robin_spreads_first_tries_evenly_over_an_unchanged_list() {
+                const ROTATIONS: u32 = 4;
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let mut replicas = Vec::with_capacity(NUM_REPLICAS);
+                        for _ in 0..NUM_REPLICAS {
+                            let inner = make_store().await;
+                            inner
+                                .clone()
+                                .put(repository, address, fragment, Some(payload.clone()), false)
+                                .await
+                                .expect("put to replica failed");
+                            replicas.push(Arc::new(CountingStore::wrapping(inner)));
+                        }
+                        let composite =
+                            round_robin_over(durable.clone(), as_stores(&replicas)).await;
+
+                        for _ in 0..ROTATIONS as usize * NUM_REPLICAS {
+                            assert_eq!(
+                                get_metadata_promptly(&composite, repository, address).await,
+                                StoreMatch::MatchFull
+                            );
+                        }
+
+                        assert_eq!(
+                            requests(&replicas, |replica| &replica.get_metadata_count),
+                            vec![ROTATIONS; NUM_REPLICAS]
+                        );
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_get_tries_the_next_replica_after_a_miss() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (Duration::ZERO, Reads::Miss),
+                            (Duration::ZERO, Reads::Answer),
+                        ]);
+                        let replicas = sequenced_replicas(
+                            repository,
+                            address,
+                            fragment,
+                            payload.clone(),
+                            &sequence,
+                        )
+                        .await;
+                        let composite = round_robin_over(durable.clone(), replicas).await;
+
+                        assert_eq!(get_promptly(&composite, repository, address).await, payload);
+                        assert_consecutive_tries(&sequence, 2);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_get_metadata_tries_the_next_replica_after_a_failure_or_partial_match()
+             {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        for first in [Reads::Fail, Reads::Partial] {
+                            let (fragment, address, payload) = generate_random();
+                            let repository: Partition = random::<RepositoryId>();
+                            let durable =
+                                seeded_durable(repository, address, fragment, payload.clone())
+                                    .await;
+                            let sequence = ReadSequence::new(vec![
+                                (Duration::ZERO, first),
+                                (Duration::ZERO, Reads::Answer),
+                            ]);
+                            let replicas = sequenced_replicas(
+                                repository, address, fragment, payload, &sequence,
+                            )
+                            .await;
+                            let composite = round_robin_over(durable.clone(), replicas).await;
+
+                            assert_eq!(
+                                get_metadata_promptly(&composite, repository, address).await,
+                                StoreMatch::MatchFull
+                            );
+                            assert_consecutive_tries(&sequence, 2);
+                            assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                        }
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_query_tries_the_next_replica_after_a_partial_match() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (Duration::ZERO, Reads::Partial),
+                            (Duration::ZERO, Reads::Answer),
+                        ]);
+                        let replicas =
+                            sequenced_replicas(repository, address, fragment, payload, &sequence)
+                                .await;
+                        let composite = round_robin_over(durable.clone(), replicas).await;
+
+                        assert_eq!(
+                            query_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_consecutive_tries(&sequence, 2);
+                        assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_next_try_starts_once_the_try_limit_passes() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (LONG_DELAY, Reads::Miss),
+                            (Duration::ZERO, Reads::Answer),
+                        ]);
+                        let replicas =
+                            sequenced_replicas(repository, address, fragment, payload, &sequence)
+                                .await;
+                        let composite =
+                            round_robin_with_try_limit(durable.clone(), replicas, LONG_DELAY).await;
+
+                        let started = std::time::Instant::now();
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+
+                        assert_consecutive_tries(&sequence, 2);
+                        let second_try = sequence.requests()[1].1;
+                        assert!(
+                            second_try.duration_since(started) >= TRY_LIMIT,
+                            "the second try must wait out the first try's limit"
+                        );
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// Long enough that a late result, which a panic delays by its report, still arrives
+            /// well before the next try is due.
+            const PASSED_OVER_LIMIT: Duration = Duration::from_millis(500);
+
+            /// A round robin composite that tries every replica, each for `PASSED_OVER_LIMIT`.
+            async fn round_robin_trying_every_replica(
+                durable: Arc<dyn ImmutableStore>,
+                replicas: Vec<Arc<dyn ImmutableStore>>,
+            ) -> Arc<CompositeStore> {
+                Arc::new(
+                    round_robin_builder(durable, replicas, LONG_DELAY)
+                        .await
+                        .with_round_robin_tries(
+                            NonZeroUsize::new(NUM_REPLICAS),
+                            Some(PASSED_OVER_LIMIT),
+                        )
+                        .build()
+                        .expect("build should work"),
+                )
+            }
+
+            /// Reads with the first try ending as `first` after it has passed its limit, the second
+            /// stalled and the third answering, and returns when the third try started, from the
+            /// start of the read.
+            async fn third_try_start_after_a_late_first_try(first: Reads) -> Duration {
+                let (fragment, address, payload) = generate_random();
+                let repository: Partition = random::<RepositoryId>();
+                let durable = seeded_durable(repository, address, fragment, payload.clone()).await;
+                let sequence = ReadSequence::new(vec![
+                    (PASSED_OVER_LIMIT * 6 / 5, first),
+                    (Duration::ZERO, Reads::Stall),
+                    (Duration::ZERO, Reads::Answer),
+                ]);
+                let replicas =
+                    sequenced_replicas(repository, address, fragment, payload, &sequence).await;
+                let composite = round_robin_trying_every_replica(durable.clone(), replicas).await;
+
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    get_metadata_promptly(&composite, repository, address).await,
+                    StoreMatch::MatchFull
+                );
+                assert_consecutive_tries(&sequence, 3);
+                assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                sequence.requests()[2].1.duration_since(started)
+            }
+
+            /// Only the current try's result moves the read on: a try past its limit that misses
+            /// later leaves the next try to the current try's limit.
+            #[tokio::test]
+            async fn round_robin_late_miss_of_a_passed_over_try_does_not_start_the_next() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let third = third_try_start_after_a_late_first_try(Reads::Miss).await;
+                        assert!(
+                            third >= PASSED_OVER_LIMIT * 2,
+                            "the third try started after {third:?}"
+                        );
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_late_panic_of_a_passed_over_try_does_not_start_the_next() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let third = third_try_start_after_a_late_first_try(Reads::Panic).await;
+                        assert!(
+                            third >= PASSED_OVER_LIMIT * 2,
+                            "the third try started after {third:?}"
+                        );
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_panic_of_the_current_try_starts_the_next() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (Duration::ZERO, Reads::Panic),
+                            (Duration::ZERO, Reads::Answer),
+                        ]);
+                        let replicas =
+                            sequenced_replicas(repository, address, fragment, payload, &sequence)
+                                .await;
+                        // Neither the try limit nor the durable delay passes within `PROMPTLY`, so
+                        // only the panic can start the second try.
+                        let composite = Arc::new(
+                            round_robin_builder(durable.clone(), replicas, LONG_DELAY)
+                                .await
+                                .with_round_robin_tries(None, Some(LONG_DELAY))
+                                .build()
+                                .expect("build should work"),
+                        );
+
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_consecutive_tries(&sequence, 2);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// A try past its limit keeps running, and settles the read if it answers first.
+            #[tokio::test]
+            async fn round_robin_slow_try_that_answers_first_settles_the_read() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (TRY_LIMIT * 2, Reads::Answer),
+                            (Duration::ZERO, Reads::Stall),
+                        ]);
+                        let replicas =
+                            sequenced_replicas(repository, address, fragment, payload, &sequence)
+                                .await;
+                        let composite =
+                            round_robin_with_try_limit(durable.clone(), replicas, LONG_DELAY).await;
+
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_consecutive_tries(&sequence, 2);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 0);
+                    })
+                    .await;
+            }
+
+            /// The durable delay counts from the start of the read, so the durable read starts
+            /// once it passes even while tries are still running.
+            #[tokio::test]
+            async fn round_robin_durable_starts_at_the_delay_while_tries_run() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let sequence = ReadSequence::new(vec![
+                            (Duration::ZERO, Reads::Stall),
+                            (Duration::ZERO, Reads::Stall),
+                        ]);
+                        let replicas =
+                            sequenced_replicas(repository, address, fragment, payload, &sequence)
+                                .await;
+                        let durable_delay = TRY_LIMIT * 2;
+                        let composite =
+                            round_robin_with_try_limit(durable.clone(), replicas, durable_delay)
+                                .await;
+
+                        let started = std::time::Instant::now();
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+
+                        assert!(started.elapsed() >= durable_delay);
+                        assert_consecutive_tries(&sequence, 2);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_tries_are_capped_at_the_replica_count() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let replica =
+                            Arc::new(CountingStore::with_reads(make_store().await, Reads::Miss));
+                        let composite = Arc::new(
+                            round_robin_builder(durable.clone(), vec![replica.clone()], LONG_DELAY)
+                                .await
+                                .with_round_robin_tries(NonZeroUsize::new(NUM_REPLICAS), None)
+                                .build()
+                                .expect("build should work"),
+                        );
+
+                        assert_eq!(
+                            get_metadata_promptly(&composite, repository, address).await,
+                            StoreMatch::MatchFull
+                        );
+                        assert_eq!(replica.get_metadata_count.load(Ordering::SeqCst), 1);
+                        assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// Builds a read replica for each peer that misses every read and counts its reads.
+            #[derive(Debug, Default)]
+            struct CountingReplicaBuilder {
+                replicas: std::sync::Mutex<HashMap<String, Arc<CountingStore>>>,
+            }
+
+            impl CountingReplicaBuilder {
+                /// The `get_metadata` reads each peer's replica has received, by peer.
+                fn requests(&self) -> HashMap<String, u32> {
+                    self.replicas
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(peer, replica)| {
+                            (
+                                peer.clone(),
+                                replica.get_metadata_count.load(Ordering::SeqCst),
+                            )
+                        })
+                        .collect()
+                }
+            }
+
+            #[async_trait]
+            impl ReplicaFactory for CountingReplicaBuilder {
+                async fn make_replica_target(
+                    &self,
+                    peer_info: &PeerInfo,
+                ) -> Result<ReplicaTargets, Box<dyn std::error::Error + Send + Sync>>
+                {
+                    let replica =
+                        Arc::new(CountingStore::with_reads(make_store().await, Reads::Miss));
+                    self.replicas
+                        .lock()
+                        .unwrap()
+                        .insert(peer_info.id.clone(), replica.clone());
+                    Ok(ReplicaTargets {
+                        read: Some(ReplicationTarget::new(peer_info.clone(), replica)),
+                        write: None,
+                    })
+                }
+            }
+
+            /// A refresh removes lost peers and appends new ones, so reads after it go only to the
+            /// peers then in the list.
+            #[tokio::test]
+            async fn round_robin_reads_follow_peer_changes() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable = seeded_durable(repository, address, fragment, payload).await;
+                        let builder = Arc::new(CountingReplicaBuilder::default());
+                        let composite = Arc::new(
+                            round_robin_builder(durable.clone(), Vec::new(), LONG_DELAY)
+                                .await
+                                .with_replica_builder(builder.clone())
+                                .build()
+                                .expect("build should work"),
+                        );
+                        let read = async |times: usize| {
+                            for _ in 0..times {
+                                assert_eq!(
+                                    get_metadata_promptly(&composite, repository, address).await,
+                                    StoreMatch::MatchFull
+                                );
+                            }
+                        };
+                        let peers: Vec<PeerInfo> = (1..=6)
+                            .map(|index| create_peer_info(&format!("peer-{index}")))
+                            .collect();
+                        let ids = |indices: &[usize]| -> Vec<String> {
+                            indices
+                                .iter()
+                                .map(|&index| peers[index].id.clone())
+                                .collect()
+                        };
+                        let refresh = async |indices: &[usize]| {
+                            composite
+                                .topology_peers_refreshed(
+                                    indices.iter().map(|&index| peers[index].clone()).collect(),
+                                )
+                                .await
+                                .expect("refresh should have worked");
+                        };
+
+                        refresh(&[0, 1, 2, 3]).await;
+                        read(3).await;
+                        let before = builder.requests();
+
+                        // One peer left: each read tries it once.
+                        refresh(&[0]).await;
+                        read(2).await;
+                        let after_removal = builder.requests();
+                        for peer in ids(&[1, 2, 3]) {
+                            assert_eq!(after_removal[&peer], before[&peer], "{peer} was removed");
+                        }
+                        assert_eq!(after_removal[&peers[0].id], before[&peers[0].id] + 2);
+
+                        // Three peers: six reads of two tries each start at successive positions,
+                        // so each peer is tried four times, whatever the start.
+                        refresh(&[0, 4, 5]).await;
+                        read(6).await;
+                        let after_addition = builder.requests();
+                        for peer in ids(&[1, 2, 3]) {
+                            assert_eq!(after_addition[&peer], before[&peer], "{peer} was removed");
+                        }
+                        assert_eq!(
+                            after_addition[&peers[0].id],
+                            after_removal[&peers[0].id] + 4
+                        );
+                        for peer in ids(&[4, 5]) {
+                            assert_eq!(after_addition[&peer], 4, "{peer} was added");
+                        }
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_without_read_replicas_reads_from_durable() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        let (fragment, address, payload) = generate_random();
+                        let repository: Partition = random::<RepositoryId>();
+                        let durable =
+                            seeded_durable(repository, address, fragment, payload.clone()).await;
+                        let composite = round_robin_over(durable.clone(), Vec::new()).await;
+
+                        assert_eq!(get_promptly(&composite, repository, address).await, payload);
+                        assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                    })
+                    .await;
+            }
+
+            /// A `get` takes any answer a replica gives, so only a miss or a failure leaves it to
+            /// the durable store.
+            #[tokio::test]
+            async fn round_robin_get_falls_back_promptly_when_the_replicas_miss_or_fail() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        for reads in [Reads::Miss, Reads::Fail] {
+                            let (fragment, address, payload) = generate_random();
+                            let repository: Partition = random::<RepositoryId>();
+                            let durable =
+                                seeded_durable(repository, address, fragment, payload.clone())
+                                    .await;
+                            let replicas = counting_replicas(reads).await;
+                            let composite =
+                                round_robin_over(durable.clone(), as_stores(&replicas)).await;
+
+                            assert_eq!(
+                                get_promptly(&composite, repository, address).await,
+                                payload
+                            );
+                            assert_eq!(durable.get_count.load(Ordering::SeqCst), 1);
+                        }
+                    })
+                    .await;
+            }
+
+            /// Replicas that each miss, partially match or fail, so every try does whichever it
+            /// is.
+            async fn unhelpful_replicas() -> Vec<Vec<Arc<dyn ImmutableStore>>> {
+                let partial = (0..NUM_REPLICAS)
+                    .map(|_| {
+                        Arc::new(TestStore::succeeding().with_mock_match(StoreMatch::MatchHash))
+                            as Arc<dyn ImmutableStore>
+                    })
+                    .collect();
+                vec![
+                    as_stores(&counting_replicas(Reads::Miss).await),
+                    partial,
+                    as_stores(&counting_replicas(Reads::Fail).await),
+                ]
+            }
+
+            #[tokio::test]
+            async fn round_robin_get_metadata_falls_back_promptly_when_no_try_settles_it() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        for replicas in unhelpful_replicas().await {
+                            let (fragment, address, payload) = generate_random();
+                            let repository: Partition = random::<RepositoryId>();
+                            let durable =
+                                seeded_durable(repository, address, fragment, payload).await;
+                            let composite = round_robin_over(durable.clone(), replicas).await;
+
+                            assert_eq!(
+                                get_metadata_promptly(&composite, repository, address).await,
+                                StoreMatch::MatchFull
+                            );
+                            assert_eq!(durable.get_metadata_count.load(Ordering::SeqCst), 1);
+                        }
+                    })
+                    .await;
+            }
+
+            #[tokio::test]
+            async fn round_robin_query_falls_back_promptly_when_no_try_settles_it() {
+                let execution = setup_test_execution();
+                LORE_CONTEXT
+                    .scope(execution, async move {
+                        for replicas in unhelpful_replicas().await {
+                            let (fragment, address, payload) = generate_random();
+                            let repository: Partition = random::<RepositoryId>();
+                            let durable =
+                                seeded_durable(repository, address, fragment, payload).await;
+                            let composite = round_robin_over(durable.clone(), replicas).await;
+
+                            assert_eq!(
+                                query_promptly(&composite, repository, address).await,
+                                StoreMatch::MatchFull
+                            );
+                            assert_eq!(durable.resolve_count.load(Ordering::SeqCst), 1);
+                        }
                     })
                     .await;
             }

@@ -6,9 +6,7 @@ use std::sync::atomic::AtomicU64;
 
 use lore_base::lore_debug;
 use lore_base::types::BranchId;
-use lore_base::types::BranchMetadata;
 use lore_base::types::BranchPoint;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_proto::lore::model::v1 as model_v1;
@@ -30,6 +28,7 @@ use crate::error::ProtocolError;
 use crate::types::BranchListResponse;
 use crate::types::BranchPushResponse;
 use crate::types::BranchQueryResponse;
+use crate::types::BranchRecord;
 use crate::types::MetadataSetResult;
 use crate::types::RevisionItem;
 use crate::types::RevisionListResponse;
@@ -64,6 +63,8 @@ impl RevisionService {
         }
     }
 
+    /// Creates the branch `branch` at the remote with the given name, category, creator and stack,
+    /// and returns the remote's record of it.
     pub async fn branch_create(
         &self,
         branch: BranchId,
@@ -71,7 +72,7 @@ impl RevisionService {
         category: &str,
         creator: &str,
         stack: &[BranchPoint],
-    ) -> Result<Hash, ProtocolError> {
+    ) -> Result<BranchRecord, ProtocolError> {
         lore_debug!("Creating remote branch {name} ({branch}) with stack {stack:?}");
         if crate::caller_operation::current_caller_operation().is_some() {
             let message = revision_v1::BranchCreateRequest {
@@ -168,8 +169,14 @@ impl RevisionService {
         Ok(())
     }
 
-    pub async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
-        self.branch_list_with_limit(None)
+    /// The records of the remote's live branches, and its archived ones when `include_deleted` is
+    /// set, limited to those `creator` created when it is given.
+    pub async fn branch_list(
+        &self,
+        creator: Option<&str>,
+        include_deleted: bool,
+    ) -> Result<BranchListResponse, ProtocolError> {
+        self.branch_list_with_limit(creator, include_deleted, None)
             .await
             .and_then(|response| {
                 response.ok_or_else(|| {
@@ -178,25 +185,28 @@ impl RevisionService {
             })
     }
 
+    /// The records of the remote's live branches, or `None` when it has more than `limit`.
     pub async fn branch_list_bounded(
         &self,
         limit: usize,
     ) -> Result<Option<BranchListResponse>, ProtocolError> {
-        self.branch_list_with_limit(Some(limit)).await
+        self.branch_list_with_limit(None, false, Some(limit)).await
     }
 
     async fn branch_list_with_limit(
         &self,
+        creator: Option<&str>,
+        include_deleted: bool,
         limit: Option<usize>,
     ) -> Result<Option<BranchListResponse>, ProtocolError> {
-        lore_debug!("List branches");
+        lore_debug!("List branches: creator[{creator:?}] / include_deleted[{include_deleted}]");
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
         let list = loop {
             let request = revision_v1::BranchListRequest {
-                creator: None,
-                include_deleted: false,
+                creator: creator.map(str::to_string),
+                include_deleted,
             };
 
             let mut client = self.client.clone();
@@ -217,6 +227,8 @@ impl RevisionService {
         Ok(list)
     }
 
+    /// The remote's record of the branch with id `branch`, or of the live branch named `name` when
+    /// `branch` is `None`. The record carries the queried id where the answer has none.
     pub async fn branch_query(
         &self,
         branch: Option<BranchId>,
@@ -257,30 +269,24 @@ impl RevisionService {
             }
         };
 
-        let mut id = Context::from(branch_record.id);
-        if id.is_zero() && branch.is_some() {
-            id = branch.unwrap_or_default();
+        let mut record = branch_record_from_v1(branch_record);
+        if record.id.is_zero()
+            && let Some(branch) = branch
+        {
+            record.id = branch;
         }
-        let latest = branch_record.latest.into();
-        let metadata = branch_record.metadata.into();
-        let deleted = branch_record.deleted;
         lore_debug!(
             "Query branch: id[{:?}] / name[{:?}] in repository {} complete: ID {} latest {} metadata {}",
             branch,
             name,
             self.repository,
-            id,
-            latest,
-            metadata,
+            record.id,
+            record.latest,
+            record.metadata,
         );
 
-        Ok(BranchQueryResponse {
-            id,
-            latest,
-            metadata,
-            deleted,
-            generation,
-        })
+        record.generation = generation;
+        Ok(record)
     }
 
     pub async fn branch_push(
@@ -481,10 +487,12 @@ impl RevisionService {
     }
 }
 
+/// The record a branch create answered with, refused unless it names xpected and carries
+/// well-formed hashes.
 fn decode_created_branch(
     response: revision_v1::BranchCreateResponse,
     expected: BranchId,
-) -> Result<Hash, ProtocolError> {
+) -> Result<BranchRecord, ProtocolError> {
     let branch = response
         .branch
         .ok_or_else(|| ProtocolError::internal("BranchCreate response missing branch"))?;
@@ -496,18 +504,24 @@ fn decode_created_branch(
             "BranchCreate response has invalid identifiers",
         ));
     }
-    Ok(Hash::from(branch.latest))
+    Ok(branch_record_from_v1(branch))
 }
 
-fn branch_metadata_from_v1(branch: model_v1::Branch) -> BranchMetadata {
-    BranchMetadata {
+/// The branch record a response carries, taking its strings as they arrived.
+#[lore_macro::test_pub]
+fn branch_record_from_v1(branch: model_v1::Branch) -> BranchRecord {
+    BranchRecord {
         id: BranchId::from(branch.id),
         name: branch.name,
         category: branch.category,
-        latest: branch.latest.into(),
         creator: branch.creator,
         created: branch.created,
+        latest: branch.latest.into(),
+        metadata: branch.metadata.into(),
+        deleted: branch.deleted,
         stack: branch.stack.into_iter().map(BranchPoint::from).collect(),
+        // Only a branch query carries the domain generation (WP-120).
+        generation: None,
     }
 }
 
@@ -523,7 +537,7 @@ async fn collect_branch_list(
             if limit.is_some_and(|limit| entries.len() == limit) {
                 return Ok(None);
             }
-            entries.push(branch_metadata_from_v1(branch));
+            entries.push(branch_record_from_v1(branch));
         }
     }
     Ok(Some(BranchListResponse { list: entries }))

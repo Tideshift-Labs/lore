@@ -3,6 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use lore_storage::CorrelationHold;
+use lore_storage::FlushOptions;
 use lore_storage::local::store_lock::StoreGuard;
 
 use crate::lore::Hash;
@@ -32,6 +34,10 @@ impl store::MutableStore for WriteDiscardingMutableStore {
 
     fn try_join_claim(&self) -> Option<StoreGuard> {
         self.base.try_join_claim()
+    }
+
+    fn hold_correlation(&self, correlation_id: &str) -> Option<CorrelationHold> {
+        self.base.hold_correlation(correlation_id)
     }
 
     async fn load(
@@ -78,7 +84,7 @@ impl store::MutableStore for WriteDiscardingMutableStore {
         self.base.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, _options: FlushOptions) -> Result<(), StoreError> {
         Ok(())
     }
 }

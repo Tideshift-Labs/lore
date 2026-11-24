@@ -368,18 +368,9 @@ async fn sync_store_branch_latest(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    branch::store_latest(
-        repository.clone(),
-        branch,
-        local_latest,
-        revision,
-        BranchLatestStatus::Convergent,
-    )
-    .await
-    .forward::<SyncError>("Failed to store revision as current branch latest")?;
-
-    branch::store_last_sync(repository, branch, revision).await;
-    Ok(())
+    branch::store_synced_latest(&repository, branch, local_latest, revision)
+        .await
+        .forward::<SyncError>("Failed to store revision as current branch latest")
 }
 
 /// Where the branch being synced stands, for the branch latest decision.
@@ -993,7 +984,8 @@ pub(crate) async fn sync(
     }
 
     // FORK-LOCAL (Tideshift, 4a2d7859): cached before realize touches the workspace, so a failure
-    // leaves the workspace and anchor as they were.
+    // leaves the workspace and anchor as they were. Upstream's cache task run beside the realize
+    // (`realize_joining`, 65c5d2b6) ignores a failed cache, which the fork refuses.
     cache_target_fragments(repository.clone(), &state_target, remote_authorized).await?;
 
     let state_synced = state_target.clone();
@@ -1060,9 +1052,15 @@ pub(crate) async fn sync(
 
             modified_times.store(repository.clone()).await;
 
-            state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
-                .await
-                .forward::<SyncError>("Failed to rebase staged anchor")?;
+            state::rebase_staged_anchor(
+                repository.clone(),
+                &operation,
+                revision,
+                force && !view_change,
+                true,
+            )
+            .await
+            .forward::<SyncError>("Failed to rebase staged anchor")?;
 
             if let Some(view_file) = view_file {
                 sync_store_view(&repository, view_file).await?;
@@ -1341,53 +1339,96 @@ async fn sync_layers(
             layer_target.revision_number()
         );
 
-        // TODO(mjansson): Sync disjoint layers in parallel
-        Box::pin(layer::sync(
-            layer_repository_current,
-            layer_repository_target.clone(),
-            layer_current,
-            layer_target,
-            mount_path.clone(),
-            source_path.clone(),
-            options.clone(),
-        ))
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
-
         // Rebasing a layer that did not move would drop its staged content: a
         // purely staged state has no dirty children, so the rebase finds nothing
         // to carry forward and clears the pin.
-        let staged = if execution_context().globals().dry_run() || layer_revision == layer.current {
-            None
-        } else if layer.staged.is_zero() || layer.staged == layer.current {
-            Some(Hash::default())
-        } else {
-            Some(
-                state::rebase_staged_state(
-                    layer_repository_target,
-                    layer.staged,
+        let dry_run = execution_context().globals().dry_run();
+        let moved = !dry_run && layer_revision != layer.current;
+        let rebases = moved && !layer.staged.is_zero() && layer.staged != layer.current;
+
+        // TODO(mjansson): Sync disjoint layers in parallel
+        with_operation::<_, SyncError, _>(
+            layer_repository_target.file_system(),
+            async |operation| {
+                Box::pin(layer::sync_in_operation(
+                    operation.clone(),
+                    layer_repository_current,
+                    layer_repository_target.clone(),
+                    layer_current,
+                    layer_target,
+                    mount_path.clone(),
+                    source_path.clone(),
+                    options.clone(),
+                ))
+                .await
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                let modified_times = operation.take_modified_times();
+
+                layer::store_layer_current(
+                    repository_target.clone(),
+                    token,
+                    mount_path.as_str(),
+                    layer.repository,
                     layer_revision,
-                    execution_context().globals().force() && !view_moved,
+                    moved.then_some(Hash::default()),
                 )
                 .await
-                .forward::<SyncError>("Failed to rebase layer staged state")?
-                .unwrap_or_default(),
-            )
-        };
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                modified_times.store(layer_repository_target.clone()).await;
 
-        layer::store_layer_current(
-            repository_target.clone(),
-            token,
-            mount_path.as_str(),
-            layer.repository,
-            layer_revision,
-            staged,
+                if rebases
+                    && let Some(staged) = state::rebase_staged_state_in(
+                        &operation,
+                        layer_repository_target.clone(),
+                        layer.staged,
+                        layer_revision,
+                        execution_context().globals().force() && !view_moved,
+                        true,
+                        Some(state::LayerPaths {
+                            source: &source_path,
+                            mount: &mount_path,
+                        }),
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to rebase layer staged state")?
+                {
+                    layer::store_layer_staged(
+                        repository_target.clone(),
+                        token,
+                        mount_path.as_str(),
+                        layer.repository,
+                        staged,
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to synchornize a layer")?;
+                }
+                Ok(())
+            },
         )
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
+        .await?;
     }
 
     Ok(())
+}
+
+/// Awaits `realize`, then `beside`, a task run alongside it, and answers what `realize` did.
+///
+/// The task is joined whether or not realizing fails. It holds the repository, and a sync that
+/// answered before it ended would leave the repository held once the command completes. It is
+/// joined rather than aborted: aborting would end the task but not the fetches it starts, which a
+/// dropped join set aborts without waiting for.
+///
+/// FORK-LOCAL (Tideshift, 4a2d7859): the fork's sync caches before it realizes and runs no task
+/// beside it, so only the unit tests call this.
+#[lore_macro::test_pub]
+#[cfg_attr(not(feature = "test-util"), allow(dead_code))]
+pub(crate) async fn realize_joining(
+    beside: tokio::task::JoinHandle<()>,
+    realize: impl Future<Output = Result<(), SyncError>>,
+) -> Result<(), SyncError> {
+    let realized = realize.await;
+    let _ = beside.await;
+    realized
 }
 
 /// Drops the times an operation collected, for a caller that does not know which revision
@@ -1421,6 +1462,10 @@ pub struct SyncVerifyArgs {
     pub operation: Arc<InstanceOperationImpl>,
     pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
+    /// Whether the verify gives the files it finds holding the incoming content the changes' own
+    /// executable bits, once every change has passed. False where a realize that verifies again
+    /// follows.
+    pub carries_modes: bool,
 }
 
 pub async fn sync_verify_filesystem(
@@ -1451,6 +1496,23 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
+    pub kept_moves: KeptMoves,
+}
+
+/// The moves a realize carries out without their rename, leaving the source where it stands: the
+/// rename was refused, and the destination names the source's own entry or cannot be told apart
+/// from it. Counted, with the first, for the one warning the realize ends with.
+#[derive(Default)]
+pub struct KeptMoves {
+    pub count: AtomicUsize,
+    pub first: std::sync::OnceLock<KeptMove>,
+}
+
+/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
+pub struct KeptMove {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {

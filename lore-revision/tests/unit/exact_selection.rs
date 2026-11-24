@@ -171,7 +171,10 @@ impl MutableStore for FaultInjectingMutableStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         self.inner.clone().flush(sync_data).await
     }
 }
@@ -263,7 +266,7 @@ async fn exercise_real_store_publication_failure(
         .expect("seed staged anchor");
     faulting_mutable
         .clone()
-        .flush(true)
+        .flush(lore_storage::FlushOptions::SYNC_DATA)
         .await
         .expect("persist original anchors");
 
@@ -288,7 +291,7 @@ async fn exercise_real_store_publication_failure(
 
     faulting_mutable
         .clone()
-        .flush(true)
+        .flush(lore_storage::FlushOptions::SYNC_DATA)
         .await
         .expect("persist post-compensation anchors");
     drop(staged_state);
@@ -901,7 +904,10 @@ impl MutableStore for FailKeyMutableStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(
+        self: Arc<Self>,
+        sync_data: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         self.inner.clone().flush(sync_data).await
     }
 }

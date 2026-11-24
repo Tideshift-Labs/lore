@@ -12,6 +12,7 @@ use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::session::MAX_CONCURRENT_SESSIONS;
+use lore_server::protocol::storage::session::SessionMap;
 use lore_server::quic::QuicService;
 use lore_server::quic::storage_service_v4::*;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
@@ -35,6 +36,7 @@ fn make_service(
         mutable_store,
         false,
         Arc::new(UserAgentFilter::default()),
+        SessionMap::default(),
     )
 }
 
@@ -242,6 +244,7 @@ mod authorized_session {
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
             jwt_typ: None,
+            exchange_issuer: None,
         }
     }
 
@@ -290,6 +293,7 @@ mod authorized_session {
             mutable_store,
             false,
             Arc::new(UserAgentFilter::default()),
+            SessionMap::default(),
         )
     }
 
@@ -523,6 +527,7 @@ mod authorized_session {
             mutable_store,
             false,
             Arc::new(UserAgentFilter::default()),
+            SessionMap::default(),
         );
 
         let token = signed_token(&[&format!("urc-{repo_b}")], &["read", "write"]);
@@ -701,6 +706,7 @@ mod require_write_dispatch_gate {
             jwt_issuer: None,
             jwt_audience: None,
             jwt_typ: None,
+            exchange_issuer: None,
         }))
     }
 
@@ -731,6 +737,7 @@ mod require_write_dispatch_gate {
             mutable_store,
             enforce_write_permission,
             Arc::new(UserAgentFilter::default()),
+            lore_server::protocol::storage::session::SessionMap::default(),
         )
     }
 
@@ -746,6 +753,7 @@ mod require_write_dispatch_gate {
                 None,
                 None,
                 false,
+                Vec::new(),
             )
             .expect("seed session");
         session_id
@@ -1110,6 +1118,7 @@ async fn session_start_trusting_unsigned_identity_names_the_caller_without_a_tok
         mutable_store,
         false,
         Arc::new(UserAgentFilter::default()),
+        SessionMap::default(),
     );
     let start = |auth_token: Vec<u8>| {
         service.run_request_handler(

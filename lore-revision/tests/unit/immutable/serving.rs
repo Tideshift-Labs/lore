@@ -10,32 +10,38 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use lore_base::error::NotFound;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
+use lore_base::types::KeyType;
 use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::test_util::context_with_state;
+use lore_storage::StoreError;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 
-use super::session_tests::context_with_state;
 use super::session_tests::under_execution_context;
 
 /// How a [`ServingStorage`] departs from serving what it holds: the address it answers with its
-/// payload altered, until a heal where it `heals`, and after that heal too where it `heal_fails`,
-/// though it reports the heal made; the address whose first get it answers `SlowDown`; whether it
-/// answers every get `NotSupported`, as a remote that does not support the request; whether it
-/// fails every get on the first session it started, as a server that lost its sessions; the gate
-/// it holds each get at until as many as the gate takes are in; and the content whose first get it
-/// holds for a notification.
+/// payload altered, a byte short where it is `shortened` and in its first byte otherwise, until a
+/// heal where it `heals`, and after that heal too where it `heal_fails`, though it reports the heal
+/// made; the address whose first get it answers `SlowDown`; whether it answers every get
+/// `NotSupported`, as a remote that does not support the request; whether it fails every get on
+/// the first session it started, as a server that lost its sessions; the gate it holds each get at
+/// until as many as the gate takes are in; the content whose first get it holds for a
+/// notification; and the refusal of the credentials it answers every get, verify and mutable load
+/// with.
 #[derive(Default)]
-pub(super) struct Serving {
+pub(crate) struct Serving {
     pub(super) tampered: Option<Address>,
+    pub(super) shortened: bool,
     pub(super) heals: bool,
     pub(super) heal_fails: bool,
     pub(super) slow_down: Option<Address>,
@@ -43,16 +49,18 @@ pub(super) struct Serving {
     pub(super) forgets_first_session: bool,
     pub(super) gate: Option<Arc<tokio::sync::Barrier>>,
     pub(super) hold: Option<(Hash, Arc<tokio::sync::Notify>)>,
+    pub(super) refusal: Option<ProtocolError>,
 }
 
 /// A remote serving what `source` stores as `serving` says, recording each address asked of it, the
-/// sessions started on it, numbered from 1, the verifies asked of it and the most gets it held at
-/// once.
-pub(super) struct ServingStorage {
+/// sessions started on it, numbered from 1, the sessions stopped, the verifies asked of it and the
+/// most gets it held at once.
+pub(crate) struct ServingStorage {
     source: Arc<RepositoryContext>,
     serving: Serving,
     asked: std::sync::Mutex<Vec<Address>>,
     starts: AtomicU32,
+    stops: AtomicU32,
     verifies: AtomicUsize,
     healed: AtomicBool,
     slowed: AtomicBool,
@@ -81,6 +89,7 @@ impl lore_transport::Storage for ServingStorage {
     }
 
     async fn session_stop(&self, _session_id: u32) -> Result<(), ProtocolError> {
+        self.stops.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -89,6 +98,9 @@ impl lore_transport::Storage for ServingStorage {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        if let Some(refusal) = &self.serving.refusal {
+            return Err(refusal.clone());
+        }
         if self.serving.forgets_first_session && session_id == 1 {
             return Err(ProtocolError::internal(
                 "the serving remote no longer knows session 1",
@@ -143,6 +155,8 @@ impl lore_transport::Storage for ServingStorage {
         ))
     }
 
+    /// Answers `NotFound` for an address `source` stores nothing at, and heals only the tampered
+    /// address, where the remote `heals`.
     async fn verify(
         &self,
         _session_id: u32,
@@ -150,6 +164,12 @@ impl lore_transport::Storage for ServingStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         self.verifies.fetch_add(1, Ordering::SeqCst);
+        if let Some(refusal) = &self.serving.refusal {
+            return Err(refusal.clone());
+        }
+        if let Err(err @ ProtocolError::NotFound(_)) = self.serve(*address).await {
+            return Err(err);
+        }
         if !(heal && self.serving.heals && self.serving.tampered == Some(*address)) {
             return Err(ProtocolError::internal("the serving remote heals nothing"));
         }
@@ -173,23 +193,44 @@ impl lore_transport::Storage for ServingStorage {
             "the serving remote takes no copies",
         ))
     }
+
+    async fn mutable_load(
+        &self,
+        _session_id: u32,
+        _key: &Hash,
+        _key_type: KeyType,
+    ) -> Result<Hash, ProtocolError> {
+        Err(self
+            .serving
+            .refusal
+            .clone()
+            .unwrap_or_else(|| ProtocolError::internal("the serving remote holds no mutable keys")))
+    }
 }
 
 impl ServingStorage {
-    /// What `source` stores at `address`, altered where it is the tampered address and not healed.
+    /// What `source` stores at `address`, altered where it is the tampered address and not healed,
+    /// and `NotFound` where it stores nothing.
     async fn serve(&self, address: Address) -> Result<(Fragment, Bytes), ProtocolError> {
         let stored = self
             .source
             .immutable_store()
             .get(self.source.id, address)
             .await
-            .map_err(|err| ProtocolError::internal(err.to_string()))?;
+            .map_err(|err| match err {
+                StoreError::AddressNotFound(_) => ProtocolError::from(NotFound),
+                err => ProtocolError::internal(err.to_string()),
+            })?;
         let payload = stored
             .payload
             .ok_or_else(|| ProtocolError::internal("the source holds no payload"))?;
         if self.serving.tampered == Some(address) && !self.healed.load(Ordering::SeqCst) {
             let mut altered = payload.to_vec();
-            altered[0] ^= 0xff;
+            if self.serving.shortened {
+                altered.pop();
+            } else {
+                altered[0] ^= 0xff;
+            }
             return Ok((stored.fragment, Bytes::from(altered)));
         }
         Ok((stored.fragment, payload))
@@ -215,6 +256,11 @@ impl ServingStorage {
         self.starts.load(Ordering::SeqCst)
     }
 
+    /// How many sessions were stopped on the remote.
+    pub(super) fn stops(&self) -> u32 {
+        self.stops.load(Ordering::SeqCst)
+    }
+
     /// How many verifies the remote was asked.
     pub(super) fn verifies(&self) -> usize {
         self.verifies.load(Ordering::SeqCst)
@@ -232,7 +278,7 @@ impl ServingStorage {
 }
 
 /// A remote serving what `source` stores as `serving` says.
-pub(super) fn serving_remote(
+pub(crate) fn serving_remote(
     source: &Arc<RepositoryContext>,
     serving: Serving,
 ) -> Arc<ServingStorage> {
@@ -241,6 +287,7 @@ pub(super) fn serving_remote(
         serving,
         asked: std::sync::Mutex::default(),
         starts: AtomicU32::new(0),
+        stops: AtomicU32::new(0),
         verifies: AtomicUsize::new(0),
         healed: AtomicBool::new(false),
         slowed: AtomicBool::new(false),
@@ -269,7 +316,7 @@ pub(super) async fn serving_session(
 
 /// `content` stored with its payload under `flags` in a repository of its own, standing in for the
 /// remote's copy, and its address and fragment.
-pub(super) async fn remote_copy(
+pub(crate) async fn remote_copy(
     content: &'static [u8],
     seed: u8,
     flags: u32,

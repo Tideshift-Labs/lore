@@ -24,10 +24,12 @@ use lore_revision::fs::filesystem_provider::create_empty_directory;
 use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
 use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
 use lore_revision::fs::filesystem_provider::test_util::StoredCalls;
+use lore_revision::fs::filesystem_provider::test_util::TestIdentity;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::infer::ConflictMarkers;
 use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
@@ -46,6 +48,7 @@ pub struct TestFilesystemProvider {
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
     pub hold_calls: HoldCalls,
+    pub warm_count: Arc<AtomicUsize>,
     pub stored_calls: StoredCalls,
     pub committed_calls: CommittedCalls,
     /// The directory file information and content are read from, where given.
@@ -54,9 +57,14 @@ pub struct TestFilesystemProvider {
     pub failing_scans: Arc<Mutex<Vec<String>>>,
     /// Paths whose scan finds the named node stale.
     pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
+    /// Paths each recursive removal was asked for.
+    pub removed: Arc<Mutex<Vec<String>>>,
+    identity: TestIdentity,
+    begin_fails: bool,
     finalize_fails: bool,
     committed_fails: bool,
     write_fails: bool,
+    file_info_fails: bool,
     content_source_fails: bool,
     content_source_missing: bool,
     holds_paths: bool,
@@ -67,6 +75,20 @@ pub struct TestFilesystemProvider {
 impl TestFilesystemProvider {
     pub fn new() -> TestFilesystemProvider {
         Self::default()
+    }
+
+    /// This provider, its operations answering whether two paths name one entry as `identity`
+    /// says.
+    pub fn with_identity(self, identity: TestIdentity) -> TestFilesystemProvider {
+        Self { identity, ..self }
+    }
+
+    /// A provider that fails to begin an operation, as one whose filesystem will not freeze.
+    pub fn failing_begin() -> TestFilesystemProvider {
+        Self {
+            begin_fails: true,
+            ..Self::new()
+        }
     }
 
     /// A provider whose operations record the finalize and then report it failed.
@@ -81,6 +103,14 @@ impl TestFilesystemProvider {
     pub fn failing_content_sources() -> TestFilesystemProvider {
         Self {
             content_source_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations cannot describe any path.
+    pub fn failing_file_info() -> TestFilesystemProvider {
+        Self {
+            file_info_fails: true,
             ..Self::new()
         }
     }
@@ -110,10 +140,11 @@ impl TestFilesystemProvider {
         }
     }
 
-    /// A provider that holds its state in a `State`.
+    /// A provider that holds its state in a `State`, whose operations fail every write.
     pub fn holding_state() -> TestFilesystemProvider {
         Self {
             holds_state: true,
+            write_fails: true,
             ..Self::new()
         }
     }
@@ -195,6 +226,9 @@ pub fn test_repository_over(
 impl FilesystemProvider for TestFilesystemProvider {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         self.begin_count.fetch_add(1, Ordering::AcqRel);
+        if self.begin_fails {
+            return Err(FsError::internal("the test provider fails to begin"));
+        }
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Test(TestOperation {
                 file_info_count: self.file_info_count.clone(),
@@ -203,10 +237,13 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_events: self.finalize_events.clone(),
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
+                file_info_fails: self.file_info_fails,
+                failing_file_infos: Arc::default(),
                 content_source_fails: self.content_source_fails,
                 content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
                 hold_calls: self.hold_calls.clone(),
+                warm_count: self.warm_count.clone(),
                 stored_calls: self.stored_calls.clone(),
                 committed_calls: self.committed_calls.clone(),
                 committed_fails: self.committed_fails,
@@ -214,6 +251,8 @@ impl FilesystemProvider for TestFilesystemProvider {
                 hold_refuses: self.hold_refuses,
                 failing_scans: self.failing_scans.clone(),
                 stale_on_scan: self.stale_on_scan.clone(),
+                removed: self.removed.clone(),
+                identity: self.identity,
             }),
             self.holds_state,
         )))
@@ -791,11 +830,12 @@ async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
                     .await
                     .expect("a path holding no file is an answer")
             );
-            assert!(
-                !operation
+            assert_eq!(
+                operation
                     .infer_is_conflicted(&path)
                     .await
-                    .expect("a path holding no file is an answer")
+                    .expect("a path holding no file is an answer"),
+                ConflictMarkers::NoFile
             );
         })
         .await;

@@ -44,9 +44,22 @@ pub const READ_ONLY_KEYS: &[&str] = &[
     branch::CATEGORY,
     branch::CREATOR,
     branch::CREATED,
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
     branch::STACK,
     branch::PARENT_DEPRECATED,
     branch::BRANCH_POINT_DEPRECATED,
+];
+
+/// The read-only keys archives and restores write, which no metadata write may add either: they
+/// decide what a later archive or restore of the branch does.
+pub const ARCHIVE_KEYS: &[&str] = &[
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
 ];
 
 /// All built-in keys. These cannot be removed via clear, but `protect` can be overwritten
@@ -57,6 +70,10 @@ pub const BUILT_IN_KEYS: &[&str] = &[
     branch::CATEGORY,
     branch::CREATOR,
     branch::CREATED,
+    branch::RESTORED,
+    branch::ARCHIVED,
+    branch::RESTORING,
+    branch::RELEASED,
     branch::PROTECT,
     branch::STACK,
     branch::PARENT_DEPRECATED,
@@ -125,8 +142,9 @@ fn validate_key(key: &str) -> Result<(), BranchMetadataError> {
 /// Fetch the current branch metadata hash pointer.
 ///
 /// When `local` is false, queries the remote for the authoritative hash via the
-/// `BranchMetadataGet` RPC and caches it locally. Falls back to the local cache if the
-/// remote is unavailable. When `local` is true, reads directly from the local mutable store.
+/// `BranchMetadataGet` RPC and caches it locally (`branch::cache_remote_metadata`). Falls back to
+/// the local cache if the remote is unavailable. When `local` is true, reads directly from the
+/// local mutable store.
 async fn fetch_metadata_hash(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
@@ -137,7 +155,7 @@ async fn fetch_metadata_hash(
         && let Ok(revision_service) = remote.revision(repo.id).await
         && let Ok(hash) = revision_service.branch_metadata_get(branch).await
     {
-        let _ = branch::mutable_store_metadata(repo.clone(), branch, hash).await;
+        let _ = branch::cache_remote_metadata(repo.clone(), branch, hash).await;
         return Ok(hash);
     }
 
@@ -156,7 +174,11 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
 
     metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
         if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
-            addresses.push(value.into());
+            let address: Address = value.into();
+            // Empty content is stored as the zero hash, which names no blob to upload.
+            if !address.hash.is_zero() {
+                addresses.push(address);
+            }
         }
     });
 
@@ -208,7 +230,7 @@ async fn ensure_remote_blobs(
 /// metadata blob itself plus any binary Address values) exist on the server, uploading
 /// any that are missing from the local store. Then calls `BranchMetadataSet` which
 /// validates read-only field protection and binary blob existence before performing the CAS.
-/// On success, updates the local cache.
+/// On success, updates the local cache (`branch::cache_remote_metadata`).
 async fn commit_metadata_hash(
     repo: Arc<RepositoryContext>,
     branch: BranchId,
@@ -253,7 +275,7 @@ async fn commit_metadata_hash(
         ));
     }
 
-    let _ = branch::mutable_store_metadata(repo, branch, new).await;
+    let _ = branch::cache_remote_metadata(repo, branch, new).await;
     Ok(())
 }
 

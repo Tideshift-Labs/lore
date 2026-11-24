@@ -667,6 +667,22 @@ impl RelativePath {
         &self.data.path_lower[self.start_lower as usize..self.end_lower as usize]
     }
 
+    /// `spelled`, a spelling of this path that differs from it in case alone, as a path. Takes this
+    /// path's lowercase form rather than folding `spelled` again.
+    pub(crate) fn respelled(&self, spelled: String) -> RelativePath {
+        debug_assert!(
+            spelled
+                .parse::<RelativePath>()
+                .is_ok_and(|path| path.as_lowercase_str() == self.as_lowercase_str()),
+            "{spelled} differs from {self} in more than case"
+        );
+        RelativePathBuf {
+            path: spelled,
+            path_lower: self.as_lowercase_str().to_owned(),
+        }
+        .freeze()
+    }
+
     pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePath, PathError> {
         RelativePathBuf::new_from_initial_path(name).map(|p| p.freeze())
     }
@@ -874,6 +890,15 @@ impl RelativePath {
         covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
     }
 
+    /// Returns `true` if `self` is strictly below `ancestor`, on the lowercased forms as
+    /// [`covers_ignore_case`](Self::covers_ignore_case) compares them. Unlike
+    /// [`below`](Self::below), `ancestor` itself is not below it, and an empty `ancestor` has
+    /// nothing below it.
+    pub fn is_below_ignore_case(&self, ancestor: &RelativePath) -> bool {
+        let (ancestor, path) = (ancestor.as_lowercase_str(), self.as_lowercase_str());
+        ancestor.len() < path.len() && covers_impl(ancestor, path)
+    }
+
     /// The names of this path below `ancestor`, or `None` where `ancestor` does not cover it.
     ///
     /// Both are spelled from the same root, so this is what a walk rooted at `ancestor` would have
@@ -886,6 +911,12 @@ impl RelativePath {
         }
         covers_impl(ancestor.as_str(), self.as_str())
             .then(|| self.as_str()[ancestor.len()..].trim_start_matches('/'))
+    }
+
+    /// [`below`](Self::below) comparing names case-insensitively, as node lookup does, and
+    /// answering the names as this path spells them.
+    pub fn below_ignore_case(&self, ancestor: &RelativePath) -> Option<&str> {
+        strip_lowercase_prefix(self.as_str(), ancestor.as_lowercase_str())
     }
 
     /// [`overlaps`](Self::overlaps) on the lowercased form, for the same reason

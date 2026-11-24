@@ -72,6 +72,7 @@ fn verifier_present() -> Arc<TokenVerification> {
         jwt_issuer: None,
         jwt_audience: None,
         jwt_typ: None,
+        exchange_issuer: None,
     }))
 }
 
