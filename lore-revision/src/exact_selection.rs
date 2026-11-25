@@ -197,6 +197,16 @@ pub struct ExactSourceHashMismatch {
     pub actual: String,
 }
 
+/// FORK-LOCAL (Tideshift): a lock another user holds on a selected path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactLockHolder {
+    /// The repository-relative path of the locked file.
+    pub path: String,
+    /// The identity the server records as the lock's holder.
+    pub owner: String,
+}
+
 /// Structured, deterministic exact-selection failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -275,6 +285,11 @@ pub enum ExactSelectionErrorKind {
         operation: String,
         reason: String,
     },
+    /// FORK-LOCAL (Tideshift): another user holds a lock on these selected paths, in path order.
+    /// Status `LockNotOwned` (45), as a staged commit's refusal. Nothing was staged or committed.
+    LockNotOwned {
+        holders: Vec<ExactLockHolder>,
+    },
 }
 
 impl fmt::Display for ExactSelectionErrorKind {
@@ -330,28 +345,21 @@ impl fmt::Display for ExactSelectionErrorKind {
                 }
             }
             Self::Internal { operation, reason } => write!(f, "{operation}: {reason}"),
+            Self::LockNotOwned { holders } => f.write_str(&crate::lock::file::held::refusal_text(
+                holders
+                    .iter()
+                    .map(|holder| (holder.path.as_str(), holder.owner.as_str())),
+            )),
         }
     }
 }
 
 /// Error wrapper carrying a Lore trace without weakening the structured payload.
 #[derive(Debug, Clone, Error)]
+#[error("{kind}")]
 pub struct ExactSelectionError {
     kind: Box<ExactSelectionErrorKind>,
     trace: Trace,
-    /// FORK-LOCAL (Tideshift): the selection was refused because another user holds a lock on a
-    /// selected path. The kind stays `InvalidInput` (the serialized payload is unchanged); the
-    /// status is `LockNotOwned` and the message is the plain refusal, as a staged commit's is.
-    locked_by_others: bool,
-}
-
-impl fmt::Display for ExactSelectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.locked_by_others, self.kind()) {
-            (true, ExactSelectionErrorKind::InvalidInput { reason, .. }) => f.write_str(reason),
-            _ => self.kind.fmt(f),
-        }
-    }
 }
 
 impl ExactSelectionError {
@@ -359,23 +367,7 @@ impl ExactSelectionError {
         Self {
             kind: Box::new(kind),
             trace: Trace::default(),
-            locked_by_others: false,
         }
-    }
-
-    /// FORK-LOCAL (Tideshift): the refusal of a selection that names `paths` another user holds a
-    /// lock on. `reason` is the refusal message. Its status is `LockNotOwned`, as a staged commit's
-    /// refusal is; its kind is `InvalidInput` with the same `reason` and `paths`.
-    pub fn locked_by_others(reason: String, paths: Vec<String>) -> Self {
-        Self {
-            locked_by_others: true,
-            ..Self::new(ExactSelectionErrorKind::InvalidInput { reason, paths })
-        }
-    }
-
-    /// Whether this is the refusal [`Self::locked_by_others`] makes.
-    pub fn is_locked_by_others(&self) -> bool {
-        self.locked_by_others
     }
 
     pub fn kind(&self) -> &ExactSelectionErrorKind {
@@ -423,10 +415,10 @@ impl From<RepositoryError> for ExactSelectionError {
 
 impl FfiError for ExactSelectionError {
     fn ffi_code(&self) -> i32 {
-        if self.locked_by_others {
-            return lore_base::error::LockNotOwned.ffi_code();
-        }
         match self.kind() {
+            ExactSelectionErrorKind::LockNotOwned { .. } => {
+                lore_base::error::LockNotOwned.ffi_code()
+            }
             ExactSelectionErrorKind::InvalidInput { .. }
             | ExactSelectionErrorKind::PathNormalization { .. }
             | ExactSelectionErrorKind::GeneratedSelectionMismatch { .. }
@@ -464,7 +456,10 @@ impl EventError for ExactSelectionError {
             | ExactSelectionErrorKind::MalformedSourceHash { .. }
             | ExactSelectionErrorKind::UnexpectedContentDigest { .. }
             | ExactSelectionErrorKind::SourceHashMismatch { .. }
-            | ExactSelectionErrorKind::UnsupportedTopology { .. } => LoreError::InvalidArguments,
+            | ExactSelectionErrorKind::UnsupportedTopology { .. }
+            // `LoreError` has no `LockNotOwned` member; the status (`code()`) is 45. A refusal of
+            // the caller's selection is closest to invalid arguments, never internal.
+            | ExactSelectionErrorKind::LockNotOwned { .. } => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

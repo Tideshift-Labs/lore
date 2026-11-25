@@ -46,6 +46,8 @@ struct Seen {
     logs: Vec<String>,
     /// The status of the last Complete event, if one arrived.
     complete_status: Option<i32>,
+    /// The `(path, owner)` of each `LockFileStatus` event, in arrival order.
+    lock_statuses: Vec<(String, String)>,
 }
 
 fn capture() -> (LoreEventCallback, Arc<Mutex<Seen>>) {
@@ -58,6 +60,10 @@ fn capture() -> (LoreEventCallback, Arc<Mutex<Seen>>) {
         match event {
             LoreEvent::Log(data) => seen.logs.push(data.message.as_str().to_owned()),
             LoreEvent::Error(data) => seen.logs.push(data.error_inner.as_str().to_owned()),
+            LoreEvent::LockFileStatus(data) => seen.lock_statuses.push((
+                data.path.as_str().to_owned(),
+                data.owner.as_str().to_owned(),
+            )),
             LoreEvent::Complete(data) => {
                 seen.complete_status = Some(data.status);
                 seen.logs.push(data.error.message.as_str().to_owned());
@@ -69,6 +75,13 @@ fn capture() -> (LoreEventCallback, Arc<Mutex<Seen>>) {
         }
     }));
     (callback, seen)
+}
+
+fn lock_statuses(seen: &Arc<Mutex<Seen>>) -> Vec<(String, String)> {
+    seen.lock()
+        .expect("the capture mutex must not be poisoned")
+        .lock_statuses
+        .clone()
 }
 
 fn joined(seen: &Arc<Mutex<Seen>>) -> String {
@@ -156,6 +169,20 @@ fn commit(rig: &Rig, refuse: u8, globals: lore::interface::LoreGlobalArgs) -> (i
     (status, joined(&seen))
 }
 
+fn commit_seen(
+    rig: &Rig,
+    refuse: u8,
+    globals: lore::interface::LoreGlobalArgs,
+) -> (i32, String, Vec<(String, String)>) {
+    let (callback, seen) = capture();
+    let status = rig.runtime.block_on(lore::revision::commit(
+        globals,
+        commit_args(refuse),
+        callback,
+    ));
+    (status, joined(&seen), lock_statuses(&seen))
+}
+
 fn lock_status_calls(rig: &Rig) -> usize {
     rig.server.calls_for(LockRpc::Status).len()
 }
@@ -173,18 +200,23 @@ fn a_commit_over_another_users_lock_is_refused_and_not_made() {
         "the change must be staged"
     );
 
-    let (status, log) = commit(&rig, 1, rig.fixture.globals());
+    let (status, log, statuses) = commit_seen(&rig, 1, rig.fixture.globals());
 
     assert_eq!(status, LOCK_NOT_OWNED, "log: {log}");
     assert_eq!(status, 45);
+    assert_eq!(
+        statuses,
+        vec![(F.to_owned(), HOLDER.to_owned())],
+        "the refusing lock must arrive as a LockFileStatus event"
+    );
     assert!(log.contains(F), "the message must name the file: {log}");
     assert!(
         log.contains(HOLDER),
         "the message must name the holder: {log}"
     );
     assert!(
-        log.contains("--ignore-locks"),
-        "the message names the override: {log}"
+        !log.contains("--ignore-locks"),
+        "the library message must not name a CLI flag: {log}"
     );
     assert!(lock_status_calls(&rig) >= 1, "the lock status was asked");
 
@@ -388,6 +420,11 @@ fn local_commit_ahead_of_remote(rig: &Rig) -> Hash {
 }
 
 fn push(rig: &Rig, refuse: bool) -> (i32, String) {
+    let (status, log, _) = push_seen(rig, refuse);
+    (status, log)
+}
+
+fn push_seen(rig: &Rig, refuse: bool) -> (i32, String, Vec<(String, String)>) {
     let (callback, seen) = capture();
     let status = rig
         .runtime
@@ -398,7 +435,7 @@ fn push(rig: &Rig, refuse: bool) -> (i32, String) {
             None,
             refuse,
         ));
-    (status, joined(&seen))
+    (status, joined(&seen), lock_statuses(&seen))
 }
 
 /// B pushes a local commit changing a file A has locked, with the check on: refused, naming the
@@ -409,13 +446,22 @@ fn a_push_over_another_users_lock_is_refused_and_sends_nothing() {
     local_commit_ahead_of_remote(&rig);
     let calls_before = rig.server.revision_calls_for(RevisionRpc::BranchPush).len();
 
-    let (status, log) = push(&rig, true);
+    let (status, log, statuses) = push_seen(&rig, true);
 
     assert_eq!(status, LOCK_NOT_OWNED, "log: {log}");
     assert!(log.contains(F), "the message must name the file: {log}");
     assert!(
         log.contains(HOLDER),
         "the message must name the holder: {log}"
+    );
+    assert!(
+        !log.contains("--ignore-locks"),
+        "the library message must not name a CLI flag: {log}"
+    );
+    assert_eq!(
+        statuses,
+        vec![(F.to_owned(), HOLDER.to_owned())],
+        "the refusing lock must arrive as a LockFileStatus event"
     );
     assert_eq!(
         rig.server.revision_calls_for(RevisionRpc::BranchPush).len(),
@@ -597,7 +643,7 @@ fn delete_f(rig: &Rig) {
     std::fs::remove_file(rig.fixture.path.join(F)).expect("deleting the fixture file");
 }
 
-/// An exact-selection commit of a file another user holds is refused as `InvalidInput`, naming
+/// An exact-selection commit of a file another user holds is refused as `LockNotOwned`, listing
 /// the path and the holder, and no revision is made.
 #[test]
 fn an_exact_selection_commit_over_another_users_lock_is_refused() {
@@ -618,7 +664,6 @@ fn an_exact_selection_commit_over_another_users_lock_is_refused() {
     let error = result.expect_err("another user's lock must refuse");
     // The status is LockNotOwned, as a staged commit's refusal is, not InvalidArguments (3).
     assert_eq!(error.code(), LOCK_NOT_OWNED);
-    assert!(error.is_locked_by_others());
     assert_eq!(
         seen.lock()
             .expect("the capture mutex must not be poisoned")
@@ -626,14 +671,21 @@ fn an_exact_selection_commit_over_another_users_lock_is_refused() {
         Some(LOCK_NOT_OWNED),
         "the Complete event carries the lock status"
     );
-    match error.kind() {
-        lore_revision::exact_selection::ExactSelectionErrorKind::InvalidInput { reason, paths } => {
-            assert_eq!(paths, &vec![F.to_owned()]);
-            assert!(reason.contains(F) && reason.contains(HOLDER), "{reason}");
-            assert_eq!(&error.to_string(), reason, "the plain refusal, no prefix");
+    assert_eq!(
+        error.kind(),
+        &lore_revision::exact_selection::ExactSelectionErrorKind::LockNotOwned {
+            holders: vec![lore_revision::exact_selection::ExactLockHolder {
+                path: F.to_owned(),
+                owner: HOLDER.to_owned(),
+            }],
         }
-        other => panic!("expected InvalidInput, got {other:?}"),
-    }
+    );
+    assert!(!error.to_string().contains("--ignore-locks"));
+    assert_eq!(
+        lock_statuses(&seen),
+        vec![(F.to_owned(), HOLDER.to_owned())],
+        "the refusing lock must arrive as a LockFileStatus event"
+    );
     let (after, _) = anchors(&rig);
     assert_eq!(after, before, "no revision may be made");
 }

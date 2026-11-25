@@ -47,11 +47,9 @@ fn lock(path: &str, owner: &str) -> LockData {
 }
 
 #[test]
-fn refusal_message_names_every_path_and_owner_and_the_hint() {
-    let message = HeldLocks::refusal_message(
-        &[lock("a/one.uasset", "alice"), lock("b/two.uasset", "bob")],
-        "--ignore-locks",
-    );
+fn refusal_message_names_every_path_and_owner_and_is_neutral() {
+    let message =
+        HeldLocks::refusal_message(&[lock("a/one.uasset", "alice"), lock("b/two.uasset", "bob")]);
 
     assert!(message.starts_with("2 file(s) in this change are locked by another user: "));
     assert!(
@@ -62,7 +60,111 @@ fn refusal_message_names_every_path_and_owner_and_the_hint() {
         message.contains("b/two.uasset (locked by bob)"),
         "{message}"
     );
-    assert!(message.contains("pass --ignore-locks"), "{message}");
+    assert!(
+        message.ends_with("Ask the holder to release the lock"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("--ignore-locks"),
+        "the library message must not name a CLI flag: {message}"
+    );
+}
+
+/// The `(path, owner)` of each `LockFileStatus` event a context's dispatcher saw.
+type SeenHolders = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// A context whose dispatcher feeds `LockFileStatus` events to the returned list as
+/// `(path, owner)`.
+fn capturing_context() -> (Arc<lore_revision::interface::ExecutionContext>, SeenHolders) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let callback: lore_revision::interface::LoreEventCallback =
+        Some(Box::new(move |event: &lore_revision::event::LoreEvent| {
+            if let lore_revision::event::LoreEvent::LockFileStatus(data) = event {
+                sink.lock()
+                    .expect("the capture mutex must not be poisoned")
+                    .push((
+                        data.path.as_str().to_owned(),
+                        data.owner.as_str().to_owned(),
+                    ));
+            }
+        }));
+    let context = Arc::new(
+        lore_revision::interface::ExecutionContext::new_client_with_user_id(
+            LoreGlobalArgs::default(),
+            lore_revision::relay::EventDispatcher::new(callback),
+            CALLER.to_string(),
+        ),
+    );
+    (context, seen)
+}
+
+/// Run `refuse_if_held_by_others` over `names` under a capturing context; returns the result and
+/// the `(path, owner)` events seen.
+fn refuse_capturing(rig: &Rig, names: &[&str]) -> (Result<(), CommitError>, Vec<(String, String)>) {
+    let (context, seen) = capturing_context();
+    let dispatch = context.clone();
+    let result = rig.runtime.block_on(LORE_CONTEXT.scope(context, async {
+        let repository = rig.fixture.connect(RepositoryAccess::ReadOnly).await;
+        let (_, branch) = lore_revision::instance::load_current_anchor_boxed(&repository)
+            .await
+            .expect("branch");
+        let result = refuse_if_held_by_others::<CommitError, _>(
+            &repository,
+            std::future::ready(Ok((branch, Some(paths(names))))),
+            "commit",
+        )
+        .await;
+        dispatch.dispatcher.drain().await;
+        result
+    }));
+    let events = seen
+        .lock()
+        .expect("the capture mutex must not be poisoned")
+        .clone();
+    (result, events)
+}
+
+/// A refusal sends one `LockFileStatus` per refusing lock, in path order, before returning.
+#[test]
+fn a_refusal_sends_one_lock_file_status_event_per_lock_in_path_order() {
+    let rig = rig(Some(CALLER));
+    rig.server.set_status_locks(vec![
+        (G.to_owned(), "user-c".to_owned()),
+        (F.to_owned(), HOLDER.to_owned()),
+    ]);
+
+    let (result, events) = refuse_capturing(&rig, &[F, G]);
+
+    assert!(
+        matches!(result, Err(CommitError::LockNotOwned(_))),
+        "{result:?}"
+    );
+    assert_eq!(
+        events,
+        vec![
+            (F.to_owned(), HOLDER.to_owned()),
+            (G.to_owned(), "user-c".to_owned()),
+        ]
+    );
+}
+
+/// No event is sent when nothing refuses: no lock, only the caller's own, or only unattributed.
+#[test]
+fn no_lock_file_status_event_is_sent_when_clear() {
+    let rig = rig(Some(CALLER));
+    for locks in [
+        Vec::new(),
+        vec![(F.to_owned(), CALLER.to_owned())],
+        vec![(F.to_owned(), UNATTRIBUTED_LOCK_OWNER.to_owned())],
+    ] {
+        rig.server.set_status_locks(locks.clone());
+
+        let (result, events) = refuse_capturing(&rig, &[F]);
+
+        assert!(result.is_ok(), "{locks:?}: {result:?}");
+        assert!(events.is_empty(), "{locks:?}: {events:?}");
+    }
 }
 
 /// The connected repository, its branch and the fixture's server, for `identity`.
@@ -218,7 +320,6 @@ fn offline_skips_the_check() {
             &repository,
             std::future::ready(Ok((branch, Some(paths(&[F]))))),
             "commit",
-            "--ignore-locks",
         )
         .await
     }));
@@ -238,7 +339,6 @@ fn a_positive_answer_refuses_with_lock_not_owned() {
             &repository,
             std::future::ready(Ok((branch, Some(paths(&[F, G]))))),
             "commit",
-            "--ignore-locks",
         )
         .await
     });
@@ -261,14 +361,12 @@ fn a_failed_path_lookup_or_nothing_to_check_goes_ahead() {
             &repository,
             std::future::ready(Err("the base revision is not local".to_owned())),
             "commit",
-            "--ignore-locks",
         )
         .await;
         let nothing = refuse_if_held_by_others::<CommitError, _>(
             &repository,
             std::future::ready(Ok((branch, None))),
             "push",
-            "--ignore-locks",
         )
         .await;
         (failed, nothing)
@@ -400,7 +498,6 @@ fn only_unattributed_locks_are_unknown_not_refused() {
             &repository,
             std::future::ready(Ok((branch, Some(paths(&[F]))))),
             "commit",
-            "--ignore-locks",
         )
         .await;
         (answer, refusal)
@@ -494,7 +591,6 @@ fn a_staged_delete_names_the_deleted_path() {
                     .map(|(branch, paths)| (branch, Some(paths)))
             },
             "commit",
-            "--ignore-locks",
         )
         .await
     });
@@ -700,7 +796,6 @@ fn a_lock_on_a_moved_directorys_child_old_path_refuses() {
                     .map(|(branch, paths)| (branch, Some(paths)))
             },
             "commit",
-            "--ignore-locks",
         )
         .await
     });

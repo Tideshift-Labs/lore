@@ -117,6 +117,10 @@ pub struct LoreLockFileStatusBeginEventData {
 }
 
 /// Data for an event reporting the lock status of a single path.
+///
+/// FORK-LOCAL (Tideshift): also sent by a commit or a push, without a `LockFileStatusBegin`, once
+/// per lock another user holds on a path it would change, just before the operation is refused
+/// with `LockNotOwned` (see `lock::file::held::find_held_by_others`).
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]

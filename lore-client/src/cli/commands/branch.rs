@@ -1077,13 +1077,16 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             .with_defaults(),
     ));
 
-    return runtime().block_on(branch::push_managed_refusing_others_locks(
+    let status = runtime().block_on(branch::push_managed_refusing_others_locks(
         globals,
         push_args,
         callback,
         None,
         !args.ignore_locks,
     )) as u8;
+    // FORK-LOCAL (Tideshift): the library's lock refusal is neutral; the CLI names its override.
+    super::revision::print_ignore_locks_hint(status, !args.ignore_locks);
+    status
 }
 
 fn handle_branch_merge_unresolve(globals: LoreGlobalArgs, args: &BranchMergeUnresolveArgs) -> u8 {

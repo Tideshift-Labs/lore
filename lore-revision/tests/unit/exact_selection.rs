@@ -388,29 +388,47 @@ fn normalized(path: &str, expected_action: ExpectedFileAction) -> NormalizedSele
 }
 
 #[test]
-fn locked_by_others_refusal_has_lock_status_plain_message_and_invalid_input_kind() {
-    let reason = "f.file is locked by someone".to_owned();
-    let paths = vec!["f.file".to_owned()];
-    let error = ExactSelectionError::locked_by_others(reason.clone(), paths.clone());
+fn lock_not_owned_has_lock_status_neutral_message_and_structured_kind() {
+    let holders = vec![
+        ExactLockHolder {
+            path: "f.file".to_owned(),
+            owner: "user-a".to_owned(),
+        },
+        ExactLockHolder {
+            path: "g.file".to_owned(),
+            owner: "user-c".to_owned(),
+        },
+    ];
+    let error = ExactSelectionError::new(ExactSelectionErrorKind::LockNotOwned {
+        holders: holders.clone(),
+    });
 
     assert_eq!(error.code(), 45);
-    assert!(error.is_locked_by_others());
-    assert_eq!(error.to_string(), reason);
+    assert!(matches!(
+        lore_revision::event::EventError::translated(&error),
+        LoreError::InvalidArguments
+    ));
     assert_eq!(
-        error.kind(),
-        &ExactSelectionErrorKind::InvalidInput {
-            reason: reason.clone(),
-            paths: paths.clone(),
-        }
+        error.to_string(),
+        "2 file(s) in this change are locked by another user: f.file (locked by user-a), \
+         g.file (locked by user-c). Ask the holder to release the lock"
     );
+    assert!(!error.to_string().contains("--ignore-locks"));
+
+    let json = serde_json::to_value(error.kind()).expect("serialize lock refusal kind");
     assert_eq!(
-        serde_json::to_value(error.kind()).expect("serialize lock refusal kind"),
+        json,
         serde_json::json!({
-            "kind": "invalidInput",
-            "reason": reason,
-            "paths": paths,
+            "kind": "lockNotOwned",
+            "holders": [
+                {"path": "f.file", "owner": "user-a"},
+                {"path": "g.file", "owner": "user-c"},
+            ],
         })
     );
+    let read: ExactSelectionErrorKind =
+        serde_json::from_value(json).expect("deserialize lock refusal kind");
+    assert_eq!(read, ExactSelectionErrorKind::LockNotOwned { holders });
 }
 
 #[test]
@@ -422,7 +440,6 @@ fn plain_invalid_input_keeps_argument_status_and_prefixed_message() {
 
     assert_eq!(error.code(), LoreError::InvalidArguments as i32);
     assert_eq!(error.code(), 3);
-    assert!(!error.is_locked_by_others());
     assert_eq!(error.to_string(), "invalid exact-selection input: bad");
 }
 

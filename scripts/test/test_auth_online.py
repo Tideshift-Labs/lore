@@ -1290,10 +1290,12 @@ def test_cli_admin_grant_releases_anothers_lock(auth_env, make_actor):
 # Fork (Tideshift): the FFI code of `LockNotOwned`, the CLI's exit status for a
 # commit or push refused over another user's lock.
 LOCK_NOT_OWNED = 45
-# The refusal sentence, naming each file and holder and the override.
+# The library's neutral refusal sentence, naming each file and holder.
 LOCK_REFUSAL = re.compile(
-    r"\d+ file\(s\) in this change are locked by another user: .*--ignore-locks to go ahead anyway"
+    r"\d+ file\(s\) in this change are locked by another user: .*Ask the holder to release the lock"
 )
+# The CLI's own way past the refusal, printed after it.
+IGNORE_LOCKS_HINT = "Pass --ignore-locks to go ahead anyway."
 
 
 def refused_status(action) -> tuple[int | None, str]:
@@ -1348,7 +1350,8 @@ def test_cli_refuses_a_commit_and_push_over_another_users_lock(auth_env, make_ac
         lambda: member.repo.revision_commit("over the owner's lock")
     )
     assert status == LOCK_NOT_OWNED, message
-    assert "locked.txt" in message and "--ignore-locks" in message, message
+    assert "locked.txt (locked by mock-user-1)" in message, message
+    assert IGNORE_LOCKS_HINT in message, message
     staged_refusal = LOCK_REFUSAL.search(message)
     assert staged_refusal, message
 
@@ -1370,12 +1373,32 @@ def test_cli_refuses_a_commit_and_push_over_another_users_lock(auth_env, make_ac
     exact_refusal = LOCK_REFUSAL.search(message)
     assert exact_refusal, message
     assert exact_refusal.group(0) == staged_refusal.group(0), message
+    assert IGNORE_LOCKS_HINT in message, message
+
+    # Under --json the refusal is the typed kind, holders as data.
+    status, message = refused_status(
+        lambda: member.repo.run(
+            [
+                "--json",
+                "revision",
+                "commit",
+                "exact over the owner's lock",
+                "--exact-selection",
+                str(selection),
+            ]
+        )
+    )
+    assert status == LOCK_NOT_OWNED, message
+    assert '"kind":"lockNotOwned"' in message, message
+    assert '"holders":[{"path":"locked.txt","owner":"mock-user-1"}]' in message, message
+    assert IGNORE_LOCKS_HINT not in message, "no plain-text hint under --json"
 
     # The override commits; the push is then refused on its own check.
     member.repo.run(["revision", "commit", "over the lock anyway", "--ignore-locks"])
     status, message = refused_status(lambda: member.repo.push())
     assert status == LOCK_NOT_OWNED, message
-    assert "locked.txt" in message, message
+    assert LOCK_REFUSAL.search(message), message
+    assert IGNORE_LOCKS_HINT in message, message
     member.repo.run(["push", "--ignore-locks"])
 
     # The holder's own work on the file is not refused.

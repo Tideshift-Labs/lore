@@ -57,3 +57,14 @@ fn branch_push_calls_no_other_push_entry() {
         );
     }
 }
+
+/// The library's lock refusal is neutral, so the push handler prints the CLI's override hint
+/// from the push status, keyed on the same flag that turned the check on.
+#[test]
+fn branch_push_prints_the_ignore_locks_hint() {
+    let handler = push_handler();
+    assert!(
+        handler.contains("print_ignore_locks_hint(status, !args.ignore_locks)"),
+        "the push handler must print the hint when the check was on: {handler}"
+    );
+}

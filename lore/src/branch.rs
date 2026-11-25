@@ -1180,7 +1180,7 @@ async fn refuse_push_over_others_locks(
             .await
             .map(|paths| (branch, paths))
     };
-    held::refuse_if_held_by_others(repository, change, "push", "--ignore-locks").await
+    held::refuse_if_held_by_others(repository, change, "push").await
 }
 
 async fn push_impl_with_runner(

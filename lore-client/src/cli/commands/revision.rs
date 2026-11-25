@@ -1233,8 +1233,12 @@ fn handle_revision_commit_exact_selection(
         }
         Err(error) => {
             // FORK-LOCAL (Tideshift): a lock refusal reads as a staged commit's does, in plain
-            // words; `--json` still prints the structured kind.
-            let json = if error.is_locked_by_others() && !json_output {
+            // words with the CLI's override hint; `--json` prints the structured kind.
+            let lock_refusal = matches!(
+                error.kind(),
+                lore_revision::exact_selection::ExactSelectionErrorKind::LockNotOwned { .. }
+            );
+            let json = if lock_refusal && !json_output {
                 None
             } else {
                 selection_json(error.kind(), json_output)
@@ -1244,10 +1248,29 @@ fn handle_revision_commit_exact_selection(
             } else {
                 eprintln!("Exact-selection commit refused: {error}");
             }
+            if lock_refusal && !json_output {
+                eprintln!("{IGNORE_LOCKS_HINT}");
+            }
             // The status code, not `translated()`: `LoreError` has no `LockNotOwned` member, so a
             // lock refusal would otherwise exit as `InvalidArguments`.
             error.code() as u8
         }
+    }
+}
+
+/// FORK-LOCAL (Tideshift): the exit status of a commit or push refused over another user's lock
+/// (`lore_base::error::LockNotOwned`'s FFI code).
+pub(crate) const LOCK_NOT_OWNED_STATUS: u8 = 45;
+
+/// FORK-LOCAL (Tideshift): the CLI's own way past a lock refusal. The library's refusal message is
+/// neutral, so the CLI adds this.
+pub(crate) const IGNORE_LOCKS_HINT: &str = "Pass --ignore-locks to go ahead anyway.";
+
+/// Print [`IGNORE_LOCKS_HINT`] after a lock refusal, when the lock check was on. Not under
+/// `--json`, whose output a caller parses.
+pub(crate) fn print_ignore_locks_hint(status: u8, checked: bool) {
+    if checked && status == LOCK_NOT_OWNED_STATUS && !config().json {
+        eprintln!("{IGNORE_LOCKS_HINT}");
     }
 }
 
@@ -1395,6 +1418,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
     // If the revision commit returned an error then don't bother resolving usernames
     if commit_result != 0 {
         println!("{}Commit failed{}", CommonStyles::FAILURE, anstyle::Reset);
+        print_ignore_locks_hint(commit_result, !args.ignore_locks);
         return commit_result;
     }
 

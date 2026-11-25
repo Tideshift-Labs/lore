@@ -17,7 +17,10 @@ use std::time::Duration;
 use lore_base::types::LockData;
 
 use crate::branch;
+use crate::event::LoreEvent;
 use crate::filter::FilterMode;
+use crate::interface::LoreString;
+use crate::lock::file::status::LoreLockFileStatusEventData;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lore::BranchId;
@@ -49,18 +52,29 @@ pub enum HeldLocks {
 
 impl HeldLocks {
     /// The refusal message for [`HeldLocks::ByOthers`], naming each path and its holder.
-    pub fn refusal_message(locks: &[LockData], override_hint: &str) -> String {
-        let listed = locks
-            .iter()
-            .map(|lock| format!("{} (locked by {})", lock.resource.description, lock.owner))
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!(
-            "{} file(s) in this change are locked by another user: {listed}. Ask the holder to \
-             release the lock, or pass {override_hint} to go ahead anyway",
-            locks.len()
+    ///
+    /// Neutral wording: how to go ahead anyway depends on the caller (the CLI adds its own
+    /// `--ignore-locks` hint).
+    pub fn refusal_message(locks: &[LockData]) -> String {
+        refusal_text(
+            locks
+                .iter()
+                .map(|lock| (lock.resource.description.as_str(), lock.owner.as_str())),
         )
     }
+}
+
+/// The neutral refusal text for `(path, holder)` pairs, shared by every lock refusal.
+pub fn refusal_text<'a>(holders: impl Iterator<Item = (&'a str, &'a str)>) -> String {
+    let listed = holders
+        .map(|(path, owner)| format!("{path} (locked by {owner})"))
+        .collect::<Vec<_>>();
+    format!(
+        "{} file(s) in this change are locked by another user: {}. Ask the holder to release the \
+         lock",
+        listed.len(),
+        listed.join(", ")
+    )
 }
 
 /// Refuse `action` when another user holds a lock on one of the paths it would change.
@@ -68,13 +82,13 @@ impl HeldLocks {
 /// `change` finds the branch and the paths, as [`staged_change_paths`] or [`push_change_paths`]
 /// do; `None` paths means there is nothing to check. Finding the change and the lookup together
 /// are bounded by [`LOCK_CHECK_TIMEOUT`]. Returns `LockNotOwned`, with a message naming each path
-/// and holder, only on a positive answer. Anything that keeps the question from being answered is
-/// logged as a warning and lets the action go ahead.
+/// and holder, only on a positive answer; each lock is also sent as a `LockFileStatus` event (see
+/// [`find_held_by_others`]). Anything that keeps the question from being answered is logged as a
+/// warning and lets the action go ahead.
 pub async fn refuse_if_held_by_others<E, F>(
     repository: &Arc<RepositoryContext>,
     change: F,
     action: &str,
-    override_hint: &str,
 ) -> Result<(), E>
 where
     E: lore_error_set::ErrorSet + From<lore_base::error::LockNotOwned>,
@@ -83,7 +97,7 @@ where
     match find_held_by_others(repository, change, action).await {
         None => Ok(()),
         Some(locks) => {
-            let message = HeldLocks::refusal_message(&locks, override_hint);
+            let message = HeldLocks::refusal_message(&locks);
             let mut error = E::from(lore_base::error::LockNotOwned);
             lore_error_set::ErrorSet::push_trace(
                 &mut error,
@@ -101,7 +115,8 @@ where
 
 /// The locks another user holds on the paths `change` finds, for a caller that builds its own
 /// refusal. `None` when nothing refuses: no such lock, or no answer (logged as a warning, as
-/// [`refuse_if_held_by_others`] does).
+/// [`refuse_if_held_by_others`] does). When it answers `Some`, each lock has been sent as a
+/// `LockFileStatus` event, in path order, so an event consumer can read the holders as data.
 pub async fn find_held_by_others<F>(
     repository: &Arc<RepositoryContext>,
     change: F,
@@ -143,7 +158,20 @@ where
             );
             None
         }
-        HeldLocks::ByOthers(locks) => Some(locks),
+        HeldLocks::ByOthers(locks) => {
+            // The existing `LockFileStatus` event carries exactly a holder's data, so a C API
+            // caller reads the refusing locks without a new event: `LoreEvent` is at bitcode's
+            // 256-variant limit.
+            for lock in &locks {
+                LoreEvent::LockFileStatus(LoreLockFileStatusEventData {
+                    path: LoreString::from(lock.resource.description.as_str()),
+                    owner: LoreString::from(lock.owner.as_str()),
+                    locked_at: lock.locked_at,
+                })
+                .send();
+            }
+            Some(locks)
+        }
     }
 }
 
