@@ -218,4 +218,59 @@ mod attempts {
              the one stamped on the request"
         );
     }
+
+    /// FORK-LOCAL (Tideshift, CR-019): the server's push-lock refusal reaches the push as
+    /// `BranchPushError::LockNotOwned`. It is a decisive answer, so the attempt settles `NotApplied`
+    /// and nothing stays unresolved; forwarded into `PushError` it stays `LockNotOwned`
+    /// (ffi code 45), not `NotAuthorized`.
+    #[tokio::test]
+    async fn a_lock_refusal_settles_not_applied_and_forwards_as_lock_not_owned() {
+        use lore_error_set::FfiError;
+        use lore_error_set::ForwardStrict;
+        use lore_revision::branch::push::PushError;
+        use lore_transport::BranchPushError;
+        use lore_transport::attempt_store::AttemptResolution;
+        use lore_transport::attempt_store::AttemptState;
+
+        let store = store();
+        let attempt = AttemptId::new();
+        let result = under_named_attempt(
+            Some(&store),
+            attempt,
+            repository(),
+            GrpcRpc::RevisionBranchPush,
+            async { Err::<(), _>(BranchPushError::from(lore_base::error::LockNotOwned)) },
+        )
+        .await;
+
+        let error = result.expect_err("a lock refusal is an error");
+        assert!(
+            matches!(error, BranchPushError::LockNotOwned(_)),
+            "{error:?}"
+        );
+        assert!(!error.is_outcome_unknown(), "{error:?}");
+        assert!(
+            store
+                .unresolved()
+                .await
+                .expect("reading the store")
+                .is_empty(),
+            "a decisive refusal must not block the repository"
+        );
+        assert_eq!(
+            store
+                .lookup(&attempt)
+                .await
+                .expect("reading the store")
+                .expect("the attempt was recorded")
+                .state,
+            AttemptState::Resolved(AttemptResolution::NotApplied)
+        );
+
+        let pushed: PushError = Err::<(), _>(error)
+            .forward::<PushError>("pushing branch to remote")
+            .unwrap_err();
+        assert!(matches!(pushed, PushError::LockNotOwned(_)), "{pushed:?}");
+        assert_eq!(pushed.ffi_code(), 45);
+    }
 }

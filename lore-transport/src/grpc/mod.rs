@@ -1347,6 +1347,37 @@ pub(crate) fn carries_branch_advanced(status: &Status) -> bool {
     status.details().len() == size_of::<Hash>()
 }
 
+/// FORK-LOCAL (Tideshift, CR-019): the metadata key of a server's push refusal reason.
+pub const PUSH_REFUSAL_HEADER: &str = "lore-push-refusal-v1";
+
+/// FORK-LOCAL (Tideshift, CR-019): the [`PUSH_REFUSAL_HEADER`] value of a push that changes a
+/// path another owner holds a lock on.
+pub const PUSH_REFUSAL_LOCK_NOT_OWNED: &str = "lock-not-owned";
+
+/// FORK-LOCAL (Tideshift, CR-019): encode the server's refusal of a branch push that changes a
+/// path another owner holds a lock on.
+///
+/// The code stays `PERMISSION_DENIED`, so a client without this mapping still reads a decisive
+/// `NotAuthorized` refusal. The marker is metadata, not details: the details of a branch push's
+/// status are already read by length ([`branch_advanced_status`], [`address_not_found_status`]).
+pub fn push_lock_refused_status(message: impl Into<String>) -> Status {
+    let mut status = Status::permission_denied(message);
+    status.metadata_mut().insert(
+        PUSH_REFUSAL_HEADER,
+        tonic::metadata::MetadataValue::from_static(PUSH_REFUSAL_LOCK_NOT_OWNED),
+    );
+    status
+}
+
+/// FORK-LOCAL (Tideshift, CR-019): whether `status` is [`push_lock_refused_status`]'s refusal.
+pub(crate) fn carries_push_lock_refused(status: &Status) -> bool {
+    status.code() == tonic::Code::PermissionDenied
+        && status
+            .metadata()
+            .get(PUSH_REFUSAL_HEADER)
+            .is_some_and(|value| value.as_bytes() == PUSH_REFUSAL_LOCK_NOT_OWNED.as_bytes())
+}
+
 /// [`handle_error`] for a branch push, whose statuses map as
 /// [`branch_push_error`](crate::error::branch_push_error) maps them. A `RESOURCE_EXHAUSTED` takes
 /// the fork split in `handle_error`: only the server's own back-pressure is waited out; a lost

@@ -329,9 +329,12 @@ impl RevisionService {
                     let response = match client.branch_push(request).await {
                         Ok(response) => response.into_inner(),
                         Err(status) => {
+                            // CR-019's lock refusal is kept aside the same way, so it stays
+                            // `LockNotOwned` rather than `NotAuthorized` once settled.
                             if matches!(
                                 crate::error::branch_push_error(status.clone()),
                                 BranchPushError::BranchAdvanced(_)
+                                    | BranchPushError::LockNotOwned(_)
                             ) && let Ok(mut kept) = refusal.lock()
                             {
                                 *kept = Some(status.clone());

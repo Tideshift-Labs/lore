@@ -372,6 +372,33 @@ async fn a_managed_plain_refusal_stays_decisive() {
     );
 }
 
+/// FORK-LOCAL (Tideshift, CR-019): the managed push answers the server's marked lock refusal as
+/// `LockNotOwned`, not `NotAuthorized`; the answer is decisive and the attempt settles not applied.
+#[tokio::test]
+async fn a_managed_lock_refusal_stays_lock_not_owned_and_settles_not_applied() {
+    let f = Fixture::new(lore_transport::grpc::push_lock_refused_status(
+        "push blocked: 1 file(s) changed are locked by another user: 'a.bin' is locked by alice",
+    ))
+    .await;
+
+    let error = f.managed_push().await.err().expect("a refusal is an error");
+
+    assert!(
+        matches!(error, BranchPushError::LockNotOwned(_)),
+        "{error:?}"
+    );
+    assert!(
+        !error.is_outcome_unknown() && !matches!(error, BranchPushError::NotAuthorized(_)),
+        "{error:?}"
+    );
+    assert_eq!(f.pushes(), 1, "a refusal is never sent again");
+    assert_eq!(
+        f.the_attempt().await,
+        AttemptState::Resolved(AttemptResolution::NotApplied)
+    );
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
+}
+
 /// Unmanaged classified path: a lost answer is `OutcomeUnknown`, the call is sent once and the
 /// channel is never rebuilt for a replay.
 #[tokio::test]

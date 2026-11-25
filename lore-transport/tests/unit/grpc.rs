@@ -398,6 +398,102 @@ fn an_unknown_outcome_marker_outranks_the_branch_advanced_details() {
     );
 }
 
+/// FORK-LOCAL (Tideshift, CR-019): the server's marked lock refusal is `LockNotOwned` and keeps
+/// the server's message on its trace; the same code without the marker stays `NotAuthorized`.
+#[test]
+fn a_marked_lock_refusal_of_a_branch_push_is_lock_not_owned_with_the_servers_message() {
+    let message =
+        "push blocked: 1 file(s) changed are locked by another user: 'a.bin' is locked by alice";
+    let error = branch_push_error(push_lock_refused_status(message));
+
+    assert!(
+        matches!(error, lore_transport::BranchPushError::LockNotOwned(_)),
+        "{error:?}"
+    );
+    assert!(
+        !error.is_outcome_unknown() && !error.is_not_authorized(),
+        "{error:?}"
+    );
+    assert!(
+        error.trace().locations().iter().any(|location| location
+            .context()
+            .is_some_and(|context| context.contains(message))),
+        "{error:?}"
+    );
+    // The marker is the documented wire contract, pinned by value.
+    let status = push_lock_refused_status("x");
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert_eq!(
+        status
+            .metadata()
+            .get("lore-push-refusal-v1")
+            .map(|value| value.as_bytes()),
+        Some(b"lock-not-owned".as_slice())
+    );
+
+    // Negative control: an unmarked `PERMISSION_DENIED` is still `NotAuthorized`.
+    let unmarked = branch_push_error(Status::permission_denied("protected branch"));
+    assert!(
+        matches!(unmarked, lore_transport::BranchPushError::NotAuthorized(_)),
+        "{unmarked:?}"
+    );
+}
+
+/// FORK-LOCAL (Tideshift, CR-019): the marker is read only on `PERMISSION_DENIED`.
+#[test]
+fn the_lock_refusal_marker_on_another_code_is_ignored() {
+    for code in [
+        tonic::Code::FailedPrecondition,
+        tonic::Code::Aborted,
+        tonic::Code::Internal,
+        tonic::Code::Unauthenticated,
+    ] {
+        let mut status = Status::new(code, "locked");
+        status.metadata_mut().insert(
+            PUSH_REFUSAL_HEADER,
+            PUSH_REFUSAL_LOCK_NOT_OWNED.parse().unwrap(),
+        );
+        let error = branch_push_error(status);
+        assert!(
+            !matches!(error, lore_transport::BranchPushError::LockNotOwned(_)),
+            "{code:?}: {error:?}"
+        );
+    }
+}
+
+/// FORK-LOCAL (Tideshift, CR-019): another marker value is not the lock refusal.
+#[test]
+fn another_push_refusal_marker_value_is_not_a_lock_refusal() {
+    let mut status = Status::permission_denied("refused");
+    status
+        .metadata_mut()
+        .insert(PUSH_REFUSAL_HEADER, "something-else".parse().unwrap());
+    let error = branch_push_error(status);
+    assert!(
+        matches!(error, lore_transport::BranchPushError::NotAuthorized(_)),
+        "{error:?}"
+    );
+}
+
+/// FORK-LOCAL (Tideshift, CR-019): a fork outcome marker outranks the lock refusal, so a push
+/// that may have applied is never reported as refused.
+#[test]
+fn an_unknown_outcome_marker_outranks_the_lock_refusal_marker() {
+    let mut status = push_lock_refused_status("locked");
+    status.metadata_mut().insert(
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+            .parse()
+            .unwrap(),
+    );
+    let error = branch_push_error(status);
+    assert!(
+        error.is_outcome_unknown()
+            && !matches!(error, lore_transport::BranchPushError::LockNotOwned(_)),
+        "{error:?}"
+    );
+}
+
 /// The other fork markers that `ProtocolError`'s mapping reads before any branch on the code also
 /// win over the details: a tonic lost response (the server produced a message this client could
 /// not read) and a client-admission refusal.

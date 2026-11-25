@@ -621,6 +621,11 @@ pub enum BranchPushError {
     NotSupported,
     Oversized,
     BranchAdvanced,
+    /// FORK-LOCAL (Tideshift, CR-019): the remote refused the push because it changes a path
+    /// another owner holds a lock on
+    /// ([`push_lock_refused_status`](crate::grpc::push_lock_refused_status)). A decisive refusal:
+    /// the push is not applied.
+    LockNotOwned,
     /// FORK-LOCAL (Tideshift, WP-120): a dispatched branch push whose outcome is not known, as
     /// [`ProtocolError::OutcomeUnknown`]. Without it the strict forward below could not carry an
     /// unknown outcome, and a lax one would turn it into `Internal`, which a caller's journal
@@ -874,6 +879,11 @@ pub(crate) fn branch_push_error(status: tonic::Status) -> BranchPushError {
         && !carries_fork_marker(&status)
     {
         return with_remote_reason(BranchPushError::from(BranchAdvanced), &status);
+    }
+    // FORK-LOCAL (Tideshift, CR-019): the server's push-lock refusal. The marker is read only on
+    // `PERMISSION_DENIED` and only when no fork outcome marker outranks it.
+    if crate::grpc::carries_push_lock_refused(&status) && !carries_fork_marker(&status) {
+        return with_remote_reason(BranchPushError::from(LockNotOwned), &status);
     }
     BranchPushError::from(ProtocolError::from(status))
 }
