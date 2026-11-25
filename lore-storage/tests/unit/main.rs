@@ -22,6 +22,7 @@ mod maintenance;
 mod mutable_conformance;
 mod mutable_store;
 mod packstore;
+mod protocol_error_mapping;
 mod read;
 mod read_flight;
 mod store_fixture;

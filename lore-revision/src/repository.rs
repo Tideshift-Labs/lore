@@ -5408,13 +5408,26 @@ pub async fn metadata_store_hash(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
+/// FORK-LOCAL (Tideshift): the context a read of repository metadata is forwarded with. A read that
+/// failed because the remote could not be reached is not evidence that the repository is missing,
+/// so only other failures say "Repository not found".
+#[lore_macro::test_pub]
+fn metadata_read_context<T>(read: &Result<T, crate::metadata::MetadataError>) -> &'static str {
+    match read {
+        Err(err) if err.is_disconnected() => "Failed to read repository metadata from the remote",
+        _ => "Repository not found",
+    }
+}
+
 pub async fn metadata(
     repository: Arc<RepositoryContext>,
     metadata: Hash,
 ) -> Result<RepositoryMetadata, RepositoryError> {
-    let metadata = Metadata::deserialize(repository, metadata)
-        .await
-        .forward::<RepositoryError>("Repository not found")?;
+    let metadata = Metadata::deserialize(repository, metadata).await;
+    // FORK-LOCAL (Tideshift): a remote that could not be reached says nothing about whether the
+    // repository exists, so its failure does not claim "not found".
+    let context = metadata_read_context(&metadata);
+    let metadata = metadata.forward::<RepositoryError>(context)?;
 
     Ok(RepositoryMetadata {
         name: metadata

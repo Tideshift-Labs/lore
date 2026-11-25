@@ -575,6 +575,29 @@ async fn cache_target_fragments(
     Ok(())
 }
 
+/// FORK-LOCAL (Tideshift): fails as `Disconnected` where the repository's remote, or the remote's
+/// storage, could not be reached. Every other outcome passes: no remote, an offline command, and a
+/// refusal, which the sync reports as a warning as before.
+///
+/// The remote's connect waits for the storage pre-warm (see `remote_connect`), so the storage
+/// readiness read here is already settled and costs no second handshake.
+#[lore_macro::test_pub]
+async fn require_remote_reachable(repository: &Arc<RepositoryContext>) -> Result<(), SyncError> {
+    let reached = match repository.remote().await {
+        Ok(remote) => match remote.ensure_storage_connected().await {
+            Err(lore_transport::ProtocolError::Disconnected(disconnected)) => {
+                Err(SyncError::Disconnected(disconnected))
+            }
+            _ => Ok(()),
+        },
+        Err(lore_transport::ProtocolError::Disconnected(disconnected)) => {
+            Err(SyncError::Disconnected(disconnected))
+        }
+        Err(_) => Ok(()),
+    };
+    reached.forward::<SyncError>("Unable to sync: the remote could not be reached")
+}
+
 /// Carries the working tree to the revision, and the view, a sync resolves.
 ///
 /// `repository` is the context the instance holds, and answers for what the working tree stands
@@ -717,6 +740,14 @@ pub(crate) async fn sync(
         unauthenticated: remote_unauthenticated,
         ..
     } = branch::resolve_remote_latest(&repository, anchor_branch).await;
+    // FORK-LOCAL (Tideshift): a sync to the branch latest fails closed when the remote, or its
+    // storage, cannot be reached. Without this, a front that passes TCP and drops UDP let the
+    // revision service answer while storage was unreachable, and the sync said "Already on branch
+    // latest" and exited 0 without proving it could fetch anything. A reset and a view change
+    // keep working offline against local history, as before.
+    if options.revision.is_none() && !options.reset && !view_change {
+        Box::pin(require_remote_reachable(&repository)).await?;
+    }
     let remote_latest = remote_latest.unwrap_or_default();
     lore_debug!("Remote latest revision is {remote_latest}");
 

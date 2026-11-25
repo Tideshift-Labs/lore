@@ -1183,9 +1183,15 @@ pub async fn clone(
 
         repository.set_disable_upload(true);
 
-        repository::metadata(repository, repository_data.metadata)
-            .await
-            .forward::<CloneError>("Repository not found")?
+        {
+            // FORK-LOCAL (Tideshift): an unreachable remote is not a missing repository.
+            let metadata = repository::metadata(repository, repository_data.metadata).await;
+            let context = match &metadata {
+                Err(err) if err.is_disconnected() => "Failed to load the repository to clone",
+                _ => "Repository not found",
+            };
+            metadata.forward::<CloneError>(context)?
+        }
     };
 
     // Mint a single write token at the start of clone and share siblings into

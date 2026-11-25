@@ -1953,6 +1953,9 @@ fn state_data_read_failure(err: ImmutableError) -> StateError {
         ImmutableError::SlowDown(traced) => StateError::SlowDown(traced),
         ImmutableError::NotAuthenticated(traced) => StateError::NotAuthenticated(traced),
         ImmutableError::NotAuthorized(traced) => StateError::NotAuthorized(traced),
+        // FORK-LOCAL (Tideshift): an unreachable remote stays `Disconnected` (exit 28), which an
+        // embedder maps to offline, rather than an internal failure (exit 255).
+        ImmutableError::Disconnected(traced) => StateError::Disconnected(traced),
         err => StateError::internal_with_context(err, "Failed to read state data"),
     }
 }

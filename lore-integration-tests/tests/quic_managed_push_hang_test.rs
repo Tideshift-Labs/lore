@@ -1161,6 +1161,91 @@ mod hang {
             });
         }
 
+        /// Take the repository's connection out of the connection cache, so the next open builds a
+        /// new one whose FIRST QUIC connect is the one that meets a dead path. A cached connection
+        /// that reconnects dies through the managed reconnect bound instead, which is another path.
+        async fn forget_cached_connection(live: &Live) {
+            let path = live.source.clone();
+            LORE_CONTEXT
+                .scope(live.execution("k10-forget"), async {
+                    let context = lore_revision::repository::load_and_connect(
+                        path.as_path(),
+                        RepositoryAccess::ReadOnly,
+                    )
+                    .await
+                    .expect("opening the repository");
+                    let connection = context.remote().await.expect("the live connection");
+                    lore_transport::connection::remove_connection(connection);
+                })
+                .await;
+        }
+
+        /// What one handshake timeout allows a command: the handshake is a fixed 5 s, so a second
+        /// one (10 s) fails this and one handshake plus the command's own work passes.
+        const HANDSHAKE_SECS: u64 = 5;
+        const ONE_HANDSHAKE_LIMIT: Duration = Duration::from_millis(HANDSHAKE_SECS * 1000 + 2500);
+
+        /// A connection that has never connected, with the path dead from its FIRST QUIC connect:
+        /// the connect fails `Disconnected` after the fixed handshake timeout (not a managed
+        /// reconnect expiry). The managed commit costs one handshake timeout, not two, and its
+        /// fragments stay local for the push once the path is back.
+        ///
+        /// The clock bounds the command; it does not show how the uploads ended. Measured, the
+        /// first upload fails at once on the connection's settled storage readiness, whatever
+        /// the pre-warm did, so the command ends at one handshake either way (5.09 s).
+        #[test]
+        fn a_managed_commit_on_a_fresh_connection_with_a_dead_quic_path_ends_at_one_handshake() {
+            lore::runtime().block_on(async {
+                let mut live = Live::start().await;
+                assert_eq!(live.push().await, 0, "draining push");
+                live.stage_file("fresh.txt").await;
+                forget_cached_connection(&live).await;
+
+                let (elapsed, _latched, _declared, black_hole) =
+                    low_level_commit(&mut live, "fresh", true, false, true).await;
+                eprintln!("MEASURED fresh connection, dead QUIC path, managed commit: {elapsed:?}");
+                assert!(
+                    elapsed >= Duration::from_secs(HANDSHAKE_SECS) - Duration::from_millis(500),
+                    "the open never met the dead path: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < ONE_HANDSHAKE_LIMIT,
+                    "one handshake timeout, not two: {elapsed:?}"
+                );
+
+                live.restore_quic(black_hole).await;
+                let before = puts(&live);
+                assert_eq!(live.push().await, 0, "push after the path is back");
+                assert!(
+                    puts(&live) > before,
+                    "the commit left its fragments local, so the push uploads them"
+                );
+            });
+        }
+
+        /// The STOCK commit (no scope) on a fresh connection with a dead path: the same one
+        /// handshake timeout, so the managed commit adds nothing to the stock cost.
+        #[test]
+        fn a_stock_commit_on_a_fresh_connection_with_a_dead_quic_path_ends_at_one_handshake() {
+            lore::runtime().block_on(async {
+                let mut live = Live::start().await;
+                assert_eq!(live.push().await, 0, "draining push");
+                live.stage_file("fresh-stock.txt").await;
+                forget_cached_connection(&live).await;
+                let (elapsed, _, _, _black_hole) =
+                    low_level_commit(&mut live, "fresh-stock", true, false, false).await;
+                eprintln!("MEASURED stock commit, fresh connection, dead QUIC path: {elapsed:?}");
+                assert!(
+                    elapsed >= Duration::from_secs(HANDSHAKE_SECS) - Duration::from_millis(500),
+                    "the open never met the dead path: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < ONE_HANDSHAKE_LIMIT,
+                    "one handshake timeout, not two: {elapsed:?}"
+                );
+            });
+        }
+
         /// Order 2, the latch path: the pre-warm succeeded and the path dies before the first
         /// upload. The first upload's reconnect expires at the bound and latches the scope; the rest
         /// skip. One bound in all.

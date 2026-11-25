@@ -58,6 +58,7 @@ mod service_state;
 mod stage;
 mod state;
 mod store;
+mod unreachable_remote;
 mod util;
 /// The seeded xorshift these tests share with the FUSE tests' own binaries.
 #[path = "../support/xorshift.rs"]

@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "test_seams")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
@@ -1774,11 +1773,27 @@ fn client_crypto_config(
     Ok(cfg)
 }
 
-pub async fn connect(
+pub fn connect<'a>(
+    config: &'a EndpointConfig,
+    certificate_settings: CertificateSettings,
+    alpn: &'a str,
+    transport: TransportConfig,
+) -> impl Future<Output = Result<quinn::Connection, ProtocolError>> + 'a {
+    connect_announcing(config, certificate_settings, alpn, transport, false)
+}
+
+/// [`connect`], which also warns the user, where `announce` is set and no handshake completed in
+/// time, that UDP to the server may be blocked. Set for each storage connection's first connect
+/// only (one per connection a command opens, `--max-connections`), so a reconnect loop does not
+/// repeat it.
+///
+/// FORK-LOCAL (Tideshift).
+pub async fn connect_announcing(
     config: &EndpointConfig,
     certificate_settings: CertificateSettings,
     alpn: &str,
     transport: TransportConfig,
+    announce: bool,
 ) -> Result<quinn::Connection, ProtocolError> {
     let remote_url = config.remote_url.as_str();
     let url = Url::parse(remote_url).internal_with(|| format!("remote {remote_url} is invalid"))?;
@@ -1847,6 +1862,10 @@ pub async fn connect(
 
     client_config.transport_config(Arc::new(transport_config));
 
+    // FORK-LOCAL (Tideshift): set by an attempt whose handshake got no answer in time, which is
+    // what a front that drops or rejects UDP looks like, as opposed to a handshake the server
+    // answered and that failed (a certificate it would not accept, say).
+    let timed_out = AtomicBool::new(false);
     let connection = connect_happy_eyeballs(
         remote_addrs,
         Duration::from_millis(HAPPY_EYEBALLS_DELAY_MS),
@@ -1856,6 +1875,7 @@ pub async fn connect(
                 host.clone(),
                 remote_addr,
                 server_name.to_string(),
+                &timed_out,
             )
         },
     )
@@ -1867,7 +1887,58 @@ pub async fn connect(
     // Every candidate address failed; the server is unreachable. Classify as
     // `Disconnected`. Per-attempt details are logged above.
     lore_debug!("QUIC connect failed {remote_url}");
-    Err(ProtocolError::from(Disconnected))
+    // FORK-LOCAL (Tideshift): the trace names the host and UDP port, so the caller's error says
+    // where the handshake went and why it may have failed, rather than only "Disconnected".
+    let message = quic_unreachable_message(
+        remote_url,
+        config.default_port,
+        timed_out.load(Ordering::Relaxed),
+    );
+    if announce && timed_out.load(Ordering::Relaxed) {
+        lore_warn!("{message}");
+    }
+    Err(ProtocolError::from(Disconnected)).forward::<ProtocolError>(&message)
+}
+
+/// FORK-LOCAL (Tideshift): what a caller is told when no QUIC connection to the server at
+/// `remote_url` could be opened: where no handshake was answered in time (`timed_out`), that UDP
+/// may be blocked, and otherwise only that the handshake failed. Names the host and UDP port only,
+/// never the URL, which may carry credentials.
+///
+/// A front that drops or rejects UDP while it passes TCP is the case the first names: sign-in and
+/// every gRPC call still work, and only the QUIC storage path fails.
+pub fn quic_unreachable_message(remote_url: &str, default_port: u16, timed_out: bool) -> String {
+    let endpoint = Url::parse(remote_url).ok().map(|url| {
+        (
+            url.host_str().unwrap_or_default().to_string(),
+            url.port().unwrap_or(default_port),
+            // The TCP scheme keeps the remote's TLS choice: `lores://` to `grpcs://`.
+            if url.scheme().ends_with('s') {
+                "grpcs"
+            } else {
+                "grpc"
+            },
+        )
+    });
+    let (host, port, tcp_scheme) =
+        endpoint.unwrap_or_else(|| (String::from("<host>"), default_port, "grpcs"));
+    if timed_out {
+        // FORK-LOCAL (Tideshift): no fallback runs; the user moves to TCP by hand. Lore has no
+        // command that changes an existing clone's remote, and its docs say not to edit
+        // `remote_url` in `.lore/config.toml` (the shared store is keyed on it), so the way is
+        // a new clone.
+        format!(
+            "Could not reach the storage service at {host} on UDP port {port}: no QUIC handshake \
+             completed within {HANDSHAKE_TIMEOUT_SECS} s. A firewall or VPN may be blocking UDP \
+             traffic to this server. To use TCP instead, clone again with \
+             {tcp_scheme}://{host}:{port}/<repository>"
+        )
+    } else {
+        format!(
+            "Could not open a QUIC connection to the storage service at {host} on UDP port \
+             {port}: the handshake failed"
+        )
+    }
 }
 
 #[lore_macro::test_pub]
@@ -1977,6 +2048,7 @@ async fn connect_to_addr(
     host: String,
     remote_addr: SocketAddr,
     server_name: String,
+    timed_out: &AtomicBool,
 ) -> Option<quinn::Connection> {
     lore_debug!("QUIC connecting to {host} at {remote_addr}");
     let bind = if remote_addr.is_ipv6() {
@@ -2037,6 +2109,7 @@ async fn connect_to_addr(
         }
         Err(_) => {
             lore_debug!("QUIC handshake timeout to {remote_addr}");
+            timed_out.store(true, Ordering::Relaxed);
             None
         }
     }

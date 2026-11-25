@@ -77,7 +77,7 @@ use super::super::client::QuicConnection;
 use super::super::client::SendWithReconnectError;
 use super::super::client::ServiceClient;
 use super::super::client::TransportConfig;
-use super::super::client::connect;
+use super::super::client::connect_announcing;
 use super::super::client::send_high_priority_with_reconnect;
 use super::super::client::send_managed_with_reconnect_outcome;
 use super::super::client::send_normal;
@@ -224,7 +224,11 @@ impl StorageClient {
 
         let start = Instant::now();
 
-        let quinn = connect(
+        // FORK-LOCAL (Tideshift): this connection's first connect warns where no handshake was
+        // answered in time, so a user whose UDP is blocked sees why before the command's own
+        // error. A reconnect (`connect`) does not repeat it. The error carries the same words in
+        // its trace.
+        let quinn = connect_announcing(
             &EndpointConfig {
                 remote_url: remote_url.to_string(),
                 default_port: Self::DEFAULT_PORT,
@@ -233,6 +237,7 @@ impl StorageClient {
             auth_adapter.client_certs(),
             Self::ALPN,
             transport_config.clone(),
+            true,
         )
         .await?;
         let connection_id = quinn.stable_id();

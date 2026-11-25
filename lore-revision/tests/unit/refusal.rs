@@ -385,7 +385,7 @@ fn failing_admin(error: ProtocolError) -> Arc<Connection> {
 ///
 /// Each test gives its contexts a repository of their own: a read joins a read of the same address
 /// in the same repository already in flight, in any test, and takes its failure.
-async fn context_with_remote(
+pub(crate) async fn context_with_remote(
     repository: RepositoryId,
     remote: RemoteState,
 ) -> Arc<RepositoryContext> {

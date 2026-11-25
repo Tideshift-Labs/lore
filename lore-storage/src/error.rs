@@ -44,7 +44,9 @@ pub fn protocol_error_to_storage(
         ProtocolError::NotFound(_) | ProtocolError::NoRemote(_) => {
             StorageError::from(AddressNotFound::from(address))
         }
-        ProtocolError::Disconnected(_) => StorageError::from(Disconnected),
+        // FORK-LOCAL (Tideshift): kept with its trace, which names where the transport failed to
+        // connect (the QUIC storage handshake's host and UDP port).
+        ProtocolError::Disconnected(disconnected) => StorageError::Disconnected(disconnected),
         ProtocolError::SlowDown(_) => StorageError::from(SlowDown),
         err => StorageError::from(NotConnected {
             reason: format!("{err}"),
