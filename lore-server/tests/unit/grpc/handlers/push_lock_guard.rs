@@ -673,3 +673,140 @@ mod collect_push_lock_conflicts_tests {
         .await;
     }
 }
+
+fn conflicts(count: usize) -> Vec<LockConflict> {
+    (0..count)
+        .map(|index| LockConflict {
+            path: format!("Art/file-{index}.uasset"),
+            owner: format!("owner-{index}"),
+        })
+        .collect()
+}
+
+/// CR-019: the refusal names at most the first five conflicts and counts the rest, so a push over
+/// a large locked set answers with a bounded message.
+#[test]
+fn describe_conflicts_names_at_most_five_and_counts_the_rest() {
+    assert_eq!(describe_conflicts(&conflicts(0)), "");
+    assert_eq!(
+        describe_conflicts(&conflicts(1)),
+        "'Art/file-0.uasset' is locked by owner-0"
+    );
+    // Exactly the bound: all named, no trailer.
+    let five = describe_conflicts(&conflicts(5));
+    assert_eq!(five.matches(" is locked by ").count(), 5, "{five}");
+    assert!(!five.contains("more"), "{five}");
+    assert!(
+        five.ends_with("'Art/file-4.uasset' is locked by owner-4"),
+        "{five}"
+    );
+    // One over: five named, then the count of the rest.
+    let seven = describe_conflicts(&conflicts(7));
+    assert_eq!(seven.matches(" is locked by ").count(), 5, "{seven}");
+    assert!(seven.ends_with("; and 2 more"), "{seven}");
+    assert!(
+        !seven.contains("file-5"),
+        "the sixth conflict is counted, not named: {seven}"
+    );
+    let six = describe_conflicts(&conflicts(6));
+    assert!(six.ends_with("; and 1 more"), "{six}");
+    // A large set stays bounded.
+    assert!(describe_conflicts(&conflicts(10_000)).len() < 400);
+}
+
+/// CR-019: the legacy guard's refusal is `PERMISSION_DENIED` carrying the `lock-not-owned`
+/// marker, under both issuer policies, and names the conflicting path and owner.
+#[tokio::test]
+async fn the_legacy_guard_refusal_carries_the_lock_not_owned_marker() {
+    for (policy, needle) in [
+        (pinned(), "locked by another user"),
+        (
+            LockOwnerIssuerPolicy::Unprovable,
+            "cannot prove who holds them",
+        ),
+    ] {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id: RepositoryId = random();
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository_id,
+                lore_revision::state::allow_all_repositories(),
+            ));
+            let branch_id = create_root_branch(&repository, "main").await;
+            let root = serialize_empty_revision(&repository, Hash::default(), 1).await;
+            push_revision(&repository, branch_id, root).await;
+
+            let path = "hero.uasset";
+            let enforcement = PushLockEnforcement {
+                lock_store: store_with_lock("alice", path, branch_id, repository_id).await,
+                issuer_policy: policy,
+            };
+            let new_revision = serialize_file_revision(&repository, root, 2, path).await;
+
+            let status = enforce_push_locks(
+                repository.clone(),
+                &enforcement,
+                branch_id,
+                new_revision,
+                &owner(ISSUER_A, "bob"),
+            )
+            .await
+            .expect_err("a foreign lock must refuse the push");
+
+            assert_eq!(status.code(), tonic::Code::PermissionDenied);
+            assert_eq!(
+                status
+                    .metadata()
+                    .get("lore-push-refusal-v1")
+                    .map(|value| value.as_bytes()),
+                Some(b"lock-not-owned".as_slice()),
+                "{status:?}"
+            );
+            assert!(status.message().contains(needle), "{status:?}");
+            assert!(
+                status
+                    .message()
+                    .contains("'hero.uasset' is locked by alice"),
+                "{status:?}"
+            );
+        }))
+        .await;
+    }
+}
+
+/// A path or owner of any length is cut on a char boundary, so one refusal stays bounded however
+/// large the locked set's names are, even percent-encoded three-fold in a header.
+#[test]
+fn describe_conflicts_cuts_a_long_path_and_a_long_multibyte_owner_on_a_char_boundary() {
+    // 3-byte chars, so a cut at a fixed byte count lands mid-character unless it is snapped.
+    let owner = "\u{20ac}".repeat(500);
+    let long = (0..7)
+        .map(|index| LockConflict {
+            path: format!("{index}/{}", "p".repeat(10 * 1024)),
+            owner: owner.clone(),
+        })
+        .collect::<Vec<_>>();
+    let message = describe_conflicts(&long);
+    assert!(message.len() * 3 < 16 * 1024, "{} bytes", message.len());
+    assert_eq!(
+        message.matches("...").count(),
+        10,
+        "5 paths and 5 owners cut"
+    );
+    assert!(message.ends_with("; and 2 more"), "{message}");
+    // `String` is valid UTF-8 by construction; the cut must not have dropped whole characters
+    // short of the bound either.
+    let cut_owner = message
+        .split(" is locked by ")
+        .nth(1)
+        .and_then(|rest| rest.split("...").next())
+        .expect("an owner entry");
+    assert!(cut_owner.chars().all(|c| c == '\u{20ac}') && cut_owner.len() > 120);
+
+    // Short names are untouched.
+    assert!(!describe_conflicts(&conflicts(3)).contains("..."));
+}

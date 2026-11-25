@@ -63,6 +63,18 @@ For detailed historical context, gotchas, and design invariants, see the [Append
 - **CR-018 QUIC write enforcement and CR-019 push-lock enforcement [SERVER]**: both default off;
   enabled cells reject data-plane writes without write permission and pushes conflicting with a
   foreign lock. Gates: the storage-service permission tests and `collect_push_lock_conflicts` tests.
+  The refusal is `PERMISSION_DENIED` plus `lore-push-refusal-v1: lock-not-owned`, read by
+  `branch_push_error` as `LockNotOwned` (CLI exit 45). On a fenced cell the check runs on EVERY push,
+  whatever `enforce_locks_on_push` says. Gates: `lore-transport` `grpc.rs`/`branch_push_wire_tests.rs`,
+  `lore-server` `push_lock_guard.rs` + `governed_tests.rs` (`#[ignore]`, live PG), `lore-revision`
+  `dispatch.rs`, and the two-process cases S (one replica) and T (lock via A, push via B) in
+  `active_active_two_process_test.rs`. Run a case alone: `pwsh -Command "& <runner>.ps1 -Case s,t"`
+  (`-File ... -Case s,t` passes one string and the runner rejects it as an unknown key). Force it
+  red by running with `-ServerBin` built from `git archive HEAD` into a scratch dir (no git state
+  touched); the pre-delta server answers the same code with no marker. A check-then-lock race has
+  no pause seam in the handler, so `a_lock_taken_after_the_fenced_check_makes_the_publish_refuse`
+  runs the handler's own `test_pub` steps in order (witness, check, lock, `publish`); it needs
+  `PostgresMutableStore::connect` first to create `lore_mutable`.
 - **CR-008 thin-client sizes [SERVER wire]**: `TreeNode.size` is optional tag 4, `mode` is tag 5,
   and `Revision.total_size_bytes` remains optional tag 11. Protobuf field names are not on the wire;
   presence is required so an empty file's zero is encoded. Gates: `lore-proto/tests/v1_thin_client.rs`

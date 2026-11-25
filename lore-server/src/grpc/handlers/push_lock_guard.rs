@@ -164,29 +164,80 @@ pub async fn enforce_push_locks(
             conflict_count = conflicts.len(),
             "Rejecting push: changed path is locked by another user",
         );
-        return Err(Status::permission_denied(
-            match &enforcement.issuer_policy {
-                LockOwnerIssuerPolicy::Pinned(_) => format!(
-                    "push blocked: {} file(s) changed are locked by another user; \
-                 e.g. '{}' is locked by {}",
-                    conflicts.len(),
-                    first.path,
-                    first.owner,
-                ),
-                LockOwnerIssuerPolicy::Unprovable => format!(
-                    "push blocked: {} file(s) changed are locked and this cell cannot prove who \
-                 holds them; e.g. '{}' is locked by subject '{}' under an unverified issuer. \
-                 Set [server.auth] jwt_issuer so lock ownership is a verified issuer/subject \
-                 pair.",
-                    conflicts.len(),
-                    first.path,
-                    first.owner,
-                ),
-            },
-        ));
+        return Err(push_lock_refused_status(match &enforcement.issuer_policy {
+            LockOwnerIssuerPolicy::Pinned(_) => format!(
+                "push blocked: {} file(s) changed are locked by another user: {}",
+                conflicts.len(),
+                describe_conflicts(&conflicts),
+            ),
+            LockOwnerIssuerPolicy::Unprovable => format!(
+                "push blocked: {} file(s) changed are locked and this cell cannot prove who \
+                 holds them: {}. Set [server.auth] jwt_issuer so lock ownership is a verified \
+                 issuer/subject pair.",
+                conflicts.len(),
+                describe_conflicts(&conflicts),
+            ),
+        }));
     }
 
     Ok(())
+}
+
+/// How many conflicts a refusal names; the rest are counted, not listed.
+const NAMED_CONFLICTS: usize = 5;
+
+/// The most bytes of one conflict's path a refusal carries.
+const NAMED_PATH_BYTES: usize = 200;
+
+/// The most bytes of one conflict's owner a refusal carries.
+const NAMED_OWNER_BYTES: usize = 128;
+
+/// `text` cut to at most `max` bytes on a char boundary, with `...` when cut.
+fn bounded(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
+
+/// `'path' is locked by owner` for the first [`NAMED_CONFLICTS`] conflicts, then a count of the
+/// rest, so a push over a large locked set answers with a bounded message.
+///
+/// Each path and owner is also cut to a byte bound. The message travels percent-encoded in the
+/// gRPC trailers, and a client's header-list limit (16 KiB in hyper's h2 client) would otherwise
+/// turn a long-path refusal into a transport failure, which a client reads as a lost answer.
+#[lore_macro::test_pub]
+pub(crate) fn describe_conflicts(conflicts: &[LockConflict]) -> String {
+    let mut named = conflicts
+        .iter()
+        .take(NAMED_CONFLICTS)
+        .map(|conflict| {
+            format!(
+                "'{}' is locked by {}",
+                bounded(&conflict.path, NAMED_PATH_BYTES),
+                bounded(&conflict.owner, NAMED_OWNER_BYTES),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if conflicts.len() > NAMED_CONFLICTS {
+        named.push_str(&format!("; and {} more", conflicts.len() - NAMED_CONFLICTS));
+    }
+    named
+}
+
+/// The refusal of a push that changes a path another owner holds a lock on.
+///
+/// `PERMISSION_DENIED` with the fork's `lore-push-refusal-v1: lock-not-owned` marker. A client
+/// that reads the marker reports `LockNotOwned`; an older client still reads a decisive
+/// `NotAuthorized`. Both settle the push as not applied: the refusal is answered before
+/// publication, and a governed push settles it against its receipt first.
+pub(crate) fn push_lock_refused_status(message: String) -> Status {
+    lore_transport::grpc::push_lock_refused_status(message)
 }
 
 /// The pure core: compute the set of changed paths on this push that are locked

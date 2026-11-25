@@ -123,6 +123,20 @@ fn owner(issuer: &str, subject: &str) -> VerifiedLockOwner {
     }
 }
 
+/// CR-019: a push refused for a foreign lock is `PERMISSION_DENIED` carrying the
+/// `lore-push-refusal-v1: lock-not-owned` marker, so a client reads `LockNotOwned`.
+fn assert_lock_not_owned_refusal(status: &Status) {
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert_eq!(
+        status
+            .metadata()
+            .get("lore-push-refusal-v1")
+            .map(|value| value.as_bytes()),
+        Some(b"lock-not-owned".as_slice()),
+        "{status:?}"
+    );
+}
+
 async fn direct_client(url: &str) -> Client {
     let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
@@ -476,7 +490,7 @@ async fn enforce_fenced_locks_blocks_a_push_from_a_foreign_owner_pair() {
     .await
     .expect_err("a foreign owner pair must block the push");
 
-    assert_eq!(error.code(), Code::PermissionDenied);
+    assert_lock_not_owned_refusal(&error);
 }
 
 #[tokio::test]
@@ -553,7 +567,7 @@ async fn enforce_fenced_locks_treats_same_subject_under_a_different_issuer_as_fo
     .await
     .expect_err("the same subject under a different issuer must remain foreign at push preflight");
 
-    assert_eq!(error.code(), Code::PermissionDenied);
+    assert_lock_not_owned_refusal(&error);
 }
 
 #[tokio::test]
@@ -639,7 +653,7 @@ async fn enforce_fenced_locks_blocks_a_push_touching_the_locked_old_path_of_a_re
     .await
     .expect_err("a lock on the rename's old path must still block the push");
 
-    assert_eq!(error.code(), Code::PermissionDenied);
+    assert_lock_not_owned_refusal(&error);
 }
 
 #[tokio::test]
@@ -684,6 +698,213 @@ async fn enforce_fenced_locks_does_not_block_a_foreign_lock_on_an_untouched_path
         }
     }))
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Section A2 — CR-019 check-then-lock race (live Postgres, `#[ignore]`)
+// ---------------------------------------------------------------------------
+
+/// What the handler's governed leg holds between its fenced check and the publication, built over
+/// the real coordinator: the lock witness captured BEFORE the check (as
+/// `prepare_governed_push` captures it), the preflight generations, and a prepared receipt.
+async fn live_governed_push(
+    store: &Arc<PostgresDomainStore>,
+    pusher: &VerifiedLockOwner,
+    repository_id: &[u8; 16],
+    branch_id: &[u8; 16],
+) -> (GovernedPushCommit, Hash) {
+    let coordinator = store.lock_coordinator();
+    let repository_snapshot = store
+        .repository_snapshot(repository_id)
+        .await
+        .expect("read the repository snapshot")
+        .expect("the fixture repository exists");
+    let branch_snapshot = store
+        .branch_snapshot(repository_id, branch_id)
+        .await
+        .expect("read the branch snapshot")
+        .expect("the fixture branch exists");
+    let lock_witness = coordinator
+        .capture_push_witness(repository_id, branch_id)
+        .await
+        .expect("capture the lock witness");
+    let binding = OperationBinding {
+        method: "branch.push".to_owned(),
+        scope: lock_tenant_scope_key(repository_id, branch_id).expect("canonical tenant scope"),
+        fingerprint_version: 1,
+        fingerprint: random::<[u8; 32]>().to_vec(),
+        canonical_intent_digest: random::<[u8; 32]>().to_vec(),
+    };
+    let operation = prepare_bound_operation(store, pusher, repository_id, branch_id, binding).await;
+    let current_head = Hash::from(
+        <[u8; 32]>::try_from(branch_snapshot.latest_hash.as_slice())
+            .expect("the fixture branch tip is 32 bytes"),
+    );
+    let governed = GovernedPushCommit {
+        domain: Arc::new(DomainContext::new(store.clone(), true)),
+        operation,
+        repository_generation: repository_snapshot.generation,
+        branch_generation: branch_snapshot.generation,
+        expected_latest_hash: branch_snapshot.latest_hash,
+        lock_witness,
+        fragment_witness: None,
+        owner: pusher.clone(),
+        branch_name: branch_snapshot.name,
+    };
+    (governed, current_head)
+}
+
+/// A lock taken by another owner AFTER a push has passed the fenced check but BEFORE it
+/// publishes must make the publication refuse: the final CAS revalidates the lock generation
+/// witness the push captured before its check (`revalidate_push_witness`). The handler's own
+/// functions run in the handler's own order against real Postgres; the lock lands in the one gap
+/// no RPC-level test can hit without a pause seam.
+///
+/// Also asserted: the branch tip is unchanged, the refusal settles the receipt `NotApplied`
+/// (`settle_governed_push` answers the original refusal, never the unknown-outcome answer), and
+/// the rerun preflight that follows refuses with the lock-not-owned marker. The positive control
+/// is the same sequence with no lock taken, which publishes.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+async fn a_lock_taken_after_the_fenced_check_makes_the_publish_refuse() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let direct = direct_client(&url).await;
+    // The publication's projection write lands in `lore_mutable`, which only the mutable
+    // store's own connect bootstraps.
+    let _mutable_store = PostgresMutableStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .expect("connect mutable store; also bootstraps lore_mutable");
+    let holder = owner("https://issuer-a.example", "holder");
+    let pusher = owner("https://issuer-a.example", "pusher");
+    let path = "hero.uasset";
+
+    for lock_after_check in [false, true] {
+        let (store, repository_id, branch_id) = fenced_fixture(&url).await;
+        let store = Arc::new(store);
+        let coordinator = store.lock_coordinator();
+        let repository = RepositoryId::from(repository_id);
+        let branch = BranchId::from(branch_id);
+        let (repository_ctx, root, execution) =
+            local_repository_with_root(repository, branch).await;
+
+        // The handler's order: witness and receipt first, then the fenced check.
+        let (governed, current_head) =
+            live_governed_push(&store, &pusher, &repository_id, &branch_id).await;
+        let new_revision = Box::pin(LORE_CONTEXT.scope(execution.clone(), {
+            let repository_ctx = repository_ctx.clone();
+            let coordinator = coordinator.clone();
+            let pusher = pusher.clone();
+            async move {
+                let new_revision = serialize_file_revision(&repository_ctx, root, 2, path).await;
+                lore_server::grpc::handlers::branch_push::enforce_fenced_locks(
+                    &coordinator,
+                    repository_ctx,
+                    branch,
+                    new_revision,
+                    &pusher,
+                )
+                .await
+                .expect("no foreign lock exists yet, so the fenced check passes");
+                new_revision
+            }
+        }))
+        .await;
+
+        if lock_after_check {
+            // The race: another owner locks the path between the check and the publication.
+            acquire_lock_on_path(&store, &holder, &repository_id, &branch_id, branch, path).await;
+        }
+
+        let new_head = Hash::hash_buffer(b"laneF CR-019 new head");
+        let published = governed
+            .publish(&repository_ctx, branch, current_head, new_head)
+            .await;
+
+        let tip: Vec<u8> = direct
+            .query_one(
+                "SELECT latest_hash FROM lore_domain_branches \
+                  WHERE repository_id=$1 AND branch_id=$2",
+                &[&repository_id.as_slice(), &branch_id.as_slice()],
+            )
+            .await
+            .expect("read the branch tip")
+            .get(0);
+
+        if !lock_after_check {
+            assert_eq!(
+                published.expect("with no lock taken the publication must succeed"),
+                new_head
+            );
+            assert_eq!(
+                tip.as_slice(),
+                new_head.as_ref(),
+                "control: the tip advanced"
+            );
+            continue;
+        }
+
+        let status = published.expect_err("a lock taken after the check must refuse the publish");
+        assert_eq!(status.code(), Code::Aborted, "{status:?}");
+        assert_eq!(
+            tip.as_slice(),
+            current_head.as_ref(),
+            "a refused publish must leave the branch tip unchanged"
+        );
+
+        // The refusal settles the receipt NotApplied: the original answer comes back, not the
+        // unknown-outcome one that an Applied or unprovable receipt would force.
+        let settled = settle_governed_push(Some(&governed), Err(status.clone()))
+            .await
+            .expect_err("a refusal stays a refusal");
+        assert_eq!(settled.code(), status.code());
+        assert_ne!(
+            settled.message(),
+            lore_server::grpc::DOMAIN_OUTCOME_UNKNOWN_DETAIL,
+            "the receipt must settle NotApplied, not unknown"
+        );
+
+        // The rerun preflight now meets the lock at the fenced check, as LockNotOwned.
+        let rerun = Box::pin(LORE_CONTEXT.scope(execution, {
+            let pusher = pusher.clone();
+            async move {
+                lore_server::grpc::handlers::branch_push::enforce_fenced_locks(
+                    &coordinator,
+                    repository_ctx,
+                    branch,
+                    new_revision,
+                    &pusher,
+                )
+                .await
+            }
+        }))
+        .await
+        .expect_err("the rerun preflight must refuse over the new lock");
+        assert_lock_not_owned_refusal(&rerun);
+    }
+}
+
+/// CR-019: the lock refusal passes through the `NotApplied` settlement unchanged, so the client
+/// still reads `lock-not-owned` from the answer.
+#[tokio::test]
+#[ignore = "needs disposable live Postgres via LORE_TEST_PG_URL; run with -- --ignored --test-threads=1"]
+async fn the_lock_refusal_marker_survives_the_not_applied_settlement() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let (store, repository_id, branch_id) = fenced_fixture(&url).await;
+    let store = Arc::new(store);
+    let pusher = owner("https://issuer-a.example", "pusher");
+    let (governed, _) = live_governed_push(&store, &pusher, &repository_id, &branch_id).await;
+
+    let refusal =
+        lore_transport::grpc::push_lock_refused_status("push blocked: 'a' is locked by b");
+    let settled = settle_governed_push(Some(&governed), Err(refusal))
+        .await
+        .expect_err("a refusal stays a refusal");
+    assert_lock_not_owned_refusal(&settled);
+    assert_eq!(settled.message(), "push blocked: 'a' is locked by b");
 }
 
 // ---------------------------------------------------------------------------

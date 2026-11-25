@@ -1276,12 +1276,10 @@ pub(crate) async fn enforce_fenced_locks(
             conflict_count = conflicts.len(),
             "Rejecting push: changed path is locked by another verified owner pair",
         );
-        return Err(Status::permission_denied(format!(
-            "push blocked: {} file(s) changed are locked by another verified owner; \
-             e.g. '{}' is locked by {}",
+        return Err(push_lock_guard::push_lock_refused_status(format!(
+            "push blocked: {} file(s) changed are locked by another verified owner: {}",
             conflicts.len(),
-            first.path,
-            first.owner,
+            push_lock_guard::describe_conflicts(&conflicts),
         )));
     }
     Ok(())

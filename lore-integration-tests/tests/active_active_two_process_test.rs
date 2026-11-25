@@ -1813,6 +1813,253 @@ mod active_active_two_process_tests {
     }
 
     // -----------------------------------------------------------------------
+    // Cases S and T — CR-019: a push over another owner's fenced lock
+    // -----------------------------------------------------------------------
+
+    /// What cases S and T prove, on a fenced (`Arming::GovernedOutbox`) cell.
+    ///
+    /// User A holds a fenced lock on `locked.bin`. User B, a released client with no carriage
+    /// and no client-side lock check (the raw gRPC `BranchPush` is the call the stock library
+    /// makes, minus the CLI's advisory refusal and `--ignore-locks`), pushes a revision that adds
+    /// that file. The fenced check runs on EVERY push on a fenced cell, whatever
+    /// `[feature] enforce_locks_on_push` says (the harness leaves it off), so the server must
+    /// refuse with `PERMISSION_DENIED` plus the `lore-push-refusal-v1: lock-not-owned` marker,
+    /// which the real client mapping (`branch_push_error`) reads as `LockNotOwned` (CLI exit 45).
+    ///
+    /// Asserted against the authority connection, never the server's own answer: the branch tip
+    /// is unchanged and no `branch.pushed` row exists. The attempt receipt, read through the
+    /// process that served none of it when there are two, is terminal and `NOT_APPLIED`.
+    ///
+    /// The control is the same push after A releases: it must then succeed, so the refusal is
+    /// the lock and nothing else (no auth, tip or content fault).
+    ///
+    /// `replicas == 1`: A locks and B pushes through process A. `replicas == 2`: A locks through
+    /// process A and B pushes through process B.
+    async fn foreign_lock_refusal_case(replicas: usize, label: &str) {
+        use lore_revision::lock::util::assemble_resource_for_path;
+        use lore_transport::BranchPushError;
+
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = if replicas == 2 {
+            Some(fixture.start("b", BootOptions::relaying()).await)
+        } else {
+            None
+        };
+        // The replica user B pushes through.
+        let pusher_endpoint = || match b.as_ref() {
+            Some(b) => b.grpc_endpoint(),
+            None => a.grpc_endpoint(),
+        };
+
+        let holder = direct_subject();
+        let pusher = direct_subject();
+        let holder_token = fixture.minter.mint(&holder);
+        let holder_authn = fixture.minter.mint_authn(&holder);
+        let pusher_token = fixture.minter.mint(&pusher);
+        let pusher_authn = fixture.minter.mint_authn(&pusher);
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &holder_token, &holder, label).await;
+        // `developer` is the floor for both `lock.acquire` and `branch.push`, so a refusal below
+        // cannot be the authorizer's.
+        fixture.stub.grant(&repository, &holder, Role::Developer);
+        fixture.stub.grant(&repository, &pusher, Role::Developer);
+
+        let path = "locked.bin";
+        let resource =
+            assemble_resource_for_path(path, lore_base::types::BranchId::from(branch)).hash;
+        let acquired = client::lock_acquire(
+            a.grpc_endpoint(),
+            &holder_token,
+            Some(&holder_authn),
+            &repository,
+            &branch,
+            resource.as_ref(),
+            path,
+        )
+        .await
+        .unwrap_or_else(|status| panic!("A's acquire through process A must succeed: {status:?}"));
+        let ownership_token = acquired
+            .locks
+            .first()
+            .unwrap_or_else(|| panic!("one lock expected: {acquired:?}"))
+            .ownership_token
+            .to_vec();
+
+        let candidate = fixture
+            .backend
+            .serialize_revision(repository_id(repository), Hash::default(), 1, Some(path))
+            .await;
+        let tip_before = fixture
+            .backend
+            .branch_latest_hash(&repository, &branch)
+            .await
+            .expect("the domain projection carries the branch");
+        assert_ne!(
+            tip_before.as_slice(),
+            candidate.as_ref(),
+            "the candidate must be a new revision, or the push is a no-op and proves nothing"
+        );
+        let pushed_before = fixture
+            .backend
+            .outbox_rows_of_kind(BRANCH_PUSHED)
+            .await
+            .len();
+
+        // B pushes over A's lock.
+        let attempt = uuid::Uuid::now_v7();
+        let refused = client::branch_push_no_carriage(
+            pusher_endpoint(),
+            &pusher_token,
+            Some(&pusher_authn),
+            &repository,
+            &branch,
+            candidate.as_ref(),
+            attempt,
+        )
+        .await
+        .expect_err("a push over another owner's lock must be refused");
+        assert_eq!(
+            refused.code(),
+            Code::PermissionDenied,
+            "the refusal keeps PERMISSION_DENIED so an older client still reads a decisive \
+             NotAuthorized, got {refused:?}"
+        );
+        assert_eq!(
+            refused
+                .metadata()
+                .get("lore-push-refusal-v1")
+                .map(|value| value.as_bytes()),
+            Some(b"lock-not-owned".as_slice()),
+            "the refusal must carry the lock-not-owned marker, got {refused:?}"
+        );
+        assert!(
+            refused.message().contains(path) && refused.message().contains(&holder),
+            "the refusal must name the locked path and its owner, got {refused:?}"
+        );
+        // The client's own mapping, applied to the real wire status.
+        let mapped = lore_transport::error::branch_push_error(refused.clone());
+        assert!(
+            matches!(mapped, BranchPushError::LockNotOwned(_)),
+            "the client must read the wire refusal as LockNotOwned, got {mapped:?}"
+        );
+        assert!(!mapped.is_outcome_unknown(), "{mapped:?}");
+
+        // Authority: nothing moved, nothing was published.
+        assert_eq!(
+            fixture
+                .backend
+                .branch_latest_hash(&repository, &branch)
+                .await
+                .expect("the branch row")
+                .as_slice(),
+            tip_before.as_slice(),
+            "a refused push must leave the authoritative branch tip unchanged"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .outbox_rows_of_kind(BRANCH_PUSHED)
+                .await
+                .len(),
+            pushed_before,
+            "a refused push must append no branch.pushed row"
+        );
+        assert_eq!(
+            fixture.backend.lock_owners(&repository).await.len(),
+            1,
+            "a refused push must not disturb the lock"
+        );
+
+        // The attempt is settled NotApplied, read through the process that served the push or,
+        // with two replicas, through the one that did not.
+        let receipt_endpoint = if replicas == 2 {
+            a.grpc_endpoint()
+        } else {
+            pusher_endpoint()
+        };
+        let receipt = client::attempt_receipt_get(receipt_endpoint, &pusher_token, attempt)
+            .await
+            .unwrap_or_else(|status| panic!("the receipt lookup must be answered: {status:?}"));
+        assert_eq!(
+            receipt.status,
+            DomainOperationReceiptStatus::Committed as i32,
+            "a refused governed push must settle its receipt, got {receipt:?}"
+        );
+        assert_eq!(
+            receipt.outcome,
+            DomainOperationOutcome::NotApplied as i32,
+            "a refused push must settle NOT_APPLIED, got {receipt:?}"
+        );
+
+        // Control: once A releases, the very same push succeeds.
+        client::lock_release(
+            a.grpc_endpoint(),
+            &holder_token,
+            Some(&holder_authn),
+            &repository,
+            &branch,
+            resource.as_ref(),
+            &ownership_token,
+        )
+        .await
+        .unwrap_or_else(|status| panic!("A's release must succeed: {status:?}"));
+        client::branch_push_no_carriage(
+            pusher_endpoint(),
+            &pusher_token,
+            Some(&pusher_authn),
+            &repository,
+            &branch,
+            candidate.as_ref(),
+            uuid::Uuid::now_v7(),
+        )
+        .await
+        .unwrap_or_else(|status| {
+            panic!(
+                "the same push must succeed once the lock is released: {status:?}; the \
+                 authorizer refused {:?}",
+                fixture.stub.refusals()
+            )
+        });
+        assert_eq!(
+            fixture
+                .backend
+                .branch_latest_hash(&repository, &branch)
+                .await
+                .expect("the branch row")
+                .as_slice(),
+            candidate.as_ref(),
+            "the released push must advance the authoritative tip"
+        );
+        assert_eq!(
+            fixture
+                .backend
+                .outbox_rows_of_kind(BRANCH_PUSHED)
+                .await
+                .len(),
+            pushed_before + 1,
+            "the released push must append exactly one branch.pushed row"
+        );
+    }
+
+    /// Case S: one replica.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_s_a_push_over_a_foreign_fenced_lock_is_refused_as_lock_not_owned_on_one_replica()
+    {
+        foreign_lock_refusal_case(1, "s").await;
+    }
+
+    /// Case T: A locks through replica 1, B pushes through replica 2.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_t_a_push_over_a_foreign_fenced_lock_is_refused_as_lock_not_owned_across_two_replicas()
+     {
+        foreign_lock_refusal_case(2, "t").await;
+    }
+
+    // -----------------------------------------------------------------------
     // Case J — WP-109 Phase 5: Postgres and relay capacity
     // -----------------------------------------------------------------------
 

@@ -150,6 +150,11 @@ $caseCatalog = @(
     # permanent, because the unacknowledged message is redelivered and the
     # one-shot anchor is spent by then. See the case's own doc comment.
     [pscustomobject]@{ Key = 'r'; Test = "$testPrefix::case_r_a_poisoned_delivery_is_parked_unacknowledged_and_stalls_the_frontier" }
+    # CR-019: a push over another owner's fenced lock is refused as LockNotOwned
+    # (PERMISSION_DENIED + the lock-not-owned marker), on one replica (S) and with
+    # the lock taken through replica A and the push made through replica B (T).
+    [pscustomobject]@{ Key = 's'; Test = "$testPrefix::case_s_a_push_over_a_foreign_fenced_lock_is_refused_as_lock_not_owned_on_one_replica" }
+    [pscustomobject]@{ Key = 't'; Test = "$testPrefix::case_t_a_push_over_a_foreign_fenced_lock_is_refused_as_lock_not_owned_across_two_replicas" }
 )
 
 $selected = if ($Case) {
