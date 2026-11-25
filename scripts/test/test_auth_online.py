@@ -948,6 +948,30 @@ RPC_ACTIONS = {
     "/urc.lock.LockService/AdminLock": ("migrate",),
 }
 
+# FORK-LOCAL (Tideshift): the fork's own gates, which run in the handler after
+# upstream's partition check, so the action that admits an RPC alone is the one
+# both ask for. Upstream's rows above stay as upstream wrote them; an upstream
+# sync shows any change to them, and this overlay shows where the fork differs.
+FORK_RPC_ACTIONS = {
+    # Fork-local RPC. `owner`, or the caller naming itself (the empty probe body
+    # names nobody): lore-server/src/grpc/lock_service.rs:1312 (CR-030, D8).
+    "/urc.lock.LockService/ForceUnlock": ("owner",),
+    # Push asks `write` before the protected-branch check:
+    # lore-server/src/grpc/revision_service.rs:239, merge decision D2.
+    "/urc.rpc.RevisionService/BranchPush": ("write",),
+    # Same gate on v1: lore-server/src/grpc/revision/v1/service.rs:275, merge decision D2.
+    "/lore.revision.v1.RevisionService/BranchPush": ("write",),
+    # Protect asks `admin`: lore-server/src/grpc/revision_service.rs:367, merge decision D2.
+    "/urc.rpc.RevisionService/BranchProtect": ("admin",),
+    # Unprotect asks `admin`: lore-server/src/grpc/revision_service.rs:423, merge decision D2.
+    "/urc.rpc.RevisionService/BranchUnprotect": ("admin",),
+    # Unlock asks `write` first: lore-server/src/grpc/lock_service.rs:1398, merge decision D2.
+    "/urc.lock.LockService/Unlock": ("write",),
+}
+
+# What the fork's server admits: upstream's table with the fork overlay on top.
+SERVER_RPC_ACTIONS = {**RPC_ACTIONS, **FORK_RPC_ACTIONS}
+
 
 def proto_rpc_paths(proto: Path, service: str) -> set[str]:
     """`/<package>.<service>/<rpc>` for every rpc of `service` in `proto`."""
@@ -970,9 +994,9 @@ def test_every_partition_scoped_rpc_is_classified():
             for proto, service in PARTITION_SCOPED_SERVICES
         )
     )
-    assert declared == set(RPC_ACTIONS), (
-        f"unclassified: {sorted(declared - set(RPC_ACTIONS))}, "
-        f"stale: {sorted(set(RPC_ACTIONS) - declared)}"
+    assert declared == set(SERVER_RPC_ACTIONS), (
+        f"unclassified: {sorted(declared - set(SERVER_RPC_ACTIONS))}, "
+        f"stale: {sorted(set(SERVER_RPC_ACTIONS) - declared)}"
     )
 
 
@@ -1013,7 +1037,7 @@ def test_every_partition_scoped_rpc_asks_its_action(auth_env, make_actor):
         )
     }
     failures = []
-    for method, accepted in RPC_ACTIONS.items():
+    for method, accepted in SERVER_RPC_ACTIONS.items():
         if accepted is None:
             continue
         for held, metadata in tokens.items():
