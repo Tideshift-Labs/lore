@@ -336,10 +336,22 @@ impl fmt::Display for ExactSelectionErrorKind {
 
 /// Error wrapper carrying a Lore trace without weakening the structured payload.
 #[derive(Debug, Clone, Error)]
-#[error("{kind}")]
 pub struct ExactSelectionError {
     kind: Box<ExactSelectionErrorKind>,
     trace: Trace,
+    /// FORK-LOCAL (Tideshift): the selection was refused because another user holds a lock on a
+    /// selected path. The kind stays `InvalidInput` (the serialized payload is unchanged); the
+    /// status is `LockNotOwned` and the message is the plain refusal, as a staged commit's is.
+    locked_by_others: bool,
+}
+
+impl fmt::Display for ExactSelectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.locked_by_others, self.kind()) {
+            (true, ExactSelectionErrorKind::InvalidInput { reason, .. }) => f.write_str(reason),
+            _ => self.kind.fmt(f),
+        }
+    }
 }
 
 impl ExactSelectionError {
@@ -347,7 +359,23 @@ impl ExactSelectionError {
         Self {
             kind: Box::new(kind),
             trace: Trace::default(),
+            locked_by_others: false,
         }
+    }
+
+    /// FORK-LOCAL (Tideshift): the refusal of a selection that names `paths` another user holds a
+    /// lock on. `reason` is the refusal message. Its status is `LockNotOwned`, as a staged commit's
+    /// refusal is; its kind is `InvalidInput` with the same `reason` and `paths`.
+    pub fn locked_by_others(reason: String, paths: Vec<String>) -> Self {
+        Self {
+            locked_by_others: true,
+            ..Self::new(ExactSelectionErrorKind::InvalidInput { reason, paths })
+        }
+    }
+
+    /// Whether this is the refusal [`Self::locked_by_others`] makes.
+    pub fn is_locked_by_others(&self) -> bool {
+        self.locked_by_others
     }
 
     pub fn kind(&self) -> &ExactSelectionErrorKind {
@@ -395,6 +423,9 @@ impl From<RepositoryError> for ExactSelectionError {
 
 impl FfiError for ExactSelectionError {
     fn ffi_code(&self) -> i32 {
+        if self.locked_by_others {
+            return lore_base::error::LockNotOwned.ffi_code();
+        }
         match self.kind() {
             ExactSelectionErrorKind::InvalidInput { .. }
             | ExactSelectionErrorKind::PathNormalization { .. }

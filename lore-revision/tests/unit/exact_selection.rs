@@ -388,6 +388,45 @@ fn normalized(path: &str, expected_action: ExpectedFileAction) -> NormalizedSele
 }
 
 #[test]
+fn locked_by_others_refusal_has_lock_status_plain_message_and_invalid_input_kind() {
+    let reason = "f.file is locked by someone".to_owned();
+    let paths = vec!["f.file".to_owned()];
+    let error = ExactSelectionError::locked_by_others(reason.clone(), paths.clone());
+
+    assert_eq!(error.code(), 45);
+    assert!(error.is_locked_by_others());
+    assert_eq!(error.to_string(), reason);
+    assert_eq!(
+        error.kind(),
+        &ExactSelectionErrorKind::InvalidInput {
+            reason: reason.clone(),
+            paths: paths.clone(),
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(error.kind()).expect("serialize lock refusal kind"),
+        serde_json::json!({
+            "kind": "invalidInput",
+            "reason": reason,
+            "paths": paths,
+        })
+    );
+}
+
+#[test]
+fn plain_invalid_input_keeps_argument_status_and_prefixed_message() {
+    let error = ExactSelectionError::new(ExactSelectionErrorKind::InvalidInput {
+        reason: "bad".to_owned(),
+        paths: vec!["f.file".to_owned()],
+    });
+
+    assert_eq!(error.code(), LoreError::InvalidArguments as i32);
+    assert_eq!(error.code(), 3);
+    assert!(!error.is_locked_by_others());
+    assert_eq!(error.to_string(), "invalid exact-selection input: bad");
+}
+
+#[test]
 fn finalize_publication_failure_maps_public_kind_json_and_internal_code() {
     for anchors_restored in [true, false] {
         let reason = format!("injected anchors_restored={anchors_restored}");

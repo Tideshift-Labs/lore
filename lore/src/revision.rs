@@ -139,9 +139,9 @@ pub async fn commit_exact_selection(
 }
 
 /// FORK-LOCAL (Tideshift): [`commit_exact_selection`] that, when `refuse_locked_by_others` is
-/// set, first refuses with `InvalidInput` (naming each selected path another user holds a lock
-/// on, and its holder) before anything is staged. When the lock lookup cannot answer, the commit
-/// goes ahead with a warning. See [`lore_revision::lock::file::held`].
+/// set, first refuses with status `LockNotOwned` (kind `InvalidInput`, naming each selected path
+/// another user holds a lock on, and its holder) before anything is staged. When the lock lookup
+/// cannot answer, the commit goes ahead with a warning. See [`lore_revision::lock::file::held`].
 pub async fn commit_exact_selection_refusing_others_locks(
     globals: LoreGlobalArgs,
     options: ExactSelectionOptions,
@@ -360,7 +360,6 @@ async fn refuse_exact_selection_over_others_locks(
     repository: &Arc<RepositoryContext>,
     options: &ExactSelectionOptions,
 ) -> Result<(), ExactSelectionError> {
-    use lore_revision::exact_selection::ExactSelectionErrorKind;
     use lore_revision::lock::file::held;
     let selected = options
         .files
@@ -374,14 +373,12 @@ async fn refuse_exact_selection_over_others_locks(
     };
     match held::find_held_by_others(repository, change, "commit").await {
         None => Ok(()),
-        Some(locks) => Err(ExactSelectionError::new(
-            ExactSelectionErrorKind::InvalidInput {
-                reason: held::HeldLocks::refusal_message(&locks, "--ignore-locks"),
-                paths: locks
-                    .iter()
-                    .map(|lock| lock.resource.description.clone())
-                    .collect(),
-            },
+        Some(locks) => Err(ExactSelectionError::locked_by_others(
+            held::HeldLocks::refusal_message(&locks, "--ignore-locks"),
+            locks
+                .iter()
+                .map(|lock| lock.resource.description.clone())
+                .collect(),
         )),
     }
 }

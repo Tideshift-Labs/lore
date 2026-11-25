@@ -1287,6 +1287,105 @@ def test_cli_admin_grant_releases_anothers_lock(auth_env, make_actor):
     assert "locked.txt" in member.repo.lock_release("locked.txt").released
 
 
+# Fork (Tideshift): the FFI code of `LockNotOwned`, the CLI's exit status for a
+# commit or push refused over another user's lock.
+LOCK_NOT_OWNED = 45
+# The refusal sentence, naming each file and holder and the override.
+LOCK_REFUSAL = re.compile(
+    r"\d+ file\(s\) in this change are locked by another user: .*--ignore-locks to go ahead anyway"
+)
+
+
+def refused_status(action) -> tuple[int | None, str]:
+    """The exit status and message of a CLI call that must fail."""
+    with pytest.raises(LoreException) as refusal:
+        action()
+    return refusal.value.returncode, str(refusal.value)
+
+
+def write_exact_selection(repo: Lore, name: str) -> Path:
+    """A `--exact-selection` file that modifies `name` as it is on disk now."""
+    import hashlib
+    import json
+
+    content = (Path(repo.path) / name).read_bytes()
+    selection = Path(repo.path).parent / f"{Path(repo.path).name}-selection.json"
+    selection.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "path": name,
+                        "expectedEffectiveAction": "modify",
+                        "sourceHash": hashlib.md5(content).hexdigest(),
+                        "fileMetadata": {"kind": "unchanged"},
+                    }
+                ]
+            }
+        )
+    )
+    return selection
+
+
+@pytest.mark.smoke
+def test_cli_refuses_a_commit_and_push_over_another_users_lock(auth_env, make_actor):
+    """Fork (Tideshift): the client-side lock refusal against an auth-ON
+    server. The caller's identity and the lock's holder both come from verified
+    tokens, so the check can tell them apart: USER2's commit, exact-selection
+    commit and push of a file USER1 holds exit `LockNotOwned`; `--ignore-locks`
+    lets each through; USER1's own commit and push of the file are not refused."""
+    owner = provision_owner(auth_env, make_actor, "user1", USER1)
+    commit_file(owner.repo, "locked.txt", "contested content")
+    member = provision_member(
+        auth_env, make_actor, owner, "member-locks", ("read", "write")
+    )
+    assert "locked.txt" in owner.repo.lock_acquire("locked.txt").acquired
+
+    # The member's staged commit is refused before it is made.
+    (Path(member.repo.path) / "locked.txt").write_text("changed by the member")
+    member.repo.file_stage("locked.txt")
+    status, message = refused_status(
+        lambda: member.repo.revision_commit("over the owner's lock")
+    )
+    assert status == LOCK_NOT_OWNED, message
+    assert "locked.txt" in message and "--ignore-locks" in message, message
+    staged_refusal = LOCK_REFUSAL.search(message)
+    assert staged_refusal, message
+
+    # So is an exact-selection commit of the same file, with the same status
+    # and the same refusal text.
+    selection = write_exact_selection(member.repo, "locked.txt")
+    status, message = refused_status(
+        lambda: member.repo.run(
+            [
+                "revision",
+                "commit",
+                "exact over the owner's lock",
+                "--exact-selection",
+                str(selection),
+            ]
+        )
+    )
+    assert status == LOCK_NOT_OWNED, message
+    exact_refusal = LOCK_REFUSAL.search(message)
+    assert exact_refusal, message
+    assert exact_refusal.group(0) == staged_refusal.group(0), message
+
+    # The override commits; the push is then refused on its own check.
+    member.repo.run(["revision", "commit", "over the lock anyway", "--ignore-locks"])
+    status, message = refused_status(lambda: member.repo.push())
+    assert status == LOCK_NOT_OWNED, message
+    assert "locked.txt" in message, message
+    member.repo.run(["push", "--ignore-locks"])
+
+    # The holder's own work on the file is not refused.
+    owner.repo.revision_sync()
+    (Path(owner.repo.path) / "locked.txt").write_text("changed by the holder")
+    owner.repo.file_stage("locked.txt")
+    owner.repo.revision_commit("the holder's own change")
+    owner.repo.push()
+
+
 @pytest.mark.smoke
 def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
     """Push and sync — the revision and storage paths a user actually

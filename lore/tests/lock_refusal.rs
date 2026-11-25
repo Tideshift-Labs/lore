@@ -44,6 +44,8 @@ const G: &str = "g.file";
 #[derive(Default)]
 struct Seen {
     logs: Vec<String>,
+    /// The status of the last Complete event, if one arrived.
+    complete_status: Option<i32>,
 }
 
 fn capture() -> (LoreEventCallback, Arc<Mutex<Seen>>) {
@@ -57,6 +59,7 @@ fn capture() -> (LoreEventCallback, Arc<Mutex<Seen>>) {
             LoreEvent::Log(data) => seen.logs.push(data.message.as_str().to_owned()),
             LoreEvent::Error(data) => seen.logs.push(data.error_inner.as_str().to_owned()),
             LoreEvent::Complete(data) => {
+                seen.complete_status = Some(data.status);
                 seen.logs.push(data.error.message.as_str().to_owned());
                 for location in data.error.trace_locations.as_slice() {
                     seen.logs.push(location.context.as_str().to_owned());
@@ -601,7 +604,7 @@ fn an_exact_selection_commit_over_another_users_lock_is_refused() {
     let rig = rig(CALLER);
     delete_f(&rig);
     let (before, _) = anchors(&rig);
-    let (callback, _) = capture();
+    let (callback, seen) = capture();
 
     let result = rig.runtime.block_on(
         lore::revision::commit_exact_selection_refusing_others_locks(
@@ -613,10 +616,21 @@ fn an_exact_selection_commit_over_another_users_lock_is_refused() {
     );
 
     let error = result.expect_err("another user's lock must refuse");
+    // The status is LockNotOwned, as a staged commit's refusal is, not InvalidArguments (3).
+    assert_eq!(error.code(), LOCK_NOT_OWNED);
+    assert!(error.is_locked_by_others());
+    assert_eq!(
+        seen.lock()
+            .expect("the capture mutex must not be poisoned")
+            .complete_status,
+        Some(LOCK_NOT_OWNED),
+        "the Complete event carries the lock status"
+    );
     match error.kind() {
         lore_revision::exact_selection::ExactSelectionErrorKind::InvalidInput { reason, paths } => {
             assert_eq!(paths, &vec![F.to_owned()]);
             assert!(reason.contains(F) && reason.contains(HOLDER), "{reason}");
+            assert_eq!(&error.to_string(), reason, "the plain refusal, no prefix");
         }
         other => panic!("expected InvalidInput, got {other:?}"),
     }

@@ -4,3 +4,4 @@ mod branch;
 mod file;
 mod operation;
 mod repository;
+mod revision;

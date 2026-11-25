@@ -48,7 +48,6 @@ use lore::interface::metadata;
 use lore::remote::command::LoreCommand;
 use lore::revision;
 use lore::revision::LoreRevisionFindArgs;
-use lore_revision::event::EventError;
 use parking_lot::Mutex;
 
 use super::file::print_metadata;
@@ -1233,12 +1232,21 @@ fn handle_revision_commit_exact_selection(
             0
         }
         Err(error) => {
-            if let Some(json) = selection_json(error.kind(), json_output) {
+            // FORK-LOCAL (Tideshift): a lock refusal reads as a staged commit's does, in plain
+            // words; `--json` still prints the structured kind.
+            let json = if error.is_locked_by_others() && !json_output {
+                None
+            } else {
+                selection_json(error.kind(), json_output)
+            };
+            if let Some(json) = json {
                 eprintln!("Exact-selection commit refused:\n{json}");
             } else {
                 eprintln!("Exact-selection commit refused: {error}");
             }
-            error.translated() as i32 as u8
+            // The status code, not `translated()`: `LoreError` has no `LockNotOwned` member, so a
+            // lock refusal would otherwise exit as `InvalidArguments`.
+            error.code() as u8
         }
     }
 }
