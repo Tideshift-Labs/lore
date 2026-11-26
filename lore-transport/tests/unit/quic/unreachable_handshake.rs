@@ -48,13 +48,37 @@ fn has_context(error: &ProtocolError, needle: &str) -> bool {
 }
 
 fn assert_names_where_it_went(error: &ProtocolError, port: u16) {
+    assert_names_where_it_went_over(error, port, "grpcs");
+}
+
+/// The error names the endpoint in its trace and carries it typed: host, UDP port, and the TCP URL
+/// (`grpcs://` for a `lores://` remote, `grpc://` for `lore://`) to clone again with.
+fn assert_names_where_it_went_over(error: &ProtocolError, port: u16, tcp_scheme: &str) {
     assert!(error.is_disconnected(), "{error:?}");
-    for needle in [
-        "127.0.0.1".to_string(),
-        format!("UDP port {port}"),
-        "firewall or VPN".to_string(),
-    ] {
-        assert!(has_context(error, &needle), "missing {needle:?}: {error:?}");
+    // The trace carries the short fact. The firewall hint lives in the message only: the CLI
+    // prints both, and would print the hint twice.
+    let short = format!("no QUIC handshake answered from 127.0.0.1 on UDP port {port} within 5 s");
+    assert!(has_context(error, &short), "missing {short:?}: {error:?}");
+    assert!(
+        !has_context(error, "firewall"),
+        "the hint must not repeat in the trace: {error:?}"
+    );
+    let unreachable = error
+        .quic_unreachable()
+        .unwrap_or_else(|| panic!("the error carries no typed unreachable detail: {error:?}"));
+    assert_eq!(unreachable.host, "127.0.0.1");
+    assert_eq!(unreachable.port, port);
+    assert_eq!(
+        unreachable.tcp_url,
+        format!("{tcp_scheme}://127.0.0.1:{port}")
+    );
+    // The message the caller reads carries the hint (the first connect logs no warning of its own).
+    let message = error.to_string();
+    for needle in ["UDP port", "firewall or VPN", unreachable.tcp_url.as_str()] {
+        assert!(
+            message.contains(needle),
+            "message lacks {needle:?}: {message}"
+        );
     }
 }
 
@@ -125,6 +149,28 @@ async fn a_storage_connect_that_gets_no_answer_is_disconnected_and_names_the_por
     assert_one_handshake_bound(elapsed);
 }
 
+#[tokio::test]
+async fn a_plain_lore_remote_maps_to_a_grpc_tcp_url() {
+    let (_socket, port) = black_hole();
+
+    let result = StorageClient::connect(
+        Weak::new(),
+        &format!("lore://127.0.0.1:{port}"),
+        "127.0.0.1".to_string(),
+        &lore_transport::auth::AuthEndpoint::none(),
+        "unreachable-handshake-plain",
+        Partition::from([0x24u8; 16]),
+        &std::sync::Arc::new(SuppliedCredentials::default()),
+        None,
+        CongestionAlgorithm::default(),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a socket that never answers cannot complete a handshake");
+    };
+    assert_names_where_it_went_over(&error, port, "grpc");
+}
 #[test]
 fn the_unreachable_message_names_host_and_port_and_never_the_credentials() {
     let message = quic_unreachable_message("lores://user:secret@example.test:1234", 41337, true);
@@ -269,4 +315,5 @@ async fn a_handshake_the_server_answers_and_fails_says_so_without_the_firewall_h
         "{error:?}"
     );
     assert!(!has_context(&error, "firewall"), "{error:?}");
+    assert!(error.quic_unreachable().is_none(), "{error:?}");
 }

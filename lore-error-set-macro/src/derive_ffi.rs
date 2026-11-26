@@ -28,6 +28,20 @@ pub fn derive_ffi_error(input: &DeriveInput) -> TokenStream {
         Err(err) => return err.to_compile_error(),
     };
 
+    // FORK-LOCAL (Tideshift): `#[ffi_unreachable_endpoint(field)]` names an
+    // `Option<Box<T>>` field whose `T` has `host`, `port` and `tcp_url`.
+    let unreachable_impl = match extract_unreachable_endpoint(input) {
+        Ok(Some(field)) => quote! {
+            fn unreachable_endpoint(&self) -> Option<(&str, u16, &str)> {
+                self.#field
+                    .as_deref()
+                    .map(|detail| (detail.host.as_str(), detail.port, detail.tcp_url.as_str()))
+            }
+        },
+        Ok(None) => TokenStream::new(),
+        Err(err) => return err.to_compile_error(),
+    };
+
     quote! {
         // Scopes the attribute to the FFI code registry. This is a bare
         // identifier, so it resolves in the module the derive expands into
@@ -49,8 +63,28 @@ pub fn derive_ffi_error(input: &DeriveInput) -> TokenStream {
         impl lore_error_set::FfiError for #name {
             fn ffi_code(&self) -> i32 { Self::FFI_CODE }
             #identity_impl
+            #unreachable_impl
         }
     }
+}
+
+/// FORK-LOCAL (Tideshift): reads an optional `#[ffi_unreachable_endpoint(field)]`, which names the
+/// field carrying the unreachable endpoint. Named explicitly for the reason
+/// [`extract_outcome_identity`] names its fields.
+fn extract_unreachable_endpoint(input: &DeriveInput) -> syn::Result<Option<syn::Ident>> {
+    let mut found: Option<syn::Ident> = None;
+    for attr in &input.attrs {
+        if attr.path().is_ident("ffi_unreachable_endpoint") {
+            if found.is_some() {
+                return Err(syn::Error::new_spanned(
+                    attr,
+                    "duplicate #[ffi_unreachable_endpoint]; a type names its endpoint field once",
+                ));
+            }
+            found = Some(attr.parse_args::<syn::Ident>()?);
+        }
+    }
+    Ok(found)
 }
 
 /// Reads an optional `#[ffi_outcome_identity(operation_field, attempt_field)]`.

@@ -738,6 +738,22 @@ pub struct LoreErrorDetail {
     /// so it names the attempt rather than the moment the loss was noticed.
     #[serde(default)]
     pub attempt_id: LoreString,
+    /// FORK-LOCAL (Tideshift): the host a QUIC storage handshake got no answer from in time, for
+    /// a disconnected error (`error_code` 28) that knows it. Empty otherwise.
+    ///
+    /// A front that drops UDP while it passes TCP produces it: sign-in and every gRPC call still
+    /// work, and only the QUIC storage path fails. Read it with `unreachable_port` and
+    /// `unreachable_tcp_url`; a consumer decides by this field being non-empty, not by parsing
+    /// `message`. Appended last so the fields before it keep their places.
+    #[serde(default)]
+    pub unreachable_host: LoreString,
+    /// The UDP port of `unreachable_host`'s handshake. `0` when `unreachable_host` is empty.
+    #[serde(default)]
+    pub unreachable_port: u16,
+    /// The TCP (gRPC) URL to the same server, `grpc://host:port` or `grpcs://host:port`, with no
+    /// repository path. Empty when `unreachable_host` is empty.
+    #[serde(default)]
+    pub unreachable_tcp_url: LoreString,
 }
 
 impl LoreErrorDetail {
@@ -792,6 +808,16 @@ impl LoreErrorDetail {
             ),
             None => (LoreString::default(), LoreString::default()),
         };
+        // FORK-LOCAL (Tideshift): read as data too, for the same reason.
+        let (unreachable_host, unreachable_port, unreachable_tcp_url) =
+            match error.unreachable_endpoint() {
+                Some((host, port, tcp_url)) => (
+                    LoreString::from(host.to_string()),
+                    port,
+                    LoreString::from(tcp_url.to_string()),
+                ),
+                None => (LoreString::default(), 0, LoreString::default()),
+            };
 
         Self {
             error_code: error.ffi_code(),
@@ -799,6 +825,9 @@ impl LoreErrorDetail {
             trace_locations: LoreArray::from_vec(trace_locations),
             operation,
             attempt_id,
+            unreachable_host,
+            unreachable_port,
+            unreachable_tcp_url,
         }
     }
 

@@ -501,6 +501,19 @@ typedef struct lore_error_detail_t {
   // recoverable rather than merely reportable. It is minted before dispatch,
   // so it names the attempt rather than the moment the loss was noticed.
   struct lore_string_t attempt_id;
+  // FORK-LOCAL (Tideshift): the host a QUIC storage handshake got no answer from in time, for
+  // a disconnected error (`error_code` 28) that knows it. Empty otherwise.
+  //
+  // A front that drops UDP while it passes TCP produces it: sign-in and every gRPC call still
+  // work, and only the QUIC storage path fails. Read it with `unreachable_port` and
+  // `unreachable_tcp_url`; a consumer decides by this field being non-empty, not by parsing
+  // `message`. Appended last so the fields before it keep their places.
+  struct lore_string_t unreachable_host;
+  // The UDP port of `unreachable_host`'s handshake. `0` when `unreachable_host` is empty.
+  uint16_t unreachable_port;
+  // The TCP (gRPC) URL to the same server, `grpc://host:port` or `grpcs://host:port`, with no
+  // repository path. Empty when `unreachable_host` is empty.
+  struct lore_string_t unreachable_tcp_url;
 } lore_error_detail_t;
 
 // Data for a completion event, marking the end of an operation.
@@ -1922,6 +1935,10 @@ typedef struct lore_lock_file_status_begin_event_data_t {
 } lore_lock_file_status_begin_event_data_t;
 
 // Data for an event reporting the lock status of a single path.
+//
+// FORK-LOCAL (Tideshift): also sent by a commit or a push, without a `LockFileStatusBegin`, once
+// per lock another user holds on a path it would change, just before the operation is refused
+// with `LockNotOwned` (see `lock::file::held::find_held_by_others`).
 typedef struct lore_lock_file_status_event_data_t {
   // Path the status applies to.
   struct lore_string_t path;

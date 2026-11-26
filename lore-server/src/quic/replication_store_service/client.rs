@@ -495,6 +495,12 @@ impl ServiceClient for ReplicationStoreClient {
         Self::ALPN
     }
 
+    // FORK-LOCAL (Tideshift, D-QS3): replica-to-replica reconnects keep upstream's attempt-count
+    // bound. The 30 s unmanaged bound is for the clients a user's command waits on.
+    fn bounds_unmanaged_reconnect(&self) -> bool {
+        false
+    }
+
     fn map_send_error(
         &self,
         _failed_request: Self::RequestType,
@@ -509,7 +515,7 @@ impl ServiceClient for ReplicationStoreClient {
             SendWithReconnectError::PermitAcquire => {
                 ReplicationStoreClientError::ClientSideThrottling
             }
-            SendWithReconnectError::Disconnected | SendWithReconnectError::ReconnectFailed => {
+            SendWithReconnectError::Disconnected | SendWithReconnectError::ReconnectFailed(_) => {
                 ReplicationStoreClientError::ConnectionFailed
             }
             // This client sends no session id, so it has nothing to rebind; the transport

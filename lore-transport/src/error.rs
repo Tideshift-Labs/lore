@@ -410,6 +410,15 @@ pub enum ProtocolError {
     OutcomeUnknown,
 }
 
+impl ProtocolError {
+    /// FORK-LOCAL (Tideshift): the endpoint where no QUIC handshake to the storage service was
+    /// answered in time, when this is a `Disconnected` that knows it.
+    pub fn quic_unreachable(&self) -> Option<&lore_base::error::QuicUnreachable> {
+        self.as_disconnected()
+            .and_then(|disconnected| disconnected.unreachable.as_deref())
+    }
+}
+
 /// Typed proof that a managed single-message mutation never left: the transport did not take
 /// its one request message within the idle bound. It rides inside `ProtocolError::Internal`;
 /// only the managed journal settle acts on it, settling the attempt not applied and reporting

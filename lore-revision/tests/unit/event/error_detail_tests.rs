@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::error::Disconnected;
 use lore_base::error::NotFound;
+use lore_base::error::QuicUnreachable;
 use lore_error_set::FfiError;
 use lore_error_set::Location;
 use lore_error_set::Trace;
@@ -49,6 +51,9 @@ fn default_is_the_empty_success_detail() {
     assert_eq!(detail.error_code, 0);
     assert!(detail.message.is_empty());
     assert!(detail.trace_locations.is_empty());
+    assert!(detail.unreachable_host.is_empty());
+    assert_eq!(detail.unreachable_port, 0);
+    assert!(detail.unreachable_tcp_url.is_empty());
 }
 
 #[test]
@@ -164,4 +169,79 @@ fn an_ordinary_error_names_no_attempt() {
     assert_ne!(detail.error_code, 248);
     assert!(detail.operation.as_str().is_empty());
     assert!(detail.attempt_id.as_str().is_empty());
+}
+
+// A set that can hold the unreachable `Disconnected`, as a real operation's error does.
+#[error_set]
+enum NetworkError {
+    Disconnected,
+    NotFound,
+}
+
+fn unreachable_disconnect() -> Disconnected {
+    Disconnected::unreachable(QuicUnreachable {
+        host: "storage.example.test".to_string(),
+        port: 41337,
+        tcp_url: "grpcs://storage.example.test:41339".to_string(),
+    })
+}
+
+/// The endpoint travels as data, so an embedder can offer the TCP URL without parsing the message.
+#[test]
+fn an_unreachable_disconnect_publishes_its_endpoint_as_fields() {
+    for detail in [
+        LoreErrorDetail::from_error_with_trace(&unreachable_disconnect(), &Trace::new()),
+        LoreErrorDetail::from_error(&NetworkError::from(unreachable_disconnect())),
+    ] {
+        assert_eq!(detail.error_code, 28);
+        assert_eq!(detail.unreachable_host.as_str(), "storage.example.test");
+        assert_eq!(detail.unreachable_port, 41337);
+        assert_eq!(
+            detail.unreachable_tcp_url.as_str(),
+            "grpcs://storage.example.test:41339"
+        );
+        assert!(detail.message.as_str().contains("firewall or VPN"));
+    }
+}
+
+/// Everything without the detail leaves the three fields empty: a plain disconnect (same code, no
+/// endpoint), an outcome-unknown error, and an ordinary error.
+#[test]
+fn errors_without_the_detail_leave_the_endpoint_fields_empty() {
+    let unknown = lore_base::error::OutcomeUnknown {
+        operation: "RevisionService.BranchCreate".to_string(),
+        attempt_id: "0199aa00-0000-7000-8000-000000000001".to_string(),
+    };
+    let details = [
+        LoreErrorDetail::from_error_with_trace(&Disconnected, &Trace::new()),
+        LoreErrorDetail::from_error(&NetworkError::from(Disconnected)),
+        LoreErrorDetail::from_error_with_trace(&unknown, &Trace::new()),
+        LoreErrorDetail::from_error_with_trace(&NotFound {}, &Trace::new()),
+        LoreErrorDetail::from_error(&NetworkError::from(NotFound)),
+    ];
+    for detail in details {
+        assert!(detail.unreachable_host.is_empty(), "{}", detail.message);
+        assert_eq!(detail.unreachable_port, 0, "{}", detail.message);
+        assert!(detail.unreachable_tcp_url.is_empty(), "{}", detail.message);
+    }
+    // The plain disconnect keeps its code, so only the fields tell the two apart.
+    assert_eq!(
+        LoreErrorDetail::from_error_with_trace(&Disconnected, &Trace::new()).error_code,
+        28
+    );
+}
+
+/// The fields serialize under camelCase keys, as the rest of the detail does.
+#[test]
+fn the_endpoint_fields_serialize_in_camel_case() {
+    let detail = LoreErrorDetail::from_error_with_trace(&unreachable_disconnect(), &Trace::new());
+
+    let json = serde_json::to_value(&detail).expect("serialize the detail");
+
+    assert_eq!(json["unreachableHost"], "storage.example.test");
+    assert_eq!(json["unreachablePort"], 41337);
+    assert_eq!(
+        json["unreachableTcpUrl"],
+        "grpcs://storage.example.test:41339"
+    );
 }

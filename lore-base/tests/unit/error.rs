@@ -475,3 +475,108 @@ mod refusal {
         assert!(error.is_file_not_found(), "{error:?}");
     }
 }
+
+/// `Disconnected` optionally carries where the QUIC storage path could not be reached. The bare
+/// value (a const of the same name) is unchanged.
+mod disconnected_detail {
+    use lore_base::error::*;
+    use lore_error_set::FfiError;
+    use lore_error_set::prelude::*;
+
+    #[error_set]
+    enum Remote {
+        Disconnected,
+        NotAuthorized,
+    }
+
+    fn unreachable() -> Disconnected {
+        Disconnected::unreachable(QuicUnreachable {
+            host: "storage.example.test".to_string(),
+            port: 41337,
+            tcp_url: "grpcs://storage.example.test:41339".to_string(),
+        })
+    }
+
+    #[test]
+    fn the_bare_value_displays_as_before_and_names_no_endpoint() {
+        assert_eq!(Disconnected.to_string(), "Disconnected from server");
+        assert_eq!(Disconnected.ffi_code(), 28);
+        assert_eq!(Disconnected.unreachable_endpoint(), None);
+        assert!(Disconnected.unreachable.is_none());
+    }
+
+    #[test]
+    fn the_detail_extends_the_message_with_where_to_look_and_how_to_use_tcp() {
+        let error = unreachable();
+        let text = error.to_string();
+
+        assert!(text.starts_with("Disconnected from server: "), "{text}");
+        for needle in [
+            "storage.example.test",
+            "UDP port 41337",
+            "firewall or VPN",
+            "grpcs://storage.example.test:41339/<repository>",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_detail_keeps_code_28_and_publishes_the_endpoint() {
+        let error = unreachable();
+
+        assert_eq!(error.ffi_code(), 28);
+        assert_eq!(
+            error.unreachable_endpoint(),
+            Some((
+                "storage.example.test",
+                41337,
+                "grpcs://storage.example.test:41339"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_detail_is_the_one_the_constructor_was_given() {
+        let error = unreachable();
+        let detail = error.unreachable.as_deref().expect("a detail");
+
+        assert_eq!(detail.host, "storage.example.test");
+        assert_eq!(detail.port, 41337);
+        assert_eq!(detail.tcp_url, "grpcs://storage.example.test:41339");
+    }
+
+    /// A set holding the variant delegates the endpoint exactly as it delegates the code, and the
+    /// bare value and every other variant report none.
+    #[test]
+    fn a_set_holding_the_variant_delegates_the_endpoint() {
+        let with = Remote::from(unreachable());
+        assert_eq!(with.ffi_code(), 28);
+        assert_eq!(
+            with.unreachable_endpoint(),
+            Some((
+                "storage.example.test",
+                41337,
+                "grpcs://storage.example.test:41339"
+            ))
+        );
+
+        let bare = Remote::from(Disconnected);
+        assert_eq!(bare.ffi_code(), 28);
+        assert_eq!(bare.unreachable_endpoint(), None);
+
+        let other = Remote::from(NotAuthorized);
+        assert_eq!(other.unreachable_endpoint(), None);
+    }
+
+    /// Cloning keeps the detail (errors are cloned along retry and reporting paths).
+    #[test]
+    fn the_detail_survives_a_clone() {
+        let error = unreachable();
+
+        assert_eq!(
+            error.clone().unreachable_endpoint(),
+            error.unreachable_endpoint()
+        );
+    }
+}

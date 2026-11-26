@@ -64,7 +64,10 @@ pub fn error_set(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// #[ffi_code(10)]
 /// struct NotFound;
 /// ```
-#[proc_macro_derive(FfiError, attributes(ffi_code, ffi_outcome_identity))]
+#[proc_macro_derive(
+    FfiError,
+    attributes(ffi_code, ffi_outcome_identity, ffi_unreachable_endpoint)
+)]
 pub fn derive_ffi_error(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as syn::DeriveInput);
     derive_ffi::derive_ffi_error(&input).into()

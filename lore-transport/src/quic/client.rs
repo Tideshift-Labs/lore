@@ -23,6 +23,7 @@ use futures::TryFutureExt;
 use futures::stream::FuturesUnordered;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
+use lore_base::error::QuicUnreachable;
 use lore_base::lore_debug;
 use lore_base::lore_error;
 use lore_base::lore_info;
@@ -361,6 +362,14 @@ pub trait ServiceClient: Send + Sync {
         false
     }
 
+    /// FORK-LOCAL (Tideshift, D-QS3): whether a reconnect outside a managed scope is bounded by
+    /// [`reconnect_timeout`]. True for the clients a user's command waits on. A server-side
+    /// client (the replication store client) returns false and keeps upstream's attempt-count
+    /// bound.
+    fn bounds_unmanaged_reconnect(&self) -> bool {
+        true
+    }
+
     /// Whether repeating `request` is safe once it has been dispatched.
     ///
     /// There is deliberately no default. A client that adds an opcode has to decide whether
@@ -458,6 +467,30 @@ fn managed_idle_timeout() -> Duration {
         .or_else(|| from_env("LORE_GRPC_STREAM_IDLE_TIMEOUT"))
         .unwrap_or(MANAGED_IDLE_TIMEOUT_SECS);
     Duration::from_secs(secs)
+}
+
+/// FORK-LOCAL (Tideshift, D-QS3): the bound on a reconnect outside a managed scope, unless
+/// `LORE_QUIC_RECONNECT_TIMEOUT` (whole seconds, above zero) says otherwise.
+///
+/// Upstream bounds a reconnect only by its attempt count (10 attempts, a 5 s handshake each, a
+/// backoff that doubles to 30 s), which is about 3.5 min of silence when the path stays dead: a
+/// process whose cached connection lost UDP mid-session hung that long, where a fresh process
+/// fails after one handshake. 30 s still covers a replica restart or a lame-duck drain (8 s) and
+/// the load balancer moving to the peer: about four attempts fit.
+const RECONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// The unmanaged reconnect bound `value` (the `LORE_QUIC_RECONNECT_TIMEOUT` setting) names.
+#[lore_macro::test_pub]
+fn reconnect_timeout_from(value: Option<&str>) -> Duration {
+    let secs = value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(RECONNECT_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+fn reconnect_timeout() -> Duration {
+    reconnect_timeout_from(std::env::var("LORE_QUIC_RECONNECT_TIMEOUT").ok().as_deref())
 }
 
 /// FORK-LOCAL (Tideshift, WP-124 K10): the managed bound, for a caller that bounds its own wait
@@ -617,6 +650,14 @@ pub struct QuicConnection {
     /// FORK-LOCAL (Tideshift, WP-124): the managed write idle bound, in milliseconds. Read once
     /// at construction from [`managed_idle_timeout`]; an atomic only so a test can shorten it.
     managed_idle_ms: AtomicU64,
+    /// FORK-LOCAL (Tideshift, D-QS3): the bound on a reconnect outside a managed scope, in
+    /// milliseconds. Read once at construction from [`reconnect_timeout`]; an atomic only so a
+    /// test can shorten it.
+    reconnect_timeout_ms: AtomicU64,
+    /// FORK-LOCAL (Tideshift): the endpoint no handshake answered when the connection was given
+    /// up (epoch 0), so every command that finds it given up can say so, not only the one whose
+    /// reconnect gave up.
+    gave_up_unreachable: SyncMutex<Option<Box<QuicUnreachable>>>,
     response_observer: ResponseObserverSlot,
 }
 
@@ -674,6 +715,10 @@ impl QuicConnection {
             managed_idle_ms: AtomicU64::new(
                 u64::try_from(managed_idle_timeout().as_millis()).unwrap_or(u64::MAX),
             ),
+            reconnect_timeout_ms: AtomicU64::new(
+                u64::try_from(reconnect_timeout().as_millis()).unwrap_or(u64::MAX),
+            ),
+            gave_up_unreachable: SyncMutex::new(None),
             response_observer: ResponseObserverSlot::default(),
         }
     }
@@ -694,6 +739,34 @@ impl QuicConnection {
     pub fn set_managed_idle_for_test(&self, idle: Duration) {
         self.managed_idle_ms.store(
             u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Give the connection up for every caller (epoch 0), recording disconnected's endpoint
+    /// detail for the commands that find it given up. The detail is stored before the epoch, so
+    /// a command that sees epoch 0 sees the detail too.
+    fn give_up_for_all(&self, disconnected: &Disconnected) {
+        *self.gave_up_unreachable.lock() = disconnected.unreachable.clone();
+        self.epoch.store(0, Ordering::Relaxed);
+    }
+
+    /// The Disconnected a command gets from a given-up connection.
+    fn given_up(&self) -> Disconnected {
+        Disconnected {
+            unreachable: self.gave_up_unreachable.lock().clone(),
+        }
+    }
+
+    fn reconnect_bound(&self) -> Duration {
+        Duration::from_millis(self.reconnect_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten the unmanaged reconnect bound. Tests only.
+    #[cfg(any(feature = "test-util", feature = "test_seams"))]
+    pub fn set_reconnect_timeout_for_test(&self, bound: Duration) {
+        self.reconnect_timeout_ms.store(
+            u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
     }
@@ -963,8 +1036,10 @@ pub enum SendWithReconnectError {
     ClientError(#[from] QuicClientError),
     #[error("Disconnected from server")]
     Disconnected,
+    /// The reconnect gave up. FORK-LOCAL (Tideshift): carries the endpoint where no handshake was
+    /// answered in time, when that is why, so the caller's `Disconnected` can say so.
     #[error("Reconnect to server failed")]
-    ReconnectFailed,
+    ReconnectFailed(Option<Box<QuicUnreachable>>),
     /// A session-bearing send was refused before dispatch because its id belongs to the
     /// connection that is gone. The send is not retried here: the session-aware layer has to
     /// resolve a replacement session first. See [`crate::session::StorageSession`].
@@ -1372,10 +1447,15 @@ where
         _ => {
             let epoch_current = service_client.quic().epoch.load(Ordering::Relaxed);
             if epoch_current == 0 {
-                return Verdict::Failed(
-                    service_client
-                        .map_send_error(request_type, SendWithReconnectError::Disconnected),
-                );
+                // FORK-LOCAL (Tideshift): the connection was given up. Reported as the give-up
+                // it is, with the endpoint no handshake answered when that was why, so a
+                // command that finds it given up says what the one that gave up said.
+                return Verdict::Failed(service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ReconnectFailed(
+                        service_client.quic().given_up().unreachable,
+                    ),
+                ));
             }
             if epoch >= epoch_current {
                 // Nothing reconnected, so this is a real failure.
@@ -1453,10 +1533,26 @@ where
 
     // FORK-LOCAL (Tideshift, WP-124): in a managed scope the reconnect is bounded by the managed
     // bound, as the send phases are. Without it a dead path costs the whole backoff loop (minutes)
-    // with no error. Outside a scope the deadline is `None` and the loop is unchanged. A managed
-    // workflow counts too: its waits before a stage, and spawned work that carried its scope.
-    let deadline = crate::caller_operation::in_managed_wait_scope()
-        .then(|| tokio::time::Instant::now() + service_client.quic().managed_idle());
+    // with no error. A managed workflow counts too: its waits before a stage, and spawned work
+    // that carried its scope.
+    //
+    // FORK-LOCAL (Tideshift, D-QS3): outside a managed scope the reconnect is bounded too, by
+    // [`reconnect_timeout`] (30 s). Upstream's loop alone is about 3.5 min of silence on a dead
+    // path, which is what a process whose cached connection lost UDP mid-session saw. At that
+    // bound the reconnect gives up as an exhausted one does, and the caller gets `Disconnected`.
+    // A server-side client opts out and keeps upstream's loop (`bounds_unmanaged_reconnect`).
+    let now = tokio::time::Instant::now();
+    let bound = if crate::caller_operation::in_managed_wait_scope() {
+        Some(ReconnectBound::Managed(
+            now + service_client.quic().managed_idle(),
+        ))
+    } else if service_client.bounds_unmanaged_reconnect() {
+        Some(ReconnectBound::Unmanaged(
+            now + service_client.quic().reconnect_bound(),
+        ))
+    } else {
+        None
+    };
     match reconnect_until(
         service_client.endpoint_config(),
         service_client.alpn(),
@@ -1464,14 +1560,21 @@ where
         service_client.transport_config(),
         service_client.quic().clone(),
         epoch,
-        deadline,
+        bound,
     )
     .await
     {
         Ok(Ok(())) => {}
-        Ok(Err(_)) => {
-            return Err(service_client
-                .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
+        Ok(Err(err)) => {
+            // The endpoint no handshake answered, when that is why it gave up.
+            let unreachable = match &err {
+                ReconnectError::Disconnected(disconnected) => disconnected.unreachable.clone(),
+                _ => None,
+            };
+            return Err(service_client.map_send_error(
+                request_type,
+                SendWithReconnectError::ReconnectFailed(unreachable),
+            ));
         }
         // Only a failure before dispatch may say the command was not sent. A dispatched
         // replay-safe read (a session start, a Query) gets the expiry too, as a dispatched one:
@@ -1773,27 +1876,11 @@ fn client_crypto_config(
     Ok(cfg)
 }
 
-pub fn connect<'a>(
-    config: &'a EndpointConfig,
-    certificate_settings: CertificateSettings,
-    alpn: &'a str,
-    transport: TransportConfig,
-) -> impl Future<Output = Result<quinn::Connection, ProtocolError>> + 'a {
-    connect_announcing(config, certificate_settings, alpn, transport, false)
-}
-
-/// [`connect`], which also warns the user, where `announce` is set and no handshake completed in
-/// time, that UDP to the server may be blocked. Set for each storage connection's first connect
-/// only (one per connection a command opens, `--max-connections`), so a reconnect loop does not
-/// repeat it.
-///
-/// FORK-LOCAL (Tideshift).
-pub async fn connect_announcing(
+pub async fn connect(
     config: &EndpointConfig,
     certificate_settings: CertificateSettings,
     alpn: &str,
     transport: TransportConfig,
-    announce: bool,
 ) -> Result<quinn::Connection, ProtocolError> {
     let remote_url = config.remote_url.as_str();
     let url = Url::parse(remote_url).internal_with(|| format!("remote {remote_url} is invalid"))?;
@@ -1888,15 +1975,21 @@ pub async fn connect_announcing(
     // `Disconnected`. Per-attempt details are logged above.
     lore_debug!("QUIC connect failed {remote_url}");
     // FORK-LOCAL (Tideshift): the trace names the host and UDP port, so the caller's error says
-    // where the handshake went and why it may have failed, rather than only "Disconnected".
-    let message = quic_unreachable_message(
-        remote_url,
-        config.default_port,
-        timed_out.load(Ordering::Relaxed),
-    );
-    if announce && timed_out.load(Ordering::Relaxed) {
-        lore_warn!("{message}");
+    // where the handshake went and why it may have failed, rather than only "Disconnected". Where
+    // no handshake was answered in time the error itself carries that as data, and its message
+    // says so, so every caller (the CLI, an embedder reading the error detail) sees it.
+    // The trace then names only the endpoint: the hint is in the message, which the CLI prints
+    // above the trace, so repeating it there would print it twice.
+    if timed_out.load(Ordering::Relaxed) {
+        let detail = quic_unreachable(remote_url, config.default_port);
+        let message = format!(
+            "no QUIC handshake answered from {} on UDP port {} within {HANDSHAKE_TIMEOUT_SECS} s",
+            detail.host, detail.port
+        );
+        return Err(ProtocolError::from(Disconnected::unreachable(detail)))
+            .forward::<ProtocolError>(&message);
     }
+    let message = quic_unreachable_message(remote_url, config.default_port, false);
     Err(ProtocolError::from(Disconnected)).forward::<ProtocolError>(&message)
 }
 
@@ -1908,20 +2001,7 @@ pub async fn connect_announcing(
 /// A front that drops or rejects UDP while it passes TCP is the case the first names: sign-in and
 /// every gRPC call still work, and only the QUIC storage path fails.
 pub fn quic_unreachable_message(remote_url: &str, default_port: u16, timed_out: bool) -> String {
-    let endpoint = Url::parse(remote_url).ok().map(|url| {
-        (
-            url.host_str().unwrap_or_default().to_string(),
-            url.port().unwrap_or(default_port),
-            // The TCP scheme keeps the remote's TLS choice: `lores://` to `grpcs://`.
-            if url.scheme().ends_with('s') {
-                "grpcs"
-            } else {
-                "grpc"
-            },
-        )
-    });
-    let (host, port, tcp_scheme) =
-        endpoint.unwrap_or_else(|| (String::from("<host>"), default_port, "grpcs"));
+    let (host, port, tcp_scheme) = unreachable_endpoint(remote_url, default_port);
     if timed_out {
         // FORK-LOCAL (Tideshift): no fallback runs; the user moves to TCP by hand. Lore has no
         // command that changes an existing clone's remote, and its docs say not to edit
@@ -1939,6 +2019,37 @@ pub fn quic_unreachable_message(remote_url: &str, default_port: u16, timed_out: 
              {port}: the handshake failed"
         )
     }
+}
+
+/// FORK-LOCAL (Tideshift): the typed detail for a QUIC connection to `remote_url` that got no
+/// handshake answer in time: its host, UDP port and TCP (gRPC) URL. Never the URL itself, which
+/// may carry credentials.
+pub fn quic_unreachable(remote_url: &str, default_port: u16) -> QuicUnreachable {
+    let (host, port, tcp_scheme) = unreachable_endpoint(remote_url, default_port);
+    QuicUnreachable {
+        tcp_url: format!("{tcp_scheme}://{host}:{port}"),
+        host,
+        port,
+    }
+}
+
+/// The host, port and TCP scheme a message about `remote_url` names.
+fn unreachable_endpoint(remote_url: &str, default_port: u16) -> (String, u16, &'static str) {
+    Url::parse(remote_url).ok().map_or_else(
+        || (String::from("<host>"), default_port, "grpcs"),
+        |url| {
+            (
+                url.host_str().unwrap_or_default().to_string(),
+                url.port().unwrap_or(default_port),
+                // The TCP scheme keeps the remote's TLS choice: `lores://` to `grpcs://`.
+                if url.scheme().ends_with('s') {
+                    "grpcs"
+                } else {
+                    "grpc"
+                },
+            )
+        },
+    )
 }
 
 #[lore_macro::test_pub]
@@ -2126,7 +2237,7 @@ pub async fn reconnect<AuthErrorType>(
 where
     AuthErrorType: std::error::Error + Send + Sync,
 {
-    // Without a deadline nothing is raced, so the deadline error cannot occur.
+    // Without a bound nothing is raced, so the deadline error cannot occur.
     reconnect_until(
         config,
         alpn,
@@ -2145,6 +2256,27 @@ where
 #[derive(Debug)]
 struct ReconnectDeadline;
 
+/// FORK-LOCAL (Tideshift): what bounds a reconnect, and what reaching the bound means.
+#[derive(Clone, Copy, Debug)]
+enum ReconnectBound {
+    /// A managed scope's bound (WP-124). At the deadline the connection is left closed with its
+    /// epoch kept, so the next command reconnects, and the caller gets the typed expiry.
+    Managed(tokio::time::Instant),
+    /// The bound outside a managed scope (D-QS3, [`reconnect_timeout`]). At the deadline the
+    /// reconnect gives up as an exhausted one does, only sooner: the epoch goes to zero, so every
+    /// command waiting on this connection fails at once rather than each starting its own bound,
+    /// and the caller gets `Disconnected`.
+    Unmanaged(tokio::time::Instant),
+}
+
+impl ReconnectBound {
+    fn deadline(self) -> tokio::time::Instant {
+        match self {
+            Self::Managed(deadline) | Self::Unmanaged(deadline) => deadline,
+        }
+    }
+}
+
 /// Race `future` against `deadline`, or just await it when there is none.
 ///
 /// Only for awaits that are safe to drop: the guard wait, a connect attempt, and a backoff
@@ -2161,13 +2293,17 @@ async fn before_deadline<T>(
     }
 }
 
-/// [`reconnect`], giving up at `deadline` when there is one.
+/// [`reconnect`], giving up at `bound` when there is one.
 ///
-/// FORK-LOCAL (Tideshift, WP-124). On the deadline the connection is left as it is between two
-/// attempts: closed, with the epoch unchanged, so the next command reconnects. The epoch is not
-/// set to zero, because that would give the connection up for every caller. The section from the
-/// swap to the published epoch is never raced: dropped inside it, the streams, the stream count
-/// and the epoch would disagree.
+/// FORK-LOCAL (Tideshift, WP-124). At a managed deadline the connection is left as it is between
+/// two attempts: closed, with the epoch unchanged, so the next command reconnects. The epoch is
+/// not set to zero, because that would give the connection up for every caller. An unmanaged
+/// deadline (D-QS3) does give it up, as an exhausted reconnect does; see [`ReconnectBound`]. The
+/// section from the swap to the published epoch is never raced: dropped inside it, the streams,
+/// the stream count and the epoch would disagree.
+///
+/// Where the reconnect gives up and no attempt got a handshake answer, the `Disconnected` it
+/// returns carries the endpoint ([`quic_unreachable`]).
 async fn reconnect_until<AuthErrorType>(
     config: EndpointConfig,
     alpn: &str,
@@ -2175,20 +2311,40 @@ async fn reconnect_until<AuthErrorType>(
     transport_config: TransportConfig,
     connection: Arc<QuicConnection>,
     epoch: u32,
-    deadline: Option<tokio::time::Instant>,
+    bound: Option<ReconnectBound>,
 ) -> Result<Result<(), ReconnectError>, ReconnectDeadline>
 where
     AuthErrorType: std::error::Error + Send + Sync,
 {
     let remote_url = &config.remote_url;
-    let Ok(_permit) = before_deadline(deadline, connection.reconnect_guard.acquire()).await? else {
+    let deadline = bound.map(ReconnectBound::deadline);
+    // Waiting for another command's reconnect. At an unmanaged deadline this command gives up
+    // without touching the connection, which that reconnect owns and bounds itself.
+    let permit = match before_deadline(deadline, connection.reconnect_guard.acquire()).await {
+        Ok(permit) => permit,
+        Err(ReconnectDeadline) if matches!(bound, Some(ReconnectBound::Unmanaged(_))) => {
+            return Ok(Err(ReconnectError::from(Disconnected)));
+        }
+        Err(ReconnectDeadline) => return Err(ReconnectDeadline),
+    };
+    let Ok(_permit) = permit else {
         return Ok(Err(ReconnectError::from(Disconnected)));
+    };
+    // Whether the last attempt that ended reached a server that answered its handshake. Until
+    // one does, the path is what a front dropping UDP looks like, and the give-up says so.
+    let mut answered = false;
+    let give_up = |answered: bool| {
+        if answered {
+            Disconnected
+        } else {
+            Disconnected::unreachable(quic_unreachable(&config.remote_url, config.default_port))
+        }
     };
 
     let epoch_current = connection.epoch.load(Ordering::Relaxed);
     if epoch_current == 0 {
         // Reconnection failed, give up
-        return Ok(Err(ReconnectError::from(Disconnected)));
+        return Ok(Err(ReconnectError::from(connection.given_up())));
     }
     if epoch < epoch_current {
         // Something else reconnected
@@ -2222,7 +2378,7 @@ where
     {
         lore_info!("Total reconnects to {remote_url} exhausted - not reconnecting");
         // Indicate that any pending commands entering their retry flow should give up
-        connection.epoch.store(0, Ordering::Relaxed);
+        connection.give_up_for_all(&Disconnected);
         return Ok(Err(ReconnectError::from(Disconnected)));
     }
 
@@ -2252,7 +2408,12 @@ where
         )
         .await;
         let Ok(attempt) = attempt else {
-            return Err(give_up_at_deadline(&connection).await);
+            return at_deadline(bound, &connection, give_up(answered)).await;
+        };
+        // A handshake the server answered, whether it then failed or not, is not a dead path.
+        answered = match &attempt {
+            Ok(_) => true,
+            Err(err) => err.quic_unreachable().is_none(),
         };
         match attempt {
             Ok(quic_connection) => {
@@ -2312,7 +2473,7 @@ where
                     ) => {
                         lore_debug!("Reconnect authorization failed, retry");
                         let Ok(more) = before_deadline(deadline, retry.wait()).await else {
-                            return Err(give_up_at_deadline(&connection).await);
+                            return at_deadline(bound, &connection, give_up(answered)).await;
                         };
                         if !more {
                             lore_debug!("Reconnect attempts exhausted, giving up");
@@ -2321,8 +2482,9 @@ where
                                 connection.connection.close(0u32.into(), b"failed connect");
                             }
                             // Indicate that any pending commands entering this flow should give up
-                            connection.epoch.store(0, Ordering::Relaxed);
-                            return Ok(Err(ReconnectError::from(Disconnected)));
+                            let disconnected = give_up(answered);
+                            connection.give_up_for_all(&disconnected);
+                            return Ok(Err(ReconnectError::from(disconnected)));
                         }
                     }
                     Err(err) => {
@@ -2333,7 +2495,7 @@ where
                                 .close(0u32.into(), b"failed authorization");
                         }
                         // Indicate that any pending commands entering this flow should give up
-                        connection.epoch.store(0, Ordering::Relaxed);
+                        connection.give_up_for_all(&Disconnected);
 
                         lore_error!("Failed to reconnect, authorization failed: {err}");
                         return Ok(Err(ReconnectError::from(NotAuthorized)));
@@ -2343,7 +2505,7 @@ where
             Err(err) => {
                 lore_debug!("Reconnect attempt failed: {err}");
                 let Ok(more) = before_deadline(deadline, retry.wait()).await else {
-                    return Err(give_up_at_deadline(&connection).await);
+                    return at_deadline(bound, &connection, give_up(answered)).await;
                 };
                 if !more {
                     lore_debug!("Reconnect attempts exhausted, giving up");
@@ -2352,8 +2514,9 @@ where
                         connection.connection.close(0u32.into(), b"failed connect");
                     }
                     // Indicate that any pending commands entering this flow should give up
-                    connection.epoch.store(0, Ordering::Relaxed);
-                    return Ok(Err(ReconnectError::from(Disconnected)));
+                    let disconnected = give_up(answered);
+                    connection.give_up_for_all(&disconnected);
+                    return Ok(Err(ReconnectError::from(disconnected)));
                 }
             }
         }
@@ -2364,6 +2527,32 @@ where
     lore_info!("Reconnected to {}", remote_url);
 
     Ok(Ok(()))
+}
+
+/// FORK-LOCAL (Tideshift): what a reconnect that held the guard returns at `bound`'s deadline.
+///
+/// Managed: [`give_up_at_deadline`], the typed expiry, with the epoch kept. Unmanaged (D-QS3):
+/// give the connection up as an exhausted reconnect does, so every command waiting on it fails at
+/// once, and return `disconnected`.
+async fn at_deadline(
+    bound: Option<ReconnectBound>,
+    connection: &QuicConnection,
+    disconnected: Disconnected,
+) -> Result<Result<(), ReconnectError>, ReconnectDeadline> {
+    if !matches!(bound, Some(ReconnectBound::Unmanaged(_))) {
+        return Err(give_up_at_deadline(connection).await);
+    }
+    lore_info!(
+        "Reconnect did not finish within {:.0}s, giving up",
+        connection.reconnect_bound().as_secs_f64()
+    );
+    {
+        let quinn = connection.connection.write().await;
+        quinn.connection.close(0u32.into(), b"reconnect timeout");
+    }
+    // Indicate that any pending commands entering their retry flow should give up.
+    connection.give_up_for_all(&disconnected);
+    Ok(Err(ReconnectError::from(disconnected)))
 }
 
 /// FORK-LOCAL (Tideshift, WP-124): leave a reconnect at its deadline.

@@ -241,10 +241,71 @@ pub struct WriteRequired;
 // later is often the right response.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Error, FfiError)]
-#[error("Disconnected from server")]
+/// The connection to the server is gone, or could not be opened.
+///
+/// FORK-LOCAL (Tideshift): a braced struct rather than upstream's unit struct, so the error can
+/// say, as data, that no QUIC handshake to the storage service was answered in time (the shape a
+/// front that drops UDP while it passes TCP produces). The same-name constant [`Disconnected`]
+/// below is the unit value upstream code spells, so every `ProtocolError::from(Disconnected)`
+/// compiles unchanged. The code stays 28 either way; a consumer that wants the reason reads
+/// [`lore_error_set::FfiError::unreachable_endpoint`], never the message.
+#[derive(Debug, Clone, Default, Error, FfiError)]
+#[error(
+    "Disconnected from server{}",
+    .unreachable.as_deref().map_or_else(String::new, |detail| format!(": {detail}"))
+)]
 #[ffi_code(28)]
-pub struct Disconnected;
+#[ffi_unreachable_endpoint(unreachable)]
+pub struct Disconnected {
+    /// Set where no QUIC handshake to the storage service was answered in time.
+    pub unreachable: Option<Box<QuicUnreachable>>,
+}
+
+/// FORK-LOCAL (Tideshift): the plain [`Disconnected`] value, with no detail.
+///
+/// Shares the type's name in the value namespace, as a unit struct's constructor does, so
+/// upstream's `Disconnected` expressions keep their meaning.
+#[allow(non_upper_case_globals)]
+pub const Disconnected: Disconnected = Disconnected { unreachable: None };
+
+impl Disconnected {
+    /// A [`Disconnected`] that says no QUIC handshake to `detail`'s endpoint was answered in time.
+    pub fn unreachable(detail: QuicUnreachable) -> Self {
+        Self {
+            unreachable: Some(Box::new(detail)),
+        }
+    }
+}
+
+/// FORK-LOCAL (Tideshift): where a QUIC storage connection got no handshake answer in time, and
+/// the TCP (gRPC) URL that reaches the same server.
+///
+/// Names the host and UDP port only, never the remote URL, which may carry credentials.
+/// `tcp_url` keeps the remote's TLS choice (`lores://` gives `grpcs://`) and has no repository
+/// path; a new clone appends one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicUnreachable {
+    /// The host the handshake went to.
+    pub host: String,
+    /// The UDP port the handshake went to.
+    pub port: u16,
+    /// `grpc(s)://host:port`, the TCP route to the same server.
+    pub tcp_url: String,
+}
+
+impl std::fmt::Display for QuicUnreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // No automatic fallback runs: Lore has no command that changes an existing clone's
+        // remote, so the way to TCP is a new clone.
+        write!(
+            f,
+            "Could not reach the storage service at {} on UDP port {}: no QUIC handshake \
+             completed in time. A firewall or VPN may be blocking UDP traffic to this server. \
+             To use TCP instead, clone again with {}/<repository>",
+            self.host, self.port, self.tcp_url
+        )
+    }
+}
 
 #[derive(Debug, Clone, Error, FfiError)]
 #[error("Not connected to remote: {reason}")]

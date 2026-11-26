@@ -155,10 +155,11 @@ async fn a_spawned_start_in_a_managed_caller_ends_at_the_bound_and_is_not_a_mana
     assert!(elapsed < BOUND + LATE_MARGIN, "{elapsed:?}");
 }
 
-/// Control: carrying the scope from an UNMANAGED task adds no bound. The same start is still
-/// reconnecting well past twice the bound.
+/// Control: carrying the scope from an UNMANAGED task adds no MANAGED bound. The same start is still
+/// reconnecting well past twice the managed bound; only the unmanaged reconnect bound (30 s by
+/// default) ends it, so the managed bound is not what governs this task.
 #[tokio::test]
-async fn a_carried_start_from_an_unmanaged_task_keeps_the_old_unbounded_behaviour() {
+async fn a_carried_start_from_an_unmanaged_task_is_not_cut_off_by_the_managed_bound() {
     let peer = Peer::start();
     let (client, _) = client_with_session(&peer).await;
     make_unreachable(&peer).await;
@@ -172,10 +173,11 @@ async fn a_carried_start_from_an_unmanaged_task_keeps_the_old_unbounded_behaviou
     );
 }
 
-/// Control: without the carry, a spawn from a managed workflow loses the scope and is unbounded.
-/// This is the defect the carry exists for.
+/// Control: without the carry, a spawn from a managed workflow loses the scope, so the MANAGED bound
+/// never fires for it: it is still reconnecting well past twice that bound, and only the unmanaged
+/// reconnect bound (30 s by default) ends it. This is what the carry exists to prevent.
 #[tokio::test]
-async fn an_uncarried_spawn_from_a_managed_workflow_is_unbounded() {
+async fn an_uncarried_spawn_from_a_managed_workflow_gets_no_managed_deadline() {
     let peer = Peer::start();
     let (client, _) = client_with_session(&peer).await;
     make_unreachable(&peer).await;
@@ -192,7 +194,7 @@ async fn an_uncarried_spawn_from_a_managed_workflow_is_unbounded() {
     .await;
     assert!(
         pending.is_err(),
-        "a spawn that did not carry the scope has no managed deadline"
+        "a spawn that did not carry the scope must not see the managed deadline"
     );
 }
 

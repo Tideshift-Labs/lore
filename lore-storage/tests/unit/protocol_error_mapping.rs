@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! `protocol_error_to_storage` keeps what a transport said about a failed connect.
 use lore_base::error::Disconnected;
+use lore_base::error::QuicUnreachable;
 use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_storage::error::StorageError;
@@ -51,4 +52,39 @@ fn a_bare_disconnected_is_still_disconnected() {
         matches!(mapped, StorageError::Disconnected(_)),
         "{mapped:?}"
     );
+}
+
+/// The typed unreachable detail (host, UDP port, TCP URL) travels with the mapped error, so a
+/// caller above storage can publish it without parsing the message.
+#[test]
+fn a_disconnected_with_the_unreachable_detail_keeps_it_through_the_storage_mapping() {
+    let unreachable = ProtocolError::from(Disconnected::unreachable(QuicUnreachable {
+        host: "127.0.0.1".to_string(),
+        port: 41337,
+        tcp_url: "grpcs://127.0.0.1:41337".to_string(),
+    }));
+    assert!(unreachable.quic_unreachable().is_some(), "precondition");
+
+    let mapped = protocol_error_to_storage(unreachable, address());
+
+    assert!(
+        matches!(mapped, StorageError::Disconnected(_)),
+        "{mapped:?}"
+    );
+    assert_eq!(
+        mapped.unreachable_endpoint(),
+        Some(("127.0.0.1", 41337, "grpcs://127.0.0.1:41337"))
+    );
+    assert!(
+        mapped.to_string().contains("UDP port 41337"),
+        "the mapped message names the port: {mapped}"
+    );
+}
+
+/// A bare `Disconnected` maps with no endpoint.
+#[test]
+fn a_bare_disconnected_maps_with_no_unreachable_endpoint() {
+    let mapped = protocol_error_to_storage(ProtocolError::from(Disconnected), address());
+
+    assert_eq!(mapped.unreachable_endpoint(), None);
 }

@@ -861,6 +861,11 @@ fn generate_ffi_error_impl(enum_name: &Ident, variants: &[&Ident]) -> TokenStrea
         quote! { Self::#v(e) => lore_error_set::FfiError::outcome_identity(&**e) }
     });
 
+    // FORK-LOCAL (Tideshift): delegated like the identity, for the same reason.
+    let unreachable_arms = variants.iter().map(|v| {
+        quote! { Self::#v(e) => lore_error_set::FfiError::unreachable_endpoint(&**e) }
+    });
+
     quote! {
         impl lore_error_set::FfiError for #enum_name {
             fn ffi_code(&self) -> i32 {
@@ -873,6 +878,13 @@ fn generate_ffi_error_impl(enum_name: &Ident, variants: &[&Ident]) -> TokenStrea
             fn outcome_identity(&self) -> Option<(&str, &str)> {
                 match self {
                     #(#identity_arms,)*
+                    Self::Internal(_) => None,
+                }
+            }
+
+            fn unreachable_endpoint(&self) -> Option<(&str, u16, &str)> {
+                match self {
+                    #(#unreachable_arms,)*
                     Self::Internal(_) => None,
                 }
             }

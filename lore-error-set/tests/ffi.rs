@@ -131,3 +131,60 @@ fn ffi_codes_are_distinct() {
     assert_ne!(pd.ffi_code(), cf.ffi_code());
     assert_ne!(nf.ffi_code(), cf.ffi_code());
 }
+
+// ---------------------------------------------------------------------------
+// `unreachable_endpoint`: defaulted to None, delegated by sets
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct Unreachable;
+
+impl fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unreachable")
+    }
+}
+
+impl Error for Unreachable {}
+
+impl FfiError for Unreachable {
+    fn ffi_code(&self) -> i32 {
+        4
+    }
+
+    fn unreachable_endpoint(&self) -> Option<(&str, u16, &str)> {
+        Some(("host.test", 41337, "grpc://host.test:41339"))
+    }
+}
+
+#[error_set]
+pub enum EndpointSet {
+    NotFound,
+    Unreachable,
+}
+
+#[test]
+fn unreachable_endpoint_is_none_unless_a_type_names_one() {
+    assert_eq!(NotFound.unreachable_endpoint(), None);
+
+    let err: FfiSet = NotFound.into();
+    assert_eq!(err.unreachable_endpoint(), None);
+
+    let io_err = std::io::Error::other("boom");
+    let traced_box = lore_error_set::TracedBox::new(Box::new(io_err), lore_error_set::Trace::new());
+    let internal = <FfiSet as lore_error_set::ErrorSet>::wrap_internal(traced_box, "test");
+    assert_eq!(internal.unreachable_endpoint(), None);
+}
+
+#[test]
+fn unreachable_endpoint_is_delegated_by_a_set_to_the_variant_that_names_one() {
+    let err: EndpointSet = Unreachable.into();
+    assert_eq!(err.ffi_code(), 4);
+    assert_eq!(
+        err.unreachable_endpoint(),
+        Some(("host.test", 41337, "grpc://host.test:41339"))
+    );
+
+    let other: EndpointSet = NotFound.into();
+    assert_eq!(other.unreachable_endpoint(), None);
+}
