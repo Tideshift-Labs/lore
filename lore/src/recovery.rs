@@ -290,6 +290,27 @@ pub async fn capture_local_commit_evidence(
         .await
 }
 
+/// FORK-LOCAL (Tideshift): [`settle_local_commits`] for an embedder outside any command: takes a
+/// recovery fence on the working copy at `root` (refused while a workflow runs there) and settles
+/// in its own offline execution context. Returns whether anything settled or closed.
+pub async fn settle_local_commits_at(root: &Path) -> Result<bool, ProtocolError> {
+    let globals = lore_revision::interface::LoreGlobalArgs {
+        repository_path: root.to_string_lossy().as_ref().into(),
+        offline: 1,
+        ..Default::default()
+    };
+    let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
+        globals,
+        lore_revision::relay::EventDispatcher::default(),
+    ));
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async {
+            let fence = RepositoryMutationGuard::recover(root).await?;
+            settle_local_commits(&fence).await
+        })
+        .await
+}
+
 /// FORK-LOCAL (Tideshift): write admission that first settles local commits from local anchors
 /// ([`settle_local_commits`]) when the working copy is blocked, then admits again. Reads nothing
 /// remote. Any other refusal, and a blocked copy local evidence cannot clear, refuses as

@@ -422,3 +422,31 @@ async fn capture_facade_reads_the_working_copy_anchors() {
         .expect("the facade captures offline");
     assert_eq!(captured, expected);
 }
+
+/// The embedder facade settles a never-applied local commit outside any command, with no caller
+/// context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_embedder_facade_settles_a_never_applied_commit() {
+    let rig = Rig::new().await;
+    let attempt = AttemptId::new();
+    let evidence = rig.evidence().await;
+    let parent = rig.leave_open_parent(attempt, evidence).await;
+    assert!(rig.refused().await);
+
+    assert!(
+        lore::recovery::settle_local_commits_at(&rig.root)
+            .await
+            .expect("the facade settles")
+    );
+    assert_eq!(
+        rig.child_state(&attempt).await,
+        AttemptState::Resolved(AttemptResolution::NotApplied)
+    );
+    assert!(rig.parent_complete(parent).await);
+    assert!(!rig.refused().await);
+    assert!(
+        !lore::recovery::settle_local_commits_at(&rig.root)
+            .await
+            .expect("a second pass finds nothing"),
+    );
+}
