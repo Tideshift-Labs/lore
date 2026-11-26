@@ -126,6 +126,12 @@ struct Shared {
     stream_count: AtomicUsize,
     /// Every connection the peer has accepted, so a test can close them from the peer's side.
     connections: Mutex<Vec<quinn::Connection>>,
+    /// Reconnect-stall repros: while set, the first stream of each connection the peer accepts is
+    /// answered with `STOP_SENDING` on its receive half, and the send half is kept open (parked in
+    /// `parked`) so the client's reader for it never ends.
+    stop_first_stream: AtomicBool,
+    stopped_streams: AtomicUsize,
+    parked: Mutex<Vec<quinn::SendStream>>,
 }
 
 pub struct Peer {
@@ -133,6 +139,9 @@ pub struct Peer {
     shared: Arc<Shared>,
     endpoint: quinn::Endpoint,
     accept: tokio::task::JoinHandle<()>,
+    /// The crypto the endpoint was built with, so [`Peer::set_new_connection_limits`] can build
+    /// another server config over the same certificate.
+    crypto: Arc<quinn::crypto::rustls::QuicServerConfig>,
 }
 
 impl Drop for Peer {
@@ -160,16 +169,10 @@ impl Peer {
             .with_single_cert(vec![cert_der], key_der)
             .expect("server crypto");
         crypto.alpn_protocols = vec![b"lore-storage/0.4".to_vec()];
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(
+        let crypto = Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto).expect("quic crypto"),
-        ));
-        let mut transport = quinn::TransportConfig::default();
-        transport
-            .stream_receive_window(quinn::VarInt::from_u64(WINDOW).expect("window"))
-            .receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024))
-            .max_concurrent_bidi_streams(16_u8.into())
-            .max_concurrent_uni_streams(0_u8.into());
-        config.transport_config(Arc::new(transport));
+        );
+        let config = server_config(&crypto, 16, WINDOW);
 
         let endpoint =
             quinn::Endpoint::server(config, format!("127.0.0.1:{port}").parse().expect("addr"))?;
@@ -188,6 +191,9 @@ impl Peer {
             closed: AtomicUsize::new(0),
             stream_count: AtomicUsize::new(0),
             connections: Mutex::new(Vec::new()),
+            stop_first_stream: AtomicBool::new(false),
+            stopped_streams: AtomicUsize::new(0),
+            parked: Mutex::new(Vec::new()),
         });
         let accept = {
             let shared = shared.clone();
@@ -209,7 +215,33 @@ impl Peer {
             shared,
             endpoint,
             accept,
+            crypto,
         })
+    }
+
+    /// From now on, connections the peer accepts grant the client at most `max_bidi` bidirectional
+    /// streams and `stream_window` bytes of credit per stream. Connections already accepted keep
+    /// the limits they were made with. The handshake still completes on a live peer, so the client
+    /// sees a healthy connection that will not let it open a stream (`max_bidi` 0) or write to one
+    /// (a tiny `stream_window`).
+    #[allow(dead_code)] // used by the unit binary only; this file is also `#[path]`-included.
+    pub fn set_new_connection_limits(&self, max_bidi: u32, stream_window: u64) {
+        self.endpoint
+            .set_server_config(Some(server_config(&self.crypto, max_bidi, stream_window)));
+    }
+
+    /// While on, the first stream of every connection accepted from now on gets `STOP_SENDING` on
+    /// its receive half as soon as the peer accepts it, and its send half stays open for good.
+    /// The client's write on that stream fails `Stopped`, but its reader for the stream never ends.
+    #[allow(dead_code)]
+    pub fn stop_first_stream_of_new_connections(&self, on: bool) {
+        self.shared.stop_first_stream.store(on, Ordering::SeqCst);
+    }
+
+    /// How many streams the peer has answered with `STOP_SENDING`.
+    #[allow(dead_code)]
+    pub fn stopped_streams(&self) -> usize {
+        self.shared.stopped_streams.load(Ordering::SeqCst)
     }
 
     /// Make the peer unreachable: close every connection and the endpoint, and stop accepting.
@@ -335,6 +367,22 @@ impl Peer {
     }
 }
 
+fn server_config(
+    crypto: &Arc<quinn::crypto::rustls::QuicServerConfig>,
+    max_bidi: u32,
+    stream_window: u64,
+) -> quinn::ServerConfig {
+    let mut config = quinn::ServerConfig::with_crypto(crypto.clone());
+    let mut transport = quinn::TransportConfig::default();
+    transport
+        .stream_receive_window(quinn::VarInt::from_u64(stream_window).expect("window"))
+        .receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024))
+        .max_concurrent_bidi_streams(quinn::VarInt::from_u32(max_bidi))
+        .max_concurrent_uni_streams(0_u8.into());
+    config.transport_config(Arc::new(transport));
+    config
+}
+
 async fn serve_connection(shared: Arc<Shared>, connection: quinn::Connection, index: usize) {
     let mut next_stream = 0usize;
     let watcher = {
@@ -438,6 +486,13 @@ async fn serve_stream(
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
 ) {
+    if stream == 0 && shared.stop_first_stream.load(Ordering::SeqCst) {
+        let _ = recv.stop(quinn::VarInt::from_u32(5));
+        shared.stopped_streams.fetch_add(1, Ordering::SeqCst);
+        // Keep the send half open: the client's reader for this stream waits on it.
+        shared.parked.lock().push(send);
+        return;
+    }
     let send = Arc::new(tokio::sync::Mutex::new(send));
     loop {
         let Some(raw) = read_header(&mut recv, &shared, stream).await else {

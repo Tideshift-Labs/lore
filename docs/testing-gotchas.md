@@ -174,7 +174,8 @@ Durable, recurring testing lessons grouped by topic.
 - **Stalling a QUIC client write on purpose (`lore-transport/tests/unit/quic/scripted_storage_peer.rs`)**: symptom, a send-bound test cannot make `write_chunks` accept zero or partial bytes. Cause: credit comes from the peer's per-stream receive window, refreshed only after it reads `WINDOW/8` on that stream. Do: raw quinn peer with a small `stream_receive_window`, read headers always but gate payload reads; keep bytes read before the gate under `WINDOW/8`, then credit left = `WINDOW` - bytes the peer counted on that stream. Fill it exactly with a `Reply::EarlyOk` write (answered from the header) to get a zero-byte stall with a free lock. A sequential caller sits on stream 2 once all 8 streams exist (9 round trips); to queue behind a stalled writer, hold one read on each of streams 2..7, answer the stream-2 one, then start the writer. A trickle (`throttle`) gives a lock holder that keeps writing. `VolatileAttemptStore` refuses `record_managed`; wrap it in a journal that overrides it.
 - **Testing the managed wait scope (`lore-revision/tests/managed_remote_scope.rs`, `managed_workflow_scope.rs`, `lore-transport/tests/unit/quic/managed_wait_scope.rs`, `lore-integration-tests/tests/quic_managed_push_hang_test.rs`)**: symptom, a spawned connect/session-start/Query reconnect has no managed deadline (a spawn drops task-locals), and a test that only waits on it hangs for minutes. Do: give every such test a hang guard (20-40 s) so a missing deadline fails red; assert the spawned task sees `has_managed_caller() == false` but `in_managed_wait_scope() == true`; prove "no total-time cap" with a sequence on a LIVE peer longer than the bound. A mid-push QUIC fault needs the real order (push #1 over QUIC, second commit, close the QUIC server, black-hole the UDP port) in a separate binary that sets `LORE_QUIC_MANAGED_IDLE_TIMEOUT` from a `ctor`; in `lore-revision` a `LiveRepository`/`LockServer` test panics ("task-local ... without setting it first") at drop time too, so wrap the WHOLE body in `LORE_CONTEXT.scope(fixture_execution_context(), Box::pin(body()))`. `LiveRepository::create` (no identity) makes `load_and_connect` run a BLOCKING connect; use `create_managed`. A server that closed the connection is only noticed on first send, so that first command counts as dispatched and its expiry is NOT the not-sent marker. A UDP black hole needs no live front: a bound `std::net::UdpSocket` that never reads (no ICMP) makes `connect` fail `Disconnected` after the fixed 5 s handshake (`unreachable_handshake.rs`). A fresh-connection commit needs `connection::remove_connection` on the cached one first (`forget_cached_connection`); the first upload fails at once on settled storage readiness, so the clock bounds the command (one 5 s handshake, not two) but cannot show how the uploads ended. A handshake the server answers and fails (untrusted cert on `lores://`) fails fast and gets the no-firewall message. Mutant check: edit a COPY of the tree (robocopy minus `.git`/`.venv`/`target`) with an isolated `CARGO_TARGET_DIR`.
 - **Live `lores://` (TLS) and lost-answer cases (`lore-integration-tests/tests/quic_lores_tls_test.rs`, `quic_managed_write_proof_test.rs`, shared fixture `quic_managed_write_support/`)**: symptom, no CA knob for the storage clients (`custom_ca: None`, `quic/storage_service/auth.rs`). Cause: `lores`/`grpcs` validate against webpki roots plus `rustls-native-certs`, which uses ONLY `SSL_CERT_FILE` when set, on Windows too. Do: rcgen CA + leaf with IP SAN `127.0.0.1` (not CA-flagged), TLS on BOTH legs (gRPC resolves the environment), and set `SSL_CERT_FILE` from a `#[ctor::ctor]` in a DEDICATED `[[test]]` binary (process-wide; a write from a test thread races C `getenv`). The connect error is a bare `Disconnected`: assert the cause from `lore_base::log::set_log_callback` + `LoreLogLevel::Debug` ("Failed QUIC connecting ... certificate"), and that `probe.wire()` stayed empty. A lost answer is deterministic: hold the first applied `Put` in `run_request_handler`, close the server, and bring the REPLACEMENT up before the writer returns (`lose_answer_and_restart`); a closed server's wire cannot show a resend. To reach the session layer's `replaced == true` path, call `Connection::advance_storage_generation_before_epoch_for_test()` while the answer is owed (mutation `not_dispatched || true` at `session.rs:468` is red only there). `declared_session_count()` on the scope is the client-side proof of a declared QUIC session (0 on gRPC). A session start must bind its id to the generation its `Authorize` was FRAMED on (`Storage::session_start_bound` / `session_start_declared` return it), never one sampled before the call: after a reconnect the first managed call makes exactly ONE declared start (wire + `Probe::declared_live()` back to 0 after the scope). Replace the server mid-test with `replace_server(&mut cell)` and call `connection.ensure_storage_connected()` first or no reconnect is exercised. Unit proof without infra: `lore-transport/tests/unit/quic/session_start_bound.rs` (scripted peer `close_connections` + `Reply::DisconnectThenOk`) and the two `*_reconnect_*` cases in `lore-transport/tests/managed_session_attempt.rs` (those alone catch a `SessionBinding::resolve` or `session_pool` pre-sample; a second write in the same scope is what exposes a stale binding).
-- **Scripted-peer unmanaged-reconnect repro (`unmanaged_reconnect_bound.rs`)**: symptom, `client.get` against the scripted peer fails `get: Invalid server response` (its default answer is an empty body, not a fragment). Do: use `client.query(session, &[addr])` with `peer.rule(Command::Query as u8, Reply::Ok(vec![0]))` as the cheap read that succeeds. To black-hole the same port: `peer.stop()`, wait `closed == accepted`, `drop(peer)`, then retry-bind a `std::net::UdpSocket` on it (no ICMP, so handshakes time out at 5 s instead of failing fast); a revived peer is `Peer::start_on(port)` retried the same way. The red at HEAD is the 45 s outer timeout on an unmanaged command (the stock loop runs about 3.5 min).
+- **Scripted-peer unmanaged-reconnect repro (`unmanaged_reconnect_bound.rs`)**: `client.get` fails `get: Invalid server response` (default answer is an empty body); use `client.query(session, &[addr])` with `peer.rule(Command::Query as u8, Reply::Ok(vec![0]))`. Black-hole the port: `peer.stop()`, wait `closed == accepted`, `drop(peer)`, retry-bind a `std::net::UdpSocket` (no ICMP: handshakes time out at 5 s); revive with `Peer::start_on(port)` retried the same way. Red at HEAD is the outer timeout (stock loop ~3.5 min).
+- **A LIVE peer that stalls the reconnect (`reconnect_stall.rs`)**: `peer.set_new_connection_limits(max_bidi, window)` (`Endpoint::set_server_config`, new connections only) then `peer.close_connections()`: `max_bidi` 0 hangs `open_bi`; `(16, 1)` plus `peer.stop_first_stream_of_new_connections(true)` stops stream 0 while its send half stays parked open, so the replacement's reader never ends and pass 2's drain hangs (window must be nonzero-but-tiny: the first frame has to open the stream at the peer). Assert `stopped_streams() >= 1` and `accepted_connections() >= 3` before the hang verdict. Pins in `unmanaged_reconnect_pins.rs`: `classify` called on a real `StorageClient` after a real give-up (`given_up()` is private); an opt-out client is a delegating `ServiceClient` wrapper with `bounds_unmanaged_reconnect() == false` driven through `send_with_reconnect` with session 0 (a pre-reconnect session id is refused after the swap).
 - **Environment-red tests on this Windows rig, not yours**: `lore-base --test heap_reap` `idle_heaps_are_reaped` fails after a 30 s wait on a pristine HEAD rebuild too (passes on some builds; flaky); `lore-revision --test unit` `fs::walk::a_faithful_copy_keeps_streams_security_attributes_and_sparse_ranges` fails on an ACL `AI` flag difference. Confirm with a throwaway `git worktree` of HEAD and a separate `CARGO_TARGET_DIR` before blaming a change.
 - **Choosing a JWT `exp` in a client or live test (WP-124 5b)**: symptom, a test needs a session token of a known age
   with no auth service. Cause: a supplied access token is returned by `exchange` unchanged (a non-empty `auth_url` is
@@ -315,90 +316,59 @@ it's derived from another column rather than a fixed literal.
   `maximum_ttl_ms` on the policy/descriptor and a sleep past it before claiming. The first window
   must also absorb a cold `DispatchRuntimePool`'s connect-and-attest round trip (seconds): warm the
   pool with any cheap call before the timed loop.
-- **Whitespace inside a plpgsql `$$...$$` body is part of `prosrc`, verbatim.** A test that restores
-  a function to its original definition (undoing a planted catalog drift, or a mutation for a
-  discrimination proof) must reproduce the exact source text, comments included: any indentation
-  or comment difference still reads as `CatalogDrift` on the `functions` manifest section. Prefer
-  `include_str!` on the real migration file plus a substring extraction over retyping the body, and
-  diff the extracted text before relying on it.
-- **A shared fixture row (one `drain_policies` row per boundary/cell reused across several test
-  cases) needs `ON CONFLICT DO NOTHING` on re-seed, and a matching top-up on any row a prior case's
-  release decremented** (`object_dispatch_quota_usage`, keyed by `(provider_boundary_id, scope_kind,
-  scope_id, quota_class)`) — otherwise the second case either fails re-inserting the policy row, or
-  the wrong exception fires (`DRAIN_COUNTER_UNDERFLOW` instead of the one actually under test)
-  because a prior case already spent that scope's counted usage.
-- **A raise inside a function called through a plain `batch_execute` string leaves the connection's
-  session state dirty.** `SET SESSION AUTHORIZATION x; BEGIN ...; SELECT <raises>; COMMIT; RESET
-  SESSION AUTHORIZATION;` never reaches the `COMMIT`/`RESET` when the `SELECT` raises — the whole
-  batch aborts at the first failing statement. A test asserting an expected raise on such a
-  connection must `ROLLBACK; RESET SESSION AUTHORIZATION;` explicitly before reusing that client.
+- **Whitespace inside a plpgsql `$$...$$` body is part of `prosrc`.** A test that restores a function
+  (undoing planted catalog drift or a mutation) must reproduce the exact text, comments included, or
+  the `functions` manifest section reads `CatalogDrift`. Prefer `include_str!` of the real migration
+  plus substring extraction over retyping, and diff the extract first.
+- **A shared fixture row (one `drain_policies` row per boundary/cell reused across cases) needs
+  `ON CONFLICT DO NOTHING` on re-seed, plus a top-up of any row a prior case's release decremented**
+  (`object_dispatch_quota_usage`, keyed `(provider_boundary_id, scope_kind, scope_id, quota_class)`).
+  Otherwise re-insert fails, or `DRAIN_COUNTER_UNDERFLOW` fires instead of the exception under test.
+- **A raise inside a plain `batch_execute` string leaves session state dirty.** `SET SESSION
+  AUTHORIZATION x; BEGIN ...; SELECT <raises>; COMMIT; RESET SESSION AUTHORIZATION;` aborts at the
+  failing statement and never reaches `RESET`. Run `ROLLBACK; RESET SESSION AUTHORIZATION;` before
+  reusing that client.
 
-- **A raw TCP fault proxy that scans the client->server direction must forward the pgwire startup
-  packet specially first.** Every message after it carries a leading tag byte before its 4-byte
-  length; the startup packet (and a preceding `SSLRequest`, absent when connecting with
-  `sslmode=disable`) does not -- it is just the length followed by that many bytes. A proxy written
-  to scan for a needle (or any other tagged-frame parsing) must relay this first message verbatim,
-  by its own untagged framing, before switching to tag-based parsing, or it misreads the startup
-  payload's first byte as a tag and hangs waiting for a length that never resolves.
-- **A `uint64` domain column needs its bound parameter cast to its own underlying type first, not
-  straight to the domain.** `$1::object_store_retention.uint64` or `$1::numeric` from an `i64`
-  binding fails as a `WrongType` on the driver side; `$1::bigint::numeric` (cast to what the Rust
-  type actually binds as, then to what the SQL expression needs) works. The existing
-  `$3::text::object_store_retention.uint64` idiom used elsewhere in this crate sidesteps the same
-  issue by going through text instead.
-- **`drain_cleanup_compact_v2` (0029; `_v1` before it) silently no-ops on a row no rotation
-  superseded when there is no matching `object_dispatch_spool_objects` row, unless the seeded
-  policy's own `expires_at_ms` is already in the past.** Its early-return guard is
-  `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`; a `SELECT INTO` (not `STRICT`) that matches zero rows leaves `s.expires_at_unix_ms` NULL, and
-  `greatest(NULL, far_future)` still evaluates to `far_future` -- every other fixture in this tier
-  deliberately seeds a far-future policy expiry specifically to keep compaction a no-op, so a test
-  that needs compaction to actually run must seed a PAST `expires_at_ms` instead, not merely omit
-  the spool_objects row.
-- **A "no other session connected" precondition counts YOUR test's own fixture connections.**
-  `upgrade_cell_schema`'s D4 check (refuse the real state-transition step, not a no-op
-  already-current call, if any other backend is connected to the cell database) counts the test's
-  own admin/superuser connection and any `DispatchRuntimePool` connection just as much as a
-  deliberately-opened "replica" session. Before the ONE call in a test that performs the real N-1→N
-  transition, explicitly drop every other handle this test opened (admin client, pool/`DrainClient`,
-  a second migrator connection) and poll `(numbackends - 1) FROM pg_stat_database WHERE datname =
-  current_database()` down to zero from the surviving connection before calling — an `AbortOnDropHandle`
-  aborting a background connection task doesn't guarantee the server has noticed the closed socket
-  yet. A call already at the current state needs none of this (D4 only gates the one transition).
-
+- **A raw TCP fault proxy scanning client->server must relay the pgwire startup packet first.** Every
+  later message has a leading tag byte before its 4-byte length; the startup packet (and a preceding
+  `SSLRequest`, absent with `sslmode=disable`) does not. Relay it verbatim by its untagged framing,
+  or the proxy misreads its first byte as a tag and hangs.
+- **A `uint64` domain column needs its bound parameter cast to the driver's type first.**
+  `$1::object_store_retention.uint64` or `$1::numeric` from an `i64` fails as `WrongType`;
+  `$1::bigint::numeric` or `$3::text::object_store_retention.uint64` works.
+- **`drain_cleanup_compact_v2` (0029; `_v1` before it) silently no-ops when no matching
+  `object_dispatch_spool_objects` row exists, unless the policy's `expires_at_ms` is already past.**
+  Its guard is `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`; a zero-row `SELECT INTO`
+  leaves `s.expires_at_unix_ms` NULL and `greatest(NULL, far_future)` is `far_future`. Other
+  fixtures seed a far-future expiry to keep compaction a no-op; a case that needs compaction to run
+  must seed a PAST `expires_at_ms`.
+- **A "no other session connected" precondition counts YOUR test's own connections.**
+  `upgrade_cell_schema`'s D4 check (gates only the real N-1 to N transition, not an already-current
+  call) counts the admin connection and any `DispatchRuntimePool` connection. Before the one real
+  transition, drop every other handle (admin client, pool/`DrainClient`, second migrator) and poll
+  `numbackends - 1` from `pg_stat_database WHERE datname = current_database()` to zero from the
+  surviving connection. An `AbortOnDropHandle` abort does not mean the server saw the socket close.
 - **`ReservePutRequest`'s `*_blake3` fields are opaque 32-byte tokens, not hashes the client must
-  derive.** `reserve_put` stores whatever bytes are supplied for `boundary_blake3`,
-  `observation_binding_blake3`, `expected_blake3` and `put_reservation_fingerprint`; nothing checks
-  that they digest anything. Through R30 the shared codec (0009) still needed a real
-  `public.blake3(bytea)` for its own ACK digest, so an R25-R30 fixture with no provider failed every
+  derive.** `reserve_put` stores them unchecked. Through R30 the shared codec (0009) still needed a
+  real `public.blake3(bytea)`, so an R25-R30 fixture without a provider failed
   `reserve_put`/`put_upload_progress`/`put_spool_ready` with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`;
-  install the genuine `plpython3u` provider (`run-cell-schema-forward-upgrade-live.ps1`'s image, not
-  a golden-vector stand-in) for those. From R31 the codec builds a digest-free preimage; none needed.
-- **A `CREATE TABLE`/`DROP TABLE` drift probe can flake a following D4 exclusivity check.** Planting
-  catalog drift with a table (then dropping it to undo the plant) can attract a stray autovacuum
-  backend shortly afterward; `upgrade_cell_schema`'s "no other session connected" poll
-  (`wait_until_exclusive`) can read zero and still lose the race to that worker before the next
-  call's own check runs. A `CREATE OR REPLACE FUNCTION`/`DROP FUNCTION` probe (no relation
-  created or dropped) proves the same catalog-drift refusal without the relation-level autovacuum
-  trigger; prefer it whenever the probe's only job is to change the manifest, not to test
-  relation-specific behavior.
+  install the genuine `plpython3u` provider (`run-cell-schema-forward-upgrade-live.ps1`'s image) for
+  those. From R31 none is needed.
+- **A `CREATE TABLE`/`DROP TABLE` drift probe can flake a following D4 check.** The dropped table
+  can attract a stray autovacuum backend that `wait_until_exclusive` loses a race to. Probe catalog
+  drift with `CREATE OR REPLACE FUNCTION`/`DROP FUNCTION` unless the probe needs relation behavior.
 
-- **Proving a migration leaves an unrelated row set untouched needs counts captured on both sides
-  of the mutation, not just a post-hoc "still not full" read.** For the R25 budget-limiter tables
-  (`object_dispatch_budget_configurations`/`_current_budget_configuration`/`_budget_bucket_state`,
-  scoped by `provider_boundary_id`), capture `(configurations, current, bucket_state)` before the
-  upgrade and assert the exact tuple again after — `(1, 1, 7)` for one published budget (7 = the
-  fixed `1..=7` cap-class loop in `publish_budget`). A refusal message asserting a remedy ("reinstall
-  the cell" / "get an owner decision") should also assert the negative — that it does NOT suggest an
-  unrelated fix (e.g. "wait for retention") — because an unfixable precondition and a merely-slow one
-  read identically if only the positive claim is checked. See
-  `budget_row_counts`/`live_install_at_r25_upgrades_to_current_and_drain_client_writes` and the two
-  R25 refusal tests in `cell_schema_forward_upgrade_live.rs`.
-- **A real `reserve_put` admission always charges quota alongside the spool row it creates**, so a
-  fixture cannot isolate "spool object present, quota untouched" through `reserve_put` alone —
-  proven by mutation: with the R25 prelude's spool-objects `IF EXISTS` disabled, the SAME
-  reserve_put-seeded database still refused, but with the quota-charge message, because admission
-  reserves quota units as part of the same call. Confirms the two R25 guards are independently
-  reachable in practice, not merely in the SQL text.
+- **Prove an unrelated row set is untouched with counts captured before and after the mutation.**
+  R25 budget tables (`object_dispatch_budget_configurations`/`_current_budget_configuration`/
+  `_budget_bucket_state`, scoped by `provider_boundary_id`): assert the exact tuple both sides
+  (`(1, 1, 7)` for one budget; 7 = the `1..=7` cap-class loop in `publish_budget`). A refusal that
+  names a remedy should also assert it does NOT suggest an unrelated one (e.g. "wait for
+  retention"). See `budget_row_counts` and the two R25 refusal tests in
+  `cell_schema_forward_upgrade_live.rs`.
+- **A real `reserve_put` always charges quota alongside the spool row**, so a fixture cannot
+  isolate "spool object present, quota untouched" through it. Mutation proof: with the R25 prelude's
+  spool-objects `IF EXISTS` disabled, the same database still refused, with the quota-charge
+  message. The two R25 guards are independently reachable.
 
 See `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs` for the resulting fixture
 (`seed_metadata_true_up_fixture`, `synthetic_descriptor`, `wait_until_exclusive`,
@@ -481,41 +451,31 @@ See `lore-postgres/tests/domain_fragment_schema_upgrade.rs` for the resulting fi
 `run-fragment-schema-upgrade-live.ps1` for the Postgres-only container (no MinIO/S3: the upgrade
 never touches a provider).
 
-**bb117070's backend-count guard refuses on this fixture file's own assertion connection.**
-`upgrade_clean_schema` now calls `refuse_other_backends` (count `pg_stat_database.numbackends`
-minus the coordinator's own pool size) before it even classifies the catalog -- so it fires on
-*every* call, including a no-op `AlreadyCurrent` rerun. Every case in
-`domain_fragment_schema_upgrade.rs` keeps its own `direct: Client` open across the whole test for
-pre/post snapshots; left connected, that is itself "another backend" and the call refuses for the
-wrong reason (backend-count, not the state the case means to exercise). Fix: drop `direct`
-immediately before every `upgrade_clean_schema`/`assert_refused` call and reconnect fresh
-afterward for post-call assertions -- see `call_upgrade`/`expect_upgraded`/
-`assert_refused_dropping` in that file, mirroring `wait_until_exclusive` in
-`lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs`. The guard's own bounded settle
-loop (`BACKEND_SETTLE_ATTEMPTS`/`BACKEND_SETTLE_INTERVAL`, ~2s) absorbs an in-process drop's
-async socket teardown, so a plain `drop` before the call is normally enough -- **except across a
-separate OS process**: `lore-server/tests/fragment_schema_upgrade_operator.rs`'s real-binary rerun
-needed an explicit poll-to-zero on `numbackends` (not just a `drop`) before launching the second
-`loreserver` subprocess, because a 4-connection pool's teardown from the FIRST process's
-perspective could outlast the coordinator's 2s budget as seen from the second process. Once ANY
-second connection (lock or not) is enough for the count check to refuse first, the `NOWAIT`
-table-lock backstop has **no remaining test that reaches it through an ordinary second
-connection** -- `a_live_lock_holder_refuses_while_another_session_is_connected` (renamed from
-`..._refuses_with_contention_not_a_wait`, which asserted only `matches!(.., Contention(_))` and so
-silently stopped discriminating the two refusal paths) and
-`a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected` both now assert the
-exact count-check message (`"other backend(s) are connected"`), naming what they actually prove.
-The NOWAIT statement is still real and still matters as the documented race backstop (a
-connection that lands between the count check passing and the `LOCK TABLE ... NOWAIT` call). No
-plain second connection reaches it. Since 2026-09-27 (WP-115 ledger row 62) the failpoint
-`schema_upgrade.drain.before_update` pauses the upgrade in exactly that window, and
+**The backend-count guard refuses on the fixture's own assertion connection.**
+`upgrade_clean_schema` calls `refuse_other_backends` (`pg_stat_database.numbackends` minus the
+coordinator's pool size) before classifying the catalog, on every call including a no-op
+`AlreadyCurrent` rerun. A test's own `direct: Client` counts as "another backend" and the call
+refuses for the wrong reason. Drop `direct` right before each `upgrade_clean_schema`/`assert_refused`
+call and reconnect after (`call_upgrade`/`expect_upgraded`/`assert_refused_dropping` in
+`domain_fragment_schema_upgrade.rs`, mirroring `wait_until_exclusive` in
+`lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs`). The guard's settle loop
+(`BACKEND_SETTLE_ATTEMPTS`/`BACKEND_SETTLE_INTERVAL`, ~2s) absorbs an in-process drop. **Across a
+separate OS process** it does not: `lore-server/tests/fragment_schema_upgrade_operator.rs` polls
+`numbackends` to zero before launching the second `loreserver`.
+
+Because any second connection trips the count check first, no ordinary second connection reaches the
+`LOCK TABLE ... NOWAIT` backstop. The `a_live_lock_holder_...` and
+`a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected` tests therefore assert
+the exact count message (`"other backend(s) are connected"`), not just `Contention(_)`. The failpoint
+`schema_upgrade.drain.before_update` pauses the upgrade between the count check and the lock;
 `the_nowait_backstop_refuses_a_lock_holder_that_races_the_backend_count` (a `failure_generator`
-build, armed per case by `run-fragment-schema-upgrade-live.ps1`) asserts the NOWAIT message itself.
-An event-trigger fault injection (`CREATE EVENT TRIGGER ... ON ddl_command_start WHEN TAG IN
-('ALTER TABLE')`, gated on `current_query() LIKE '%<a string unique to the target DDL>%'`) is a
-reliable way to fail a specific statement mid-multi-statement-`batch_execute` without touching
-production code; pair it with a positive control (`RAISE ... USING ERRCODE` on a throwaway
-connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expected to surface.
+build, armed per case by `run-fragment-schema-upgrade-live.ps1`) asserts the NOWAIT message.
+
+To fail one statement inside a multi-statement `batch_execute` without touching production code,
+use an event trigger (`CREATE EVENT TRIGGER ... ON ddl_command_start WHEN TAG IN ('ALTER TABLE')`,
+gated on `current_query() LIKE '%<string unique to the target DDL>%'`). Pair it with a positive
+control (`RAISE ... USING ERRCODE` on a throwaway connection) proving the SQLSTATE the coordinator's
+`pg()` wrapper surfaces.
 
 ## General Pitfalls
 

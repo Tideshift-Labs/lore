@@ -2403,8 +2403,9 @@ async fn before_deadline<T>(
 /// two attempts: closed, with the epoch unchanged, so the next command reconnects. The epoch is
 /// not set to zero, because that would give the connection up for every caller. An unmanaged
 /// deadline (D-QS3) does give it up, as an exhausted reconnect does; see [`ReconnectBound`]. The
-/// section from the swap to the published epoch is never raced: dropped inside it, the streams,
-/// the stream count and the epoch would disagree.
+/// section from the swap to the published epoch is never dropped: dropped inside it, the streams,
+/// the stream count and the epoch would disagree. Its restart is bounded instead by closing the
+/// replacement at the deadline and awaiting the restart to its end (D-QS3 lane M).
 ///
 /// Where the reconnect gives up and no attempt got a handshake answer, the `Disconnected` it
 /// returns carries the endpoint ([`quic_unreachable`]).
@@ -2539,9 +2540,21 @@ where
                 );
 
                 let connection_id = quic_connection.stable_id();
+                // FORK-LOCAL (Tideshift, D-QS3 lane M): a handle on the replacement, so the
+                // deadline below can close it while `create_initial_stream` holds the lock.
+                let replacement = quic_connection.clone();
 
                 {
                     let mut connection_lock = connection.connection.write().await;
+                    // FORK-LOCAL (Tideshift, D-QS3 lane M): close the outgoing connection before
+                    // waiting for its readers. A reader ends only when its stream does. On the
+                    // first pass the lost connection is already closed above. On a later pass it
+                    // is the replacement whose restart failed, which nothing closed, and a live
+                    // peer holding one of its streams open would hang this wait under the write
+                    // lock forever.
+                    connection_lock
+                        .connection
+                        .close(0u32.into(), b"replaced connection");
                     for reader in connection_lock.reader.drain(..) {
                         let _ = reader.task.await;
                     }
@@ -2568,7 +2581,30 @@ where
                 let restart_flow = connection
                     .create_initial_stream()
                     .and_then(|_| auth_adapter.reconnect_authorize(connection.clone()));
-                match restart_flow.await {
+                // FORK-LOCAL (Tideshift, D-QS3 lane M): the restart is bounded by the deadline
+                // too. A live peer that grants no stream, or no credit for the identify write,
+                // otherwise holds it forever: keep-alive stops quinn's idle timeout. It runs
+                // between the swap and the published epoch, so it is never dropped. At the
+                // deadline the replacement is closed, which ends the open and the write at once,
+                // and the restart is awaited to its end before the deadline's exit.
+                let restarted = match deadline {
+                    None => restart_flow.await,
+                    Some(deadline) => {
+                        let mut restart_flow = std::pin::pin!(restart_flow);
+                        match tokio::time::timeout_at(deadline, restart_flow.as_mut()).await {
+                            Ok(restarted) => restarted,
+                            Err(_elapsed) => {
+                                replacement.close(0u32.into(), b"reconnect deadline");
+                                // Required, not tidiness: the restart may hold the connection
+                                // write lock, which `at_deadline` takes. No test tells dropping it
+                                // here from awaiting it; the rule is kept by review.
+                                let _ = restart_flow.await;
+                                return at_deadline(bound, &connection, give_up(answered)).await;
+                            }
+                        }
+                    }
+                };
+                match restarted {
                     Ok(_) => {
                         // FORK-LOCAL (Tideshift, D-QS3 refined): the path answers again. A later
                         // loss is a new outage and gets a bound of its own. The old connection's
@@ -2593,6 +2629,11 @@ where
                         | QuicClientError::SlowDown,
                     ) => {
                         lore_debug!("Reconnect authorization failed, retry");
+                        // FORK-LOCAL (Tideshift, D-QS3 lane M): the failed replacement is closed
+                        // before the backoff. Left open, a sender could hold the write lock across
+                        // `add_stream`'s `open_bi` on it, and the next pass would wait for that
+                        // lock, unbounded, before it could close the connection itself.
+                        replacement.close(0u32.into(), b"failed reconnect");
                         let Ok(more) = before_deadline(deadline, retry.wait()).await else {
                             return at_deadline(bound, &connection, give_up(answered)).await;
                         };
