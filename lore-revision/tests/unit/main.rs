@@ -41,6 +41,7 @@ mod layer;
 mod link;
 #[cfg(feature = "test_seams")]
 mod live_fixture;
+mod local_commit_evidence;
 mod lock;
 mod merge;
 mod metadata;

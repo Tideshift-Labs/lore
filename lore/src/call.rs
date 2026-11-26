@@ -294,8 +294,14 @@ where
         };
 
     let fence =
-        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
-            .await
+        // FORK-LOCAL (Tideshift): a working copy blocked by a local commit whose outcome its own
+        // anchors prove settles here, with no network. Boxed: cold, and the write futures are
+        // size-sensitive.
+        match Box::pin(crate::recovery::acquire_settling_local_commits(
+            &repository_path,
+            &execution,
+        ))
+        .await
         {
             Ok(fence) => fence,
             Err(error) => {
@@ -374,8 +380,14 @@ where
         };
 
     let fence =
-        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
-            .await
+        // FORK-LOCAL (Tideshift): a working copy blocked by a local commit whose outcome its own
+        // anchors prove settles here, with no network. Boxed: cold, and the write futures are
+        // size-sensitive.
+        match Box::pin(crate::recovery::acquire_settling_local_commits(
+            &repository_path,
+            &execution,
+        ))
+        .await
         {
             Ok(fence) => fence,
             Err(error) => {
@@ -478,8 +490,14 @@ where
     // FORK-LOCAL (Tideshift): the fork layers of [`repository_call_write`] (mutation fence,
     // caller attempt scope, caller operation), repeated here as upstream repeats its body.
     let fence =
-        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
-            .await
+        // FORK-LOCAL (Tideshift): a working copy blocked by a local commit whose outcome its own
+        // anchors prove settles here, with no network. Boxed: cold, and the write futures are
+        // size-sensitive.
+        match Box::pin(crate::recovery::acquire_settling_local_commits(
+            &repository_path,
+            &execution,
+        ))
+        .await
         {
             Ok(fence) => fence,
             Err(error) => {

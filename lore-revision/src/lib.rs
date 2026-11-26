@@ -48,6 +48,7 @@ pub mod link;
 /// own docs for why the remote is a `tonic` stub rather than a loreserver.
 #[cfg(feature = "test_seams")]
 pub mod live_fixture;
+pub mod local_commit_evidence;
 pub mod lock;
 pub mod logging;
 pub mod shared_store;

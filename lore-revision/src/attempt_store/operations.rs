@@ -103,11 +103,10 @@ impl AttemptStore for RepositoryAttemptStore {
                 .as_ref()
                 .and_then(|child| child.managed.clone())
         };
-        self.write_child(
-            &document,
-            &StoredChild::new(StoredAttempt::try_from(record)?, managed),
-            existing,
-        )?;
+        let mut child = StoredChild::new(StoredAttempt::try_from(record)?, managed);
+        // A re-record keeps the local commit evidence the child was journalled with.
+        child.local = existing.child.as_ref().and_then(|stored| stored.local);
+        self.write_child(&document, &child, existing)?;
         if let Some(index) = orphan {
             // Preserve ordinary record's v1 meaning: the old intent remains attached. Publish
             // its child before removing the root copy; a failed second publication cannot
@@ -362,6 +361,132 @@ impl RepositoryAttemptStore {
         operation: String,
         canonical_intent: Vec<u8>,
     ) -> Result<(), ProtocolError> {
+        self.record_child_with_evidence(parent, attempt, operation, canonical_intent, None)
+            .await
+    }
+
+    /// FORK-LOCAL (Tideshift): [`Self::record_workflow_child`] for a local commit, journalled
+    /// with the anchors it would move, so recovery can settle it from local state alone (see
+    /// [`crate::local_commit_evidence`]); recovery settles it only as not applied.
+    pub async fn record_local_commit_child(
+        &self,
+        parent: Uuid,
+        attempt: AttemptId,
+        operation: String,
+        canonical_intent: Vec<u8>,
+        evidence: crate::local_commit_evidence::LocalCommitEvidence,
+    ) -> Result<(), ProtocolError> {
+        self.record_child_with_evidence(
+            parent,
+            attempt,
+            operation,
+            canonical_intent,
+            Some(evidence),
+        )
+        .await
+    }
+
+    /// FORK-LOCAL (Tideshift): every unresolved child journalled with local commit evidence,
+    /// with that evidence.
+    pub async fn unresolved_local_commits(
+        &self,
+    ) -> Result<
+        Vec<(
+            AttemptId,
+            String,
+            crate::local_commit_evidence::LocalCommitEvidence,
+        )>,
+        ProtocolError,
+    > {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let document = self.load(&guard)?;
+        let mut found = Vec::new();
+        for child in self.children(&document, true)? {
+            if !child.attempt.state.is_unresolved() {
+                continue;
+            }
+            if let Some(evidence) = child.local {
+                found.push((
+                    parse_attempt_id(&child.attempt.attempt_id)?,
+                    child.attempt.operation.clone(),
+                    evidence,
+                ));
+            }
+        }
+        Ok(found)
+    }
+
+    /// FORK-LOCAL (Tideshift): closes every open parent that local commit evidence proved had
+    /// no effect: no uncertainty code, no root orphan intent, and at least one child, every one
+    /// of them settled `NotApplied` and at least one of them a local commit. Every step records
+    /// its child before any effect, so such a parent moved nothing anywhere; this is the same
+    /// argument [`Self::settle_receiptless`] makes for settled legacy writes. Call this only under
+    /// the exclusive admission lock. Returns whether a parent closed.
+    pub async fn close_parents_without_effect(&self) -> Result<bool, ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load_for_write(&guard)?;
+        Self::validate_parents(&document)?;
+        let children = self.children(&document, false)?;
+        let orphaned = document
+            .managed
+            .iter()
+            .map(|intent| intent.parent.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut closed = false;
+        for parent in document.parents.iter_mut().filter(|parent| {
+            !parent.complete
+                && parent.parent_uncertainty_code.is_none()
+                && !orphaned.contains(&parent.id)
+        }) {
+            let own: Vec<_> = children
+                .iter()
+                .filter(|child| {
+                    child
+                        .managed
+                        .as_ref()
+                        .is_some_and(|intent| intent.parent == parent.id)
+                })
+                .collect();
+            let not_applied = |child: &&StoredChild| {
+                matches!(
+                    child.attempt.state,
+                    StoredState::Resolved {
+                        resolution: StoredResolution::NotApplied
+                    }
+                )
+            };
+            if own.is_empty()
+                || !own.iter().all(not_applied)
+                || !own.iter().any(|child| child.local.is_some())
+            {
+                continue;
+            }
+            crate::lore_info!(
+                "Closing managed parent {} ({}): its local commit did not apply and no other \
+                 step had an effect",
+                parent.id,
+                parent.operation
+            );
+            parent.body_completed = true;
+            parent.complete = true;
+            closed = true;
+        }
+        if closed {
+            self.store(&guard, &document)?;
+        }
+        Ok(closed)
+    }
+
+    async fn record_child_with_evidence(
+        &self,
+        parent: Uuid,
+        attempt: AttemptId,
+        operation: String,
+        canonical_intent: Vec<u8>,
+        local: Option<crate::local_commit_evidence::LocalCommitEvidence>,
+    ) -> Result<(), ProtocolError> {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let document = self.load_for_write(&guard)?;
@@ -385,26 +510,24 @@ impl RepositoryAttemptStore {
                 "workflow parent missing or child already exists",
             ));
         }
-        self.write_child(
-            &document,
-            &StoredChild::new(
-                StoredAttempt::try_from(&AttemptRecord {
-                    attempt_id: attempt,
-                    state: AttemptState::Unresolved,
-                    operation: operation.clone(),
-                    repository: RepositoryId::from([0u8; 16]),
-                    recorded_at_unix_millis: now_unix_millis(),
-                    receipt: None,
-                })?,
-                Some(StoredManagedIntent {
-                    attempt: attempt.to_string(),
-                    parent: parent.to_string(),
-                    rpc: operation,
-                    canonical_request: canonical_intent,
-                }),
-            ),
-            existing,
-        )
+        let mut child = StoredChild::new(
+            StoredAttempt::try_from(&AttemptRecord {
+                attempt_id: attempt,
+                state: AttemptState::Unresolved,
+                operation: operation.clone(),
+                repository: RepositoryId::from([0u8; 16]),
+                recorded_at_unix_millis: now_unix_millis(),
+                receipt: None,
+            })?,
+            Some(StoredManagedIntent {
+                attempt: attempt.to_string(),
+                parent: parent.to_string(),
+                rpc: operation,
+                canonical_request: canonical_intent,
+            }),
+        );
+        child.local = local;
+        self.write_child(&document, &child, existing)
     }
 
     /// Admission and recovery call this once. Validate the full history here, never on each

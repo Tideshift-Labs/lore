@@ -13,6 +13,7 @@ mod call;
 mod call_delegation;
 mod close_race;
 mod file;
+mod local_commit_recovery;
 mod lock;
 mod log;
 mod recovery;

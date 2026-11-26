@@ -95,6 +95,10 @@ pub(super) struct StoredChild {
     version: u8,
     pub(super) attempt: StoredAttempt,
     pub(super) managed: Option<StoredManagedIntent>,
+    /// FORK-LOCAL (Tideshift): the anchors a journalled local commit would move, read before it
+    /// ran; see [`crate::local_commit_evidence`]. Additive: an older build ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) local: Option<crate::local_commit_evidence::LocalCommitEvidence>,
 }
 
 /// Single-use lookup retained while its journal lock is held. Callers must not write
@@ -112,6 +116,7 @@ impl StoredChild {
             version: ATTEMPT_STORE_VERSION,
             attempt,
             managed,
+            local: None,
         }
     }
 }

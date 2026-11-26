@@ -94,6 +94,8 @@ where
 {
     // Legacy Put, Copy and PutResolved children and childless parents need no server answer.
     fence.settle_receiptless().await?;
+    // FORK-LOCAL (Tideshift): nor does a local commit journalled with its anchors.
+    settle_local_commits(fence).await?;
     let mut blockers = Vec::new();
     for (source, store) in fence.recovery_stores() {
         for child in store.unresolved().await.map_err(|error| {
@@ -191,6 +193,138 @@ where
         Ok(())
     } else {
         Err(ProtocolError::internal(blockers.join("\n")))
+    }
+}
+
+/// FORK-LOCAL (Tideshift): settles, from the working copy's own anchors, every unresolved child
+/// journalled with local commit evidence (see [`lore_revision::local_commit_evidence`]), then
+/// closes each parent that evidence proved had no effect. Reads no receipt and resends nothing.
+/// A child whose anchors prove nothing, or that cannot be read, stays unresolved. Returns
+/// whether anything settled or closed.
+///
+/// Runs inside an execution context, under a recovery fence.
+pub async fn settle_local_commits(fence: &RepositoryMutationGuard) -> Result<bool, ProtocolError> {
+    // Inside a running workflow the child may be the body's own, mid-commit: its anchors have
+    // not moved yet, and that must never read as NotApplied.
+    if !fence.holds_admission_lock() {
+        return Err(ProtocolError::internal(
+            "cannot settle local commits inside a running managed workflow",
+        ));
+    }
+    let mut pending = Vec::new();
+    for (source, store) in fence.recovery_stores() {
+        let found = store.unresolved_local_commits().await.map_err(|error| {
+            ProtocolError::internal(format!("{source}: cannot read local commits: {error}"))
+        })?;
+        if !found.is_empty() {
+            pending.push((store, found));
+        }
+    }
+    if pending.is_empty() {
+        return Ok(false);
+    }
+    if lore_revision::runtime::try_execution_context().is_none() {
+        // Opening the working copy needs a command's context; without one nothing settles.
+        return Ok(false);
+    }
+    let repository = lore_revision::repository::load_and_connect(
+        fence.root(),
+        lore_revision::repository::RepositoryAccess::ReadOnly,
+    )
+    .await
+    .map_err(|error| ProtocolError::internal(format!("opening the working copy: {error}")))?;
+    let mut changed = false;
+    for (store, found) in pending {
+        for (attempt, operation, evidence) in found {
+            match lore_revision::local_commit_evidence::decide(&repository, &evidence).await {
+                Ok(Some(resolution)) => {
+                    lore_revision::lore_info!(
+                        "Settled local commit {attempt} ({operation}) from local anchors: \
+                         {resolution:?}"
+                    );
+                    store.resolve(&attempt, resolution).await?;
+                    changed = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    lore_revision::lore_warn!(
+                        "Local commit {attempt} ({operation}) stays unresolved: {error}"
+                    );
+                }
+            }
+        }
+        changed |= store.close_parents_without_effect().await?;
+    }
+    Ok(changed)
+}
+
+/// FORK-LOCAL (Tideshift): reads, offline and in its own execution context, the anchors a local
+/// commit of the working copy at `root` would move, for
+/// `RepositoryAttemptStore::record_local_commit_child`. Fails where the working copy has no such
+/// evidence (links, layers, a shared store) or a read fails; the caller then journals the child
+/// without it, which leaves a lost outcome blocked as before.
+pub async fn capture_local_commit_evidence(
+    root: &Path,
+) -> Result<lore_revision::local_commit_evidence::LocalCommitEvidence, ProtocolError> {
+    let globals = lore_revision::interface::LoreGlobalArgs {
+        repository_path: root.to_string_lossy().as_ref().into(),
+        offline: 1,
+        ..Default::default()
+    };
+    let execution = Arc::new(lore_revision::interface::ExecutionContext::new_client(
+        globals,
+        lore_revision::relay::EventDispatcher::default(),
+    ));
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async {
+            let repository = lore_revision::repository::load_and_connect(
+                root,
+                lore_revision::repository::RepositoryAccess::ReadOnly,
+            )
+            .await
+            .map_err(|error| {
+                ProtocolError::internal(format!("opening the working copy: {error}"))
+            })?;
+            lore_revision::local_commit_evidence::capture(&repository).await
+        })
+        .await
+}
+
+/// FORK-LOCAL (Tideshift): write admission that first settles local commits from local anchors
+/// ([`settle_local_commits`]) when the working copy is blocked, then admits again. Reads nothing
+/// remote. Any other refusal, and a blocked copy local evidence cannot clear, refuses as
+/// [`RepositoryMutationGuard::acquire`] does.
+pub async fn acquire_settling_local_commits(
+    root: &Path,
+    execution: &Arc<lore_revision::interface::ExecutionContext>,
+) -> Result<RepositoryMutationGuard, ProtocolError> {
+    let refusal = match RepositoryMutationGuard::acquire(root).await {
+        Ok(guard) => return Ok(guard),
+        Err(refusal) => refusal,
+    };
+    // Offline: a settlement inside admission must not reach the network (a not-found branch
+    // latest, for one, falls back to a metadata read that can go remote). Its own dispatcher, so
+    // it emits nothing on the caller's event stream. The recovery fence holds the admission lock
+    // and is dropped before admitting again.
+    let mut globals = execution.globals().clone();
+    globals.offline = 1;
+    let offline = Arc::new(lore_revision::interface::ExecutionContext::new_client(
+        globals,
+        lore_revision::relay::EventDispatcher::default(),
+    ));
+    let settled = lore_base::runtime::LORE_CONTEXT
+        .scope(offline, async {
+            let fence = RepositoryMutationGuard::recover(root).await?;
+            settle_local_commits(&fence).await
+        })
+        .await;
+    match settled {
+        Ok(true) => RepositoryMutationGuard::acquire(root).await,
+        Ok(false) => Err(refusal),
+        Err(error) => {
+            lore_revision::lore_warn!("Local commit recovery did not run: {error}");
+            Err(refusal)
+        }
     }
 }
 

@@ -250,6 +250,12 @@ impl RepositoryMutationGuard {
         Ok(())
     }
 
+    /// FORK-LOCAL (Tideshift): whether this guard holds the admission lock itself, so no managed
+    /// workflow body can be live on the worktree. False for a guard nested in a running workflow.
+    pub fn holds_admission_lock(&self) -> bool {
+        self.lock.is_some()
+    }
+
     /// The canonical worktree root this guard admits.
     pub fn root(&self) -> &Path {
         &self.root

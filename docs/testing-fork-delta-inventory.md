@@ -158,6 +158,18 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   wire attempt id of an unjournaled Put reads it from the error text. Gates: `cargo test -j 4 -p
   lore-transport --test unit -- storage_client` `cargo test -j 4 -p lore-revision --test put_fence
   --test repository_fence` `cargo test -j 4 -p lore-client --test unit -- operation`
+- **Local-commit evidence settling [CLIENT]** (`lore-revision/src/local_commit_evidence.rs`, journal
+  `local` child field, `lore/src/recovery.rs::settle_local_commits`, `call.rs` write admission).
+  Tests: `lore-revision/tests/unit/local_commit_evidence.rs` (real commits on `with_instance`; a
+  commit's key rides `commit_with_metadata_boxed`; cut-short = store `ANCHOR_COMMITTING`; fields a
+  commit cannot reach are built by hand for `decide_from`), `.../attempt_store/local_commit_tests.rs`
+  (journal; the root file is `store.path()`, children are `<id>.json` under the generation),
+  `lore/tests/unit/local_commit_recovery.rs` (facade `file::stage` admits/refuses). Gotcha: an
+  Applied fixture must commit through the facade (`commit_exact_selection` with `revision_metadata`
+  and `source_hash` of the written bytes): a raw `commit_with_metadata_boxed` on a reopened
+  repository leaves the commit intent non-zero, which reads as cut short (unknown). Gates:
+  `cargo test -j 4 -p lore-revision --test unit -- local_commit` `cargo test -j 4 -p lore --test
+  unit -- local_commit_recovery`
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --test unit -- charge_bound`
 - **CR-038 cell schema forward upgrade and spool metadata true-up [SERVER]**: migration 0028 trues
   up a released spool row's metadata charge to its actual retained size (was a flat 16,384-byte
