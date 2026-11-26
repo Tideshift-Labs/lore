@@ -276,3 +276,68 @@ def test_exact_selection_json_flag_prints_one_compact_line(repo_with_baseline):
     assert payload["revision"]
     assert [row["path"] for row in payload["effectiveActions"]] == ["added.txt"]
     assert repo.revision_info(offline=True).message == "Json commit"
+
+
+def _write_bytes(repo: Lore, path: str, content: bytes) -> None:
+    full_path = os.path.join(repo.path, path)
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    with open(full_path, "wb") as output_file:
+        output_file.write(content)
+
+
+def _modify_entry_commit(
+    repo: Lore, message: str, path: str, content: bytes
+) -> subprocess.CompletedProcess[str]:
+    selection = _write_selection(
+        repo,
+        f"selection-{hashlib.md5(message.encode()).hexdigest()}.json",
+        json.dumps(
+            _selection([_entry(path, "modify", hashlib.md5(content).hexdigest())])
+        ),
+    )
+    return _commit_exact(
+        repo, message, "--exact-selection", selection, global_args=("--json",)
+    )
+
+
+@pytest.mark.parametrize("push_between", [False, True], ids=["no-push", "push"])
+@pytest.mark.parametrize("size", [3000, 3_000_000])
+def test_exact_selection_commits_old_bytes_written_back_in_a_second_clone(
+    new_lore_repo, size, push_between
+):
+    """A clone's local store holds only a header-only, durable entry for content it realized
+    (cache off by default). Writing those exact bytes back stages no payload, so the source-hash
+    check must take the bytes from the working-tree file instead of failing with
+    `missing immutable content`."""
+    path = "Content/actor.uasset"
+    v1 = os.urandom(size)
+    changed = bytearray(v1)
+    changed[size // 2] ^= 0xFF
+    v2 = bytes(changed)
+
+    origin: Lore = new_lore_repo()
+    _write_bytes(origin, path, v1)
+    origin.stage(scan=True, offline=True)
+    origin.commit("v1", offline=True)
+    origin.push()
+
+    writer = origin.clone()
+    _write_bytes(writer, path, v2)
+    modified = _modify_entry_commit(writer, "v2", path, v2)
+    assert modified.returncode == 0, modified.stderr
+    if push_between:
+        writer.push()
+
+    _write_bytes(writer, path, v1)
+    reverted = _modify_entry_commit(writer, "back to v1", path, v1)
+
+    assert reverted.returncode == 0, reverted.stderr
+    payload = json.loads(reverted.stdout.strip().splitlines()[-1])
+    assert [(row["path"], row["action"]) for row in payload["effectiveActions"]] == [
+        (path, "modify")
+    ]
+    writer.push()
+
+    fresh = origin.clone()
+    with open(os.path.join(fresh.path, path), "rb") as input_file:
+        assert input_file.read() == v1

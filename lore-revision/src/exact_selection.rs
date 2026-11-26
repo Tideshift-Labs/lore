@@ -42,6 +42,7 @@ use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreMetadataType;
 use crate::interface::LoreString;
+use crate::lore::Address;
 use crate::lore::Hash;
 use crate::lore::TypedBytes;
 use crate::metadata::Metadata;
@@ -1122,6 +1123,46 @@ where
     })
 }
 
+/// FORK-LOCAL (Tideshift): the content a staged node names, read from the working-tree file at
+/// `path` where the local store holds no payload for it.
+///
+/// The file is read once into memory, and those same bytes are measured against `address` and
+/// returned, so the bytes the caller hashes are the bytes proven to be the staged content. A file
+/// that cannot be read, or whose bytes do not answer for `address`, is an error: the check stays
+/// as strict as reading the stored payload.
+#[lore_macro::test_pub]
+async fn staged_content_from_working_tree(
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+    address: Address,
+    size: u64,
+) -> Result<Bytes, String> {
+    let root = repository
+        .require_path()
+        .map_err(|err| format!("resolving repository root: {err}"))?;
+    let file = lore_storage::ContentSource::owned_file(root.join(path));
+    let bytes = file
+        .read_all()
+        .await
+        .map_err(|err| format!("reading the working-tree file: {err}"))?;
+    let established = lore_storage::ContentHashes::default();
+    let matched = immutable::file_matches(
+        repository.clone(),
+        address,
+        Some(size as usize),
+        &lore_storage::ContentSource::memory(bytes.clone()),
+        &established,
+    )
+    .await
+    .map_err(|err| format!("comparing the working-tree file: {err}"))?;
+    match matched {
+        lore_storage::FileMatch::Match => Ok(bytes),
+        other => Err(format!(
+            "the working-tree file does not hold the staged content ({other:?})"
+        )),
+    }
+}
+
 fn semantic_node_equal(left: &Node, right: &Node) -> bool {
     left.is_file() == right.is_file()
         && left.is_link() == right.is_link()
@@ -1388,14 +1429,30 @@ impl ExactSelectionAdmission {
                     ExactSelectionError::internal("reading immutable content node", err)
                 })?;
             let payload = map_immutable_read(&selected.row.path, async {
-                immutable::read(
+                let stored = immutable::read(
                     repository.clone(),
                     node.address,
                     None,
                     immutable::read_options_from_repository(&repository).with_cache(),
                 )
-                .await
-                .map_err(|err| err.to_string())
+                .await;
+                match stored {
+                    Ok(payload) => Ok(payload),
+                    // FORK-LOCAL (Tideshift): stage stores no payload for content the local store
+                    // already describes as durable on the remote, such as a revision's bytes a
+                    // clone realized and a user later wrote back. The staged address still names
+                    // that content, so the working-tree file stands in for it where it hashes to
+                    // the staged address; any other file fails as before.
+                    // Boxed: the fallback is cold, and inline it would grow every commit future.
+                    Err(err) => Box::pin(staged_content_from_working_tree(
+                        &repository,
+                        &selected.row.path,
+                        node.address,
+                        node.size,
+                    ))
+                    .await
+                    .map_err(|fallback| format!("{err}; {fallback}")),
+                }
             })
             .await?;
             let actual = hex::encode(Md5::digest(&payload));

@@ -1306,3 +1306,291 @@ async fn vanished_add_anchors(
             .revision,
     )
 }
+
+fn exact_modify(path: &str, bytes: &[u8]) -> SelectedFile {
+    SelectedFile {
+        expected_effective_action: ExpectedFileAction::Modify,
+        ..exact_add(path, bytes)
+    }
+}
+
+/// Deterministic, poorly compressible content, so a fragment's payload is real.
+fn exact_content(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 7) as u8 ^ seed)
+        .collect()
+}
+
+/// The staged-or-current address and size the committed tree names for `path`.
+async fn current_node_address(
+    repository: &Arc<RepositoryContext>,
+    path: &str,
+) -> (lore_base::types::Address, u64) {
+    let revision = lore_revision::instance::load_current_anchor_boxed(repository)
+        .await
+        .expect("current anchor")
+        .0;
+    let state = State::deserialize(repository.clone(), revision)
+        .await
+        .expect("deserialize current state");
+    let link = state
+        .find_node_link(repository.clone(), path)
+        .await
+        .expect("node link");
+    let node = state
+        .node(repository.clone(), link.node)
+        .await
+        .expect("node");
+    (node.address, node.size)
+}
+
+/// The address and stored representation a fixture repository gives `bytes` once it commits them,
+/// learned in a throwaway repository so another can be seeded with a header-only entry for it.
+#[allow(clippy::disallowed_methods)]
+async fn learn_stored_content(
+    bytes: &[u8],
+) -> (lore_base::types::Address, lore_base::types::Fragment) {
+    let (_tempdir, repository, token, root, _branch, _armed, _triggered) =
+        build_exact_selection_store_order_fixture().await;
+    std::fs::write(root.join("file.bin"), bytes).expect("write learned content");
+    commit_exact_selection(
+        repository.clone(),
+        &token,
+        ExactSelectionOptions {
+            message: "learn".to_string(),
+            files: vec![exact_add("file.bin", bytes)],
+            revision_metadata: Vec::new(),
+            stats: false,
+        },
+    )
+    .await
+    .expect("learning commit");
+    let (address, _) = current_node_address(&repository, "file.bin").await;
+    let held = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        .expect("learned entry");
+    (address, held.fragment)
+}
+
+/// Records a header-only, durable entry for `address`: what a clone holds for content it realized
+/// with the cache off.
+async fn seed_header_only_durable(
+    repository: &Arc<RepositoryContext>,
+    address: lore_base::types::Address,
+    learned: lore_base::types::Fragment,
+) {
+    use lore_base::types::Fragment;
+    use lore_base::types::FragmentFlags;
+    repository
+        .immutable_store()
+        .put(
+            repository.id,
+            address,
+            Fragment {
+                // Keep the stored representation (compression) and drop only the payload marks.
+                flags: (learned.flags & !FragmentFlags::PayloadStored)
+                    | FragmentFlags::PayloadStoredDurable.bits(),
+                ..learned
+            },
+            None,
+            false,
+        )
+        .await
+        .expect("record the header-only durable entry");
+    assert!(
+        immutable_read_fails(repository, address).await,
+        "fixture: the entry must hold no payload"
+    );
+}
+
+async fn immutable_read_fails(
+    repository: &Arc<RepositoryContext>,
+    address: lore_base::types::Address,
+) -> bool {
+    lore_revision::immutable::read(
+        repository.clone(),
+        address,
+        None,
+        lore_revision::immutable::read_options_from_repository(repository).with_cache(),
+    )
+    .await
+    .is_err()
+}
+
+/// A fixture repository with `file.bin` committed as `second` and the store holding `first`
+/// header-only and durable under the context `file.bin` carries, which is the address a later
+/// commit of `first` stages. Returns that address.
+#[allow(clippy::disallowed_methods)]
+async fn header_only_history(
+    first: &[u8],
+    second: &[u8],
+) -> (
+    tempfile::TempDir,
+    Arc<RepositoryContext>,
+    RepositoryWriteToken,
+    PathBuf,
+    BranchId,
+    lore_base::types::Address,
+) {
+    let (learned_address, learned) = learn_stored_content(first).await;
+    let (tempdir, repository, token, root, branch, _armed, _triggered) =
+        build_exact_selection_store_order_fixture().await;
+    std::fs::write(root.join("file.bin"), second).expect("write second");
+    commit_exact_selection(
+        repository.clone(),
+        &token,
+        ExactSelectionOptions {
+            message: "second".to_string(),
+            files: vec![exact_add("file.bin", second)],
+            revision_metadata: Vec::new(),
+            stats: false,
+        },
+    )
+    .await
+    .expect("second commit");
+    let (current, _) = current_node_address(&repository, "file.bin").await;
+    let address = lore_base::types::Address {
+        hash: learned_address.hash,
+        context: current.context,
+    };
+    seed_header_only_durable(&repository, address, learned).await;
+    (tempdir, repository, token, root, branch, address)
+}
+/// A user writes back the bytes of an older revision whose local entry is header-only and
+/// durable. Staging stores no payload for them, so the source-hash check must take the bytes from
+/// the working-tree file, which hash to the staged address.
+#[allow(clippy::disallowed_methods)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_selection_accepts_written_back_bytes_whose_local_entry_is_header_only() {
+    LORE_CONTEXT
+        .scope(store_order_execution(), async {
+            let first = exact_content(1, 4096);
+            let second = exact_content(2, 4096);
+            let (_tempdir, repository, token, root, _branch, address) =
+                header_only_history(&first, &second).await;
+
+            std::fs::write(root.join("file.bin"), &first).expect("write the old bytes back");
+            let result = commit_exact_selection(
+                repository.clone(),
+                &token,
+                ExactSelectionOptions {
+                    message: "back to first".to_string(),
+                    files: vec![exact_modify("file.bin", &first)],
+                    revision_metadata: Vec::new(),
+                    stats: false,
+                },
+            )
+            .await
+            .expect("written-back bytes must commit");
+
+            assert_eq!(result.effective_actions.len(), 1);
+            assert_eq!(
+                result.effective_actions[0].action,
+                ExpectedFileAction::Modify
+            );
+            assert_eq!(
+                current_node_address(&repository, "file.bin").await.0,
+                address,
+                "the commit must name the old content again"
+            );
+        })
+        .await;
+}
+
+/// The fallback is as strict as reading the stored payload: where the payload is absent and the
+/// working-tree file does not answer for the staged address, the commit still fails.
+#[allow(clippy::disallowed_methods)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn staged_content_from_working_tree_rejects_a_file_that_does_not_hold_the_staged_content() {
+    LORE_CONTEXT
+        .scope(store_order_execution(), async {
+            let first = exact_content(1, 4096);
+            let second = exact_content(2, 4096);
+            let (_tempdir, repository, _token, root, _branch, address) =
+                header_only_history(&first, &second).await;
+            let size = first.len() as u64;
+
+            // The working tree still holds the second bytes: same size, other content.
+            let differing =
+                staged_content_from_working_tree(&repository, "file.bin", address, size)
+                    .await
+                    .expect_err("a differing file must not stand in for the staged content");
+            assert!(
+                differing.contains("does not hold the staged content"),
+                "{differing}"
+            );
+
+            std::fs::remove_file(root.join("file.bin")).expect("remove the file");
+            let missing = staged_content_from_working_tree(&repository, "file.bin", address, size)
+                .await
+                .expect_err("a missing file must not stand in for the staged content");
+            assert!(
+                missing.contains("reading the working-tree file"),
+                "{missing}"
+            );
+
+            std::fs::write(root.join("file.bin"), &first).expect("restore the old bytes");
+            let bytes = staged_content_from_working_tree(&repository, "file.bin", address, size)
+                .await
+                .expect("the matching file answers for the staged content");
+            assert_eq!(bytes.as_ref(), first.as_slice());
+        })
+        .await;
+}
+
+/// A typed rejection inside the transaction applies nothing: the current, staged and
+/// branch-latest anchors are what they were before the call.
+#[allow(clippy::disallowed_methods)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn source_hash_mismatch_rejection_preserves_anchors_and_history() {
+    LORE_CONTEXT
+        .scope(store_order_execution(), async {
+            let (_tempdir, repository, token, root, branch, armed, triggered) =
+                build_exact_selection_store_order_fixture().await;
+            assert!(!armed.load(Ordering::SeqCst));
+            let original = b"original\n";
+            std::fs::write(root.join("subject.bin"), original).expect("write subject");
+            commit_exact_selection(
+                repository.clone(),
+                &token,
+                ExactSelectionOptions {
+                    message: "add subject".to_string(),
+                    files: vec![exact_add("subject.bin", original)],
+                    revision_metadata: Vec::new(),
+                    stats: false,
+                },
+            )
+            .await
+            .expect("add subject");
+
+            let changed = b"changed\n";
+            std::fs::write(root.join("subject.bin"), changed).expect("modify subject");
+            let before = vanished_add_anchors(&repository, branch).await;
+            let error = commit_exact_selection(
+                repository.clone(),
+                &token,
+                ExactSelectionOptions {
+                    message: "wrong source hash".to_string(),
+                    files: vec![exact_modify("subject.bin", b"not the file\n")],
+                    revision_metadata: Vec::new(),
+                    stats: false,
+                },
+            )
+            .await
+            .expect_err("a wrong source hash must reject");
+
+            assert!(
+                matches!(error.kind(), ExactSelectionErrorKind::SourceHashMismatch { mismatches } if mismatches.len() == 1),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(
+                vanished_add_anchors(&repository, branch).await,
+                before,
+                "current, staged and branch-latest anchors must be unchanged"
+            );
+            assert!(!triggered.load(Ordering::SeqCst), "no unrelated store fault may fire");
+        })
+        .await;
+}
