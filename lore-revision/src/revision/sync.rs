@@ -588,7 +588,16 @@ async fn require_remote_reachable(repository: &Arc<RepositoryContext>) -> Result
             Err(lore_transport::ProtocolError::Disconnected(disconnected)) => {
                 Err(SyncError::Disconnected(disconnected))
             }
-            _ => Ok(()),
+            // FORK-LOCAL (Tideshift, D-QS3 refined): a warm process reuses a storage connection
+            // whose first connect succeeded, so the readiness above stays `Ok` after its UDP path
+            // went dark. The pre-warm of this call then gave up on reaching storage, and that is
+            // the same fact a cold process's failed first connect reports: fail closed with it.
+            _ => match crate::runtime::try_execution_context()
+                .and_then(|context| context.prewarm_disconnected())
+            {
+                Some(disconnected) => Err(SyncError::Disconnected(disconnected)),
+                None => Ok(()),
+            },
         },
         Err(lore_transport::ProtocolError::Disconnected(disconnected)) => {
             Err(SyncError::Disconnected(disconnected))

@@ -37,10 +37,11 @@
 // A hang guard of 40 s turns a missing bound into a failure that does not wait out the unbounded
 // reconnect (about 236 s measured).
 //
-// The unmanaged cases (no managed scope anywhere) pin the other half of the fix: the repository's
-// connect always runs its session-pool pre-warm in a managed workflow, so an unmanaged open or a
-// local commit after QUIC died waits about one bound for the pre-warm and ignores its error
-// instead of waiting out the whole reconnect loop.
+// The unmanaged cases (no managed scope anywhere) pin the other half of the fix: an unmanaged open
+// or a local commit after QUIC died waits about one bound for the repository's session-pool
+// pre-warm and ignores its error instead of waiting out the whole reconnect loop. Since D-QS3
+// (refined) an unmanaged command's pre-warm runs under the unmanaged reconnect bound
+// (`LORE_QUIC_RECONNECT_TIMEOUT`), not the managed one, so this binary sets both to `BOUND_SECS`.
 #[cfg(all(test, feature = "integration_tests"))]
 #[allow(dead_code)]
 mod common;
@@ -62,7 +63,7 @@ pub fn setup_execution(
 pub const BOUND_SECS: u64 = 4;
 
 /// Points this binary's global config, credentials and service socket at names of its own, and
-/// sets the managed bound, before `main` (single-threaded, so no reader races the writes).
+/// sets the managed and unmanaged bounds, before `main` (single-threaded, so no reader races the writes).
 #[cfg(all(test, feature = "integration_tests"))]
 #[ctor::ctor]
 fn sandbox_machine_settings() {
@@ -79,6 +80,7 @@ fn sandbox_machine_settings() {
             format!("lore_service-hang-{}", &unique[..12]),
         );
         std::env::set_var("LORE_QUIC_MANAGED_IDLE_TIMEOUT", BOUND_SECS.to_string());
+        std::env::set_var("LORE_QUIC_RECONNECT_TIMEOUT", BOUND_SECS.to_string());
     }
 }
 

@@ -3372,34 +3372,58 @@ fn remote_connect(
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
         // Pre-warm the session pool so it's ready when the command runs.
         //
-        // FORK-LOCAL (Tideshift, WP-124): the pre-warm always runs in a managed wait scope, so
-        // its QUIC reconnect and its session starts end at the managed bound for every
-        // caller. Unbounded, a dead QUIC path held an unmanaged command that awaits the
-        // remote (a local commit) for the whole reconnect loop (about 236 s), and every
-        // retry left one more such loop running in a task nobody awaits. A pre-warm is
-        // best effort: an unmanaged command that needs QUIC still reconnects on its own
-        // first use, unbounded as before.
-        if !repository.is_zero()
-            && let Err(error) = lore_transport::with_managed_workflow(
-                connection.session_pool(repository, &correlation_id),
-            )
-            .await
-            && lore_transport::is_managed_reconnect_expired(&error)
-        {
-            // FORK-LOCAL (Tideshift, WP-124): the QUIC path could not be replaced within the
-            // managed bound. A command that stores bytes would only reconnect and wait the
-            // bound again, so the command gets the expiry now (ffi 28, offline and retryable).
-            // Accepted cost: a managed command that needs only gRPC (a lock verb) also fails
-            // as offline here, where ignoring the pre-warm would have let it finish.
-            // An unmanaged command ignores every pre-warm error, as it always did.
+        // FORK-LOCAL (Tideshift, WP-124): a managed command's pre-warm runs in its managed wait
+        // scope, so its QUIC reconnect and its session starts end at the managed bound.
+        //
+        // FORK-LOCAL (Tideshift, D-QS3 refined): an unmanaged command's pre-warm runs under the
+        // unmanaged reconnect bound (30 s from when the path went silent). It used to be forced
+        // into the managed scope, because the unmanaged reconnect was unbounded (a dead QUIC path
+        // held a local commit for about 236 s); D-QS3 bounds it now. The managed bound is 60 s and
+        // keeps the connection at its deadline, so the forced scope made a warm unmanaged sync
+        // pay it and then a whole unmanaged bound more on its own first read (120 s, RC2).
+        let prewarmed = if repository.is_zero() {
+            Ok(())
+        } else {
+            let prewarm = connection.session_pool(repository, &correlation_id);
             if managed {
-                return Err(error);
+                lore_transport::with_managed_workflow(prewarm)
+                    .await
+                    .map(drop)
+            } else {
+                prewarm.await.map(drop)
             }
-            // FORK-LOCAL (Tideshift, WP-124 K10): an unmanaged command still finishes, but
-            // its declared, best-effort uploads (a commit's) skip instead of spending a second
-            // bound on their own reconnect. This runs in the context of the call that starts
-            // the connect (upstream may start it lazily, at the context's first remote use).
-            if let Some(context) = crate::runtime::try_execution_context() {
+        };
+        if let Err(error) = prewarmed {
+            if lore_transport::is_managed_reconnect_expired(&error) {
+                // FORK-LOCAL (Tideshift, WP-124): the QUIC path could not be replaced within
+                // the managed bound. A command that stores bytes would only reconnect and wait
+                // the bound again, so the command gets the expiry now (ffi 28, offline and
+                // retryable). Accepted cost: a managed command that needs only gRPC (a lock
+                // verb) also fails as offline here, where ignoring the pre-warm would have let
+                // it finish.
+                if managed {
+                    return Err(error);
+                }
+            }
+            // An unmanaged command ignores a pre-warm error, as it always did, except for what
+            // it records below.
+            if let ProtocolError::Disconnected(disconnected) = &error
+                && let Some(context) = crate::runtime::try_execution_context()
+            {
+                // FORK-LOCAL (Tideshift, D-QS3 refined): the storage path gave up (it found no
+                // server within the unmanaged bound). Recorded so a command that must reach
+                // storage fails closed with this typed `Disconnected` (a sync,
+                // `require_remote_reachable`), and so declared, best-effort uploads skip
+                // (WP-124 K10), instead of each spending a bound of its own.
+                context.note_prewarm_disconnected(disconnected.clone());
+            } else if lore_transport::is_managed_reconnect_expired(&error)
+                && let Some(context) = crate::runtime::try_execution_context()
+            {
+                // FORK-LOCAL (Tideshift, WP-124 K10): an unmanaged command still finishes, but
+                // its declared, best-effort uploads (a commit's) skip instead of spending a
+                // second bound on their own reconnect. This runs in the context of the call that
+                // starts the connect (upstream may start it lazily, at the context's first
+                // remote use).
                 context.note_prewarm_expired();
             }
         }

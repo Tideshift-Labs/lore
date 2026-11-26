@@ -30,6 +30,50 @@ use crate::quic::chunking::ParallelChunking;
 
 pub(crate) type PendingResultSender = oneshot::Sender<Result<Bytes, QuicClientError>>;
 
+/// FORK-LOCAL (Tideshift, D-QS3 refined): when, and how, a connection was found lost.
+///
+/// A stream reader records the loss the moment its read fails with the connection gone, so a
+/// reconnect can count its bound from when the path went silent rather than from when a command
+/// happened to notice ([`super::client`]'s `reconnect_deadline`). The first loss on a connection
+/// wins; a successful reconnect clears it. A close this client made itself is not a loss.
+#[derive(Debug, Default)]
+pub struct PathLoss {
+    /// One word, so a reader never pairs the time of one loss with the kind of another: zero is
+    /// "not lost"; otherwise bit 0 says the loss was quinn's idle timeout (nothing at all was
+    /// heard for the whole idle timeout before it, keep-alives included), and the bits above it
+    /// hold the milliseconds from the connection's `created` to the loss, plus one.
+    state: AtomicU64,
+}
+
+impl PathLoss {
+    /// Record a loss found now, unless one is recorded already.
+    pub(crate) fn record(&self, created: Instant, by_idle: bool) {
+        let at = u64::try_from(created.elapsed().as_millis())
+            .unwrap_or(u64::MAX >> 2)
+            .min(u64::MAX >> 2)
+            .saturating_add(1);
+        let state = (at << 1) | u64::from(by_idle);
+        let _ = self
+            .state
+            .compare_exchange(0, state, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The recorded loss: when it was found and whether it was the idle timeout.
+    pub(crate) fn found(&self, created: Instant) -> Option<(Instant, bool)> {
+        let state = self.state.load(Ordering::Acquire);
+        let at = (state >> 1).checked_sub(1)?;
+        Some((
+            created + std::time::Duration::from_millis(at),
+            state & 1 == 1,
+        ))
+    }
+
+    /// Forget the loss, once a reconnect replaced the connection.
+    pub(crate) fn clear(&self) {
+        self.state.store(0, Ordering::Release);
+    }
+}
+
 /// A command waiting for its answer.
 struct PendingCommand {
     sender: PendingResultSender,
@@ -130,6 +174,7 @@ impl ResponseReader {
         pending: Arc<PendingCommands>,
         max_chunk_size: usize,
         last_recv: Arc<AtomicU64>,
+        path_loss: Arc<PathLoss>,
         created: Instant,
         v4: bool,
         connection: quinn::Connection,
@@ -145,6 +190,7 @@ impl ResponseReader {
                         max_chunk_size,
                         pending.clone(),
                         last_recv,
+                        path_loss,
                         created,
                         v4,
                         StreamIdentity {
@@ -190,11 +236,13 @@ struct StreamIdentity {
     index: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_response(
     mut stream: quinn::RecvStream,
     max_chunk_size: usize,
     pending: Arc<PendingCommands>,
     last_recv: Arc<AtomicU64>,
+    path_loss: Arc<PathLoss>,
     created: Instant,
     v4: bool,
     identity: StreamIdentity,
@@ -216,6 +264,12 @@ async fn read_response(
             Err(err) => {
                 if err != ReadError::ConnectionLost(ConnectionError::LocallyClosed) {
                     lore_debug!("Error reading chunk: {err}");
+
+                    // FORK-LOCAL (Tideshift, D-QS3 refined): the connection, not just this
+                    // stream, is gone. Recorded for the reconnect's deadline.
+                    if let ReadError::ConnectionLost(lost) = &err {
+                        path_loss.record(created, matches!(lost, ConnectionError::TimedOut));
+                    }
 
                     if let ReadError::ConnectionLost(lost_error) = err
                         && let ConnectionError::ConnectionClosed(closed_error) = lost_error

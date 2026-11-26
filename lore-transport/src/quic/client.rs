@@ -53,6 +53,7 @@ use super::TIME_THRESHOLD;
 use super::command_header::CommandHeader;
 use super::response_observer::ResponseObserver;
 use super::response_observer::ResponseObserverSlot;
+use super::response_reader::PathLoss;
 use super::response_reader::PendingCommands;
 use super::response_reader::ResponseReader;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
@@ -489,6 +490,40 @@ fn reconnect_timeout_from(value: Option<&str>) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// FORK-LOCAL (Tideshift, D-QS3 refined): the least time a reconnect bounded by `bound` gets: one
+/// handshake attempt, or the whole bound where a test sets one shorter than a handshake.
+fn reconnect_floor(bound: Duration) -> Duration {
+    Duration::from_secs(HANDSHAKE_TIMEOUT_SECS).min(bound)
+}
+
+/// FORK-LOCAL (Tideshift, D-QS3 refined): the pure rule of [`QuicConnection::reconnect_deadline`]
+/// at `now`, for a connection whose recorded loss is `loss` (when it was found, and whether it
+/// was quinn's idle timeout). See that method for the rule and why.
+#[lore_macro::test_pub]
+fn reconnect_deadline_from(
+    now: Instant,
+    loss: Option<(Instant, bool)>,
+    bound: Duration,
+) -> Instant {
+    let floor = now + reconnect_floor(bound);
+    let silent_since = loss
+        // A loss found more than one bound ago is a stale death: the outage starts now.
+        .filter(|(found, _)| now.saturating_duration_since(*found) <= bound)
+        .map(|(found, by_idle)| {
+            if by_idle {
+                found
+                    .checked_sub(Duration::from_millis(u64::from(IDLE_TIMEOUT_MS)))
+                    .unwrap_or(found)
+            } else {
+                found
+            }
+        });
+    match silent_since {
+        Some(silent_since) => (silent_since + bound).max(floor),
+        None => now + bound,
+    }
+}
+
 fn reconnect_timeout() -> Duration {
     reconnect_timeout_from(std::env::var("LORE_QUIC_RECONNECT_TIMEOUT").ok().as_deref())
 }
@@ -521,6 +556,7 @@ impl QuicQuinnConnection {
             pending.clone(),
             quic.max_chunk_size,
             quic.last_recv.clone(),
+            quic.path_loss.clone(),
             quic.created,
             quic.v4,
             self.connection.clone(),
@@ -610,6 +646,9 @@ pub struct QuicConnection {
     created: Instant,
     last_send: AtomicU64,
     last_recv: Arc<AtomicU64>,
+    /// FORK-LOCAL (Tideshift, D-QS3 refined): when the connection in hand was found lost, which a
+    /// reconnect counts its bound from. See [`QuicConnection::reconnect_deadline`].
+    path_loss: Arc<PathLoss>,
     pub epoch: AtomicU32,
     /// Which underlying connection the streams inside `connection` belong to.
     ///
@@ -692,6 +731,7 @@ impl QuicConnection {
             created: Instant::now(),
             last_send: AtomicU64::new(0),
             last_recv: Arc::new(AtomicU64::new(0)),
+            path_loss: Arc::default(),
             epoch: AtomicU32::new(1),
             generation: AtomicU32::new(1),
             sessions: dashmap::DashMap::new(),
@@ -760,6 +800,40 @@ impl QuicConnection {
 
     fn reconnect_bound(&self) -> Duration {
         Duration::from_millis(self.reconnect_timeout_ms.load(Ordering::Relaxed))
+    }
+
+    /// FORK-LOCAL (Tideshift, D-QS3 refined): the deadline of a reconnect bounded by `bound`,
+    /// starting now.
+    ///
+    /// The rule: **a reconnect bound counts from when the path went silent, not from when a
+    /// reconnect starts**, with a floor of one handshake attempt ([`HANDSHAKE_TIMEOUT_SECS`],
+    /// 5 s) from now. (A bound shorter than a handshake, which only tests set, is its own floor.)
+    ///
+    /// - The path went silent when the connection was found lost ([`PathLoss`], recorded by the
+    ///   stream reader), less quinn's idle timeout when that is how it was lost: keep-alives run
+    ///   every [`KEEP_ALIVE_MS`], so an idle timeout means nothing at all was heard for
+    ///   [`IDLE_TIMEOUT_MS`] before it.
+    /// - No loss recorded (a reconnect after a command failed on a connection that still reads),
+    ///   or a loss found more than one `bound` ago (a stale death nobody noticed): the outage that
+    ///   matters starts now, and the reconnect gets the whole bound.
+    /// - The floor: however much of the bound the silence has used, the reconnect still makes one
+    ///   handshake attempt, so a server that came back in the meantime is reached.
+    ///
+    /// Without it each wait counted its bound afresh: a read sent on a live connection whose UDP
+    /// was then dropped waited quinn's 30 s idle timeout, then a whole bound, and a command after
+    /// it a whole bound more (120 s for a warm sync; RC2, 2026-11-26). And a caller that dropped
+    /// its command part way (the desktop's 15 s probe budget) restarted the clock every time, so
+    /// the typed `Disconnected` never came. The loss is on the connection, so every command and
+    /// every retry counts from the same moment, and a successful reconnect clears it.
+    fn reconnect_deadline(&self, bound: Duration) -> ReconnectDeadlineAt {
+        let now = Instant::now();
+        let deadline = reconnect_deadline_from(now, self.path_loss.found(self.created), bound);
+        let tokio_now = tokio::time::Instant::now();
+        ReconnectDeadlineAt {
+            at: tokio_now + deadline.saturating_duration_since(now),
+            floor: reconnect_floor(bound),
+            guard_wait: tokio_now + bound,
+        }
     }
 
     /// Shorten the unmanaged reconnect bound. Tests only.
@@ -1541,17 +1615,22 @@ where
     // path, which is what a process whose cached connection lost UDP mid-session saw. At that
     // bound the reconnect gives up as an exhausted one does, and the caller gets `Disconnected`.
     // A server-side client opts out and keeps upstream's loop (`bounds_unmanaged_reconnect`).
-    let now = tokio::time::Instant::now();
-    let bound = if crate::caller_operation::in_managed_wait_scope() {
-        Some(ReconnectBound::Managed(
-            now + service_client.quic().managed_idle(),
-        ))
-    } else if service_client.bounds_unmanaged_reconnect() {
-        Some(ReconnectBound::Unmanaged(
-            now + service_client.quic().reconnect_bound(),
-        ))
-    } else {
-        None
+    //
+    // FORK-LOCAL (Tideshift, D-QS3 refined): both bounds count from when the path went silent,
+    // with a floor of one handshake attempt ([`QuicConnection::reconnect_deadline`]).
+    let bound = {
+        let quic = service_client.quic();
+        if crate::caller_operation::in_managed_wait_scope() {
+            Some(ReconnectBound::Managed(
+                quic.reconnect_deadline(quic.managed_idle()),
+            ))
+        } else if service_client.bounds_unmanaged_reconnect() {
+            Some(ReconnectBound::Unmanaged(
+                quic.reconnect_deadline(quic.reconnect_bound()),
+            ))
+        } else {
+            None
+        }
     };
     match reconnect_until(
         service_client.endpoint_config(),
@@ -2261,18 +2340,43 @@ struct ReconnectDeadline;
 enum ReconnectBound {
     /// A managed scope's bound (WP-124). At the deadline the connection is left closed with its
     /// epoch kept, so the next command reconnects, and the caller gets the typed expiry.
-    Managed(tokio::time::Instant),
+    Managed(ReconnectDeadlineAt),
     /// The bound outside a managed scope (D-QS3, [`reconnect_timeout`]). At the deadline the
     /// reconnect gives up as an exhausted one does, only sooner: the epoch goes to zero, so every
     /// command waiting on this connection fails at once rather than each starting its own bound,
     /// and the caller gets `Disconnected`.
-    Unmanaged(tokio::time::Instant),
+    Unmanaged(ReconnectDeadlineAt),
+}
+
+/// FORK-LOCAL (Tideshift, D-QS3 refined): a reconnect's deadline
+/// ([`QuicConnection::reconnect_deadline`]) and its floor, the time it may still take once it holds
+/// the reconnect guard, so a wait for another command's reconnect does not eat the one handshake
+/// attempt the floor promises.
+#[derive(Clone, Copy, Debug)]
+struct ReconnectDeadlineAt {
+    at: tokio::time::Instant,
+    floor: Duration,
+    /// How long the command may wait for another command's reconnect: the whole bound from now,
+    /// never the anchored deadline. That reconnect bounds itself and, when it gives up, every
+    /// waiter learns so at once (the epoch goes to zero); a waiter cut short at the anchored
+    /// deadline would report `Disconnected` on a path whose reconnect is about to succeed.
+    guard_wait: tokio::time::Instant,
 }
 
 impl ReconnectBound {
-    fn deadline(self) -> tokio::time::Instant {
+    /// The deadline of the wait for another command's reconnect (the guard).
+    fn guard_deadline(self) -> tokio::time::Instant {
         match self {
-            Self::Managed(deadline) | Self::Unmanaged(deadline) => deadline,
+            Self::Managed(deadline) | Self::Unmanaged(deadline) => deadline.guard_wait,
+        }
+    }
+
+    /// The deadline once the guard is held: never sooner than the floor from now.
+    fn deadline_holding_guard(self) -> tokio::time::Instant {
+        match self {
+            Self::Managed(deadline) | Self::Unmanaged(deadline) => deadline
+                .at
+                .max(tokio::time::Instant::now() + deadline.floor),
         }
     }
 }
@@ -2317,10 +2421,13 @@ where
     AuthErrorType: std::error::Error + Send + Sync,
 {
     let remote_url = &config.remote_url;
-    let deadline = bound.map(ReconnectBound::deadline);
     // Waiting for another command's reconnect. At an unmanaged deadline this command gives up
     // without touching the connection, which that reconnect owns and bounds itself.
-    let permit = match before_deadline(deadline, connection.reconnect_guard.acquire()).await {
+    //
+    // FORK-LOCAL (Tideshift, D-QS3 refined): the wait races the whole bound from now, not the
+    // deadline anchored to the path's silence (see `ReconnectDeadlineAt::guard_wait`).
+    let guard_wait = bound.map(ReconnectBound::guard_deadline);
+    let permit = match before_deadline(guard_wait, connection.reconnect_guard.acquire()).await {
         Ok(permit) => permit,
         Err(ReconnectDeadline) if matches!(bound, Some(ReconnectBound::Unmanaged(_))) => {
             return Ok(Err(ReconnectError::from(Disconnected)));
@@ -2330,6 +2437,9 @@ where
     let Ok(_permit) = permit else {
         return Ok(Err(ReconnectError::from(Disconnected)));
     };
+    // FORK-LOCAL (Tideshift, D-QS3 refined): holding the guard, the reconnect still gets its
+    // floor (one handshake attempt) however long it waited for another command's reconnect.
+    let deadline = bound.map(ReconnectBound::deadline_holding_guard);
     // Whether the last attempt that ended reached a server that answered its handshake. Until
     // one does, the path is what a front dropping UDP looks like, and the give-up says so.
     let mut answered = false;
@@ -2368,6 +2478,12 @@ where
             quinn.connection.stats()
         );
 
+        // FORK-LOCAL (Tideshift, D-QS3 refined): the loss is recorded here too, before this
+        // reconnect closes the connection itself (a close of our own is not recorded by the
+        // stream readers). A reconnect a caller drops part way then leaves its start behind, so
+        // the next one counts from it rather than from scratch. A loss the readers found first
+        // wins.
+        connection.path_loss.record(connection.created, false);
         quinn.connection.close(0u32.into(), b"lost connection");
     }
 
@@ -2454,6 +2570,11 @@ where
                     .and_then(|_| auth_adapter.reconnect_authorize(connection.clone()));
                 match restart_flow.await {
                     Ok(_) => {
+                        // FORK-LOCAL (Tideshift, D-QS3 refined): the path answers again. A later
+                        // loss is a new outage and gets a bound of its own. The old connection's
+                        // readers were drained before the swap above, so none of them can record
+                        // its loss after this.
+                        connection.path_loss.clear();
                         connection.stream_count.store(1, Ordering::Relaxed);
                         // Indicate that the reconnect attempt was successful and let any
                         // pending commands see that they can just early out and resend

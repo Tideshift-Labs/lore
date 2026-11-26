@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+mod black_path_put;
 mod chunking;
 mod client;
 mod managed_reconnect_bound;
@@ -8,6 +9,7 @@ mod managed_send_bound;
 mod managed_wait_scope;
 mod net_runtime;
 mod read_resend_marker;
+mod reconnect_deadline;
 mod response_observer;
 mod response_reader;
 mod scripted_storage_peer;

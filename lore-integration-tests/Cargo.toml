@@ -41,6 +41,11 @@ path = "tests/quic_managed_read_bound_test.rs"
 required-features = ["integration_tests"]
 
 [[test]]
+name = "quic_warm_unmanaged_sync"
+path = "tests/quic_warm_unmanaged_sync_test.rs"
+required-features = ["integration_tests"]
+
+[[test]]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"
 

@@ -1082,6 +1082,12 @@ pub struct ExecutionContext {
     /// declared, best-effort upload scope reads it and skips every upload. Shared so the scope can
     /// read it without holding this context.
     prewarm_expired: Arc<std::sync::atomic::AtomicBool>,
+    /// FORK-LOCAL (Tideshift, D-QS3 refined): the `Disconnected` a repository this call opened
+    /// got when its storage pre-warm gave up (no server reached within the unmanaged reconnect
+    /// bound). Read by a command that must reach storage, so it fails closed with the typed
+    /// detail rather than reconnecting again.
+    prewarm_disconnected:
+        parking_lot::Mutex<Option<lore_error_set::Traced<lore_base::error::Disconnected>>>,
     /// FORK-LOCAL (Tideshift, WP-124 K10): this call's declared, best-effort upload scope, when
     /// the command installed one. See `crate::managed_commit_uploads`.
     managed_uploads: parking_lot::Mutex<Option<Arc<lore_storage::managed_uploads::ManagedUploads>>>,
@@ -1223,6 +1229,25 @@ impl ExecutionContext {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// FORK-LOCAL (Tideshift, D-QS3 refined): record that a pre-warm of this call found the
+    /// storage path given up, with its `Disconnected`. It also counts as an expired pre-warm for
+    /// the declared, best-effort uploads ([`Self::note_prewarm_expired`]). The first one wins.
+    pub(crate) fn note_prewarm_disconnected(
+        &self,
+        disconnected: lore_error_set::Traced<lore_base::error::Disconnected>,
+    ) {
+        self.note_prewarm_expired();
+        self.prewarm_disconnected.lock().get_or_insert(disconnected);
+    }
+
+    /// FORK-LOCAL (Tideshift, D-QS3 refined): the `Disconnected` a pre-warm of this call got, if
+    /// one gave up. See [`Self::note_prewarm_disconnected`].
+    pub(crate) fn prewarm_disconnected(
+        &self,
+    ) -> Option<lore_error_set::Traced<lore_base::error::Disconnected>> {
+        self.prewarm_disconnected.lock().clone()
+    }
+
     /// FORK-LOCAL (Tideshift, WP-124 K10): the flag [`Self::note_prewarm_expired`] sets.
     pub(crate) fn prewarm_expired_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.prewarm_expired.clone()
@@ -1265,6 +1290,7 @@ impl Default for ExecutionContext {
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
             prewarm_expired: Arc::default(),
+            prewarm_disconnected: parking_lot::Mutex::new(None),
             managed_uploads: parking_lot::Mutex::new(None),
             push_budget: OnceLock::new(),
             environment: None,
