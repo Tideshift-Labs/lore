@@ -17,26 +17,27 @@ service run and case to have a unique namespace, and rejects `#[serial]` as a
 substitute; the two processes of ONE case deliberately share that case's
 namespace, which is the whole point of the proof, and nothing else does.
 
-Reuses existing local infrastructure rather than standing up its own: the
-`lorehub-dataplane-test` Postgres, the dev MinIO, and the dev NATS. Those are
-long-lived developer services, so this runner never starts, stops, or removes
-one, and refuses to run if it cannot see them. It creates and removes the
-per-case database and bucket it named itself.
+Reuses two long-lived local services: the `lorehub-dataplane-test` Postgres and
+the dev MinIO. This runner never starts, stops, or removes either, and refuses
+to run if it cannot see them. It creates and removes the per-case database and
+bucket it named itself, and leaves MinIO's `local` `mc` alias set to the same
+endpoint and credentials the compose `minio-init` one-shot already uses.
 
-Two things it touches on a shared service and deliberately LEAVES behind, both
-idempotent: the three JetStream streams for the cell (`ensureCellStreams` is
-idempotent, and the local broker is budgeted for a fixed set of cell slots, so
-churning them costs more than keeping them), and MinIO's `local` `mc` alias,
-which it sets to the same endpoint and credentials the compose `minio-init`
-one-shot already uses.
+NATS is the run's OWN by default. The runner brings up the lorehub compose
+`nats` service (same image, version and JetStream config as the dev data plane)
+as compose project `lore-aa2p-<run id>` on the band's ports PortBase-18 (client)
+and PortBase-17 (monitoring), never slot 0's 4222/8223, and removes its
+container, volumes and network by exact name at the end (`own_nats.ps1`). A
+shared broker is not used because its state outlives runs: campaign c52b failed
+case D when the dev broker's DURABLE stream had reached the account's 1,280
+consumer ceiling. `-NatsUrl` points the runner at a given broker instead.
 
-It also leaves behind one durable CONSUMER per receiver generation, because
-every receiver identity is namespaced to the run (see `LORE_AA2P_RUN_ID` below)
-and consumer names are derived from it. That is deliberate: reusing an identity
-across runs attaches to the previous run's consumer and gaps the new receiver's
-frontier permanently. The cost is a slowly growing consumer list on the local
-broker, which is a developer's own `nats consumer rm` to prune; this runner does
-not delete broker resources it cannot prove it created.
+Every receiver identity is namespaced to the run (see `LORE_AA2P_RUN_ID`
+below), so each receiver generation opens a durable consumer no other run can
+attach to. At the end the runner deletes exactly the consumers this run's
+identities can name (`prune-run-consumers.ts`, generations 1..64) on either
+broker, and FAILS when any of them is left. On its own broker it also fails
+when any consumer at all is left on the stream.
 
 .PARAMETER KeepOnFailure
 Leave the case database, the bucket, and the process logs behind when a case
@@ -62,6 +63,10 @@ to measure a binary from a KNOWN revision when the working tree is dirty: WP-109
 evidence has to name an exact revision, and a tree carrying another lane's
 uncommitted changes cannot. Skips the build step entirely.
 
+.PARAMETER NatsUrl
+Use this broker instead of starting the run's own. For development only; the
+Gate 0 capture passes no NatsUrl and so always gets an isolated broker.
+
 .EXAMPLE
 pwsh lore-integration-tests/tests/run-active-active-two-process-live.ps1
 #>
@@ -77,7 +82,7 @@ param(
     [string]$PostgresHostPort = '11832',
     [string]$PostgresRole = 'lorehub',
     [string]$MinioEndpoint = 'http://127.0.0.1:9000',
-    [string]$NatsUrl = 'nats://127.0.0.1:4222',
+    [string]$NatsUrl,
     [string]$LorehubRoot,
     [string]$ServerBin
 )
@@ -95,8 +100,20 @@ if (-not (Test-Path (Join-Path $lorehubRoot 'apps/notification-gateway'))) {
 }
 $gatewayRoot = Join-Path $lorehubRoot 'apps/notification-gateway'
 $fixtures = Join-Path $lorehubRoot 'docker/test-fixtures'
+. (Join-Path $PSScriptRoot 'own_nats.ps1')
 
 $runId = [Guid]::NewGuid().ToString('N').Substring(0, 12)
+# Own broker unless the caller named one. The plan is made up front so the
+# teardown can find a half-started broker by its project name.
+$ownNats = [string]::IsNullOrWhiteSpace($NatsUrl)
+$natsPlan = $null
+if ($ownNats) {
+    $natsPlan = New-OwnNatsPlan -RunId $runId -PortBase $PortBase -ComposeFile (Join-Path $lorehubRoot 'docker/compose.yaml')
+    $NatsUrl = $natsPlan.Url
+}
+$natsStarted = $false
+$runIdentities = [Collections.Generic.List[string]]::new()
+$teardownFailures = [Collections.Generic.List[string]]::new()
 $runRoot = Join-Path ([IO.Path]::GetTempPath()) "wp109-aa2p-$runId"
 $certDir = Join-Path $runRoot 'certs'
 
@@ -293,7 +310,19 @@ try {
     Assert-ContainerRunning -Name $PostgresContainer
     Assert-ContainerRunning -Name $MinioContainer
     Assert-Listening -Label 'MinIO' -Endpoint $MinioEndpoint
-    Assert-Listening -Label 'NATS (compose profile "notifications")' -Endpoint $NatsUrl
+    if ($ownNats) {
+        # The ports must be free: a listener there is someone else's, and
+        # compose would either fail to bind or the run would talk to it.
+        foreach ($port in @($natsPlan.Port, $natsPlan.MonitorPort)) {
+            if (Test-NetConnection -ComputerName 127.0.0.1 -Port $port -InformationLevel Quiet -WarningAction SilentlyContinue) {
+                throw "port $port for the run-owned NATS is already in use; choose another -PortBase"
+            }
+        }
+        if (-not (Test-Path $natsPlan.ComposeFile)) { throw "no lorehub compose file at $($natsPlan.ComposeFile)" }
+    }
+    else {
+        Assert-Listening -Label 'NATS (-NatsUrl)' -Endpoint $NatsUrl
+    }
     foreach ($required in @('jwks.json', 'jwt-private-key.pem')) {
         $path = Join-Path $fixtures $required
         if (-not (Test-Path $path)) { throw "missing TEST key material: $path" }
@@ -343,6 +372,19 @@ try {
     if (-not (Test-Path $serverBin)) { throw 'the release loreserver binary was not produced' }
     }
 
+    # -- the run's own broker ----------------------------------------------
+    # After the build, so the broker lives only as long as the cases need it.
+    if ($ownNats) {
+        Write-Host "== starting the run-owned NATS ($($natsPlan.Project)) =="
+        $commandLog.Add("docker $($natsPlan.UpArgs -join ' ')   # LH_NATS_PORT=$($natsPlan.Port) LH_NATS_MONITOR_PORT=$($natsPlan.MonitorPort)")
+        $natsStarted = $true
+        $natsResources = Start-OwnNats -Plan $natsPlan
+        Write-Host "   $($natsResources.Containers -join ', ') on $NatsUrl; volumes: $($natsResources.Volumes -join ', '); anonymous: $(if ($natsResources.AnonymousVolumes.Count) { $natsResources.AnonymousVolumes -join ', ' } else { '(none)' }); networks: $($natsResources.Networks -join ', ')"
+    }
+    else {
+        Write-Host "== using the given NATS $NatsUrl (not run-owned) =="
+    }
+
     # -- gateway trust material and streams --------------------------------
     Write-Host '== provisioning the private gateway =='
     # The generator hardcodes cell `sfo3-cell-a` in the relay leaf's SPIFFE SAN,
@@ -377,8 +419,8 @@ try {
     # with no boot failure to point at.
     #
     # `ensureCellStreams` UPDATES an existing stream rather than recreating it,
-    # and this runner deliberately leaves the cell's streams behind, so the
-    # value is stable across runs on one machine.
+    # so on a given (-NatsUrl) broker the value is stable across runs; on the
+    # run's own broker the stream is new and so is the epoch.
     $streamIdentity = "DURABLE-$CellId"
     $createdMatch = [regex]::Match(
         $provisionOutput,
@@ -473,6 +515,7 @@ try {
         $bucket = "wp109-aa2p-$($result.Case)-$runId"
         $casePortBase = $PortBase + ($ordinal * 10)
         $caseWork = Join-Path $runRoot "case-$($result.Case)"
+        foreach ($identity in (Get-CaseReceiverIdentities -CasePortBase $casePortBase -RunId $runId)) { $runIdentities.Add($identity) }
 
         Write-Host ""
         Write-Host "== case $($result.Case): $($result.Test) =="
@@ -600,6 +643,51 @@ finally {
     if ($null -ne $gatewayEnv) {
         foreach ($key in @($gatewayEnv.Keys)) { [Environment]::SetEnvironmentVariable($key, $null, 'Process') }
     }
+    $runFailed = $null -ne $setupError -or @($results | Where-Object { $_.Status -ne 'PASS' }).Count -ne 0
+    $keepBroker = $KeepOnFailure -and $runFailed
+
+    # -- this run's durable consumers ---------------------------------------
+    # After the gateway stopped, so nothing re-creates one. On every path,
+    # including a failed case or a failed setup: a consumer is the one broker
+    # resource a receiver generation leaves behind.
+    # A run-owned broker kept for debugging keeps its consumers too: it is
+    # removed whole later, and the consumers are part of what is being debugged.
+    $consumerCheck = $null
+    if ($runIdentities.Count -gt 0 -and (-not $ownNats -or ($natsStarted -and -not $keepBroker))) {
+        # Contained: a throw here must not skip the broker, database and bucket
+        # teardown below. It is recorded and fails the run instead.
+        try {
+            $pruneArgs = Get-PruneConsumersArgs -NatsUrl $NatsUrl -CellId $CellId -RunId $runId -Identities @($runIdentities) -RequireEmpty:$ownNats
+            $commandLog.Add("bun $($pruneArgs -join ' ')   # cwd=$gatewayRoot")
+            Push-Location $gatewayRoot
+            try { $pruneOutput = & bun @pruneArgs 2>&1 | Out-String; $pruneExit = $LASTEXITCODE }
+            finally { Pop-Location }
+            $pruneLine = (($pruneOutput -split "`r?`n") | Where-Object { $_ -match '^PRUNE \{' } | Select-Object -Last 1)
+            if ($pruneLine) { $consumerCheck = ($pruneLine -replace '^PRUNE ', '') | ConvertFrom-Json }
+            if ($pruneExit -ne 0 -or $null -eq $consumerCheck -or -not $consumerCheck.ok) {
+                $teardownFailures.Add("consumer check failed (exit $pruneExit): $($pruneOutput.Trim())")
+            }
+        }
+        catch {
+            $consumerCheck = $null
+            $teardownFailures.Add("consumer check could not run: $($_.Exception.Message)")
+        }
+    }
+
+    # -- the run's own broker -----------------------------------------------
+    $natsTeardown = $null
+    if ($ownNats -and $natsStarted) {
+        if ($keepBroker) {
+            Write-Warning "keeping the run-owned NATS project $($natsPlan.Project) ($NatsUrl) for debugging; remove its container, volumes and network by name"
+        }
+        else {
+            $natsTeardown = Remove-OwnNats -Plan $natsPlan
+            if (-not $natsTeardown.Clean) {
+                $teardownFailures.Add("run-owned NATS teardown left containers=$($natsTeardown.ContainersLeft) volumes=$($natsTeardown.VolumesLeft) networks=$($natsTeardown.NetworksLeft): $($natsTeardown.Errors -join '; ')")
+            }
+        }
+    }
+
     if (-not $KeepOnFailure) {
         foreach ($database in @($createdDatabases)) { Remove-CaseDatabase -Name $database }
         foreach ($bucket in @($createdBuckets)) { Remove-CaseBucket -Name $bucket }
@@ -620,6 +708,16 @@ $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
 Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($results.Count)"
+if ($null -ne $consumerCheck) {
+    Write-Host ("Consumers: stream={0} before={1} deleted={2} left-from-run={3} left-total={4} require-empty={5}" -f
+        $consumerCheck.stream, $consumerCheck.before, @($consumerCheck.deleted).Count,
+        @($consumerCheck.remainingFromRun).Count, $consumerCheck.remainingTotal, $consumerCheck.requireEmpty)
+}
+if ($null -ne $natsTeardown) {
+    Write-Host ("Own NATS {0}: removed containers={1} volumes={2} networks={3}; left containers={4} volumes={5} networks={6}" -f
+        $natsPlan.Project, @($natsTeardown.Removed.Containers).Count, @($natsTeardown.Removed.Volumes).Count,
+        @($natsTeardown.Removed.Networks).Count, $natsTeardown.ContainersLeft, $natsTeardown.VolumesLeft, $natsTeardown.NetworksLeft)
+}
 Write-Host ''
 Write-Host 'NOW COVERED, and how (the cross-process governed mutation this runner used to be blind to):'
 Write-Host '  Both loreservers point [environment.endpoint] auth_url at a rebac/auth-grpc stand-in'
@@ -684,9 +782,12 @@ Write-Host '  - authorization expiry and the durable authorization row. The stub
 Write-Host '    witnesses in memory for the life of a case, with no TTL and no retention sweep, so'
 Write-Host '    nothing here exercises the platform''s five-minute window or its audit record.'
 
+# Reported before the setup exit, so a leak is never hidden behind it.
+foreach ($failure in $teardownFailures) { Write-Warning "Teardown failed: $failure" }
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"
     exit 1
 }
+if ($teardownFailures.Count -ne 0) { exit 1 }
 if ($failCount -ne 0 -or $notRunCount -ne 0) { exit 1 }
 exit 0
