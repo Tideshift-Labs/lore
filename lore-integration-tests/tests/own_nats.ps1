@@ -156,17 +156,19 @@ function Remove-OwnNats {
     try { $found = Get-OwnNatsResources -Plan $Plan -Docker $Docker }
     catch { $errors.Add($_.Exception.Message) }
     if ($null -ne $found) {
-        foreach ($name in $found.Containers) {
-            $r = & $Docker @('rm', '-f', $name)
-            if ($r.ExitCode -ne 0) { $errors.Add("docker rm -f $name exited $($r.ExitCode): $($r.Output.Trim())") }
-        }
-        foreach ($name in $found.Volumes) {
-            $r = & $Docker @('volume', 'rm', $name)
-            if ($r.ExitCode -ne 0) { $errors.Add("docker volume rm $name exited $($r.ExitCode): $($r.Output.Trim())") }
-        }
-        foreach ($name in $found.Networks) {
-            $r = & $Docker @('network', 'rm', $name)
-            if ($r.ExitCode -ne 0) { $errors.Add("docker network rm $name exited $($r.ExitCode): $($r.Output.Trim())") }
+        # Containers first (they hold the volumes and the network), then the rest.
+        # Each removal is contained: one failure must not stop the others.
+        $removals = @(
+            foreach ($name in $found.Containers) { , @('rm', '-f', $name) }
+            foreach ($name in $found.Volumes) { , @('volume', 'rm', $name) }
+            foreach ($name in $found.Networks) { , @('network', 'rm', $name) }
+        )
+        foreach ($removal in $removals) {
+            try {
+                $r = & $Docker $removal
+                if ($r.ExitCode -ne 0) { $errors.Add("docker $($removal -join ' ') exited $($r.ExitCode): $($r.Output.Trim())") }
+            }
+            catch { $errors.Add("docker $($removal -join ' ') failed: $($_.Exception.Message)") }
         }
     }
     $left = $null

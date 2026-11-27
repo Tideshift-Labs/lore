@@ -9,12 +9,6 @@ $script:cases = 0
 function Assert-True($Condition, [string]$Message) {
     if (-not $Condition) { throw "FAIL: $Message" }
 }
-# A strict assertion that the implementation currently fails: recorded, the
-# run continues, and the file exits non-zero at the end. Not weakened.
-$script:defects = [Collections.Generic.List[string]]::new()
-function Assert-Defect($Condition, [string]$Message) {
-    if (-not $Condition) { $script:defects.Add($Message); Write-Host "DEFECT: $Message" }
-}
 function Assert-Equal($Actual, $Expected, [string]$Message) {
     $a = @($Actual) -join '|'
     $e = @($Expected) -join '|'
@@ -203,6 +197,15 @@ Assert-Equal $r.VolumesLeft 1 'throwing inspect counts the volume as left'
 Assert-True ($r.Errors.Count -ge 1) 'throwing inspect adds an Error'
 $script:cases++
 
+# a throwing `rm -f`: recorded, Clean=false, volume and network removals still issued, no throw
+$rmThrow = New-FakeDocker -Containers @('lore-aa2p-abc123def-nats-1') -Volumes @('lore-aa2p-abc123def_nats') -Networks @('lore-aa2p-abc123def_default') -ThrowOn @('rm -f *')
+$r = Remove-OwnNats -Plan $plan -Docker $rmThrow.Block
+Assert-True (-not $r.Clean) 'throwing rm is not clean'
+Assert-True (($r.Errors -join ' ') -match 'docker rm -f lore-aa2p-abc123def-nats-1 failed: ') 'throwing rm recorded in Errors'
+Assert-True ($rmThrow.State.Calls -contains 'volume rm lore-aa2p-abc123def_nats') 'volume rm still issued after a throwing rm'
+Assert-True ($rmThrow.State.Calls -contains 'network rm lore-aa2p-abc123def_default') 'network rm still issued after a throwing rm'
+$script:cases++
+
 # discovery failure: no throw, not clean
 $noDocker = { param([string[]]$DockerArgs) [pscustomobject]@{ ExitCode = 1; Output = 'daemon down' } }
 $r = Remove-OwnNats -Plan $plan -Docker $noDocker
@@ -243,7 +246,4 @@ Assert-True ($runner -notmatch '(?m)^\s*\$NatsUrl\s*=\s*.*4222') 'runner never a
 Assert-True ($runner -match "own_nats\.ps1") 'runner dot-sources own_nats.ps1'
 $script:cases++
 
-if ($script:defects.Count -gt 0) {
-    throw "own_nats: $($script:cases) groups ran; $($script:defects.Count) implementation defect(s): $($script:defects -join ' || ')"
-}
 Write-Host "PASS: own_nats ($($script:cases) groups)"
