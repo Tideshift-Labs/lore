@@ -53,3 +53,25 @@ pub fn protocol_error_to_storage(
         }),
     }
 }
+
+/// FORK-LOCAL (Tideshift, silence bound): [`protocol_error_to_storage`] for a remote READ, with one
+/// difference: a read the transport's bound ended (the server took it and sent no byte for one
+/// bound, or the path could not be replaced within it; see
+/// `lore_transport::quic::client::bound_unmanaged_silence`) is `Disconnected` (ffi 28), not
+/// `NotConnected`.
+///
+/// `NotConnected` reads as a stale session, which a remote read retries on a fresh session up to
+/// five times, each retry waiting a whole bound again: a sync took six bounds to fail. The bound
+/// already decided, as an exhausted reconnect does, and `Disconnected` is the error a read does
+/// not retry. A write keeps [`protocol_error_to_storage`]; its callers read the transport error
+/// itself (`note_unmanaged_refusal`).
+pub fn read_error_to_storage(
+    err: ProtocolError,
+    address: lore_base::types::Address,
+) -> StorageError {
+    if lore_transport::is_managed_reconnect_expired(&err) {
+        lore_base::lore_warn!("remote read ended by the transport's bound: {err}");
+        return StorageError::from(crate::errors::Disconnected);
+    }
+    protocol_error_to_storage(err, address)
+}

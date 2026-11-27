@@ -78,6 +78,14 @@ pub enum Reply {
     /// [`Peer::release_held`]. Lets a test put several commands in flight on one session before
     /// any of them is answered.
     HoldStatus(u32),
+    /// Answer success with `body`, but write the answer frame (header and body) `piece` bytes at a
+    /// time with `every` between pieces: an answer that is slow but never silent.
+    #[allow(dead_code)] // used by the unit binary only; this file is also `#[path]`-included.
+    Trickle {
+        body: Vec<u8>,
+        piece: usize,
+        every: Duration,
+    },
 }
 
 /// One request header the peer has read.
@@ -468,6 +476,27 @@ async fn respond(
     let _ = send.write_all(payload).await;
 }
 
+/// The success answer written `piece` bytes at a time, `every` apart (`Reply::Trickle`).
+async fn respond_trickled(
+    send: &Arc<tokio::sync::Mutex<quinn::SendStream>>,
+    request: &CommandHeader,
+    payload: &[u8],
+    piece: usize,
+    every: Duration,
+) {
+    let header = request.response_success(payload.len() as u32);
+    let (bytes, len) = header.response_bytes();
+    let mut frame = bytes[..len].to_vec();
+    frame.extend_from_slice(payload);
+    let mut send = send.lock().await;
+    for chunk in frame.chunks(piece.max(1)) {
+        if send.write_all(chunk).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(every).await;
+    }
+}
+
 async fn respond_status(
     send: &Arc<tokio::sync::Mutex<quinn::SendStream>>,
     request: &CommandHeader,
@@ -530,6 +559,9 @@ async fn serve_stream(
             }
             Some(Reply::Ok(body)) => respond(&send, &header, &body).await,
             Some(Reply::Status(status)) => respond_status(&send, &header, status).await,
+            Some(Reply::Trickle { body, piece, every }) => {
+                respond_trickled(&send, &header, &body, piece, every).await;
+            }
             Some(Reply::Hold(body)) => shared.held.lock().push(Held {
                 stream,
                 send: send.clone(),

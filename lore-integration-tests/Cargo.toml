@@ -40,6 +40,13 @@ name = "quic_managed_read_bound"
 path = "tests/quic_managed_read_bound_test.rs"
 required-features = ["integration_tests"]
 
+# Its own target: `bound_unmanaged_silence()` is a one-way process switch and the bound
+# (`LORE_QUIC_MANAGED_IDLE_TIMEOUT`) is process-wide.
+[[test]]
+name = "quic_unmanaged_silence_sync"
+path = "tests/quic_unmanaged_silence_sync_test.rs"
+required-features = ["integration_tests"]
+
 [[test]]
 name = "quic_warm_unmanaged_sync"
 path = "tests/quic_warm_unmanaged_sync_test.rs"

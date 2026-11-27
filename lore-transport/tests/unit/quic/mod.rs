@@ -16,6 +16,7 @@ mod response_reader;
 mod scripted_storage_peer;
 mod session_expiry;
 mod session_start_bound;
+mod silence_bound;
 mod slow_response;
 pub(crate) mod storage_service;
 mod unmanaged_reconnect_bound;

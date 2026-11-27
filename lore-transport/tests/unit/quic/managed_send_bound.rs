@@ -1681,7 +1681,9 @@ async fn a_managed_get_whose_answer_never_comes_ends_at_one_bound_without_a_reco
 }
 
 /// Control for the case above: the same silent peer and the same Get, outside any managed scope,
-/// keeps waiting. The bound is for a managed wait only.
+/// keeps waiting. This is the stock default (the process-wide silence switch is off, and this
+/// binary never turns it on): the silence bound is an embedder opt-in, covered per connection in
+/// `silence_bound.rs`.
 #[tokio::test]
 async fn an_unmanaged_get_whose_answer_never_comes_is_still_pending_after_four_bounds() {
     let peer = Peer::start();

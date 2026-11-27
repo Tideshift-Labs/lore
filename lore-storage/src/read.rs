@@ -167,7 +167,7 @@ pub async fn remote_get_retry(
                 }
             }
             Err(err) => {
-                let storage_err = crate::error::protocol_error_to_storage(err, address);
+                let storage_err = crate::error::read_error_to_storage(err, address);
                 if !session_retries
                     .retry(&storage_err, session, &mut retry)
                     .await
@@ -544,7 +544,7 @@ pub fn fetch_metadata<'a>(
             None => session
                 .get_metadata(address)
                 .await
-                .map_err(|err| crate::error::protocol_error_to_storage(err, *address))?,
+                .map_err(|err| crate::error::read_error_to_storage(err, *address))?,
         };
         store_fetched(store, *partition, *address, fragment, None, keep).await;
         Ok(fragment)
@@ -2664,7 +2664,7 @@ async fn remote_get_resolved_retry(
                 }
             }
             Err(err) => {
-                let storage_err = crate::error::protocol_error_to_storage(err, key_address);
+                let storage_err = crate::error::read_error_to_storage(err, key_address);
                 if !session_retries
                     .retry(&storage_err, session, &mut retry)
                     .await

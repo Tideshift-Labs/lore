@@ -10,6 +10,7 @@ use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -535,6 +536,46 @@ pub fn managed_wait_bound() -> Duration {
     managed_idle_timeout()
 }
 
+/// FORK-LOCAL (Tideshift, silence bound): whether this process bounds an unmanaged command's send
+/// by silence. Off by default, so the stock CLI and the server's own clients wait for an answer as
+/// upstream does. Set once by an embedder (the desktop) through [`bound_unmanaged_silence`].
+static UNMANAGED_SILENCE_BOUND: AtomicBool = AtomicBool::new(false);
+
+/// FORK-LOCAL (Tideshift, silence bound): bound every unmanaged QUIC command of this process by
+/// silence, as a managed command is bounded (see [`send_bounded`]).
+///
+/// The rule: **a command that has seen no progress for one bound ends; a command that keeps
+/// moving never does.** Progress is any byte the connection receives (an answer, a part of one,
+/// or an answer to a sibling command), any byte the command's stream accepts, so a slow but
+/// moving transfer is never cut, however long it takes. Keep-alive frames are not progress. The
+/// bound is the managed one ([`managed_wait_bound`], 60 s unless `LORE_QUIC_MANAGED_IDLE_TIMEOUT`
+/// says otherwise).
+///
+/// Without it, an unmanaged command whose request the server accepted but never answers waits
+/// forever while the connection stays alive, since keep-alive stops quinn's idle timeout.
+///
+/// At the bound: a replay-safe read ends with the typed read expiry
+/// ([`crate::error::is_managed_reconnect_expired`]), with no resend and no reconnect; a
+/// dispatched command that must not be repeated ends as an unknown outcome, never resent; a
+/// command whose bytes never left ends not dispatched. One-way and process-wide on purpose: a
+/// spawned task carries no task-local scope, and an embedder that wants the bound wants it on
+/// every command.
+pub fn bound_unmanaged_silence() {
+    UNMANAGED_SILENCE_BOUND.store(true, Ordering::Relaxed);
+}
+
+/// FORK-LOCAL (Tideshift, silence bound): whether [`bound_unmanaged_silence`] has been called.
+pub fn bounds_unmanaged_silence() -> bool {
+    UNMANAGED_SILENCE_BOUND.load(Ordering::Relaxed)
+}
+
+/// A connection's own setting for the silence bound: follow the process.
+const SILENCE_FOLLOWS_PROCESS: u8 = 0;
+/// A connection's own setting for the silence bound: always on. Tests only.
+const SILENCE_ON: u8 = 1;
+/// A connection's own setting for the silence bound: always off. Tests only.
+const SILENCE_OFF: u8 = 2;
+
 impl QuicQuinnConnection {
     /// Adds the stream of `quic` whose halves are `send` and `recv`, with its writer and a reader
     /// of its answers, which share the commands waiting on the stream.
@@ -693,6 +734,10 @@ pub struct QuicConnection {
     /// milliseconds. Read once at construction from [`reconnect_timeout`]; an atomic only so a
     /// test can shorten it.
     reconnect_timeout_ms: AtomicU64,
+    /// FORK-LOCAL (Tideshift, silence bound): whether an unmanaged command on this connection is
+    /// bounded by silence. [`SILENCE_FOLLOWS_PROCESS`] unless a test sets it, so one test binary's
+    /// connections do not share a process-wide switch.
+    silence_bound: AtomicU8,
     /// FORK-LOCAL (Tideshift): the endpoint no handshake answered when the connection was given
     /// up (epoch 0), so every command that finds it given up can say so, not only the one whose
     /// reconnect gave up.
@@ -758,6 +803,7 @@ impl QuicConnection {
             reconnect_timeout_ms: AtomicU64::new(
                 u64::try_from(reconnect_timeout().as_millis()).unwrap_or(u64::MAX),
             ),
+            silence_bound: AtomicU8::new(SILENCE_FOLLOWS_PROCESS),
             gave_up_unreachable: SyncMutex::new(None),
             response_observer: ResponseObserverSlot::default(),
         }
@@ -781,6 +827,28 @@ impl QuicConnection {
             u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// FORK-LOCAL (Tideshift, silence bound): whether an unmanaged command on this connection is
+    /// bounded by silence (see [`bound_unmanaged_silence`]).
+    fn bounds_silence(&self) -> bool {
+        match self.silence_bound.load(Ordering::Relaxed) {
+            SILENCE_ON => true,
+            SILENCE_OFF => false,
+            _ => bounds_unmanaged_silence(),
+        }
+    }
+
+    /// Bound this connection's unmanaged commands by silence (`Some(true)`), never
+    /// (`Some(false)`), or as the process says (`None`). Tests only.
+    #[cfg(any(feature = "test-util", feature = "test_seams"))]
+    pub fn set_silence_bound_for_test(&self, bound: Option<bool>) {
+        let value = match bound {
+            Some(true) => SILENCE_ON,
+            Some(false) => SILENCE_OFF,
+            None => SILENCE_FOLLOWS_PROCESS,
+        };
+        self.silence_bound.store(value, Ordering::Relaxed);
     }
 
     /// Give the connection up for every caller (epoch 0), recording disconnected's endpoint
@@ -1473,6 +1541,9 @@ where
     // (see [`send_bounded`]). That is the bound the caller was promised, so it ends here as a
     // managed expiry, never as a reconnect that would start a second bound. A mutation never
     // reaches this: a dispatched one returned above, and one not sent keeps its own error.
+    // FORK-LOCAL (Tideshift, silence bound): the same for an unmanaged read in a process that
+    // bounds silence ([`bound_unmanaged_silence`]): the server took the read and went silent on a
+    // live connection, so a reconnect and a resend would only wait again.
     if service_client.replay_class(request_type) == ReplayClass::ReadRetryable
         && matches!(
             failure.error,
@@ -3188,7 +3259,16 @@ async fn send_command_tracked<
         // `classify` turns the bound's expiry on a read into a terminal managed expiry, never a
         // reconnect. A runtime check rather than a const generic: the read path's instantiations
         // carry only the box, and an unmanaged caller takes the unchanged path below.
-        if MANAGED || (AWAIT_RESPONSE && crate::caller_operation::in_managed_wait_scope()) {
+        //
+        // FORK-LOCAL (Tideshift, silence bound): an unmanaged command that waits for its answer
+        // leaves too when its process asked for the silence bound (the desktop does, see
+        // [`bound_unmanaged_silence`]). Otherwise a server that accepted the request and never
+        // answers holds it forever on a live connection.
+        if MANAGED
+            || (AWAIT_RESPONSE
+                && (crate::caller_operation::in_managed_wait_scope()
+                    || connection.bounds_silence()))
+        {
             return Box::pin(send_bounded(&connection, &writer, chunks, rx)).await;
         }
         (writer.send.clone(), rx, stream_index, inflight)
@@ -3435,6 +3515,10 @@ const MANAGED_STALL_CLOSE_CODE: u32 = 1;
 /// and identity, so sibling traffic extends a stalled read, as it does a stalled write. Per-stream
 /// progress stamps are a WP-124 follow-up, wanted only if a server that hangs one stream on a
 /// healthy connection is ever seen.
+///
+/// FORK-LOCAL (Tideshift, silence bound): an unmanaged command takes this send too when its
+/// process asked for it ([`bound_unmanaged_silence`]). Every phase above is already a silence
+/// bound, counted from the last progress and never from the send, so it is the same send.
 async fn send_bounded(
     connection: &QuicConnection,
     writer: &StreamWriter,
@@ -3460,7 +3544,7 @@ async fn send_bounded(
                     if writer.progress.load(Ordering::Relaxed) > last {
                         continue;
                     }
-                    lore_warn!("managed QUIC write: no progress on its stream for {idle:?}; not sent");
+                    lore_warn!("bounded QUIC send: no progress on its stream for {idle:?}; not sent");
                     return Err(SendFailure::not_dispatched(QuicClientError::WriterLockTimeout));
                 }
             }
@@ -3483,12 +3567,12 @@ async fn send_bounded(
                     () = tokio::time::sleep_until(deadline(last)), if !closed => {
                         if !wrote {
                             lore_warn!(
-                                "managed QUIC write: the stream took no byte for {idle:?}; not sent"
+                                "bounded QUIC send: the stream took no byte for {idle:?}; not sent"
                             );
                             return Err(SendFailure::not_dispatched(QuicClientError::WriteTimeout));
                         }
                         lore_warn!(
-                            "managed QUIC write: the stream took no byte for {idle:?} after a partial write; closing its connection"
+                            "bounded QUIC send: the stream took no byte for {idle:?} after a partial write; closing its connection"
                         );
                         writer.connection.close(
                             VarInt::from_u32(MANAGED_STALL_CLOSE_CODE),
@@ -3532,7 +3616,7 @@ async fn send_bounded(
                 if connection.last_recv.load(Ordering::Relaxed) > last {
                     continue;
                 }
-                lore_warn!("managed QUIC write: no answer on its connection for {idle:?}; the answer is lost");
+                lore_warn!("bounded QUIC send: no byte received on its connection for {idle:?}; the answer is lost");
                 return Err(SendFailure::response_lost(QuicClientError::AnswerTimeout));
             }
         }
